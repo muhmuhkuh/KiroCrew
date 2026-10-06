@@ -89,6 +89,7 @@ EXPECTED_CTX_METHODS: dict[str, tuple[bool, list[tuple[str, str, bool]]]] = {
             ("phase", "KEYWORD_ONLY", True),
             ("schema", "KEYWORD_ONLY", True),
             ("model", "KEYWORD_ONLY", True),
+            ("backend", "KEYWORD_ONLY", True),
             ("agent", "KEYWORD_ONLY", True),
             ("effort", "KEYWORD_ONLY", True),
             ("cwd", "KEYWORD_ONLY", True),

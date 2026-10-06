@@ -2,23 +2,25 @@
   "$comment": "AUTO-GENERATED from the dashboard settings panels by website/scripts/gen-settings-registry.mjs — DO NOT EDIT. How to use a route: settings-deeplink.md (same directory).",
   "settings": [
     {
-      "id": "about.auto-update-on-restart",
-      "label": "Auto-update on restart",
+      "id": "about.install-app-updates-automatically",
+      "label": "Install app updates automatically",
       "tab": "about",
-      "route": "/settings/about?highlight=about.auto-update-on-restart"
-    },
-    {
-      "id": "about.update-notifications",
-      "label": "Notify when an update is available",
-      "tab": "about",
-      "route": "/settings/about?highlight=key%3Aauto_update",
-      "configKey": "auto_update"
+      "route": "/settings/about?highlight=about.install-app-updates-automatically",
+      "description": "Downloads new versions in the background and installs them the next time you quit the app."
     },
     {
       "id": "about.update-channel",
       "label": "Update channel",
       "tab": "about",
       "route": "/settings/about?highlight=about.update-channel"
+    },
+    {
+      "id": "about.update-the-gateway-automatically",
+      "label": "Update the gateway automatically",
+      "tab": "about",
+      "route": "/settings/about?highlight=key%3Aauto_update",
+      "description": "Installs a new release once no work is running and restarts the gateway, on installs that can update themselves.",
+      "configKey": "auto_update"
     },
     {
       "id": "browser.attach-token",
@@ -120,6 +122,14 @@
       "tab": "channels",
       "route": "/settings/channels/teams?highlight=channels.app-password-client-secret-teams",
       "description": "Azure Bot client secret. Stored only in .env (never config.json)."
+    },
+    {
+      "id": "channels.connect-new-sessions-to-slack-automatically-slack",
+      "label": "Connect new sessions to Slack automatically (Slack)",
+      "tab": "channels",
+      "route": "/settings/channels/slack?highlight=key%3Aslack.auto_link_sessions",
+      "description": "Every new dashboard session gets a Slack thread on its first message, in your private direct message with the bot. Sessions started by cron, apps or sub-agents, sessions that began in Slack or another messaging app, and incognito or temporary sessions are left alone. A session connected this way does not count as a Slack session for the folder setting below: it stays where it is in the sidebar, and only conversations that start in Slack are filed.",
+      "configKey": "slack.auto_link_sessions"
     },
     {
       "id": "channels.enable-imessage-channel-imessage",
@@ -445,13 +455,15 @@
       "id": "chat.background-effort",
       "label": "Background Effort",
       "tab": "chat",
-      "route": "/settings/chat/models?highlight=chat.background-effort"
+      "route": "/settings/chat/models?highlight=chat.background-effort",
+      "description": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort."
     },
     {
       "id": "chat.background-model",
       "label": "Background Model",
       "tab": "chat",
-      "route": "/settings/chat/models?highlight=chat.background-model"
+      "route": "/settings/chat/models?highlight=chat.background-model",
+      "description": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it."
     },
     {
       "id": "chat.compact-empty-folders",
@@ -492,6 +504,7 @@
       "label": "Content-filter fallback model",
       "tab": "chat",
       "route": "/settings/chat/models?highlight=key%3Aagent.refusal_fallback_model",
+      "description": "Auto retries on the model the provider suggests in its refusal, when it names one. The retry is announced in chat. Disabled shows the refusal as before.",
       "configKey": "agent.refusal_fallback_model"
     },
     {
@@ -507,21 +520,14 @@
       "label": "Default Model",
       "tab": "chat",
       "route": "/settings/chat/models?highlight=chat.default-model",
-      "description": "Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there."
+      "description": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open. Which model new sessions start with when their agent pins none. Set a model per agent under Capabilities → Agents, or pick one inside a session to override it there."
     },
     {
       "id": "chat.default-reasoning-effort",
       "label": "Default Reasoning Effort",
       "tab": "chat",
       "route": "/settings/chat/models?highlight=chat.default-reasoning-effort",
-      "description": "How long models think before answering by default. Higher is slower and costs more. Only available on reasoning-capable models (Opus, Sonnet, Fable, GPT-5.x)."
-    },
-    {
-      "id": "chat.default-to-autopilot-mode",
-      "label": "Default to Autopilot Mode",
-      "tab": "chat",
-      "route": "/settings/chat/sessions?highlight=chat.default-to-autopilot-mode",
-      "description": "New sessions start in autopilot mode (plan → approve → execute). You can still toggle individual sessions."
+      "description": "Higher is slower and costs more. Only available on reasoning-capable models."
     },
     {
       "id": "chat.describe-your-role",
@@ -529,6 +535,13 @@
       "tab": "chat",
       "route": "/settings/chat/aboutyou?highlight=chat.describe-your-role",
       "description": "Kiro uses this description to adapt vocabulary and examples to your role."
+    },
+    {
+      "id": "chat.dim-inactive-panes",
+      "label": "Dim Inactive Panes",
+      "tab": "chat",
+      "route": "/settings/chat/sessions?highlight=chat.dim-inactive-panes",
+      "description": "In split view, fade every pane that does not have keyboard focus. When off, all panes stay at full brightness and the accent border marks the focused one."
     },
     {
       "id": "chat.double-click-to-edit-your-messages",
@@ -542,13 +555,15 @@
       "label": "Fallback model",
       "tab": "chat",
       "route": "/settings/chat/models?highlight=key%3Aagent.fallback_model",
+      "description": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
       "configKey": "agent.fallback_model"
     },
     {
       "id": "chat.feature-tips",
       "label": "Feature Tips",
       "tab": "chat",
-      "route": "/settings/chat/discovery?highlight=chat.feature-tips"
+      "route": "/settings/chat/discovery?highlight=chat.feature-tips",
+      "description": "Show occasional feature discovery tips above the composer while the agent is working"
     },
     {
       "id": "chat.file-change-chips",
@@ -735,7 +750,8 @@
       "id": "chat.soft-stop-budget-seconds",
       "label": "Soft-stop budget (seconds)",
       "tab": "chat",
-      "route": "/settings/chat/composer?highlight=chat.soft-stop-budget-seconds"
+      "route": "/settings/chat/composer?highlight=chat.soft-stop-budget-seconds",
+      "description": "How long to wait for the agent to honor a Stop press before forcefully killing the session. Longer budgets preserve session state more often but make stops feel laggy when agents are stuck in long tool calls."
     },
     {
       "id": "chat.spell-check-message-input",
@@ -761,13 +777,15 @@
       "id": "chat.subagent-effort",
       "label": "Subagent Effort",
       "tab": "chat",
-      "route": "/settings/chat/models?highlight=chat.subagent-effort"
+      "route": "/settings/chat/models?highlight=chat.subagent-effort",
+      "description": "Applies only on reasoning-capable models. 'Model default' applies no override — this work does not inherit your Default Reasoning Effort."
     },
     {
       "id": "chat.subagent-model",
       "label": "Subagent Model",
       "tab": "chat",
-      "route": "/settings/chat/models?highlight=chat.subagent-model"
+      "route": "/settings/chat/models?highlight=chat.subagent-model",
+      "description": "'Auto' lets the provider pick — it does not inherit your Default Model. Pin a model to run this work on it."
     },
     {
       "id": "chat.tail-only-fork",
@@ -801,7 +819,8 @@
       "id": "chat.what-enter-does-while-the-agent-is-working",
       "label": "What Enter does while the agent is working",
       "tab": "chat",
-      "route": "/settings/chat/composer?highlight=chat.what-enter-does-while-the-agent-is-working"
+      "route": "/settings/chat/composer?highlight=chat.what-enter-does-while-the-agent-is-working",
+      "description": "Steer interrupts the current turn; Queue waits for it."
     },
     {
       "id": "chat.widget-density",
@@ -920,6 +939,13 @@
       "description": "Adds “New chat on crew” to the create menu, which starts a session on a remote crew — another machine you have connected under Settings > Remote Crew. Unfinished: the session opens in that crew’s own pane and is not listed in this dashboard’s sessions yet, so to return to it later, switch to that crew’s pane."
     },
     {
+      "id": "developer.composable-layout",
+      "label": "Composable layout",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.composable-layout",
+      "description": "Turns on an in-development, developer-only harness for a new layout mechanism. Nothing you can see changes yet: the mechanism has no page of its own, so this exists only so it can be built and tested behind a switch."
+    },
+    {
       "id": "developer.crewmates",
       "label": "Crewmates",
       "tab": "developer",
@@ -931,7 +957,7 @@
       "label": "Decisions (Jev)",
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.decisions-jev",
-      "description": "Jev is a small, fast decision model. With this on, Kiro Crew asks Jev which one of your skills fits the message you just sent — or that none does — and uses Jev's pick for the share of your sessions shown under the switch; the rest keep the word-matching rule this build ships with. If Jev is slow, unreachable or answers with nothing usable, that message falls back to the same rule, so a decision never holds up your reply. Each call is also recorded in a log on the machine that runs Kiro Crew, for diagnostics. This switch is saved on the machine that runs Kiro Crew, not in this browser, so it applies on every device you open it from."
+      "description": "A small, fast model makes quick calls for Kiro Crew, such as which of your skills fits your message. Pick the model below. If it is slow or does not answer, the built-in rule decides instead, so your reply is never held up."
     },
     {
       "id": "developer.developer-mode",
@@ -939,6 +965,13 @@
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.developer-mode",
       "description": "Show Developer page in sidebar with Logs, System metrics, and Memory internals"
+    },
+    {
+      "id": "developer.dynamic-dashboard",
+      "label": "Dynamic Dashboard",
+      "tab": "developer",
+      "route": "/settings/developer?highlight=developer.dynamic-dashboard",
+      "description": "Turns on the in-development Dynamic Dashboard: a status row above the chat composer, a Dashboard view in the side panel and on a crewmate’s page, and an All Dashboards page. Its layout is still being designed, so it is not shown until you turn it on. Also holds the switch for automatic cards."
     },
     {
       "id": "developer.earlier-conversation-one-decision-may-carry-in-characters",
@@ -966,7 +999,7 @@
       "label": "Remote crew sessions",
       "tab": "developer",
       "route": "/settings/developer?highlight=developer.remote-crew-sessions",
-      "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. Functional, but not finished."
+      "description": "Merge a connected remote crew's live sessions into the Sessions list, each marked with a server badge. A remote crew is another machine you have connected, not your agents. Functional, but not finished."
     },
     {
       "id": "developer.reply-threads-on-crewmate-chat-messages",
@@ -1022,7 +1055,7 @@
       "label": "Default shell",
       "tab": "display",
       "route": "/settings/display/terminal?highlight=key%3Adashboard.terminal.shell",
-      "description": "Shell the built-in terminal launches — an absolute path or a command on PATH. Leave empty to use the system default ($SHELL).",
+      "description": "The shell the built-in terminal launches. An absolute path or a command on PATH. Leave empty to use the system default ($SHELL).",
       "configKey": "dashboard.terminal.shell"
     },
     {
@@ -1101,6 +1134,14 @@
       "tab": "display",
       "route": "/settings/display/sidebar?highlight=display.palette",
       "description": "Choose a color palette for your sidebar sessions."
+    },
+    {
+      "id": "display.reuse-the-current-terminal",
+      "label": "Reuse the current terminal",
+      "tab": "display",
+      "route": "/settings/display/terminal?highlight=key%3Adashboard.terminal.reuse_current",
+      "description": "Copies the command instead of running it: Run in terminal focuses the terminal tab you have selected and copies the command, so you can paste it into that shell while keeping its working directory, environment, and any active login session. With no terminal open, it still copies the command for you to paste — it is never run for you.",
+      "configKey": "dashboard.terminal.reuse_current"
     },
     {
       "id": "display.theme",
@@ -1351,7 +1392,7 @@
       "label": "Auto-generate skills from sessions",
       "tab": "skills",
       "route": "/settings/skills?highlight=key%3Askills.auto_create_from_sessions",
-      "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Agent Capabilities → Skills for review — nothing goes live without your approval (see below).",
+      "description": "Analyze each completed session and draft a reusable SKILL.md when the session demonstrates a recurring procedure — one a future session, working on a different target, would run again. Off by default. Drafts are staged to the pending queue on Customize → Skills for review — nothing goes live without your approval (see below).",
       "configKey": "skills.auto_create_from_sessions"
     },
     {
@@ -1374,6 +1415,7 @@
       "label": "Auto-submit when I finish speaking",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.endpointing",
+      "description": "Use a fast model to detect when you've finished a complete request and send it automatically. Streaming providers only.",
       "configKey": "stt.endpointing"
     },
     {
@@ -1405,16 +1447,26 @@
       "description": "AWS region for Transcribe"
     },
     {
+      "id": "voice.custom-vocabulary",
+      "label": "Custom vocabulary",
+      "tab": "voice",
+      "route": "/settings/voice?highlight=key%3Astt.transcribe_vocabulary",
+      "description": "Names and terms you uploaded to Amazon Transcribe so dictation spells them right. Listed from the AWS profile and region above.",
+      "configKey": "stt.transcribe_vocabulary"
+    },
+    {
       "id": "voice.dictation-panel",
       "label": "Dictation panel",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.dictation-panel"
+      "route": "/settings/voice?highlight=voice.dictation-panel",
+      "description": "Show an animated panel while recording instead of the thin status bar. Falls back to the bar when the browser lacks WebGL2 or your system requests reduced motion."
     },
     {
       "id": "voice.enabled",
       "label": "Enabled",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.enabled"
+      "route": "/settings/voice?highlight=voice.enabled",
+      "description": "Transcribe voice into the message box when you click the mic"
     },
     {
       "id": "voice.engine",
@@ -1434,19 +1486,22 @@
       "label": "Language",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.language_code",
+      "description": "BCP-47 language code for speech recognition",
       "configKey": "stt.language_code"
     },
     {
       "id": "voice.microphone",
       "label": "Microphone",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.microphone"
+      "route": "/settings/voice?highlight=voice.microphone",
+      "description": "Input device used to capture your voice"
     },
     {
       "id": "voice.model",
       "label": "Model",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.model",
+      "description": "Models download on demand. Select one and click Download now; the desktop app already includes every other runtime dependency.",
       "configKey": "stt.model"
     },
     {
@@ -1468,6 +1523,7 @@
       "label": "Provider",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.provider",
+      "description": "Local speech recognition runs on this machine and sends nothing anywhere. Transcribe uploads your audio to AWS.",
       "configKey": "stt.provider"
     },
     {
@@ -1509,6 +1565,7 @@
       "label": "Streaming",
       "tab": "voice",
       "route": "/settings/voice?highlight=key%3Astt.streaming",
+      "description": "Show the transcript in the input box as you speak, instead of only when you stop.",
       "configKey": "stt.streaming"
     },
     {

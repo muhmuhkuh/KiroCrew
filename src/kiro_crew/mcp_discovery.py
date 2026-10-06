@@ -38,12 +38,14 @@ from kiro_crew.env import (
     describe_search_path,
     emit_env,
     mcp_search_path,
+    resolved_command_casing,
     sanitize_spec_env,
     spec_env_path,
     spec_path_key,
 )
 from kiro_crew.executors import mcp_probe_executor
 from kiro_crew.hooks import safe_read_file
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.mcp_cleanup import (
     invalid_disabled_flag,
     mcp_entry_is_muted,
@@ -65,6 +67,7 @@ from kiro_crew.sandbox import (
     sandboxed_spawn_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.user_json import loads_user_json
 
 logger = logging.getLogger(__name__)
 
@@ -432,6 +435,9 @@ class _ProbeResult:
     # all of its life showing the vaguer wording.
     auth_challenge: bool = False
     auth_grant_present: bool | None = None
+    # The probe's declared-temp refusals (see ``McpServerInfo.temp_refusals``),
+    # cached so the panel keeps showing them for the whole TTL.
+    temp_refusals: list[dict[str, str]] = field(default_factory=list)
     # Fingerprint of the config inputs this answer was probed UNDER, so an entry
     # cannot outlive the configuration that produced it. The cache is keyed on
     # the server NAME alone, and a name is not an identity: editing a command,
@@ -668,6 +674,7 @@ def _cache_probe(server: McpServerInfo) -> None:
         probe_mode=server.probe_mode,
         auth_challenge=server.auth_challenge,
         auth_grant_present=server.auth_grant_present,
+        temp_refusals=[dict(r) for r in server.temp_refusals],
         identity=identity,
     )
 
@@ -919,6 +926,11 @@ class McpServerInfo:
     # None means the lookup could not answer. Only meaningful alongside
     # ``auth_challenge``; see :func:`_runtime_grant_present`.
     auth_grant_present: bool | None = None
+    # Spec-declared temp keys the local probe refused, one dict per key:
+    # ``key``, ``path`` (redacted like the WARNING) and ``cause`` (``sealed``,
+    # ``unclassifiable`` or ``check-failed``). Same facts as the journal line,
+    # so the dashboard row can say the probe ran with the managed temp instead.
+    temp_refusals: list[dict[str, str]] = field(default_factory=list)
 
     @property
     def is_remote(self) -> bool:
@@ -979,6 +991,9 @@ class McpServerInfo:
                 # safe wording, a false would name an action.
                 if self.auth_grant_present is not None:
                     d["authGrantPresent"] = self.auth_grant_present
+        # Omitted when empty, like ``authChallenge``: absent means no refusal.
+        if self.temp_refusals:
+            d["tempRefusals"] = [dict(r) for r in self.temp_refusals]
         if self.disabled_tools:
             d["disabledTools"] = self.disabled_tools
         if self.disabled:
@@ -1070,7 +1085,7 @@ def _mcp_names_from_file(path: Path) -> set[str]:
     if not path.is_file():
         return set()
     try:
-        data = json.loads(safe_read_file(str(path)))
+        data = loads_user_json(safe_read_file(str(path)))
     except (json.JSONDecodeError, OSError, TypeError):
         return set()
     servers = data.get("mcpServers") if isinstance(data, dict) else None
@@ -1135,7 +1150,7 @@ def _load_mcp_json_by_source() -> dict[str, dict[str, Any]]:
         if not p.is_file():
             continue
         try:
-            data = json.loads(safe_read_file(str(p)))
+            data = loads_user_json(safe_read_file(str(p)))
         except (json.JSONDecodeError, OSError) as exc:
             # PermissionError (subclass of OSError) is raised by
             # safe_read_file when is_sensitive_path() blocks the read.
@@ -1414,6 +1429,25 @@ def _managed_tools_in_process(name: str) -> list[str] | None:
 _resolved_managed_invocation: dict[str, tuple[str, list[str]]] = {}
 
 
+def _cached_managed_invocation(name: str) -> tuple[str, list[str]] | None:
+    """The cached invocation for *name*, or ``None`` once its command is gone.
+
+    The cache outlives the install it was resolved from: an update that prunes
+    the previous version directory leaves an absolute command here that no
+    longer exists, and serving it would keep relaunching ``kirocrew-core`` /
+    ``kirocrew-cron`` from the pruned tree. A vanished absolute command is
+    evicted so the caller re-resolves against the current install.
+    """
+    invocation = _resolved_managed_invocation.get(name)
+    if invocation is None:
+        return None
+    command = invocation[0]
+    if os.path.isabs(command) and not os.path.isfile(command):
+        _resolved_managed_invocation.pop(name, None)
+        return None
+    return invocation
+
+
 def _fix_stale_managed_command(name: str, spec: dict) -> None:
     """Re-resolve command + args for a managed MCP server to the running install.
 
@@ -1437,7 +1471,7 @@ def _fix_stale_managed_command(name: str, spec: dict) -> None:
     subcommand = _MANAGED_SERVER_SUBCOMMANDS.get(name)
     if subcommand is None:
         return
-    invocation = _resolved_managed_invocation.get(name)
+    invocation = _cached_managed_invocation(name)
     if invocation is None:
         try:
             from kiro_crew.agent import _kirocrew_mcp_invocation  # circular import
@@ -1487,7 +1521,7 @@ def _is_first_party_managed_argv(
     subcommand = _MANAGED_SERVER_SUBCOMMANDS.get(name)
     if subcommand is None:
         return False
-    invocation = _resolved_managed_invocation.get(name)
+    invocation = _cached_managed_invocation(name)
     try:
         # circular import: agent is loaded during package init
         from kiro_crew.agent import _kirocrew_mcp_invocation, _managed_mcp_env
@@ -1767,6 +1801,7 @@ def list_servers() -> list[McpServerInfo]:
         if cached is not None and cached.identity == identity:
             s.auth_challenge = cached.auth_challenge
             s.auth_grant_present = cached.auth_grant_present
+            s.temp_refusals = [dict(r) for r in cached.temp_refusals]
 
     return list(servers.values())
 
@@ -1785,12 +1820,9 @@ async def _read_jsonrpc_response(resp: aiohttp.ClientResponse) -> dict:
             if line.startswith("data:"):
                 payload = line[len("data:") :].strip()
                 if payload:
-                    try:
-                        parsed = json.loads(payload)
-                        if isinstance(parsed, dict) and "id" in parsed:
-                            last = parsed
-                    except json.JSONDecodeError:
-                        pass
+                    parsed = parse_json_object_line(payload)
+                    if parsed is not None and "id" in parsed:
+                        last = parsed
         return last
     return await resp.json()
 
@@ -2129,7 +2161,7 @@ async def _probe_remote(
 
 
 # Cap on how many *non-JSON banner* lines to skip while waiting for the
-# JSON-RPC handshake. Only undecodable banner/log lines count toward this cap;
+# JSON-RPC handshake. Only lines that are not JSON count toward this cap;
 # blank lines and well-formed JSON-RPC notifications are bounded by the shared
 # timeout budget alone (so a chatty-but-spec-compliant server that emits many
 # notifications before its response is not mis-capped). A well-behaved server
@@ -2153,7 +2185,7 @@ async def _read_stdio_jsonrpc_response(
     This consumes lines within one overall ``timeout`` budget, skipping blank
     lines, non-JSON lines, and JSON-RPC *notifications* (objects without an
     ``id``), and returns the first JSON object that carries an ``id`` (a
-    response). Only non-JSON *banner* lines count toward ``_MAX_BANNER_LINES``;
+    response). Only lines that are not JSON count toward ``_MAX_BANNER_LINES``;
     blanks and notifications are bounded by the timeout alone. Returns ``None``
     on EOF or once more than ``_MAX_BANNER_LINES`` banner lines have arrived
     (the flood case is logged). Raises ``asyncio.TimeoutError`` if the deadline
@@ -2190,9 +2222,10 @@ async def _read_stdio_jsonrpc_response(
             continue  # blank line — bounded by the timeout budget, not the cap
         try:
             parsed = json.loads(text)
-        except json.JSONDecodeError:
-            # Non-JSON banner/log line (e.g. `aim` self-update). Only these
-            # count toward the flood cap.
+        except (ValueError, RecursionError):
+            # Not JSON: a banner/log line (e.g. `aim` self-update), or a value
+            # nested past the decoder's ceiling. Only these count toward the
+            # flood cap.
             banner_lines += 1
             if not first_banner:
                 first_banner = text[:120]
@@ -2207,8 +2240,9 @@ async def _read_stdio_jsonrpc_response(
                 return None
             continue
         # A JSON-RPC response always carries "id"; skip notifications (objects
-        # with "method" and no "id") and non-object payloads. These do NOT
-        # count toward the banner cap — the timeout budget bounds them.
+        # with "method" and no "id") and non-object payloads (a progress
+        # counter, a list). These do NOT count toward the banner cap — the
+        # timeout budget bounds them.
         if isinstance(parsed, dict) and "id" in parsed:
             return parsed
 
@@ -2245,6 +2279,32 @@ async def _probe_on_private_loop(
         raise
 
 
+def _drop_temp_refusals(server: McpServerInfo) -> None:
+    """Clear a skipped probe's refusals on the row AND in the probe cache.
+
+    A skipped probe stands behind no refusal, and ``list_servers`` rehydrates
+    the row from the cache on the next read, so clearing the row alone would
+    bring the stale refusal back.
+    """
+    server.temp_refusals = []
+    cached = _probe_cache.get(server.name)
+    if cached is not None:
+        cached.temp_refusals = []
+
+
+def _redact_temp_refusal_text(text: str) -> str:
+    """The redactor the declared-temp WARNING applies to a path or failure."""
+    return _sanitize_probe_error(ValueError(text))
+
+
+def _temp_refusal_records(refused: dict[str, tuple[str, str]]) -> list[dict[str, str]]:
+    """``McpServerInfo.temp_refusals`` entries for a refused temp declaration."""
+    return [
+        {"key": key, "path": _redact_temp_refusal_text(path), "cause": cause}
+        for key, (path, cause) in sorted(refused.items())
+    ]
+
+
 async def probe_server(
     server: McpServerInfo,
     *,
@@ -2273,7 +2333,12 @@ async def probe_server(
     probe must pass through removes that whole class; callers keep their own
     filters and error surfaces as behaviour and UX, not as the safety property.
     """
+    # This probe is the sole authority for its own temp refusals; a row
+    # rehydrated from the cache must not keep an earlier probe's list on any
+    # exit, including the ones below that never spawn.
+    server.temp_refusals = []
     if server.disabled:
+        _drop_temp_refusals(server)
         server.status = "disabled"
         # Truthy rather than ``is True``: a hand-built McpServerInfo may carry
         # anything here, and any non-empty value should withhold the spawn.
@@ -2346,7 +2411,21 @@ async def probe_server(
         # the search-path report exists to draw -- so the report gets "" while
         # the lookup below still uses the real PATH.
         reported_path = "" if os.path.dirname(server.command) else effective_path
-        resolved = shutil.which(server.command, path=effective_path)
+        # Same rule the agent-config resolver and gatewayd's rewriter apply, so
+        # the probe spawns the spelling the session will use: an absolute
+        # command that exists and is executable is the operator's own spelling
+        # and runs verbatim; a PATH-resolved one gets the casing repair, since
+        # a PATHEXT-synthesized ``.EXE`` reaching an ``argv[0]``-dispatching
+        # shim would fail (or pass) the probe for a reason the session does
+        # not share.
+        if (
+            os.path.isabs(server.command)
+            and os.path.isfile(server.command)
+            and os.access(server.command, os.X_OK)
+        ):
+            resolved = server.command
+        else:
+            resolved = resolved_command_casing(shutil.which(server.command, path=effective_path))
         if not resolved:
             server.status = "error"
             server.error = _unresolved_error(server.command, reported_path)
@@ -2359,7 +2438,7 @@ async def probe_server(
         # fail later (no response, a JSON-RPC error reply, a timeout, any other
         # exception), leaving a stale key that silences the WARNING if the binary
         # is removed again. `command` is necessarily a str here, since
-        # `shutil.which` returned truthy for it.
+        # it resolved to a truthy path above.
         _clear_unresolvable(server.name, server.command)
 
         # A hostile MCP-config entry names the binary spawned here, so route it
@@ -2433,19 +2512,20 @@ async def probe_server(
             )
             _declared_temp_upper = set(accepted)
             if _sealed_temp:
+                server.temp_refusals = _temp_refusal_records(_sealed_temp)
                 logger.warning(
                     "MCP probe [%s]: ignoring spec-declared %s — %s; probing with the "
                     "managed temp instead",
                     server.name,
                     format_declared_temp_refusals(
                         _sealed_temp,
-                        redactor=lambda path: _sanitize_probe_error(ValueError(path)),
+                        redactor=_redact_temp_refusal_text,
                     ),
                     "; ".join(
                         declared_temp_refusal_reasons(
                             _sealed_temp,
                             failure,
-                            redactor=lambda text: _sanitize_probe_error(ValueError(text)),
+                            redactor=_redact_temp_refusal_text,
                         )
                     ),
                 )
@@ -3036,6 +3116,7 @@ async def probe_all() -> list[McpServerInfo]:
         # to the probe cache -- no probe ran.
         s.status = "disabled"
         s.error = ""
+        _drop_temp_refusals(s)
     # Keep the warn-once ledger bounded by the config rather than by config
     # churn: a command edited to a different missing binary must not retain the
     # superseded string. Runs before the early return so emptying the config
@@ -3072,6 +3153,7 @@ async def probe_all() -> list[McpServerInfo]:
         if s.name in excluded:
             s.status = "outdated"
             s.error = ""
+            _drop_temp_refusals(s)
             return s
         async with sem:
             return await probe_server(s)
@@ -3515,7 +3597,7 @@ def register_servers_for_cc(
     existing: dict = {}
     if mcp_json_path.is_file():
         try:
-            existing = json.loads(mcp_json_path.read_text(encoding="utf-8"))
+            existing = loads_user_json(mcp_json_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             existing = {}
 

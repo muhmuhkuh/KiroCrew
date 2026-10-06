@@ -95,7 +95,7 @@ System channels are fixed in `notifications.bus.SYSTEM_CHANNELS`, including `sys
 
 `system.monitor` is a system channel for the gateway's monitoring-loop stop and finish notices. `GatewayOrchestrator._notify_nudge_expired` emits them through `DashboardState.notify(..., channel=MONITOR_CHANNEL)`, and the note keeps the legacy `kind` `agent`. The channel shares the `system.agent` default priority and is not protected. `ChannelSettings._seed_monitor_from_agent` runs at construction: a settings mapping with no `system.monitor` key receives an in-memory copy of its `system.agent` entry, so a boot never writes the file and a fresh install with no stored `system.agent` entry seeds nothing. The next `update()` persists the copy. Every `update()` write keeps a `system.monitor` key, `{}` when the channel has no settings, as the record that the seed ran; a build without this key handling rewrites every dict-valued `channel_settings` entry as-is, so the record survives a downgrade, and removing it re-runs the seed and can re-mute a channel the user unmuted. `all_settings()` omits empty entries, so the channels listing never shows `{}`. `test_notification_settings.py::TestSeedMonitorFromAgent` pins the seed, with `test_unmuted_monitor_survives_downgrade_rewrite` and `test_fresh_install_agent_mute_does_not_seed_monitor` covering the downgrade and fresh-install boundaries; `test_monitor_notice_channel.py` pins channel registration, the legacy `kind` override, notice routing and the settings listing.
 
-Dashboard-user settings routes expose the union of registered channels and stored settings through `api_notification_channels`; `api_notification_channel_settings` accepts mute and priority updates, clears an override for `priority: null`, and broadcasts `notification_channel_settings`.
+Dashboard-user settings routes (in `dashboard/messaging_api/notifications.py`, beside the feed routes) expose the union of registered channels and stored settings through `api_notification_channels`; `api_notification_channel_settings` accepts mute and priority updates, clears an override for `priority: null`, and broadcasts `notification_channel_settings`.
 
 ## Agent notifications and expiration
 
@@ -289,8 +289,9 @@ predicate.
 
 ## In-app banner (client)
 
-`website/src/components/notifications/NotificationBanner.tsx`, mounted once by
-the bell button in `App.tsx` and portalled beside the bell's sheet, shows a
+`website/src/components/notifications/NotificationBanner.tsx`, mounted once with
+the bell's sheet (`website/src/shell/notifications/notificationSheet.tsx`, which
+the bell button in `App.tsx` renders) and portalled beside it, shows a
 macOS Notification Center-style card under the top bar for a **live**
 notification. The card body is `NotificationCard.tsx`, the ONE rendering the
 bell popover's mac rows and the banner both use (kind-tinted 26 px icon square,
@@ -342,7 +343,7 @@ same window that mutes the turn-done chime.
 | Priority | Banner |
 |---|---|
 | `critical` | stays until clicked, dismissed, or acted on; the live region is `role="alert"` while one is pending |
-| `default` | auto-hides after `BANNER_AUTO_HIDE_MS` (6 s). Every pending default card shares ONE timer, restarted by each default arrival and paused while the stack is hovered or holds focus. The pointer and keyboard are tracked as two separate holds and the clock resumes only when BOTH have let go. A card's removal destroys ownership without firing the release event, so the holds are re-read after every change to the deck: FOCUS is owned by an element (held while the stack still contains the active one, released when its holder unmounts), the POINTER by the container (a removal does not move that boundary, so only a real pointer-leave — or an empty deck — releases it) |
+| `default` | auto-hides after `BANNER_AUTO_HIDE_MS` (6 s). Every pending default card shares ONE timer, restarted by each default arrival and paused while the stack is hovered or holds focus. The pointer and keyboard are tracked as two separate holds and the clock resumes only when BOTH have let go. A card's removal destroys ownership without firing the release event, so the holds are re-read after every change to the deck and to how it is rendered (expanding it, or crossing the mobile breakpoint, unmounts the focusable "+N" pill and deck shells with no note leaving): FOCUS is owned by an element (held while a card still shown contains the active one; a leaving card stays mounted and focused through its exit animation and nothing re-reads the holds when it finally unmounts, so focus inside it is released as it starts to leave), the POINTER by the container (a removal does not move that boundary, so only a real pointer-leave — or an empty deck — releases it) |
 | `passive`, or `silenced` (`isSilencedNote`) | never |
 
 Auto-hide does **not** acknowledge: the note stays unread in the bell, and the

@@ -91,7 +91,7 @@ Usage: <credits> credits · <elapsed>
   The agent-name parenthetical is present only when the sub-agent ran under a named
   agent.
 - The detail is the trimmed result when it fits. When the completion copy dropped
-  content, or in orchestrator mode, it is a summary plus a `result_path` pointer, so
+  content, it is a summary plus a `result_path` pointer, so
   the parent reads the full transcript on demand (`read`, `grep`, `spawn_status`)
   instead of re-running the sub-agent.
 - Usage is cumulative across all attempted turns in the run, including billed
@@ -172,13 +172,18 @@ never from its error wording):
 The result-path lines are present only when a result file exists. **The result is
 on disk**, so use the `read` tool to retrieve it rather than re-running the work.
 
-Three adjacent variants exist for a gateway restart, same prefix:
-These notices omit usage because an interrupted run has no settled terminal
-billing record:
+Four adjacent variants exist for a gateway restart, same prefix. They omit
+usage because a run the restart caught has no settled terminal billing record:
 
-- `⚠️ orphaned by gateway restart` plus `Result saved at: <path>` and
+- `✅ finished before gateway restart` plus `Result saved at: <path>` and
   `Use the read tool to retrieve it.` — only when the run recorded
-  `result_complete`, i.e. its stream reached the complete event.
+  `result_complete`, which a run that claimed its completed ending does once
+  `result.txt` holds the whole answer (the window this leaves:
+  [subagent](../modules/subagent.md#gateway-restart-reconciliation)). It is a
+  completed run (outcome `ok`) that arrives late.
+- `✅ finished before gateway restart` plus a line saying it finished without
+  writing any text — a run that recorded `result_complete` with no
+  `result.txt` (a tool-only run).
 - `⚠️ cut off mid-turn by gateway restart` plus `Partial output saved at: <path>`
   and a line saying the text stops wherever the restart landed. `result.txt` is
   appended per streamed chunk, so a run killed mid-turn leaves a non-empty file
@@ -192,7 +197,7 @@ billing record:
   that resumes it — see `orphan_resume_hint` in
   [subagent](../modules/subagent.md#gateway-restart-reconciliation).
 
-All three are redacted before any delivery path. When the parent has no open
+All four are redacted before any delivery path. When the parent has no open
 dashboard surface, undelivered notices are batched into a single digest DM rather
 than N pings.
 
@@ -378,6 +383,101 @@ surfaces with its verdict (host deny / user rejection / cleanup / mixed) and
 fails when a site is missing from the enumeration, a host deny is not preceded
 by the steer, a user rejection is, or a mixed site's steer is not under its host
 guard.
+
+**The prompt optimizer, the task-refine turn and the unattended auto-improvement
+runner steer the same notice.** `dashboard/handlers/optimizer.py` rewrites one
+prompt in a side-session that runs no tools; its one reject is `surface_policy`,
+the notice saying the optimizer permits nothing. `dashboard/handlers/taskrunner.py`
+(`_run_refine`) drafts a task spec with text only; its one reject is
+`surface_policy` the same way. Both write the denied attempt as a SEL row
+FIRST (`source` `optimizer` / `taskrunner_refine`), then steer, then reject. The
+unattended auto-improvement runner
+(`apps/builtins/auto_improvement/spine/agent_runner.py`) denies through ONE
+funnel, `SessionAgentRunner._reject`, whose REQUIRED `cause=` keyword is the
+per-site verdict; the SEL row is written first, its `error` naming which gate
+refused (`governance_deny`, `governance_hook_unavailable`, `shell_denylist`,
+`not_in_allowed_tools`). No person is attached to this surface, so every deny
+is a host deny. Per site:
+
+- the platform governance gate's `deny` -- `policy`, with the hook's own reason;
+  the same gate's fail-closed arm, when the hook LAYER raised -- `hook_error`
+  (nothing judged the call). The gate names the cause itself
+  (`_GovernanceDeny.cause`) rather than leaving the funnel to read it off the
+  reason's wording.
+- the app-local shell denylist (`shell_command_refusal`) -- `policy`, with the
+  denylist's reason.
+- the caller's `allowed_tools` refusing a tool it does not list (or an empty
+  list refusing every tool) -- `surface_policy`; the notice names what the run
+  permits, never a sanctioned alternative.
+- `_approve`'s audit-or-deny arm, when the SEL row an unattended approval
+  requires cannot be written -- the new `audit_unavailable` cause: the host
+  could not record the call, so it refused rather than run it unaudited;
+  nothing judged the action, and one retry is reasonable. Distinct from
+  `hook_error`, which would send the model looking at a gate that never ran.
+
+`test_handlers_auto_improvement_deny_notice.py` enumerates every `reject_tool(`
+in the three modules and every funnel call with its verdict, pins the funnel's
+order and required keyword, and drives each deny with a provider double
+recording steer/reject order.
+
+**The task runner steers the same notice.** `task_executor` answers the
+permission requests of every autonomous-project and cron-launched step turn
+through ONE funnel, `_reject_and_log`, whose REQUIRED `cause=` keyword is the
+per-site verdict: a `DENY_CAUSE_*` name steers `llm_helpers._steer_host_deny`
+before the reject, and `None` is the explicit "not a host deny" that stays bare,
+so a site added later has to write one or the other. The SEL row is written
+first at every site. Per site:
+
+- the agent spec's PreToolUse gate blocked the call (a delivered deny, or a gate
+  with no verdict — an unreadable spec, a hook that could not run) — `policy`,
+  with the gate's reason, as the chat runner steers the same `BLOCKED:` strings;
+  the stored hooks' `deny` — `policy`, with the hook's reason.
+- the unattended run refusing a call nothing trusts (no approval handler, no
+  hook auto-approve) — `surface_policy`; the notice says what the surface
+  permits (tools in `hooks.auto_approve_tools`) and offers no remediation.
+- the interactive handler's no (`interactive_rejected`) and the reject that
+  precedes a mid-stream compaction send no notice: the first is the person's
+  verdict, the second tears the turn down to re-run it, so there is no
+  continuing turn for a notice to correct.
+
+`task_planner.decompose` (the decomposition turn) denies inline, audit → steer →
+reject: the stored hooks' `deny` — `policy`; the deny-by-default when the phase
+has no hook store to gate a call — `surface_policy` (the planning phase runs no
+tools). `test_taskrunner_deny_notice.py` enumerates both modules' sites with
+their verdicts, pins the funnel's order and required keyword, and drives each
+deny with a provider double recording steer/reject order.
+
+**The eval harness and the subagent surface steer the same notice.**
+`eval/runner.py` answers a scenario turn's permission requests inline, audit →
+steer → reject, at three sites: the permission gate's refusal (`refusal_for`) —
+`policy`, with the gate's own reason; the harness's own path check on a
+filesystem tool (a sensitive credential path, or no path it can read from the
+input) — `policy`; and a tool the harness does not know to be read-only —
+`surface_policy`, the notice saying the harness runs tools read-only and
+offering no remediation. `eval/judge.py` denies every tool call at its one site —
+`surface_policy` (the judge runs no tools). The subagent surface denies through
+ONE funnel, `SubagentManager._reject_and_log` in `subagent.py`, called from
+`subagent_manager/run.py`; its REQUIRED `cause=` keyword is the per-site
+verdict, so a site added later has to write one or the other. The SEL row (and
+the child-denial metric) is written first. Per site in `run.py`:
+
+- the agent spec's PreToolUse gate blocked the call, and the stored hooks'
+  `deny` — `policy`, with the gate's or the hook's reason.
+- the unattended run refusing a call nothing positively authorizes (no approval
+  handler, no `parent_policy=auto`, no hook auto-approve) — `surface_policy`;
+  the notice names every tier that could still have authorized it. The
+  fail-closed answer to a backend child's request whose security context is
+  absent (`child_low_fidelity`, no approver attached) — `surface_policy`.
+- the approvers' no (the per-subagent factory, the gateway fallback, the
+  child-request approver) send no notice: the person's verdict is the truth.
+  The rejects that precede a `turn_limit` / `child_escalation_limit` bail send
+  none either: the run ends there, so no continuing turn exists for a notice to
+  correct.
+
+`test_eval_subagent_deny_notice.py` enumerates every `reject_tool(` in the two
+eval modules and every funnel call in `run.py` with its verdict, pins the
+funnel's order and required keyword, and drives each deny with a provider double
+recording steer/reject order.
 
 The recovery classification for the last two rows of the marker table above
 is **structural**: the queue entry
@@ -577,8 +677,9 @@ text back toward the session, but it **cannot inject a turn**. The path is:
    (truncated to 64 chars), the payload must be a plain object, and the composed
    text is capped. It formats `[UI] <action>: <JSON payload>` (or `[UI] <action>`
    with no payload) and dispatches an internal `mc-widget-send` event.
-3. `ChatPage.tsx` **pre-fills the composer** with that text and records it. It
-   never auto-submits.
+3. `ChatPage.tsx` **pre-fills the composer** with that text and records it
+   (the `mc-widget-send` listener in `useAutoSendIntake`,
+   `website/src/pages/chat/page/launchIntake.ts`). It never auto-submits.
 
 The iframe's own `isTrusted` click check is NOT the trust boundary and must not be
 treated as authoritative: LLM-emitted `<script>` in the same document can
@@ -587,11 +688,9 @@ the parent requires an explicit human gesture, so a widget action can never beco
 a user-role turn on its own.
 
 When the user does send the pre-filled text, the turn is tagged
-`meta.origin = 'widget'`. The backend then refuses the one chat-text-reachable
-privilege escalation for such turns: orchestrator `go` / `go all` auto-run is
-denied (audited as `auto_run_denied`) and the text falls through to a normal, fully
-gated turn. Mode changes and tool approvals live on separate endpoints an iframe
-cannot reach.
+`meta.origin = 'widget'` and runs as a normal, fully gated turn. No chat text
+grants a privilege: mode changes and tool approvals live on separate endpoints
+an iframe cannot reach.
 
 So there is no `[Widget action event]` envelope. What reaches the session is an
 ordinary user message beginning `[UI] `, sent by a human, carrying an origin tag.
@@ -608,7 +707,7 @@ speech rather than as the user.
 | `[work ledger — …]` | `session_ledger.py` snapshot builder, composed into a nudge by `dashboard/handlers/autonudge.py` | Durable per-session state that outranks the model's recollection of earlier cycles. |
 | `[Hook context:]` … `[End of hook context]` | `context.py` hook-context assembly | Context supplied by a configured hook whose action is `HOOK_INJECT_CONTEXT`; webhook-restored workflow state is one producer, not the envelope's only meaning. The payload is untrusted third-party data. |
 | `[Previous run result — do NOT repeat the same content]` | `cron_service/identity.py` (`build_cron_session_context`) | A recurring cron's own last output, so the turn reports only what changed. |
-| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`; take the lighter path this turn. |
+| `[RESOURCES]` | `resource_status.py` advisory builder | Host memory crossed the tight/critical threshold, **or** the agent slice sits within `_SLICE_TASKS_TIGHT_RATIO` of its cgroup `pids.max`, **or** the macOS kernel reports memory pressure of WARN or worse (`ResourceStatus.memory_pressure_held`) while the figure reads ample or cannot be read; take the lighter path this turn. |
 | `[Relevant skills for this message]` | `skill_runtime/delivery.py` pointer renderer (`trigger_hint`) | Skill candidates named by path instead of by injected body. The body must be read before use unless that skill already appears earlier in the conversation, where native history still carries its instructions. |
 | `[INCOGNITO SESSION]` / `[TEMPORARY SESSION]` | `dashboard/chat_utils.py` ephemeral-session prefixes | An instruction, not a tool-level gate: it forbids memory tools (writes in incognito, reads as well in temporary) and learns nothing from the chat — the transcript itself is kept in History for the user, but no lesson, memory or summary is derived from it. `learn_remove` and the cron tools stay permitted as active user actions, and a cron change persists outside the transcript. |
 

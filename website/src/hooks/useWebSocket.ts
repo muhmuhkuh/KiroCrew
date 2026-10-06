@@ -12,10 +12,29 @@ import { TAB_ID } from '../api/tabId'
 import type { Notification, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
 import { teamRoots } from '../pages/chat/command-center/model'
+import {
+  applySessionProjection,
+  readSessionProjectionFrame,
+  refetchSessionProjections,
+} from './websocket/sessionProjection'
+import {
+  onUsageFrame,
+  rereadAllContextTraces,
+  resetContextTraceRefresh,
+} from './websocket/contextTraceRefresh'
+import {
+  fetchingAnyFoldQuery,
+  invalidateBelowFloor,
+  recordSlotProjectionFloor,
+  resetSlotProjectionRevisions,
+  seedFoldedProjection,
+  takeFoldedSlotProjection,
+} from './websocket/slotProjection'
 import { useSocketConnection } from './websocket/connection'
 import { decodeFrame } from './websocket/frames'
 import { useStreamBuffers } from './websocket/streamBuffers'
 import { useVoicePlayback } from './websocket/voicePlayback'
+import { useRowDeliveryWatchdog } from './websocket/rowDeliveryWatchdog'
 import { useApprovalRegistry } from './websocket/approvals'
 import { useComposerCards } from './websocket/composerCards'
 import { useAutomationSeed } from './websocket/automationSeed'
@@ -52,6 +71,35 @@ export { identityOf, askIdsOf, reconcileQuestions, staleAskIds } from './websock
 export { resolvedSince } from './websocket/retiredIds'
 export { UPDATE_RESTART_LATCH_KEY, UPDATE_RESTART_LATCH_TTL_MS, consumeUpdateRestartLatch } from './websocket/bundleReload'
 export { emitSlotFocused } from './websocket/attention'
+// The revision ledger is module state, so it has one home and is reached through
+// this facade like every other owner binding.
+// The crew-log panel's cache key and frame applier, reached through this facade
+// like every other owner binding.
+export {
+  applySessionProjection,
+  crewLogProjectionsKey,
+  readSessionProjectionFrame,
+  refetchSessionProjections,
+} from './websocket/sessionProjection'
+export {
+  COALESCE_MS as CONTEXT_TRACE_COALESCE_MS,
+  contextTraceKey,
+  onUsageFrame,
+  rereadAllContextTraces,
+  resetContextTraceRefresh,
+} from './websocket/contextTraceRefresh'
+export {
+  baselineOrHeld,
+  fetchingAnyFoldQuery,
+  invalidateBelowFloor,
+  recordSlotProjectionFloor,
+  resetSlotProjectionRevisions,
+  seedFoldedProjection,
+  slotProjectionFloor,
+  takeFoldedSlotProjection,
+} from './websocket/slotProjection'
+
+export { ROW_STALL_MS, ROW_STALL_TICK_MS } from './websocket/rowDeliveryWatchdog'
 
 /** A socket that has delivered nothing for this long while the page is visible
  *  is treated as dead, even when its `readyState` still reads OPEN. The gateway
@@ -121,6 +169,16 @@ export function useWebSocket() {
       silenceClockStartedAtRef.current = Date.now()
       lastFrameAtRef.current = silenceClockStartedAtRef.current
       slotList.resetForConnection()
+      // A fold revision is minted by the gateway process that folded, so numbers
+      // from the previous socket are not comparable with this one's: carried over,
+      // a restarted gateway's frames would all read as stale.
+      resetSlotProjectionRevisions()
+      // The crew-log panel's cached read carries the PREVIOUS process's revisions,
+      // which a restarted gateway's frames would all fall below. One re-read per
+      // connection re-bases it on the process now serving.
+      void queryClient.invalidateQueries({ queryKey: ['crew-log-projections'] }, { cancelRefetch: false })
+      // The Context tab's usage revisions belong to the previous process too.
+      resetContextTraceRefresh()
       // Cache auto-speak preference
       voice.refreshAutoSpeak()
       const catchUp = {
@@ -134,6 +192,9 @@ export function useWebSocket() {
         syncWorkflowRuns,
       }
       if (socket.wasConnectedRef.current) {
+        // No frame could arrive while the socket was down (a gateway restart is
+        // one), so the Context tab's trace may have moved unseen: read it once.
+        rereadAllContextTraces(queryClient)
         runReconnectCatchUp(ws, catchUp)
         return
       }
@@ -277,7 +338,8 @@ export function useWebSocket() {
             dispatch(clearAllNotifications())
             break
           case 'approval': {
-            queryClient.invalidateQueries({ queryKey: ['command-center', 'approvals'] })
+            // The approvals module refreshes the shared `global-approvals` cache,
+            // which the command center reads too.
             // The registry, the chime, the feed note and the live banner; the
             // owning slot comes back ('' for an unowned approval).
             const targetSlot = approvals.onApprovalFrame(data, reconnectingRef.current)
@@ -314,7 +376,8 @@ export function useWebSocket() {
             break
           }
           case 'approval_resolved':
-            queryClient.invalidateQueries({ queryKey: ['command-center', 'approvals'] })
+            // The approvals module refreshes the shared `global-approvals` cache,
+            // which the command center reads too.
             approvals.onApprovalResolved(data)
             break
           case 'refresh': {
@@ -550,14 +613,69 @@ export function useWebSocket() {
             // Wave lifecycle markers — no dedicated UI yet; the chip derives
             // its histogram from per-agent state. Reserved for wave grouping.
             break
+          case 'session_projection': {
+            // One SESSION fold the gateway folded as its entry landed: the crew-log
+            // panel's value, pushed instead of re-read. Applied by revision; a frame
+            // the cache cannot take (another unit, a read in flight) prompts one read.
+            const frame = readSessionProjectionFrame(data)
+            if (!frame) break
+            if (applySessionProjection(queryClient, frame) === 'refetch') {
+              refetchSessionProjections(queryClient, frame.slot)
+            }
+            // A `usage` frame also means the Context tab's trace moved. The frame
+            // is one unit's fold and the trace joins the slot's units, so it is a
+            // signal to re-read, not a value to apply.
+            onUsageFrame(queryClient, frame)
+            break
+          }
+          case 'slot_projection/subscribed':
+            // The revision floor, sent before this tab issues any baseline read.
+            // It carries no values, but a read that completed before it arrived
+            // may hold a board below the new floor, and nothing else would move
+            // that board: so every such board is re-read.
+            recordSlotProjectionFloor(data)
+            invalidateBelowFloor(queryClient)
+            break
           case 'slot_projection': {
             // A slot's crew log grew. A work board folds its conductor's units
             // with its bound workers', so the boards that move are this slot's
-            // and every ancestor's. A read already in flight absorbs a burst of
-            // frames instead of being cancelled and restarted.
+            // and every ancestor's. A read in flight is never cancelled -- a
+            // steady stream of frames would restart a whole-log fold forever --
+            // but it may have folded before this growth, so one more read
+            // follows it once it settles.
             if (typeof data.slot !== 'string') break
+            // The VALUED shape, which an eager advance sends: the fold is already
+            // done, so the frame replaces the read rather than prompting one.
+            const read = takeFoldedSlotProjection(data)
+            // A revision at or below what this tab holds is a duplicate delivery.
+            // Dropped outright -- re-reading there would spend the request the
+            // revision exists to save.
+            if (read.kind === 'stale') break
+            // SEEDING IS REFUSED WHILE A READ IS IN FLIGHT. A REST response that
+            // is already on the wire resolves into this same cache entry and
+            // overwrites whatever is there, so a value written now is replaced by
+            // an OLDER one with nothing left to correct it. The fall-through below
+            // is the path that already handles a read in flight: it waits for the
+            // promise and invalidates after it settles.
+            //
+            // ONLY THE FRAME'S OWN BOARD IS SEEDED. The value is the board of
+            // `frame.slot`; an ancestor root reads ITS OWN board over a different
+            // unit set, so writing this value under the ancestor's key would show
+            // one board's items as another's. Ancestors are re-read below instead.
+            let seededRoot: string | null = null
+            if (read.kind === 'folded' && !fetchingAnyFoldQuery(queryClient, read.frame)) {
+              // A fold this tab caches under no key of its own falls through to
+              // the invalidate below, so its own reader still learns the board
+              // moved -- the push is an optimisation, never the only channel.
+              if (seedFoldedProjection(queryClient, read.frame.slot, read.frame)) seededRoot = read.frame.slot
+            }
             for (const root of teamRoots(store.getState().dashboard.slots, data.slot)) {
-              queryClient.invalidateQueries({ queryKey: ['command-center', root, 'work'], exact: true }, { cancelRefetch: false })
+              if (root === seededRoot) continue
+              const key = ['command-center', root, 'work']
+              const inFlight = queryClient.getQueryCache().find({ queryKey: key, exact: true })
+              if (inFlight?.state.fetchStatus === 'fetching' && inFlight.promise) {
+                void inFlight.promise.catch(() => undefined).finally(() => { void queryClient.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false }) })
+              } else queryClient.invalidateQueries({ queryKey: key, exact: true }, { cancelRefetch: false })
             }
             break
           }
@@ -695,6 +813,7 @@ export function useWebSocket() {
   const forceReconnect = useCallback(() => {
     socket.forceReconnect(voice.releaseVoiceOnSocketLoss, connect)
   }, [socket, voice, connect])
+  useRowDeliveryWatchdog(dispatch, forceReconnect)
 
   /** Replace a socket that is OPEN but has stopped delivering.
    *

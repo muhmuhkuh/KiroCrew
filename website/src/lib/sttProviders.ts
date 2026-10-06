@@ -115,6 +115,42 @@ export function unavailableMessage(code: string, detail = ''): string {
 }
 
 /**
+ * Per-code reason for a surface — the chat mic modal — that can only offer an
+ * "Open settings" button, never a provider menu, an enable toggle or a download
+ * control.
+ *
+ * The availability catalog is written for Settings → Voice and several of its
+ * sentences point "above"/"below" at a control that lives only there:
+ * `stt_disabled` ("Switch it on above"), `stt_provider_off` ("Pick another
+ * provider from the Provider menu below"), `stt_unsupported_cpu` /
+ * `stt_load_crashed` / `stt_native_probe_crashed` ("Turn speech-to-text off
+ * above") and `stt_model_missing` ("Download it below"). Pointing the modal user
+ * at a control that is not on screen is the dead end this surface removes, so:
+ *
+ *   - a code whose sentence is self-contained (extra missing, no wheel, import
+ *     failed, the Apple codes) renders that sentence unchanged;
+ *   - `stt_model_missing` gets a modal-specific sentence — its generic fallback
+ *     would wrongly say "provider isn't installed" when only the model is absent —
+ *     naming the real cause and pointing at the modal's own Open settings button;
+ *   - everything else returns '' so the caller shows its generic, button-backed
+ *     fallback rather than a "below" the modal does not have.
+ */
+const MODAL_SAFE_UNAVAILABLE_CODES = new Set([
+  'stt_extra_missing',
+  'stt_no_wheel_for_platform',
+  'stt_import_failed',
+  'stt_apple_unsupported',
+  'stt_apple_needs_toolchain',
+])
+
+export function modalUnavailableMessage(code: string): string {
+  if (code === 'stt_model_missing') {
+    return i18nT('components.voiceDisabledModal.model_not_downloaded_open_settings')
+  }
+  return MODAL_SAFE_UNAVAILABLE_CODES.has(code) ? unavailableMessage(code) : ''
+}
+
+/**
  * Catalog KEY for each machine-readable reason a live dictation STREAM failed.
  *
  * The `error` frame's `code` is the contract and its `message` is advisory English,
@@ -122,6 +158,12 @@ export function unavailableMessage(code: string, detail = ''): string {
  * the codes only the streaming path can produce, plus `stt_model_missing`, which
  * reaches the socket too and needs different words there: the settings panel's
  * version says "Download it below", and below the composer there is no "below".
+ *
+ * `stt_consent_required` is the AWS consent gate refusing a Transcribe stream, with
+ * the gateway's refusal reason as its advisory English `message`. It is re-checked
+ * live on every stream, so an expired credential on an already-confirmed profile
+ * lands here too, not only a first use — which is why the notice points to the
+ * settings page rather than describing a one-time confirmation.
  *
  * Keys, not resolved strings, for the same reason as `PROVIDER_LABEL_KEY` — the
  * table is evaluated at module load, so an `i18nT()` here would freeze the boot
@@ -132,6 +174,10 @@ export const STREAM_ERROR_CODE_KEY: Record<string, string> = {
   stt_session_failed: 'lib.sttProviders.stream_error_session_failed',
   stt_max_duration_exceeded: 'lib.sttProviders.stream_error_max_duration',
   stt_model_missing: 'lib.sttProviders.stream_error_model_missing',
+  stt_consent_required: 'lib.sttProviders.stream_error_consent_required',
+  // Amazon Transcribe refused the chosen custom vocabulary. Retrying cannot help,
+  // so the sentence names the setting that can.
+  stt_transcribe_vocabulary_rejected: 'lib.sttProviders.stream_error_vocabulary_rejected',
 }
 
 /**

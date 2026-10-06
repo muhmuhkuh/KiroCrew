@@ -9,24 +9,26 @@ import logging
 import os
 import re
 import shutil
+import signal
 import stat
 import struct
 import subprocess
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from aiohttp import web
 
 from kiro_crew import platform_compat
-from kiro_crew.config.loader import config_path
+from kiro_crew.config.loader import config_path, read_config_text
 from kiro_crew.dashboard import terminal_commands
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+from kiro_crew.dashboard.handlers.files import _PathProbeBusy, _run_path_probe
 from kiro_crew.dashboard.origin import check_origin, mark_audit_claimed
 from kiro_crew.executors import discovery_executor, subprocess_executor
 from kiro_crew.hooks import validate_file_path
+from kiro_crew.notifications.bus import NotificationBus, NotificationPayload
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, RLIMIT_PROFILE_NONE, spawn_shim_argv
 from kiro_crew.security import (
     is_sensitive_path,
@@ -76,6 +78,12 @@ _TAKEOVER_READY_TIMEOUT_S = 5.0
 # Bound each transport operation so a wedged peer cannot retain its handler or
 # hold replace_lock indefinitely.
 _TERMINAL_WS_CLEANUP_TIMEOUT_S = 1.0
+# A selected workspace can sit on an unresponsive mount. Stop waiting without
+# holding terminal capacity or a dashboard-discovery worker indefinitely.
+_TERMINAL_CWD_TIMEOUT_S = 5.0
+# A submitted close retains ownership of its descriptor after this wait ends.
+# Repeated handler cancellation must not restart the deadline or cancel it.
+_TERMINAL_FD_CLOSE_TIMEOUT_S = 5.0
 # Advisory control frames (title, cwd, pong) ride the owner's transport lock.
 # Bound lock acquisition plus the send so the singleton title poller can never
 # park behind a displaced socket's blocked write or a wedged owner transport.
@@ -86,6 +94,16 @@ _OWNER_CONTROL_SEND_TIMEOUT_S = 2.0
 # that socket: two live windows must not displace each other in a loop.
 _STALE_OWNER_ERROR_MESSAGE = "Another connection owns this terminal session"
 _STALE_OWNER_ERROR_CODE = "displaced"
+# Private-use WebSocket close code: the shell is gone, so clients must close the
+# tab instead of treating the close as a transient drop and redialing.
+_TERMINAL_WS_CLOSE_SHELL_EXITED = 4001
+# Ceiling on the wait for the child to be reaped after reader EOF. Set by
+# ConPTY, which took 3.08s to report a clean ``cmd.exe`` exit dead on
+# windows-latest; POSIX resolves in well under 20ms, so there the bound only
+# matters for a child that never goes.
+_CHILD_REAP_TIMEOUT_S = 10.0
+# ConPTY has no child watcher, so its liveness is polled at this interval.
+_CONPTY_STATUS_POLL_S = 0.05
 
 
 def _sel():
@@ -161,7 +179,7 @@ class _TerminalSession:
 
     session_id: str
     master_fd: int
-    proc: asyncio.subprocess.Process | None = None
+    proc: "asyncio.subprocess.Process | None" = None
     winpty: _ConptyBackend | None = None  # WindowsPty (ConPTY) backend on Windows
     cols: int = 80
     rows: int = 24
@@ -286,6 +304,7 @@ async def _close_terminal_ws_bounded(
     *,
     error_message: str | None = None,
     error_code: str | None = None,
+    close_code: int | None = None,
 ) -> None:
     """Best-effort terminal WebSocket cleanup with bounded transport waits."""
     if ws.closed:
@@ -304,8 +323,9 @@ async def _close_terminal_ws_bounded(
     if ws.closed:
         return
     try:
+        close = ws.close() if close_code is None else ws.close(code=close_code)
         await asyncio.wait_for(
-            ws.close(),
+            close,
             timeout=_TERMINAL_WS_CLEANUP_TIMEOUT_S,
         )
     except (ConnectionResetError, RuntimeError, OSError, asyncio.TimeoutError):
@@ -563,8 +583,6 @@ async def _resize_terminal(
             except OSError:
                 pass
         else:
-            if fcntl is None or termios is None:
-                return False
             try:
                 fcntl.ioctl(
                     sess.master_fd,  # wokeignore:rule=master
@@ -596,7 +614,7 @@ def _get_config(request: web.Request) -> dict:
     which is also what an absent key means.
     """
     try:
-        data = json.loads(config_path().read_text(encoding="utf-8"))
+        data = json.loads(read_config_text(config_path()))
     except (OSError, ValueError):
         return {}
     if not isinstance(data, dict):
@@ -652,24 +670,23 @@ def _completion_disabled(completion_cfg: dict) -> bool:
     to the default (enabled). ``bool("false") is True``, so coercing would turn a
     hand-edited string into the opposite of what it reads like.
     """
-    value = completion_cfg.get("enabled", True)
-    return isinstance(value, bool) and not value
+    return completion_cfg.get("enabled", True) is False
 
 
 def _resolve_cwd(cfg: dict, requested: str | None) -> str:
     """Resolve the PTY working directory.
 
-    A valid client-requested dir (the chat's project dir, passed as ?cwd=) wins;
-    otherwise the configured cwd, else $HOME. The requested dir must be an
-    existing directory — this is the user's own interactive shell (auth is
-    enforced at the WS handshake), so there is no root restriction beyond isdir.
+    A client-requested dir (the chat's project dir, passed as ?cwd=) must exist.
+    Without one, use the configured cwd, else $HOME. This is the user's own
+    interactive shell (auth is enforced at the WS handshake), so there is no
+    root restriction beyond isdir.
     """
     default = cfg.get("cwd") or os.environ.get("HOME") or "/"
     if requested:
         candidate = os.path.abspath(os.path.expanduser(requested))
         if os.path.isdir(candidate):
             return candidate
-        logger.warning("terminal: ignoring invalid cwd %r", requested)
+        raise ValueError("Terminal working directory does not exist")
     return default
 
 
@@ -757,16 +774,16 @@ def _proc_cwd(pid: int) -> str | None:
     lsof = next((p for p in _LSOF_PATHS if os.path.isfile(p)), None)
     if not lsof:
         return None  # fail closed rather than resolve via PATH
-    with suppress(OSError, subprocess.SubprocessError):
+    try:
         out = subprocess.run(
             [lsof, "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True,
-            text=True,
-            timeout=2,
+            capture_output=True, text=True, timeout=2,
         ).stdout
         for line in out.splitlines():
             if line.startswith("n") and len(line) > 1:
                 return line[1:]
+    except (OSError, subprocess.SubprocessError):
+        pass
     return None
 
 
@@ -778,7 +795,7 @@ def _proc_cwd(pid: int) -> str | None:
 _CWD_PROBE_TTL_S = 0.4
 
 
-def _session_cwd(sess: _TerminalSession) -> str | None:
+def _session_cwd(sess: "_TerminalSession") -> str | None:
     """Full current working directory of the session's shell, or None.
 
     Memoized on the session for :data:`_CWD_PROBE_TTL_S`, because the answer has
@@ -797,7 +814,7 @@ def _session_cwd(sess: _TerminalSession) -> str | None:
     return cwd
 
 
-async def _session_cwd_cached(sess: _TerminalSession) -> str | None:
+async def _session_cwd_cached(sess: "_TerminalSession") -> str | None:
     """``_session_cwd`` probed off the event loop, skipping the executor hop
     entirely on a memo hit.
 
@@ -819,7 +836,7 @@ async def _session_cwd_cached(sess: _TerminalSession) -> str | None:
     return cwd
 
 
-def _session_title(sess: _TerminalSession) -> str | None:
+def _session_title(sess: "_TerminalSession") -> str | None:
     """Best-effort "what is this terminal doing" label: the foreground command
     name while one runs, else the shell's cwd basename. Returns None when it
     can't tell (client keeps its current title, so a host that can resolve
@@ -827,9 +844,7 @@ def _session_title(sess: _TerminalSession) -> str | None:
 
     The cwd goes through :func:`_session_cwd` rather than :func:`_proc_cwd` so
     that deriving this label shares one probe with the poller's cwd frame."""
-    if (
-        not platform_compat.IS_POSIX or sess.master_fd < 0 or sess.proc is None
-    ):  # wokeignore:rule=master
+    if not platform_compat.IS_POSIX or sess.master_fd < 0 or sess.proc is None:  # wokeignore:rule=master
         return None
     try:
         fg = os.tcgetpgrp(sess.master_fd)  # wokeignore:rule=master
@@ -950,18 +965,18 @@ def _resolve_fence_shells(launched: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for name in _FENCE_SHELL_NAMES:
         candidate = os.path.join(trusted_dir, name)
+        if os.path.islink(candidate):
+            continue  # the link target is outside what was vetted above
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
         try:
-            if os.path.islink(candidate):
-                continue  # the link target is outside what was vetted above
-            if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
-                continue
             st = os.lstat(candidate)
-            if st.st_uid == uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-                continue  # rewritable in place
-            if os.access(candidate, os.W_OK):
-                continue  # rewritable in place via an ACL the mode bits do not show
         except OSError:
             continue
+        if st.st_uid == uid or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            continue  # rewritable in place
+        if os.access(candidate, os.W_OK):
+            continue  # rewritable in place via an ACL the mode bits do not show
         found[name] = candidate
     return found
 
@@ -1110,7 +1125,7 @@ def _bash_ready_env(token: str) -> dict[str, str]:
     return env
 
 
-def _consume_ready_marker(sess: _TerminalSession, data: bytes) -> bool:
+def _consume_ready_marker(sess: "_TerminalSession", data: bytes) -> bool:
     """Advance the split-safe Bash marker matcher for one raw PTY read."""
     marker = sess.ready_marker
     if sess.shell_ready or marker is None:
@@ -1126,7 +1141,7 @@ def _consume_ready_marker(sess: _TerminalSession, data: bytes) -> bool:
     return False
 
 
-def _sess_alive(sess: _TerminalSession) -> bool:
+def _sess_alive(sess: "_TerminalSession") -> bool:
     """Whether the session's child process is still running (either backend)."""
     if sess.winpty is not None:
         try:
@@ -1138,11 +1153,169 @@ def _sess_alive(sess: _TerminalSession) -> bool:
     return False
 
 
-def _sess_pid(sess: _TerminalSession) -> int | None:
+def _sess_pid(sess: "_TerminalSession") -> int | None:
     """PID of the session's child process (either backend), or None."""
     if sess.winpty is not None:
         return sess.winpty.pid
     return sess.proc.pid if sess.proc is not None else None
+
+
+async def _child_exit_status(sess: _TerminalSession) -> int | None:
+    """Wait, bounded, for the session's child to go; return its exit status.
+
+    ``None`` when the status is unavailable: the child outlived
+    ``_CHILD_REAP_TIMEOUT_S``, or it ran under ConPTY, whose wrapper reports
+    liveness but no exit code. Callers tell those apart with ``_sess_alive``.
+    """
+    wp = sess.winpty
+    if wp is not None:
+        # Poll the non-blocking ``isalive()`` rather than pywinpty's ``wait()``,
+        # whose executor thread cannot be cancelled at the deadline.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CHILD_REAP_TIMEOUT_S
+        while wp.isalive():
+            if loop.time() >= deadline:
+                return None
+            await asyncio.sleep(_CONPTY_STATUS_POLL_S)
+        return None
+    proc = sess.proc
+    if proc is None:
+        return None
+    if proc.returncode is None:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=_CHILD_REAP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return None
+    return proc.returncode
+
+
+def _shell_failure_note(status: int) -> tuple[str, str]:
+    """Title and body of the bell note for a shell that exited non-zero.
+
+    The title is fixed; the body says how the shell ended, and asyncio reports
+    a death by signal as a negative code, so that case names the signal
+    instead. The note carries
+    nothing about the session itself -- no id, shell path or directory --
+    because the notification feed reaches every dashboard session, including
+    ones that are not the terminal's owner.
+    """
+    if status < 0:
+        try:
+            how = f"was killed by {signal.Signals(-status).name}"
+        except ValueError:
+            how = f"was killed by signal {-status}"
+    else:
+        how = f"exited with code {status}"
+    return "Terminal exited abnormally", f"The shell {how}."
+
+
+def _notify_shell_failed(bus: NotificationBus, sess: _TerminalSession, status: int) -> None:
+    """Push one bell-feed note for a shell that exited with a non-zero code.
+
+    The tab closes with the shell, so this note is the only place the code is
+    left to read. One ``group_key`` for all sessions, so a shell dying in a
+    loop stacks. Best-effort: a refusing bus is logged and the reap goes on.
+    """
+    title, body = _shell_failure_note(status)
+    try:
+        bus.push(
+            NotificationPayload(
+                source="system",
+                channel="system.terminal",
+                title=title,
+                body=body,
+                group_key="terminal-exit",
+                meta={"status": status},
+            )
+        )
+    except Exception:  # noqa: BLE001 -- the reap must not depend on the feed
+        logger.warning(
+            "terminal %s: could not publish the exit notification", sess.session_id, exc_info=True
+        )
+
+
+async def _handle_pty_reader_end(
+    registry: dict[str, _TerminalSession | None],
+    sess: _TerminalSession,
+    *,
+    bus: NotificationBus | None = None,
+) -> None:
+    """Close the tab of a session whose shell exited on its own, then reap it.
+
+    The reader also ends on a deliberate teardown (``DELETE``, the orphan
+    sweep, a dial replacing a dead entry), which raises the same ``OSError``.
+    Each of those pops the registry entry or cancels this task before closing
+    the fd, so the identity check below tells them apart from an exit.
+
+    The attached window gets ``{"type": "exit", "status": N|null}`` and a 4001
+    close, and removes the tab. A detached window learns nothing here: its next
+    dial finds no entry, which the client already reads as a fresh session.
+    """
+    if registry.get(sess.session_id) is not sess:
+        return  # deliberate teardown, already accounted for by its own path
+    status = await _child_exit_status(sess)
+    if registry.get(sess.session_id) is not sess:
+        return  # teardown or replacement took the slot while status resolved
+    if status is None and _sess_alive(sess):
+        return  # the fd closed under a child that is still running: not an exit
+    if bus is not None and status is not None and status != 0:
+        # Published before any transport await so owner churn cannot lose it.
+        _notify_shell_failed(bus, sess, status)
+    async with sess.replace_lock:
+        # Serialized with reconnect publication: a reconnect that won the lock
+        # is the owner told below; one queued behind it finds the entry gone.
+        if registry.get(sess.session_id) is not sess:
+            return
+        ws = sess.ws
+        if ws is not None:
+            await _send_owner_control_frame(sess, ws, {"type": "exit", "status": status})
+            if sess.ws is ws:
+                await _close_terminal_ws_bounded(ws, close_code=_TERMINAL_WS_CLOSE_SHELL_EXITED)
+        if registry.get(sess.session_id) is not sess:
+            return
+        registry.pop(sess.session_id, None)
+    # We run inside reader_task. On ConPTY, _kill_session cancels and awaits the
+    # reader before terminating the child, which from inside that task would
+    # abort the teardown before the pseudo-console is closed.
+    sess.reader_task = None
+    await _kill_session(sess)
+
+
+async def _close_terminal_fd(fd: int) -> None:
+    """Submit close once, retaining queued work through cancellation or timeout."""
+    loop = asyncio.get_running_loop()
+    closing = loop.run_in_executor(subprocess_executor(), os.close, fd)
+    deadline = loop.time() + _TERMINAL_FD_CLOSE_TIMEOUT_S
+    cancelled: asyncio.CancelledError | None = None
+
+    def report_late_close(done: asyncio.Future[None]) -> None:
+        try:
+            done.result()
+        except (asyncio.CancelledError, OSError, RuntimeError):
+            logger.warning("terminal: delayed descriptor close failed", exc_info=True)
+
+    try:
+        while not closing.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError
+            try:
+                await asyncio.wait_for(asyncio.shield(closing), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        closing.result()
+    except asyncio.TimeoutError:
+        logger.warning(
+            "terminal: descriptor close still pending after %ss", _TERMINAL_FD_CLOSE_TIMEOUT_S
+        )
+        raise
+    finally:
+        if not closing.done():
+            # Never retry the numeric fd: the submitted close may finish and
+            # the OS may reuse it before this callback observes completion.
+            closing.add_done_callback(report_late_close)
+        if cancelled is not None:
+            raise cancelled
 
 
 async def _kill_session(sess: _TerminalSession) -> None:
@@ -1156,21 +1329,28 @@ async def _kill_session(sess: _TerminalSession) -> None:
         sess.winpty = None
         if sess.reader_task is not None:
             sess.reader_task.cancel()
-            with suppress(asyncio.CancelledError, Exception):
+            try:
                 await sess.reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
         loop = asyncio.get_running_loop()
         pid = getattr(wp, "pid", 0)
         # Reap the whole console tree (the shell + anything it spawned) via
         # taskkill /T so a background child can't outlive the closed terminal.
         if pid:
-            with suppress(OSError, ProcessLookupError):
-                await platform_compat.kill_process_tree_async(pid, platform_compat.SIGTERM)
+            try:
+                await platform_compat.kill_process_tree_async(
+                    pid, platform_compat.SIGTERM
+                )
+            except (OSError, ProcessLookupError):
+                pass
         # Free the pseudo-console + handles (TerminateProcess is a backstop).
-        with suppress(OSError, RuntimeError):
+        try:
             await loop.run_in_executor(
-                subprocess_executor(),
-                wp.terminate,  # type: ignore[attr-defined]
+                subprocess_executor(), wp.terminate,  # type: ignore[attr-defined]
             )
+        except (OSError, RuntimeError):
+            pass
         return
     # The child goes FIRST, then the PTY's controller descriptor, and the order
     # is the fix for a real deadlock. Closing the controller end while the reader
@@ -1246,27 +1426,24 @@ async def _kill_session(sess: _TerminalSession) -> None:
     # wedged close then costs at most one pool thread instead of freezing the
     # whole gateway, and shares no workers with the orphan-reaping maintenance
     # sweep.
-    if sess.master_fd >= 0:  # wokeignore:rule=master
-        fd = sess.master_fd  # wokeignore:rule=master
-        # Clear the handle BEFORE the await: if this coroutine is cancelled while
-        # suspended on the executor (e.g. aiohttp cancels the request handler on
-        # client disconnect), the fd must not be left referenced on the session.
-        sess.master_fd = -1  # wokeignore:rule=master
-        try:
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), os.close, fd,
-            )
-        except (OSError, RuntimeError):
-            # OSError: close failed. RuntimeError: the subprocess pool was
-            # already torn down (shutdown races interpreter exit): submit
-            # raises rather than returning a future; the fd is reaped on exit.
-            pass
-    if sess.reader_task is not None:
-        sess.reader_task.cancel()
-        try:
-            await sess.reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    try:
+        if sess.master_fd >= 0:  # wokeignore:rule=master
+            fd = sess.master_fd  # wokeignore:rule=master
+            # Ownership transfers to the submitted close before awaiting it.
+            sess.master_fd = -1  # wokeignore:rule=master
+            try:
+                await _close_terminal_fd(fd)
+            except (OSError, RuntimeError, asyncio.TimeoutError):
+                # A timed-out close stays owned by its executor work. If the
+                # pool has already shut down, process exit reaps the descriptor.
+                pass
+    finally:
+        if sess.reader_task is not None:
+            sess.reader_task.cancel()
+            try:
+                await sess.reader_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.Response:
@@ -1278,6 +1455,10 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         - Client→Server: {"type":"resize","cols":N,"rows":N}
         - Client→Server: {"type":"ping"}
         - Server→Client: {"type":"pong"}
+        - Server→Client: {"type":"exit","status":N|null} -- the shell exited on
+          its own; the socket closes with 4001 and the session is reaped, so
+          the client closes the tab instead of redialing. ``status`` is null
+          when the exit code is unavailable.
     """
     # A WebSocket upgrade is a GET, and `csrf_middleware` validates the origin
     # only for unsafe methods, so the handshake would otherwise arrive
@@ -1334,30 +1515,17 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     registry = _get_registry(request)
     cfg = _get_config(request)
     max_sessions = cfg.get("max_sessions", _MAX_SESSIONS)
-    posix_pty = _pty
-    posix_fcntl = fcntl
-    posix_termios = termios
-    # Resolve the shell HERE, before the reservation region below: the
-    # resolution is a PATH scan (shutil.which stats every entry) that must run
-    # off-loop, and the spawn branches sit between the placeholder reservation
-    # and the session registration, where an added await would suspend the
-    # handler with the registry still holding the None placeholder — a window
-    # every concurrent reader of the registry would then observe. One hop per
-    # WS open, now also carrying the fence-shell map the ready frame reports;
-    # a reconnect keeps the values its original open resolved.
+    # Shell discovery scans PATH and can block on filesystem access, so run it
+    # off-loop before reserving terminal capacity. Reconnects keep the shell
+    # and fence-shell map saved with their existing session.
     shell, rejected_shell, fence_shells = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(),
-        _resolve_shell_with_fence_shells,
-        cfg,
+        discovery_executor(), _resolve_shell_with_fence_shells, cfg,
     )
 
-    # Check if reconnecting to existing session. A None VALUE under an
-    # existing key is another handler's reservation placeholder (set below,
-    # held across its awaits): treat it as "session already being opened" and
-    # refuse, instead of reading it as absent — two tabs racing the same
-    # unregistered session id would otherwise both pass the reservation check
-    # and spawn two PTYs, leaking one. This guards every await in this
-    # handler (the off-loop shell resolution above and ws.prepare below).
+    # A None entry reserves this session id and capacity throughout opening,
+    # including asynchronous setup and any refusal response. Reject duplicate
+    # opens until the entry becomes a session or its opening handler removes
+    # the reservation; treating it as absent could spawn duplicate PTYs.
     if session_id in registry and registry[session_id] is None:
         _sel().log_api_access(
             caller=caller,
@@ -1366,11 +1534,27 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
             source="dashboard",
             resources=f"session={session_id},reservation_in_flight=1",
         )
-        return web.Response(status=409, text="Terminal session is already being opened")
+        return web.Response(
+            status=409, text="Terminal session is already being opened"
+        )
     existing = registry.get(session_id)
     if existing and not _sess_alive(existing):
-        # Process died — clean up stale entry
+        # Process died — clean up stale entry. The reader is cancelled first:
+        # the kill's awaits would otherwise let it reach its exit handling and
+        # reap this entry as a shell exit under the teardown.
+        if existing.reader_task is not None:
+            existing.reader_task.cancel()
         await _kill_session(existing)
+        # DELETE or another opener can replace the entry while teardown waits.
+        if registry.get(session_id) is not existing:
+            _sel().log_api_access(
+                caller=caller,
+                operation="terminal.ws.open",
+                outcome="denied",
+                source="dashboard",
+                resources=f"session={session_id},session_changed=1",
+            )
+            return web.Response(status=409, text="Terminal session changed while opening")
         del registry[session_id]
         existing = None
 
@@ -1390,244 +1574,327 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
     if placeholder:
         registry[session_id] = None
 
-    ws = web.WebSocketResponse(heartbeat=30, timeout=300)
     try:
-        await ws.prepare(request)
-    except Exception:
+        ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+        cwd = ""
         if placeholder:
-            registry.pop(session_id, None)  # type: ignore[arg-type]
-        raise
+            try:
+                requested_cwd = request.query.get("cwd")
+                if requested_cwd:
+                    cwd = await asyncio.wait_for(
+                        _run_path_probe(_resolve_cwd, cfg, requested_cwd),
+                        timeout=_TERMINAL_CWD_TIMEOUT_S,
+                    )
+                else:
+                    # Selecting the configured/HOME/root default performs no
+                    # path stat and remains available when probes are exhausted.
+                    cwd = _resolve_cwd(cfg, None)
+            except (OSError, ValueError, asyncio.TimeoutError, _PathProbeBusy):
+                registry.pop(session_id, None)
+                placeholder = False
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="terminal.ws.open",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=(
+                        f"session={session_id},invalid_cwd=1," f"cwd={request.query.get('cwd')!r}"
+                    ),
+                )
+                # A browser WebSocket cannot read a rejected handshake's JSON
+                # body. No shell can be created after refusal, so retire the
+                # reservation before even a slow handshake can retain it.
+                await ws.prepare(request)
+                await _close_terminal_ws_bounded(
+                    ws,
+                    error_message="Terminal working directory is unavailable",
+                    error_code="terminal_invalid_cwd",
+                )
+                return ws
+        await ws.prepare(request)
 
-    if existing:
-        # Reconnect to existing PTY.
-        replaced = await _replace_terminal_ws(existing, ws)
-        if not replaced:
+        if existing:
+            # Reconnect to existing PTY.
+            replaced = await _replace_terminal_ws(existing, ws)
+            if not replaced:
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="terminal.ws.reconnect",
+                    outcome="error",
+                    source="dashboard",
+                    resources=f"session={session_id},takeover_failed=1",
+                )
+                await _close_terminal_ws_bounded(
+                    ws,
+                    error_message="Terminal reconnect failed",
+                )
+                return ws
+            sess = existing
+            if registry.get(session_id) is not sess:
+                # A shell exit reaped this session while the reconnect queued on
+                # replace_lock, so the socket was published on a dead entry. The
+                # 4001 close tells this window what the exit already told the last
+                # one: the shell is gone, close the tab rather than redial.
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="terminal.ws.reconnect",
+                    outcome="error",
+                    source="dashboard",
+                    resources=f"session={session_id},reaped_during_reconnect=1",
+                )
+                await _close_terminal_ws_bounded(
+                    ws, close_code=_TERMINAL_WS_CLOSE_SHELL_EXITED
+                )
+                return ws
             _sel().log_api_access(
                 caller=caller,
                 operation="terminal.ws.reconnect",
-                outcome="error",
+                outcome="ok",
                 source="dashboard",
-                resources=f"session={session_id},takeover_failed=1",
+                resources=f"session={session_id},pid={_sess_pid(sess)}",
             )
-            await _close_terminal_ws_bounded(
-                ws,
-                error_message="Terminal reconnect failed",
-            )
-            return ws
-        sess = existing
-        _sel().log_api_access(
-            caller=caller,
-            operation="terminal.ws.reconnect",
-            outcome="ok",
-            source="dashboard",
-            resources=f"session={session_id},pid={_sess_pid(sess)}",
-        )
-    elif platform_compat.IS_WINDOWS:
-        # Windows: spawn a ConPTY-backed shell (PowerShell by default). There is
-        # no POSIX pty/fork; kiro_crew.conpty drives the Win32 pseudo-console via
-        # ctypes (stdlib, no extra dependency).
-        from kiro_crew.conpty import WindowsPty
+        elif platform_compat.IS_WINDOWS:
+            # Windows: spawn a ConPTY-backed shell (PowerShell by default). There is
+            # no POSIX pty/fork; kiro_crew.conpty drives the Win32 pseudo-console via
+            # ctypes (stdlib, no extra dependency).
+            from kiro_crew.conpty import WindowsPty
 
-        if rejected_shell:
-            logger.warning(
-                "terminal: configured shell %r not executable; falling back to %r",
-                rejected_shell,
-                shell,
+            if rejected_shell:
+                logger.warning(
+                    "terminal: configured shell %r not executable; falling back to %r",
+                    rejected_shell, shell,
+                )
+            if not request.query.get("cwd") and not os.path.isdir(cwd):
+                cwd = os.path.expanduser("~")
+            env = _pty_child_env({"KIROCREW_TERMINAL": "1"})
+            argv = [shell, "-NoLogo"] if "powershell" in shell.lower() else [shell]
+            try:
+                wp = WindowsPty(argv, cwd=cwd, env=env, cols=80, rows=24)
+            except Exception as exc:
+                registry.pop(session_id, None)
+                placeholder = False
+                _sel().log_api_access(
+                    caller=caller, operation="terminal.ws.open",
+                    outcome="error", source="dashboard",
+                    resources=f"conpty_spawn_failed={exc}",
+                )
+                if not ws.closed:
+                    await ws.send_str(json.dumps(
+                        {"type": "error", "message": f"Failed to start terminal: {exc}"}
+                    ))
+                    await ws.close()
+                return ws
+            sess = _TerminalSession(
+                session_id=session_id, master_fd=-1, proc=None, winpty=wp, ws=ws, shell=shell,  # wokeignore:rule=master
+                fence_shells=fence_shells,
             )
-        cwd = _resolve_cwd(cfg, request.query.get("cwd"))
-        if not os.path.isdir(cwd):
-            cwd = os.path.expanduser("~")
-        env = _pty_child_env({"KIROCREW_TERMINAL": "1"})
-        argv = [shell, "-NoLogo"] if "powershell" in shell.lower() else [shell]
-        try:
-            wp = WindowsPty(argv, cwd=cwd, env=env, cols=80, rows=24)
-        except Exception as exc:
-            registry.pop(session_id, None)  # type: ignore[arg-type]
+            registry[session_id] = sess
+            placeholder = False
+            _sel().log_api_access(
+                caller=caller, operation="terminal.ws.open",
+                outcome="ok", source="dashboard",
+                resources=f"session={session_id},pid={wp.pid},shell={shell}",
+            )
+        else:
+            if rejected_shell:
+                logger.warning(
+                    "terminal: configured shell %r not executable; falling back to %r",
+                    rejected_shell, shell,
+                )
+            # Spawn new PTY. Bash is a real login shell (`-l`) so the user's own
+            # profile chain runs with `shopt -q login_shell` true, and it inherits a
+            # PROMPT_COMMAND that emits a definitive readiness marker once the
+            # profiles return. Foreground process ownership alone is insufficient: a
+            # profile's builtin `read` runs in the shell process and would consume an
+            # early command batch.
+            master_fd, worker_fd = _pty.openpty()  # wokeignore:rule=master
+            sess = _TerminalSession(
+                session_id=session_id,
+                master_fd=master_fd,  # wokeignore:rule=master
+                proc=None,
+                ws=ws,
+                shell=shell,
+                fence_shells=fence_shells,
+            )
+            ready_marker: bytes | None = None
+            close_cancelled: asyncio.CancelledError | None = None
+            spawn_error: BaseException | None = None
+            try:
+                try:
+                    fcntl.ioctl(
+                        worker_fd,
+                        termios.TIOCSWINSZ,
+                        struct.pack("HHHH", 24, 80, 0, 0),
+                    )
+                    env = _pty_child_env({
+                        "TERM": "xterm-256color",
+                        "KIROCREW_TERMINAL": "1",
+                        # Export the shell actually being spawned (already resolved to
+                        # an absolute path). Without this, a configured shell that
+                        # differs from the login shell leaves the inherited $SHELL
+                        # pointing at the login shell, so programs that consult it
+                        # (vim's :sh, tmux default-shell) open the wrong one. POSIX
+                        # branch only: PowerShell does not consult $SHELL.
+                        "SHELL": shell,
+                    })
+                    # Security: intentionally unsandboxed — this is the user's own
+                    # interactive terminal (like SSH), not agent-executed code.
+                    # Auth is enforced at WS handshake via token_auth_middleware.
+                    # See CLI_PANEL_DESIGN.md §8 "Security Considerations".
+                    # The PTY has to become the child's CONTROLLING terminal or Ctrl+C
+                    # reaches nothing: the kernel needs a foreground process group to
+                    # deliver SIGINT to, and inheriting an already-open terminal
+                    # descriptor does not confer one. It has to be claimed, after
+                    # setsid(), by the session leader itself.
+                    #
+                    # The claim is made AFTER exec, by the post-exec shim, against fd 0
+                    # (the PTY, below). Asking for it with preexec_fn instead is what
+                    # makes CPython fork this whole multi-GB, ~120-thread gateway and run
+                    # Python in the clone before exec, and the ioctl is not what costs:
+                    # the page-table copy blocks the event loop for ~107ms per terminal
+                    # open at 3GB resident, and a clone that cannot reach exec blocks it
+                    # without bound, because the parent waits inside an un-awaitable
+                    # os.read on the loop thread that no timeout can reach. The shim runs
+                    # the same ioctl single-threaded in the exec'd child, where none of
+                    # that applies -- see the module docstring of _spawn_exec_shim.py.
+                    argv = [shell, "-l"]
+                    if _is_bash_shell(shell):
+                        token = uuid.uuid4().hex
+                        ready_marker = (
+                            f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
+                        )
+                        env.update(_bash_ready_env(token))
+
+                    # RLIMIT_PROFILE_NONE: the user's own interactive shell carries no
+                    # rlimits and no OOM bias, and never did. The controlling terminal is
+                    # the only thing this spawn asks the shim for.
+                    ctty_shim = spawn_shim_argv(RLIMIT_PROFILE_NONE, ctty_fd=0)
+                    if not ctty_shim:
+                        # Deliberately NOT falling back to preexec_fn: reintroducing the
+                        # fork is the whole defect this spawn is avoiding, and a terminal
+                        # whose Ctrl+C is dead is a smaller harm than a gateway the
+                        # watchdog kills. Reachable only on a truncated install, where
+                        # the shim source could not be captured at import.
+                        logger.warning(
+                            "terminal: post-exec shim unavailable; opening the shell with no "
+                            "controlling terminal, so Ctrl+C will not reach it"
+                        )
+
+                    proc = await asyncio.create_subprocess_exec(
+                        *ctty_shim,
+                        *argv,
+                        stdin=worker_fd,
+                        stdout=worker_fd,
+                        stderr=worker_fd,
+                        start_new_session=True,
+                        cwd=cwd,
+                        env=env,
+                    )
+                    # Own the returned child before closing the parent's worker
+                    # descriptor: cancellation at that await must reap it too.
+                    sess.proc = proc
+                    sess.ready_marker = ready_marker
+                except asyncio.CancelledError as cancellation:
+                    close_cancelled = cancellation
+                    raise
+                except BaseException as error:
+                    spawn_error = error
+                    raise
+                finally:
+                    try:
+                        await _close_terminal_fd(worker_fd)
+                    except (OSError, RuntimeError, asyncio.TimeoutError):
+                        # A failed setup reports its own cause: the close that
+                        # follows it must not replace that error for the owner.
+                        if spawn_error is None:
+                            raise
+                        logger.warning(
+                            "terminal: worker descriptor close failed after a setup error",
+                            exc_info=True,
+                        )
+                    finally:
+                        if close_cancelled is not None:
+                            raise close_cancelled
+            except BaseException as exc:
+                # Keep both the reservation and teardown owned until disposal
+                # settles, even if another cancellation arrives while queued.
+                cleanup = asyncio.create_task(_kill_session(sess))
+                try:
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError as cancellation:
+                            exc = cancellation
+                    cleanup.result()
+                finally:
+                    if not isinstance(exc, Exception):
+                        raise exc
+                registry.pop(session_id, None)
+                placeholder = False
+                # WS already prepared — send error over WS then close. A timed-out
+                # descriptor close carries no text of its own.
+                if not ws.closed:
+                    message = str(exc) or f"Failed to start terminal: {type(exc).__name__}"
+                    await ws.send_str(json.dumps({"type": "error", "message": message}))
+                    await ws.close()
+                return ws
+
+            registry[session_id] = sess
+            placeholder = False
             _sel().log_api_access(
                 caller=caller,
                 operation="terminal.ws.open",
-                outcome="error",
+                outcome="ok",
                 source="dashboard",
-                resources=f"conpty_spawn_failed={exc}",
+                resources=f"session={session_id},pid={proc.pid},shell={shell}",
             )
-            if not ws.closed:
-                await ws.send_str(
-                    json.dumps({"type": "error", "message": f"Failed to start terminal: {exc}"})
-                )
-                await ws.close()
-            return ws
-        sess = _TerminalSession(
-            session_id=session_id,
-            master_fd=-1,
-            proc=None,
-            winpty=wp,
-            ws=ws,
-            shell=shell,  # wokeignore:rule=master
-            fence_shells=fence_shells,
-        )
-        registry[session_id] = sess
-        _sel().log_api_access(
-            caller=caller,
-            operation="terminal.ws.open",
-            outcome="ok",
-            source="dashboard",
-            resources=f"session={session_id},pid={wp.pid},shell={shell}",
-        )
-    else:
-        # The branch is selected after the Windows path, but the imports are
-        # optional so type checkers cannot infer the POSIX modules here.
-        assert posix_pty is not None
-        assert posix_fcntl is not None
-        assert posix_termios is not None
-        if rejected_shell:
-            logger.warning(
-                "terminal: configured shell %r not executable; falling back to %r",
-                rejected_shell,
-                shell,
-            )
-        # Spawn new PTY. Bash is a real login shell (`-l`) so the user's own
-        # profile chain runs with `shopt -q login_shell` true, and it inherits a
-        # PROMPT_COMMAND that emits a definitive readiness marker once the
-        # profiles return. Foreground process ownership alone is insufficient: a
-        # profile's builtin `read` runs in the shell process and would consume an
-        # early command batch.
-        master_fd, worker_fd = posix_pty.openpty()
-        ready_marker: bytes | None = None
-        try:
-            posix_fcntl.ioctl(
-                worker_fd,
-                posix_termios.TIOCSWINSZ,
-                struct.pack("HHHH", 24, 80, 0, 0),
-            )
-            cwd = _resolve_cwd(cfg, request.query.get("cwd"))
-            env = _pty_child_env(
-                {
-                    "TERM": "xterm-256color",
-                    "KIROCREW_TERMINAL": "1",
-                    # Export the shell actually being spawned (already resolved to
-                    # an absolute path). Without this, a configured shell that
-                    # differs from the login shell leaves the inherited $SHELL
-                    # pointing at the login shell, so programs that consult it
-                    # (vim's :sh, tmux default-shell) open the wrong one. POSIX
-                    # branch only: PowerShell does not consult $SHELL.
-                    "SHELL": shell,
-                }
-            )
-            # Security: intentionally unsandboxed — this is the user's own
-            # interactive terminal (like SSH), not agent-executed code.
-            # Auth is enforced at WS handshake via token_auth_middleware.
-            # See CLI_PANEL_DESIGN.md §8 "Security Considerations".
-            # The PTY has to become the child's CONTROLLING terminal or Ctrl+C
-            # reaches nothing: the kernel needs a foreground process group to
-            # deliver SIGINT to, and inheriting an already-open terminal
-            # descriptor does not confer one. It has to be claimed, after
-            # setsid(), by the session leader itself.
-            #
-            # The claim is made AFTER exec, by the post-exec shim, against fd 0
-            # (the PTY, below). Asking for it with preexec_fn instead is what
-            # makes CPython fork this whole multi-GB, ~120-thread gateway and run
-            # Python in the clone before exec, and the ioctl is not what costs:
-            # the page-table copy blocks the event loop for ~107ms per terminal
-            # open at 3GB resident, and a clone that cannot reach exec blocks it
-            # without bound, because the parent waits inside an un-awaitable
-            # os.read on the loop thread that no timeout can reach. The shim runs
-            # the same ioctl single-threaded in the exec'd child, where none of
-            # that applies -- see the module docstring of _spawn_exec_shim.py.
-            argv = [shell, "-l"]
-            if _is_bash_shell(shell):
-                token = uuid.uuid4().hex
-                ready_marker = f"\x1b]697;KiroCrewReady;{token}\x07".encode("ascii")
-                env.update(_bash_ready_env(token))
+            if ready_marker is None:
+                # The reliable injection above intentionally targets Bash, the
+                # reported shell. Configured shells whose startup protocol we cannot
+                # control fall back to transport-ready.
+                sess.shell_ready = True
+                try:
+                    async with sess.send_lock:
+                        if sess.ws is ws and not ws.closed:
+                            await ws.send_str(json.dumps({
+                                "type": "ready",
+                                "shell": sess.shell,
+                                "fence_shells": sess.fence_shells,
+                            }))
+                except (ConnectionResetError, RuntimeError, OSError):
+                    pass
 
-            # RLIMIT_PROFILE_NONE: the user's own interactive shell carries no
-            # rlimits and no OOM bias, and never did. The controlling terminal is
-            # the only thing this spawn asks the shim for.
-            ctty_shim = spawn_shim_argv(RLIMIT_PROFILE_NONE, ctty_fd=0)
-            if not ctty_shim:
-                # Deliberately NOT falling back to preexec_fn: reintroducing the
-                # fork is the whole defect this spawn is avoiding, and a terminal
-                # whose Ctrl+C is dead is a smaller harm than a gateway the
-                # watchdog kills. Reachable only on a truncated install, where
-                # the shim source could not be captured at import.
-                logger.warning(
-                    "terminal: post-exec shim unavailable; opening the shell with no "
-                    "controlling terminal, so Ctrl+C will not reach it"
-                )
-
-            proc = await asyncio.create_subprocess_exec(
-                *ctty_shim,
-                *argv,
-                stdin=worker_fd,
-                stdout=worker_fd,
-                stderr=worker_fd,
-                start_new_session=True,
-                cwd=cwd,
-                env=env,
-            )
-        except Exception as exc:
-            with suppress(OSError):
-                os.close(master_fd)
-            registry.pop(session_id, None)  # type: ignore[arg-type]
-            # WS already prepared — send error over WS then close
-            if not ws.closed:
-                await ws.send_str(json.dumps({"type": "error", "message": str(exc)}))
-                await ws.close()
-            return ws
-        finally:
-            os.close(worker_fd)
-
-        sess = _TerminalSession(
-            session_id=session_id,
-            master_fd=master_fd,
-            proc=proc,
-            ws=ws,
-            ready_marker=ready_marker,
-            shell=shell,
-            fence_shells=fence_shells,
-        )
-        registry[session_id] = sess
-        _sel().log_api_access(
-            caller=caller,
-            operation="terminal.ws.open",
-            outcome="ok",
-            source="dashboard",
-            resources=f"session={session_id},pid={proc.pid},shell={shell}",
-        )
-        if ready_marker is None:
-            # The reliable injection above intentionally targets Bash, the
-            # reported shell. Configured shells whose startup protocol we cannot
-            # control fall back to transport-ready.
-            sess.shell_ready = True
-            with suppress(ConnectionResetError, RuntimeError, OSError):
-                async with sess.send_lock:
-                    if sess.ws is ws and not ws.closed:
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "type": "ready",
-                                    "shell": sess.shell,
-                                    "fence_shells": sess.fence_shells,
-                                }
-                            )
-                        )
+    finally:
+        # Only this opener can remove its reservation. Publication or an early
+        # release retires that ownership before another handler can reserve it.
+        if placeholder:
+            registry.pop(session_id, None)
 
     # --- Read loop: PTY → WebSocket ---
+    notification_bus: NotificationBus | None = getattr(
+        request.app.get("state"), "notification_bus", None
+    )
+
     async def read_pty():
+        reader_ended = False
         try:
             loop = asyncio.get_running_loop()
-            winpty = sess.winpty
+            if sess.winpty is not None:
+                reader = lambda: sess.winpty.read(4096)  # noqa: E731
+            else:
+                reader = lambda: os.read(sess.master_fd, 4096)  # noqa: E731  # wokeignore:rule=master
             while True:
-                if winpty is not None:
-                    data = await loop.run_in_executor(None, winpty.read, 4096)
-                else:
-                    data = await loop.run_in_executor(
-                        None, os.read, sess.master_fd, 4096  # wokeignore:rule=master
-                    )
+                data = await loop.run_in_executor(None, reader)
                 if not data:
+                    reader_ended = True
                     break
                 await _record_and_forward_terminal_output(sess, data)
         except OSError:
-            return
+            # EIO: the child exited, or a teardown closed the fd under us.
+            # _handle_pty_reader_end tells those apart.
+            reader_ended = True
+        if reader_ended:
+            await _handle_pty_reader_end(registry, sess, bus=notification_bus)
 
     if sess.reader_task is None or sess.reader_task.done():
         sess.reader_task = asyncio.ensure_future(read_pty())
@@ -1741,9 +2008,7 @@ async def api_terminal_create(request: web.Request) -> web.Response:
     # Off-loop for the same reason as the spawn sites: the PATH scan must not
     # stall the event loop at request rate.
     shell, rejected_shell = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(),
-        _resolve_shell,
-        cfg,
+        discovery_executor(), _resolve_shell, cfg,
     )
     _sel().log_api_access(
         caller=caller,
@@ -1873,7 +2138,7 @@ def _split_path_token(token: str) -> tuple[str, str]:
     idx = token.rfind("/")
     if idx < 0:
         return "", token
-    return token[: idx + 1], token[idx + 1 :]
+    return token[: idx + 1], token[idx + 1:]
 
 
 def _resolve_completion_dir(cwd: str, dir_part: str) -> str:
@@ -2199,8 +2464,8 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         return web.json_response(
             {
                 "error": "expected JSON body "
-                "{session_id: string, token?: string, folders_only?: boolean, "
-                "argv?: string[]}",
+                         "{session_id: string, token?: string, folders_only?: boolean, "
+                         "argv?: string[]}",
                 "code": "terminal_invalid_body",
             },
             status=400,
@@ -2242,7 +2507,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
             return web.json_response(
                 {
                     "error": "argv must be a non-empty list of plain words whose first "
-                    "entry is a bare command name",
+                             "entry is a bare command name",
                     "code": "terminal_invalid_argv",
                 },
                 status=400,
@@ -2254,9 +2519,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
     # this route fires per keystroke, so on a slow home filesystem an inline read
     # would stall every gateway task) and type-checked at both nesting levels.
     completion_cfg = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(),
-        _completion_cfg,
-        request,
+        discovery_executor(), _completion_cfg, request,
     )
     if _completion_disabled(completion_cfg):
         # Gated ABOVE the tier split, so `completion.enabled: false` silences the
@@ -2269,7 +2532,9 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # change. Audited as `ok`: nothing was refused, and naming the state lets
         # an operator tell a configured silence from a broken route.
         _log_complete(caller, "ok", "completion_disabled")
-        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
+        return web.json_response(
+            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
+        )
 
     cwd = await _session_cwd_cached(sess)
 
@@ -2286,10 +2551,7 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # and type-checked at both nesting levels — so this branch reuses it
         # rather than paying a second per-keystroke read of config.json.
         cmd_entries, reason = await terminal_commands.complete(
-            argv,
-            token,
-            cwd,
-            completion_cfg.get("commands"),
+            argv, token, cwd, completion_cfg.get("commands"),
         )
         _log_complete(caller, "denied" if reason == "sensitive_path" else "ok", reason)
         # `dir: null` — the same "nothing was resolved on the filesystem" signal
@@ -2310,7 +2572,9 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # rather than an error the frontend would have to special-case. A null
         # ``dir`` is the signal that nothing was resolved.
         _log_complete(caller, "ok", "no_cwd")
-        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
+        return web.json_response(
+            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
+        )
 
     loop = asyncio.get_running_loop()
     # discovery_executor, not subprocess_executor: this is a read-only
@@ -2336,7 +2600,9 @@ async def api_terminal_complete(request: web.Request) -> web.Response:
         # special case — and so the response does not disclose whether the path
         # exists.
         _log_complete(caller, "denied", "sensitive_path")
-        return web.json_response({"dir": None, "prefix": prefix, "entries": [], "truncated": False})
+        return web.json_response(
+            {"dir": None, "prefix": prefix, "entries": [], "truncated": False}
+        )
     _log_complete(caller, "ok", "listed")
     return web.json_response(
         {
@@ -2395,9 +2661,20 @@ async def api_terminal_delete(request: web.Request) -> web.Response:
         return web.Response(status=400, text="Invalid session_id")
 
     registry = _get_registry(request)
-    sess = registry.pop(session_id, None)  # type: ignore[arg-type]
-    if not sess:
+    if session_id not in registry:
         return web.Response(status=404, text="Session not found")
+    sess = registry[session_id]
+    if sess is None:
+        # An opening handler can still publish a shell; 404 would claim it stopped.
+        _sel().log_api_access(
+            caller=caller,
+            operation="terminal.session.delete",
+            outcome="denied",
+            source="dashboard",
+            resources=f"session={session_id},reservation_in_flight=1",
+        )
+        return web.Response(status=409, text="Terminal session is still opening")
+    del registry[session_id]
 
     if sess.ws and not sess.ws.closed:
         await sess.ws.close()
@@ -2473,24 +2750,22 @@ async def reap_orphaned_terminals(app: web.Application) -> None:
             state = app.get("state")
             if not state or not hasattr(state, "_terminal_sessions"):
                 continue
-            registry: dict[str, _TerminalSession] = state._terminal_sessions
-            now = time.monotonic()
-            to_remove = []
-            for sid, sess in registry.items():
-                if sess is None:
-                    continue  # placeholder during ws.prepare()
-                # Reap if disconnected too long
-                if (
-                    sess.last_ws_disconnect and (now - sess.last_ws_disconnect) > _ORPHAN_TIMEOUT_S
-                ) or not _sess_alive(sess):
-                    to_remove.append(sid)
-            for sid in to_remove:
-                removed = registry.pop(sid, None)
-                if removed is not None:
-                    await _kill_session(removed)
-                    logger.info("Reaped orphaned terminal session %s", sid)
+            registry: dict[str, _TerminalSession | None] = state._terminal_sessions
+            for sid, sess in list(registry.items()):
+                # Earlier teardown can yield to DELETE, a new opener, or reconnect.
+                if sess is None or registry.get(sid) is not sess:
+                    continue
+                now = time.monotonic()
+                if not (
+                    sess.last_ws_disconnect
+                    and (now - sess.last_ws_disconnect) > _ORPHAN_TIMEOUT_S
+                ) and _sess_alive(sess):
+                    continue
+                registry.pop(sid)
+                await _kill_session(sess)
+                logger.info("Reaped orphaned terminal session %s", sid)
     except asyncio.CancelledError:
-        return
+        pass
 
 
 async def poll_terminal_titles(app: web.Application) -> None:
@@ -2558,4 +2833,4 @@ async def poll_terminal_titles(app: web.Application) -> None:
                     ):
                         sess.last_cwd = cwd
     except asyncio.CancelledError:
-        return
+        pass

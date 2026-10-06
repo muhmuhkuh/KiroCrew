@@ -22,9 +22,44 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from kiro_crew import sandbox
 from kiro_crew.dashboard.handlers import agents
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+
+def _drain_catalog_task():
+    # A degraded fetch that timed out at the request bound leaves its background
+    # task running; cancel and await it before clearing the slot so it cannot
+    # resume after this test's patches exit and run real sandbox / kiro-cli
+    # resolution against a later test (no-test-side-effects).
+    task = agents._catalog_cache.task
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        asyncio.get_event_loop().run_until_complete(asyncio.gather(task, return_exceptions=True))
+    except RuntimeError:
+        # No usable loop (closed/none): the task is detached from any live loop,
+        # so clearing the slot is enough — it has no loop to resume on.
+        pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_catalog_cache():
+    # The catalog is cached in a module-level singleton (one slow success warms
+    # every later poll). Reset it around each test so a success in one does not
+    # short-circuit the degraded-branch fetch another is pinning.
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
+    yield
+    _drain_catalog_task()
+    agents._catalog_cache.models = None
+    agents._catalog_cache.fetched_at = 0.0
+    agents._catalog_cache.task = None
 
 
 async def _no_audit(**kwargs: Any) -> None:
@@ -77,7 +112,12 @@ def _run(coro):
 
 async def _raise_timeout(awaitable, timeout):
     del timeout
-    awaitable.close()
+    # api_models awaits asyncio.shield(task) (a Future), while the background
+    # fetch awaits proc.communicate() (a coroutine). Close the coroutine so it
+    # does not warn; a Future has no close() and needs none.
+    close = getattr(awaitable, "close", None)
+    if callable(close):
+        close()
     raise asyncio.TimeoutError
 
 

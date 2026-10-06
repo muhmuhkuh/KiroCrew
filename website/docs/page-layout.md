@@ -14,14 +14,16 @@ conventions around them (a11y, data fetching, typography) live in
 ### Dashboard in chat and Crew
 
 Long-run status uses the existing side-panel dock, expansion and narrow-screen
-overlay, not another drawer. In chat, a one-time hint card above the composer
-opens the **Dashboard** tab. It sits in the chat content column like the other
-status bars and carries the Running/Blocked/Approvals summary plus one line
-naming the outcome (“Opens the Dashboard panel. This hint won't show again.”,
-also the button's accessible description); it has no collapse toggle. Once
-clicked it fades out (cut, under reduced motion) and stays dismissed for that
-session (`mc-task-dashboard-dismissed:<slot>`, collected by `storageGc`); the
-panel tab and its + menu are the way back in. Crew reuses its single permanent **Dashboard** tab instead: its compact
+overlay, not another drawer. In chat, a dock above the composer, in the
+composer's own column (`--mc-input-width`), shows three tiles: progress (done/total
+with a plan, else "N running"), blocked
+and Needs you. Each tile is a disclosure button for the short list beneath it (a
+second click closes it), and the row wraps in a narrow column; beside the tiles
+sit two actions, open the **Dashboard** tab (a labelled "Open Dashboard" button) and
+hide. Hidden, the dock is one pill at the row's end. It carries the hide glyph,
+or a red count while something needs the user (`mc-task-dashboard-hidden`, per
+browser); the dock is one element in both forms. It is removed once every run rests,
+no request waits and the plan is complete. Crew reuses its single permanent **Dashboard** tab instead: its compact
 entrance focuses that tab, and its + menu withholds the parallel chat view.
 The existing member publication and task artifacts share a Published view selector, with
 human-readable titles, while retaining their separate renderer sandboxes. A
@@ -36,9 +38,8 @@ tabs, but unload model-authored iframe documents while inactive to cap resources
 This does not change the existing Crew protected-template renderer's lifecycle.
 Approval counts and exact session identity stay outside the
 sandboxed page, so a model redesign cannot hide or impersonate those controls.
-The panel keeps its approval count on the Approvals tab; the hint card shows the
-Needs you count until it is dismissed, after which the panel's Questions and
-Approvals tabs carry it.
+The panel keeps its approval count on the Approvals tab; the dock's Needs you
+tile and its hidden pill carry the same count.
 
 The Sessions header's three-dot menu offers **All Dashboards**, a standalone
 `/session-dashboards` page with currently open sessions' saved summaries and authored
@@ -327,6 +328,25 @@ through `mountIndex` and `estimateRowTop`. The page keeps `overflow-anchor: auto
 on the scroller as the browser's own stabiliser. WebKit ships none, so the hook
 carries its own anchors as well.
 
+The pinned-prompt card is an overlay beside the scroller, not a row in it, and
+it paints above the composer dock, so nothing but geometry bounds it. Its
+ceiling is the transcript FLOOR: the scroller's bottom less the scroller's own
+`padding-bottom`, which is each host's statement of where readable rows stop
+(the main chat pads by the dock's height plus a clearance). `usePinnedPrompt`
+measures that floor off the scroller rather than taking it as a prop, clamps the
+fold's live height to it and hands it to the card as `maxH`, which lands as
+`max-height` on the bubble; the body is a shrinkable flex column so the cap
+scrolls the prompt instead of clipping it. A host that moves its floor (a dock
+that grows a status bar) only has to keep its `padding-bottom` honest. A prompt
+whose part still below the band is taller than the resting card is not pinned
+at all: the real bubble stays in the transcript, so a long prompt reads and
+scrolls as itself, and the card takes over only once what remains fits it. The
+resting height belongs to one prompt's card (an image-only card is two lines
+tall, a text card one), so it falls back to the default whenever the pin
+candidate changes, until the card reports it for that prompt — the host hands
+the card the candidate's identity as `promptKey`, so a card that stays mounted
+across the change re-measures and reports too.
+
 | What moves the scroller | Owner (`website/src/hooks/virtualizer/`) |
 |---|---|
 | Following the live turn, the jump-to-latest pill, scrolling to a row | `followPolicy.ts` (every write goes through its `writeScrollTop`) |
@@ -338,6 +358,33 @@ carries its own anchors as well.
 
 The full owner map is in
 [history](../../docs/system-specs/modules/history.md#the-dashboard-transcript-window-frontend).
+
+### Decided: the transcript scrolls under the composer glass
+
+This is a design decision, not a defect, and it is settled
+([`docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md`](../../docs/decisions/2026-10-02-chat-transcript-scrolls-under-the-composer-glass.md)).
+On the main chat page the composer dock floats over the bottom of the transcript
+scroller (the iOS toolbar layout): the scroller runs the full height of the pane,
+the conversation passes under the dock's translucent glass at every scroll
+position, and the scroller pays for the covered strip with its `padding-bottom`
+(the dock's height plus a clearance, measured from the dock by a
+`ResizeObserver`). That holds whether or not the status stack above the composer
+holds a bar and whether or not the jump-to-bottom pill is showing; the pill
+floats over the transcript. Do not make the scroller's box end above the dock,
+reserve the dock's height with a margin, or otherwise clip the transcript so that
+"no text is read through glass": [#15820](https://github.com/kirodotdev/KiroCrew/pull/15820)
+did exactly that and its transcript half was reverted on the maintainer's
+decision. Legibility of what sits over the transcript is the glass recipe's job
+(blur and tint), never the scroller's.
+
+The welcome hero (`key="welcome-hero"`) is the one box that ENDS above the dock
+(`marginBottom: dockH`, never padding under it): its suggestion cards and the
+Refresh link are controls, and a control under the glass is an ambiguous tap.
+It is `isolate` so WelcomeView's own z-indexes order its cards against each other
+and never against the composer's, and its column uses `safe center` and compact
+rows under 600px tall so a short window still fits both rows and the link above
+the dock (this is #15820's hero half, kept). The side-panel `ChatPane.tsx` keeps
+its bars in flow and needs none of this.
 
 ## Stat cards
 

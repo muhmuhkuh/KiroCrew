@@ -109,12 +109,24 @@ function execCommandCopy(text: string): boolean {
   ta.style.border = '0'
   ta.style.opacity = '0'
   document.body.appendChild(ta)
+  // Hand the text over in the `copy` event too. An open modal menu (Radix
+  // FocusScope) pulls focus straight back off the textarea on `select()`, so
+  // `execCommand('copy')` would copy the menu's empty selection and still
+  // return true: a "Copied" tick over an unchanged clipboard. Writing
+  // `clipboardData` in the event does not depend on where focus landed.
+  const onCopy = (e: ClipboardEvent) => {
+    if (!e.clipboardData) return
+    e.clipboardData.setData('text/plain', text)
+    e.preventDefault()
+  }
+  document.addEventListener('copy', onCopy, true)
   try {
     ta.select()
     return document.execCommand('copy')
   } catch {
     return false
   } finally {
+    document.removeEventListener('copy', onCopy, true)
     document.body.removeChild(ta)
     if (selection) {
       selection.removeAllRanges()

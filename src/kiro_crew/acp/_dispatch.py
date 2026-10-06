@@ -19,11 +19,13 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 from kiro_crew import mcp_apps_render, session_directive
+from kiro_crew.acp.harness_tool_names import MAX_HARNESS_TOOL_NAME_LEN, qualified_harness_tool_id
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -863,6 +865,134 @@ def parse_claude_compaction_notice(chunk: str) -> tuple[str, str] | None:
     return None
 
 
+#: How many launch labels one session's record keeps for the recycle notice. A
+#: session can launch any number of background tasks; the notice names the
+#: newest few, and the record stays bounded however many it saw.
+BACKGROUND_LAUNCH_LABELS_MAX = 3
+
+#: Claude Code tools whose asynchronous launch the adapter waits out before it
+#: answers the prompt (``Turn.deferredSettle`` in claude-agent-acp).
+_HELD_ASYNC_LAUNCH_TOOLS = frozenset({"Agent", "Task"})
+
+
+def _printable_launch_label(name: str) -> str:
+    """Fold a model-authored workflow name into one line of printable text.
+
+    The label is retained on the session record, written to a ``logger.info``
+    line, and surfaced to the user as the recycle notice reason, so a newline,
+    ANSI escape or bidi override in it forges log lines or steers the display.
+    ``redact_text`` scrubs credentials and exfil URLs only, and the shared
+    terminal sanitizers (``kiro_crew.terminal_safe``) keep tab/newline as
+    content and pass bidi format characters through — neither leaves this sink
+    clean. Category ``Cc`` covers ESC, newlines, tabs and NUL; ``Cf`` covers
+    bidi overrides and other invisibles. Each becomes a space so the words it
+    separated stay separated, then whitespace runs collapse so the label reads
+    as one line. A name with no printable content folds to the empty string,
+    which the caller maps to its generic label.
+    """
+    spaced = "".join(" " if unicodedata.category(char) in ("Cc", "Cf") else char for char in name)
+    return " ".join(spaced.split())
+
+
+def parse_background_launch(update: dict[str, Any]) -> str | None:
+    """Name the background work a ``tool_call_update`` reports launching, or None.
+
+    Claude Code runs a backgrounded Bash command or a Workflow in the session's
+    own process tree after the prompt returns, and claude-agent-acp says so on
+    the launching call's structured tool response,
+    ``_meta.claudeCode.toolResponse``: a Bash command carries its
+    ``backgroundTaskId``, and an asynchronous launch (a Workflow) carries
+    ``status: "async_launched"`` with its ``taskId``. Both are structured fields
+    of the harness's own result, never prose, so the parse cannot be steered by
+    what a command printed. Nothing reports the END of that work to a client
+    that has not declared the adapter's AIR extension, which is why this only
+    names a launch. The marker is stamped by the harness's PostToolUse hook,
+    which runs only for a live call, so a ``session/load`` replay cannot set it.
+
+    An asynchronous sub-agent (``Agent`` / ``Task``) reports the same
+    ``async_launched`` status but is not counted: the adapter holds the prompt
+    open until such a sub-agent settles, so the turn is still in flight and the
+    busy semaphore already covers it.
+
+    Returns a short human label for the notice (``workflow "name"`` or
+    ``background command``), or ``None`` for every other frame, including every
+    frame of a harness that stamps no ``claudeCode`` key.
+    """
+    if update.get("sessionUpdate") != UPDATE_TOOL_CALL_UPDATE:
+        return None
+    meta = update.get("_meta")
+    claude = meta.get("claudeCode") if isinstance(meta, dict) else None
+    if not isinstance(claude, dict):
+        return None
+    response = claude.get("toolResponse")
+    if not isinstance(response, dict):
+        return None
+    task_id = response.get("backgroundTaskId")
+    if isinstance(task_id, str) and task_id.strip():
+        return "background command"
+    task_id = response.get("taskId")
+    if claude.get("toolName") in _HELD_ASYNC_LAUNCH_TOOLS:
+        return None
+    if response.get("status") == "async_launched" and isinstance(task_id, str) and task_id.strip():
+        name = response.get("workflowName")
+        if isinstance(name, str):
+            # Defang before redacting (controls out, then credentials), and
+            # bound only AFTER redaction so a slice cannot sever a credential.
+            printable = _printable_launch_label(name)
+            if printable:
+                return f'workflow "{redact_text(printable)[:80]}"'
+        return "background task"
+    return None
+
+
+@dataclass
+class BackgroundLaunchRecord:
+    """When a session's harness last launched background work, and what it was.
+
+    One per session, kept by ``AcpClient`` only — the transport that serves
+    claude, the one harness whose adapter stamps ``_meta.claudeCode`` on its
+    frames. The ``AcpSessionHandle`` transport serves only backends that never
+    stamp the marker, so a record there could never note anything. ``note`` is
+    called on every session update and is cheap on the miss path. The record is
+    only ever overwritten, never cleared by a later turn: a turn ending says
+    nothing about whether work it did not start has finished.
+    """
+
+    launched_at: float | None = None
+    labels: list[str] = field(default_factory=list)
+    omitted: int = 0
+
+    def note(self, update: object, now: float) -> bool:
+        """Record *update* if it reports a background launch; True when it did."""
+        if not isinstance(update, dict):
+            return False
+        label = parse_background_launch(update)
+        if label is None:
+            return False
+        self.launched_at = now
+        if label in self.labels:
+            self.labels.remove(label)
+        self.labels.append(label)
+        overflow = len(self.labels) - BACKGROUND_LAUNCH_LABELS_MAX
+        if overflow > 0:
+            self.omitted += overflow
+            del self.labels[:overflow]
+        return True
+
+    def age(self, now: float) -> float | None:
+        """Seconds since the newest launch, or ``None`` when there was none."""
+        if self.launched_at is None:
+            return None
+        return max(0.0, now - self.launched_at)
+
+    def describe(self) -> str:
+        """The launched work, newest last, for a user-facing notice."""
+        described = ", ".join(self.labels)
+        if self.omitted:
+            return f"{described} (and {self.omitted} more)"
+        return described
+
+
 #: The key codex-acp stamps on ``_meta`` for a context-compaction frame, with a
 #: ``{"version": 1}`` payload. Its own name for the field, so a reader can match
 #: this literal against the adapter bundle.
@@ -1374,6 +1504,35 @@ def _permission_tool_id(params: dict[str, Any]) -> str:
     return tool_id
 
 
+def harness_tool_name(update: dict[str, Any]) -> str:
+    """The tool's own name as a ``tool_call`` frame states it, or "".
+
+    goose writes it in ``_meta.goose.toolCall.toolName``; opencode writes it as the
+    first frame's ``title`` (``bash``), where later updates carry the command. Read
+    from that first frame only, and only as an identifier: a title with whitespace
+    or any other prose character is not a name and yields "". Which backend's
+    table the name is looked up in is decided by the permission event's caller
+    (:func:`kiro_crew.acp.harness_tool_names.qualified_harness_tool_id`), so the
+    title of a backend with no table is never read as a name.
+    """
+    meta = update.get("_meta")
+    goose = meta.get("goose") if isinstance(meta, dict) else None
+    call = goose.get("toolCall") if isinstance(goose, dict) else None
+    name = call.get("toolName") if isinstance(call, dict) else None
+    if name is None:
+        name = update.get("title")
+    # Bounded by MAX_HARNESS_TOOL_NAME_LEN, not KAS's 128: an opencode MCP title
+    # fuses an operator-chosen server name with the tool's, and one dropped here
+    # leaves a deny hook matching the title alone.
+    if (
+        not isinstance(name, str)
+        or len(name) > MAX_HARNESS_TOOL_NAME_LEN
+        or not _HARNESS_TOOL_ID_RE.fullmatch(name)
+    ):
+        return ""
+    return name
+
+
 def build_permission_event(
     msg: JsonRpcMessage,
     *,
@@ -1387,6 +1546,9 @@ def build_permission_event(
     diff_path_cache: dict[str, str] | None = None,
     gate_envelope_nonce: str | None = None,
     kas_consent_meta: bool = False,
+    harness_tool_name_cache: dict[str, str] | None = None,
+    harness_backend: str = "",
+    harness_mcp_servers: tuple[str, ...] = (),
 ) -> tuple[AcpEvent | None, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
@@ -1400,6 +1562,14 @@ def build_permission_event(
     Crew name as ``tool_name`` so deny and governance rules bind to it; it never sets
     ``is_shell`` True and never overrides a cache hit. Every other backend leaves it
     False, so its payloads are read exactly as before.
+
+    ``harness_tool_name_cache`` (caller-owned ``toolCallId -> harness_tool_name``)
+    and ``harness_backend`` give a backend that states no ``_meta.kiro.toolId`` a
+    ``harness_tool_id`` anyway: the tool name its preceding ``tool_call`` frame
+    stated, qualified by the backend (``goose#shell``). Only a backend with a name
+    table (:mod:`kiro_crew.acp.harness_tool_names`) gets one; every other backend's
+    event is built exactly as before. ``harness_mcp_servers`` are the server names
+    Crew placed on the session, so an opencode MCP tool's fused name is split.
 
     Single source of truth shared by ``AcpClient`` and ``AcpSessionHandle`` so
     the two transports cannot drift on the kiro/claude permission payload shape:
@@ -1672,6 +1842,21 @@ def build_permission_event(
     # ``_meta.kiro.toolId``). Not read under a gate envelope: the frame's _meta
     # then describes the dialog, not the call the envelope names.
     _harness_tool_id = _permission_tool_id(params) if envelope is None else ""
+    # goose and opencode state no such id; the tool name their tool_call frame
+    # stated stands in for it, qualified so it is read through that backend's table.
+    if not _harness_tool_id and harness_tool_name_cache is not None and tool_call_id:
+        _harness_tool_id = qualified_harness_tool_id(
+            harness_backend, harness_tool_name_cache.get(_ck, ""), harness_mcp_servers
+        )
+
+    # The agent's stated reason for the call, shown beside the approval. The
+    # same agent-authored display text a tool_call frame carries, read the same
+    # way: from the params the preceding tool_call cached, else the frame's own.
+    _purpose = extract_tool_purpose(_resolved_raw_params) or extract_tool_purpose(
+        tool_call.get("rawInput")
+    )
+    if _purpose:
+        _purpose = _redact(_purpose)
 
     event = AcpEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -1692,6 +1877,7 @@ def build_permission_event(
         diff_path=_diff_path,
         spawn_target=_spawn_target,
         harness_tool_id=_harness_tool_id,
+        tool_purpose=_purpose,
     )
     return event, recorded
 
@@ -1706,6 +1892,7 @@ def _build_tool_call_event(
     cache_scope: str = "",
     tool_input_redacted_cache: dict[str, bool] | None = None,
     diff_path_cache: dict[str, str] | None = None,
+    harness_tool_name_cache: dict[str, str] | None = None,
 ) -> AcpEvent:
     """Build an ``EVENT_TOOL_CALL`` from a ``tool_call`` update (with redaction)."""
     title = update.get("title", "unknown")
@@ -1780,6 +1967,11 @@ def _build_tool_call_event(
     _tool_name = identity.tool_name
     if tool_call_id and tool_name_cache is not None:
         tool_name_cache[_ck] = _tool_name
+    # The tool's own name from this first frame, for the permission event's
+    # harness_tool_id on a backend with no _meta.kiro.toolId. Written on every
+    # tool_call, "" included, so a reused id never inherits a stale name.
+    if tool_call_id and harness_tool_name_cache is not None:
+        harness_tool_name_cache[_ck] = harness_tool_name(update)
     # Initial tool input string from raw params.
     input_str = ""
     if tool_call_id and raw_input:
@@ -2710,6 +2902,7 @@ def parse_session_update(
     cache_scope: str = "",
     tool_input_redacted_cache: dict[str, bool] | None = None,
     diff_path_cache: dict[str, str] | None = None,
+    harness_tool_name_cache: dict[str, str] | None = None,
 ) -> list[AcpEvent]:
     """Parse one ``session/update`` inner ``update`` dict into ``AcpEvent``s.
 
@@ -2748,6 +2941,7 @@ def parse_session_update(
                 cache_scope=cache_scope,
                 tool_input_redacted_cache=tool_input_redacted_cache,
                 diff_path_cache=diff_path_cache,
+                harness_tool_name_cache=harness_tool_name_cache,
             )
         )
         return events

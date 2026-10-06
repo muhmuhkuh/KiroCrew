@@ -173,25 +173,21 @@ async def test_invalid_backend_never_mutates_or_resets(state, body):
 
 
 @pytest.mark.asyncio
-async def test_local_autopilot_backend_selectable_and_allocated(state, cfg, tmp_path):
-    slot = state.get_or_create_slot("autopilot", mode="orchestrator", origin="user")
+async def test_local_chat_backend_selectable_and_allocated(state, cfg, tmp_path):
+    slot = state.get_or_create_slot("local", origin="user")
     assert slot.to_dict()["backend_selection_supported"] is True
     assert (await post_backend(state, slot, {"acp_backend": "pi"}))[0] == 200
-    # Both planning and each stage reach _run_chat's chat_session_selection.
-    for in_stage in (False, True):
-        slot._in_stage_execution = in_stage
-        selection = chat_session_selection(slot, cfg, cfg.agent.model)
-        model = selection.pop("model")
-        provider = cfg.create_provider_factory()(
-            "dashboard:autopilot", model_override=model, cwd=str(tmp_path), **selection
-        )
-        assert provider.client.backend == "pi"
-        assert provider.client._model in {"", "auto"}
-    slot._in_stage_execution = False
+    selection = chat_session_selection(slot, cfg, cfg.agent.model)
+    model = selection.pop("model")
+    provider = cfg.create_provider_factory()(
+        "dashboard:local", model_override=model, cwd=str(tmp_path), **selection
+    )
+    assert provider.client.backend == "pi"
+    assert provider.client._model in {"", "auto"}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["turn", "eager", "provider", "queue", "lease", "stage"])
+@pytest.mark.parametrize("kind", ["turn", "eager", "provider", "queue", "lease"])
 async def test_busy_switch_refused_without_commit(state, kind):
     slot = state.get_or_create_slot("a", model="keep-pin")
     task = None
@@ -208,9 +204,6 @@ async def test_busy_switch_refused_without_commit(state, kind):
         state.sessions.reset.return_value = False
     if kind == "queue":
         slot._queue.append("queued")
-    if kind == "stage":
-        slot.mode = "orchestrator"
-        slot._in_stage_execution = True
     try:
         status, body = await asyncio.wait_for(post_backend(state, slot, {"acp_backend": "pi"}), 5)
         assert status == 409 and body["code"] == "turn_in_flight"

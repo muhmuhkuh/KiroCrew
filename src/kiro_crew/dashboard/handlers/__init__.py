@@ -16,6 +16,8 @@ from kiro_crew.config.loader import KiroCrewConfig, config_dir, config_path  # n
 from kiro_crew.dashboard.handlers_system import (  # noqa: F401
     api_compliance_yolo_status,
     api_governance_channels,
+    api_leaked_runtimes,
+    api_leaked_runtimes_reclaim,
     api_sso_ttl,
     api_status,
     api_system,
@@ -381,6 +383,7 @@ from kiro_crew.dashboard.handlers.messaging import (  # noqa: E402, F401
     api_webex_config_save,
     api_wecom_config_get,
     api_wecom_config_save,
+    stop_browser_install,
 )
 
 # ── Rendered slides for the file panel (handlers/office_slides.py) ──
@@ -469,6 +472,7 @@ from kiro_crew.dashboard.handlers.side import (  # noqa: E402, F401
     api_side_open,
     api_side_queue_cancel,
     api_side_queue_edit,
+    api_side_stop,
     api_side_turn,
 )
 
@@ -1007,6 +1011,7 @@ from kiro_crew.dashboard.handlers.core import (  # noqa: E402, F401
     api_stt_prewarm,
     api_stt_status,
     api_stt_transcribe,
+    api_stt_vocabularies,
     api_theme_boot,
     api_theme_config,
     api_token_local,
@@ -1030,6 +1035,10 @@ from kiro_crew.dashboard.handlers.decisions import (  # noqa: E402, F401
     api_decisions_consent_get,
     api_decisions_consent_put,
     api_decisions_feedback,
+    api_decisions_local_model_delete,
+    api_decisions_local_model_status,
+    api_decisions_provider_get,
+    api_decisions_provider_put,
 )
 
 # Flagged-file delivery consent — owner-gated, and the ONLY writer of
@@ -1072,4 +1081,7 @@ from kiro_crew.dashboard.handlers.security import (  # noqa: E402, F401
     api_trusted_app_revoke,
     api_trusted_apps_allow_all,
     api_trusted_apps_list,
+    api_trusted_registries_list,
+    api_trusted_registry_grant,
+    api_trusted_registry_revoke,
 )

@@ -167,13 +167,16 @@ def test_every_builtin_declares_an_icon() -> None:
 def test_every_discovered_builtin_declares_a_real_screenshot() -> None:
     """A hero is marketing art, not proof of the product surface.
 
-    Every manifest-backed builtin must give its detail page at least one real UI
-    capture. Keeping this on discovered manifests avoids the legacy static
-    registration records, which are runtime shims rather than Store listings.
+    Every manifest-backed builtin with UI must give its detail page at least one
+    real UI capture. Backend-only apps have no product UI to capture. Keeping
+    this on discovered manifests avoids the legacy static registration records,
+    which are runtime shims rather than Store listings.
     """
+    ui_apps = [app for app in discover_builtin_apps() if app.get("ui")]
+    assert len(ui_apps) >= 20, "builtin UI discovery is near-vacuous"
     missing = [
         app.get("name")
-        for app in discover_builtin_apps()
+        for app in ui_apps
         if not isinstance(app.get("screenshots"), list) or not app["screenshots"]
     ]
     assert not missing, f"builtin manifests with no screenshots: {sorted(map(str, missing))}"

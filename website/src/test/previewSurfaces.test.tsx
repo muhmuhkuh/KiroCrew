@@ -46,6 +46,7 @@ import notificationsReducer from '../store/notificationsSlice'
 import '../surfaces/builtins'
 import {
   PREVIEW_CREW,
+  PREVIEW_DASHBOARD,
   PREVIEW_FLAG_EVENT,
   PREVIEW_FLAG_PREFIX,
   PREVIEW_INSTANCE_SESSIONS,
@@ -485,11 +486,23 @@ describe('Settings > Developer > Feature Previews', () => {
         .filter(el => !decisionsFrame()?.contains(el))
         .map(nameOf)
         .sort()
-    expect(ingressButtons()).toEqual([])
+    // Every button outside the Decisions card is observed and partitioned:
+    // the rows' InfoTip help toggles (named 'More information'; they open a
+    // tooltip, never a page) are counted exactly, and whatever is left is the
+    // ingress census proper. The partition keeps the ratchet exhaustive --
+    // an unexpected button lands in `ingress`, an extra or missing tip
+    // changes `tips` -- while saying what each half protects.
+    const INFO_TIP = 'More information'
+    const INFO_TIP_COUNT = 4 // one per Feature Previews row carrying a `hint`
+    const partition = () => {
+      const all = ingressButtons()
+      return { tips: all.filter(n => n === INFO_TIP).length, ingress: all.filter(n => n !== INFO_TIP) }
+    }
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: [] })
     await act(async () => {
       screen.getByRole('switch', { name: /^crewmates$/i }).click()
     })
-    expect(ingressButtons()).toEqual([])
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: [] })
     // The Decisions subtree, exactly. A new button here -- or a duplicate of one of
     // these -- fails, which a name allowance could not do.
     // The Decisions subtree, exactly, once its reads have settled. Awaited rather than
@@ -504,7 +517,7 @@ describe('Settings > Developer > Feature Previews', () => {
     await act(async () => {
       screen.getByRole('switch', { name: /webhooks/i }).click()
     })
-    expect(ingressButtons()).toEqual(['Open Webhooks'])
+    expect(partition()).toEqual({ tips: INFO_TIP_COUNT, ingress: ['Open Webhooks'] })
     // And the card beside it still draws only its own two.
     expect(decisionsButtons()).toEqual(['Ask the agent', 'Show'])
   })
@@ -526,18 +539,33 @@ describe('Settings > Developer > Feature Previews', () => {
     // answer "is this row selected?" instead.
     const { container } = renderTab()
     // Awaited: the Decisions card is not drawn until the governance read
-    // (`decisions_enabled`) lands, so the fifth switch arrives a tick late.
+    // (`decisions_enabled`) lands, so the last switch arrives a tick late.
     await waitFor(() => {
-      expect(screen.getAllByRole('switch')).toHaveLength(5)
+      expect(screen.getAllByRole('switch')).toHaveLength(8)
     })
     const anchors = container.querySelectorAll(`[data-setting-key="${FEATURE_PREVIEWS_HIGHLIGHT_ANCHOR}"]`)
     expect(anchors).toHaveLength(1)
     const anchor = anchors[0]
     expect(anchor.contains(screen.getByRole('heading', { name: /feature previews/i }))).toBe(true)
-    // Five, not four: the count is here so a card added outside the anchor
-    // fails rather than silently escaping the ring. The fifth is Decisions,
-    // whose switch is backend config — a different write path, the same ring.
+    // The count is here so a card added outside the anchor fails rather than
+    // silently escaping the ring. The last is Decisions, whose switch is
+    // backend config — a different write path, the same ring.
     for (const s of screen.getAllByRole('switch')) expect(anchor.contains(s)).toBe(true)
+  })
+
+  it('carries a Dynamic Dashboard card that starts off and hosts the automatic-cards switch in both states', async () => {
+    // The gateway-wide cost opt-in rides inside the preview's card, and stays
+    // there with the preview off: it is server state, and hiding its only
+    // control would leave a spend running that this machine cannot stop.
+    renderTab()
+    const card = screen.getByRole('switch', { name: /^dynamic dashboard$/i })
+    expect(card.getAttribute('aria-checked')).toBe('false')
+    const autoOff = await screen.findByRole('switch', { name: /automatic cards for all sessions/i })
+    expect(screen.getByTestId('feature-preview-dashboard-settings')).toContainElement(autoOff)
+    await act(async () => { card.click() })
+    expect(localStorage.getItem(PREVIEW_DASHBOARD)).toBe('1')
+    expect(localStorage.getItem(PREVIEW_WEBHOOKS)).not.toBe('1')
+    expect(await screen.findByRole('switch', { name: /automatic cards for all sessions/i })).toBeTruthy()
   })
 
   it('carries a remote-crew-sessions card that starts off and writes only its own key', async () => {

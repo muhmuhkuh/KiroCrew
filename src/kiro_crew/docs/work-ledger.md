@@ -53,7 +53,12 @@ An item is the unit of dispatch. It holds:
 
 The conductor writes its half with `work_ledger_record` (one action per call:
 `goal`, `create`, `bind`, `decide`, `verdict`, `accept`, `close`) and reads the
-whole ledger back with `work_ledger_read`. A worker writes its half with
+ledger back with `work_ledger_read`. A patrol cycle reads it with `compact=true`
+(status columns and derived flags only); `item_id`, `state`, `since` and
+`events` narrow a full read. A reply over the tool-result limit comes back as
+valid JSON marked `truncated`: event tails go first, then oversized acceptances
+are elided, then rows are dropped (closed first, then open oldest-created), and
+the newest open item is always kept. A worker writes its half with
 `work_report` and reads its own item with `work_brief`. A conductor whose ledger
 files read as damaged or missing rewrites them from the crew log with
 `work_ledger_rebuild`: every accepted write was recorded there, so the files are a
@@ -147,9 +152,15 @@ separate values and not one "stuck". A build the worker does not control is
 `blocked`; a choice only the conductor can make is `question`.
 
 Reports belong at real milestones, not on a timer.
-`summary` is capped at 500 characters and is **refused rather than truncated**
-when longer, so a report that lands is a report that landed whole. Evidence goes in `artifacts` as
-pointers — a branch, a commit, a path, a pull request number.
+`summary` is capped at 500 characters.
+A longer one is **cut to the cap, not refused**: the stored value carries a note
+saying how many characters were dropped, and `work_report`'s reply repeats it
+with the length the caller sent, so a worker learns it overran in the same
+round-trip that accepted the report instead of spending another one rewriting
+it. Evidence goes in `artifacts` as pointers — a branch, a commit, a path, a
+pull request number. `artifacts`, `pr` and `status` are still refused when they
+are wrong or oversized: a truncated pointer is a broken pointer, while prose cut
+at the cap still reads.
 
 ## Why `done` is a claim
 

@@ -375,6 +375,7 @@ Tests: `test/metrics/test_resource_attrs.py`.
 | `kirocrew.acp.child_permission.denied` | counter | `surface` (`runtime` / `session_handle` / `subagent`), `reason` (closed denial reason) | `acp/runtime.py::_audit_denied_off_loop`, `acp/session_handle.py::_audit_handle_reject`, and `subagent.py::_reject_and_log`; one point per backend-child permission request rejected before it can become a silent hang. |
 | `kirocrew.acp.child_permission.routed` | counter | `surface` (`runtime`) | `acp/runtime.py` when a child permission request reaches the mode-parity pipeline. Together with `.denied`, this accounts for handled child permission requests. |
 | `kirocrew.acp.dropped_frames` | counter | `method_class` (`permission` / `update` / `other`) | `acp/runtime.py::_note_dropped_frame`; counts unroutable ACP frames without exposing backend method names. A non-zero `permission` series is the hang-regression signal. |
+| `kirocrew.acp.skill_view.fallback` | counter | `outcome` (`loaded_after_retry` / `refused_unloaded` / `refused_unprepared` / `refused_superseded`) | `acp/runtime.py::_activate_mode_bracketed`; one point per `session/set_mode` that did not land on the freshly prepared skill-view alias first time: loaded after a forced reload, or the session start refused because the host never loaded it, no view could be prepared, or a concurrent start adopted a newer view of the agent (or began one that did not complete) while this one's `set_mode` was pending. More than a trickle of `refused_unloaded` or `refused_unprepared` means the host is not loading published aliases; `refused_superseded` means session starts overlapped an edit to the same agent's spec, or a newer preparation that did not complete. Starting again uses the new view when it offers the agent; when the new view refuses the agent, starts keep failing until the spec is fixed. |
 | `kirocrew.turn.timeout.cause` | counter | `path` (`provider_timeout` / `dashboard_ceiling`), `awaiting_permission` (bool), `children_announced` (bool) | `dashboard/chat_runner.py` and `dashboard/turn_dispatch.py`; attributes the two timeout exits to a pending permission prompt and announced child work. |
 | `kirocrew.session.idle_expired` | counter | `turn_active` (bool), `orphaned` (bool) | `session_cleanup.py`; emitted after an idle/orphan sweep successfully resets a session. |
 | `kirocrew.session.startup.duration` | histogram (ms) | `outcome` (`ready` / `auth_required` / `error`), `spawned` (bool), `backend` (`kiro`) + `phase` (`total` / `spawn_init` / `session_new` / `session_load` / `set_model`), `channel` (conversation source), `resumed` (bool) on the kiro path | Two sites. **claude**: `acp/client.py::AcpClient.ensure_ready()` — times cold-start (spawn + session init) and emits in a `finally` so every exit path is measured, with no `phase` attr. **kiro** (default): `providers/acp.py::_emit_kiro_startup_metric` — one `phase=total` point PLUS one point per internal phase; `spawned` is unconditionally `True` because `_start_kiro_runtime_impl` always spawns a fresh runtime (the warm fast-path returns before reaching either site and is NOT measured). `outcome` defaults to `"error"` so an unexpected exception is never mislabeled `"ready"`. Consumers MUST treat only the end-to-end point (`phase` absent or `total`) as a startup — the phase points are components of one startup. `channel` comes from `messaging.link::telemetry_channel_of`, a closed label set (an unrecognised key classifies as `other`, never the key itself) answering WHICH surface paid the cost; `resumed` separates the `session/load` path from `session/new`. `session_load` is recorded only when a resume was attempted, and `session_new` only when `create_session` actually ran, so a resumed startup never reports a near-zero `session_new`. |
@@ -894,15 +895,19 @@ Each row (`_build_token_record`) carries:
 | `agent` | str | **(#647)** agent id resolved for the turn; `""` if unset |
 | `context_used` | int | **(#647)** context-window tokens occupied after the turn (int-coerced) |
 | `context_window` | int | **(#647)** served context-window size in tokens (int-coerced) |
-| `ctx_blocks` | dict[str,int] | per-turn injection breakdown: context block label → **characters** (never tokens); non-positive / non-numeric sizes dropped; `{}` when the turn injected nothing |
-| `phase` | str | `session_start` (the first turn's one-off injection) vs `per_turn` (every later turn); `""` if unset |
 | `stop_reason` | str | the turn's terminal stop reason read off the EVENT_COMPLETE event (`""` when the producer has none, e.g. a bare `TurnUsage` from `provider_last_turn_usage`). Free-form is fine HERE (the row store has no cardinality limit, unlike OTel attrs) — this is where per-agent stall analysis happens: joining `stop_reason` (`error: tool stall` / `stale_recover`) against the row's `agent` field attributes watchdog outcomes to free-form agent names retroactively |
 
-The `surface` / `agent` / `context_used` / `context_window` fields (all #647),
-the later `ctx_blocks` / `phase` pair, and `stop_reason` are all **additive** —
-every field defaults (`""` / `{}` / `0`) so existing callers stay valid and
-shards predating a field (which lack its key) remain parseable; readers must
-tolerate their absence.
+The `surface` / `agent` / `context_used` / `context_window` fields (all #647) and
+`stop_reason` are all **additive** — every field defaults (`""` / `0`) so existing
+callers stay valid and shards predating a field (which lack its key) remain
+parseable; readers must tolerate their absence.
+
+The row no longer carries an injection breakdown. `ctx_blocks` and `phase` were
+written here for one reader, `context_trace`, which is now served from the crew log's
+`usage` projection; the same composition is recorded by `crew_log.emit
+.on_context_composed` as `context/composed`, with the same block labels and the same
+`phase`. Shards written earlier still carry both keys and stay parseable — nothing
+reads them.
 `context_used` / `context_window`
 are read from the provider at the persist call site via
 `usage.read_context_tokens(source)`, which calls the provider's public
@@ -917,7 +922,8 @@ monitor/heartbeat/webhook/taskrunner/workflow) retain their canonical source;
 `taskrunner` when rows are read. Zero-token surfaces (cron `script=`/`command=`
 modes, heartbeat maintenance ticks) never call a model and must not write a row.
 
-**Per-turn injection breakdown (`ctx_blocks` / `phase`).** `ctx_blocks` is
+**Per-turn injection breakdown (`context/composed`).** Recorded in the crew log
+rather than on this row (see above). Its `sources` are
 produced by `context_blocks.split_blocks(prompt, user_chars=…)`, which attributes
 the FINAL assembled prompt to the blocks that produced it by matching the bracket
 markers the assembly emits (`[CRITICAL RULES`, `[Memory`, `[Skills:]`,
@@ -1039,18 +1045,32 @@ shard-fingerprint + 30s-TTL cache, same contract as `_parse_token_history`), and
 `handlers/telemetry.py` serves it as the `context` block of
 `GET /api/telemetry/startup` (a plain module-scope import — `handlers.usage`
 imports nothing from `dashboard.handlers`, so there is no cycle to dodge).
-`usage.context_trace(slot, days)` is the per-session drill-down: it returns each
-turn's `ctx_blocks` in chronological order plus per-block `totals`,
-`injected_chars`, `user_chars` (the `your_message` label), and the occupancy
-pair `peak_context_used` (largest `context_used` across the turns, in TOKENS)
-and `context_window` (newest non-zero window size), which the Session Breakdown
-tree turns into a fill ratio. Block sizes are characters and occupancy is tokens;
-the trace carries both as recorded and derives nothing across that unit
-boundary — there is no chars-per-token estimate of the un-instrumented remainder
-on the wire, because a number that mixed fixed kiro-cli overhead with the growing
-conversation had no honest reader. Rows
-predating the field carry no `ctx_blocks` and are skipped, not zero-filled, so
-the trace starts where the recording does. Billing is not on this payload:
+`usage.context_trace(slot, days)` is the per-session drill-down, and it reads the
+slot's `usage` PROJECTION rather than the shards: one memoised fold of the crew log's
+`context/composed` entries, where the scan it replaced opened every shard in the
+window and discarded all but one slot's rows. It returns each composition in
+chronological order plus per-block `totals`, `injected_chars`, `user_chars` (the
+`your_message` label), and the occupancy pair `peak_context_used` / `context_window`
+— the provider's own reading and the window it was measured against, both taken from
+the single `turn/completed` inside the requested window that is the FULLEST: the one
+with the highest `used` / `used_window` ratio, which the Session Breakdown tree turns
+into a fill ratio. Fullest is the ratio and not the largest absolute `used`, because a
+model switch moves the window: a turn reading 90k against a 100k window is fuller than
+a later turn reading 200k against a 1M one, and ranking by `used` alone would crown the
+emptier turn and then draw it as the session's peak. The comparison is integer-exact
+by cross-multiplication, so a reading whose window the provider never stated has no
+ratio and is not a candidate at all. The pair travels together because a reading over
+a window from another turn describes no turn that ran; neither half is derived from the
+turn's token counts, which are billing summed over every model call. Block sizes are
+characters and the occupancy pair is tokens; the trace carries both as recorded and
+derives nothing across that unit boundary — there is no chars-per-token estimate of
+the un-instrumented remainder on the wire, because a number that mixed fixed kiro-cli
+overhead with the growing conversation had no honest reader. Two bounds apply: `days`,
+as before, and the fold's own newest-200 window, which needs no count on the wire
+because every row carries the `ordinal` it was assigned before the trim. A session whose
+compositions predate the fold reads with an unstated `phase` and no occupancy, and one
+recorded with the crew log switched off reads empty — this surface depends on that
+switch, which is the one thing it is not independent of. Billing is not on this payload:
 `slot_turn_usage` (below) is the per-turn reader for `credits` / `duration_ms`,
 and a trace row carries only what was injected.
 

@@ -73,7 +73,7 @@ def test_babysit_keeps_finite_legacy_path_when_terminal_success_must_report() ->
 
 
 def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> None:
-    skill_path = _BABYSIT_SKILL.parent.parent / "prepare-pr/SKILL.md"
+    skill_path = _BABYSIT_SKILL.parent.parent / "kirocrew-prepare-pr/SKILL.md"
     skill = skill_path.read_text(encoding="utf-8")
     recipe = next(
         textwrap.dedent(block).strip()
@@ -89,7 +89,7 @@ def test_prepare_pr_recipe_covers_its_poll_budget_without_provider_gating() -> N
     applied = session_directive.decode(result, "monitor_start")
     assert applied is not None
     loop = NudgeLoop(
-        id="prepare-pr",
+        id="kirocrew-prepare-pr",
         slot_key=_BINDING,
         message=applied["message"],
         idle_secs=applied["idle_secs"],
@@ -282,9 +282,12 @@ async def test_babysit_create_requires_application_before_state_is_authoritative
     assert monitor["objective"] == "review_ready"
     assert monitor["cadence_secs"] == 300
     assert monitor["token_usage_known"] is True
+    # A call that named no budgets gets the shipped defaults, and the wake budget's
+    # default is 0 -- unlimited. The runtime, token and provider-error budgets are
+    # what retire this watch.
     assert monitor["budgets"] == {
         "max_runtime_secs": 14_400,
-        "max_agent_turns": 8,
+        "max_agent_turns": 0,
         "max_tokens": 250_000,
         "max_provider_errors": 3,
     }

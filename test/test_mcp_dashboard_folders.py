@@ -1,6 +1,6 @@
 """Tests for the chat (sidebar) folder tools on the kirocrew-dashboard server.
 
-Covers dispatch for ``chat_folder_tree/create/move/move_session`` — schema
+Covers dispatch for ``chat_folder_tree/create/move/move_session/delete`` — schema
 validation, path→id resolution, mkdir -p, session-reference resolution, HTTP
 call shape, and result formatting. The HTTP helpers are patched; the endpoints
 themselves are tested by ``test_folder_store_writer.py`` and
@@ -664,6 +664,112 @@ class TestFolderMove:
         assert "bbbbbbbbbbbb" in out and "cccccccccccc" in out
         mock_post.assert_not_called()
         mock_patch.assert_not_called()
+
+
+class TestFolderDelete:
+    """``chat_folder_delete`` asks the endpoint for its empty-only delete."""
+
+    _URL = "/api/chat/folders/cccccccccccc?if_empty=true"
+
+    def test_deletes_an_empty_folder_by_path(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._delete", return_value={"ok": True}) as mock_delete,
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Travel"})
+        assert mock_delete.call_args.args == (self._URL,)
+        # The verified caller key is what the write carries, not a re-resolved one.
+        assert mock_delete.call_args.kwargs == {"session_key": "dashboard:chat-1-100"}
+        assert out == "Deleted empty folder `Travel` (id=cccccccccccc)."
+
+    def test_the_tool_does_not_decide_emptiness_itself(self) -> None:
+        """No pre-check: a folder with children still goes to the endpoint.
+
+        A read here would be stale by the time the DELETE lands; the endpoint
+        decides occupancy under the folder-store lock instead.
+        """
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._delete",
+                return_value={"error": "folder has subfolders", "code": "folder_not_empty"},
+            ) as mock_delete,
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "kirocrew"})
+        assert mock_delete.call_args.args[0].endswith("?if_empty=true")
+        assert out.startswith("Error:") and "subfolders" in out
+        assert "chat_folder_move_session" in out
+
+    def test_a_not_empty_refusal_names_no_session(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._delete",
+                return_value={
+                    "error": "folder still holds live sessions",
+                    "code": "folder_not_empty",
+                },
+            ),
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Travel"})
+        assert out.startswith("Error:") and "live sessions" in out
+        assert "chat-" not in out
+
+    def test_a_folder_that_is_not_the_callers_is_left_for_the_person(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._delete",
+                return_value={"error": "x", "code": "folder_not_agent_owned"},
+            ),
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Travel"})
+        assert out.startswith("Error:") and "did not create it" in out
+        assert "Leave it for the person" in out
+
+    def test_root_is_not_a_deletable_subject(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._delete") as mock_delete,
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "root"})
+        assert out.startswith("Error:")
+        mock_delete.assert_not_called()
+
+    def test_unknown_folder_errors(self) -> None:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._delete") as mock_delete,
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Nope"})
+        assert out.startswith("Error:") and "folder not found" in out
+        mock_delete.assert_not_called()
+
+    def test_the_endpoint_refusal_is_surfaced(self) -> None:
+        """An app or crew-member caller is refused by the endpoint, not here."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._delete",
+                return_value={"error": "an app cannot delete folders"},
+            ),
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Travel"})
+        assert out == "Error: an app cannot delete folders"
+
+    def test_an_unverifiable_caller_cannot_delete(self) -> None:
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._delete") as mock_delete,
+        ):
+            out = _call_tool_inner("chat_folder_delete", {"folder": "Travel"})
+        assert out.startswith("Error:") and "deleting a folder" in out
+        mock_delete.assert_not_called()
+
+    def test_folder_is_required(self) -> None:
+        with pytest.raises(ValidationError):
+            _call_tool_inner("chat_folder_delete", {})
 
 
 class TestFolderMoveSession:
@@ -1880,16 +1986,22 @@ class TestAdvertisedSet:
             "chat_folder_create",
             "chat_folder_move",
             "chat_folder_move_session",
+            "chat_folder_delete",
             "chat_folder_file_self",
             "chat_tag_list",
             "chat_tag_create",
             "chat_tag_update",
             "chat_tag_assign",
+            "chat_tag_column_list",
+            "chat_tag_column_create",
+            "chat_tag_column_move",
             "chat_session_pin",
             "session_create",
             "session_fork",
             "session_stop",
+            "session_end_wait",
             "session_set_model",
+            "session_reload",
             "session_close",
             "session_revive",
             "session_send",
@@ -2086,6 +2198,33 @@ class TestFolderPosition:
         }
         mock_patch.assert_not_called()
         assert "before `Bravo`" in out
+
+    def test_the_renumber_states_its_container_to_the_endpoint(self) -> None:
+        """The reorder POST carries ``expected_parent`` naming the destination.
+
+        The batch is computed from a snapshot of the tree, so the claim is what
+        lets the endpoint refuse the renumber (409) when a concurrent reparent
+        moves a sibling between that read and the write. The destination here is
+        the root lane, and the claim for it is the empty string -- a real value,
+        present in the body, not an omitted key.
+        """
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_ordered_rows),
+            patch("kiro_crew.mcp_dashboard._patch"),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={"ok": True},
+            ) as mock_post,
+        ):
+            out = _call_tool_inner("chat_folder_move", {"folder": "Delta", "after": "Alpha"})
+        assert not out.startswith("Error:")
+        reorder_bodies = [
+            call.args[1]
+            for call in mock_post.call_args_list
+            if call.args[0] == "/api/chat/folders/reorder"
+        ]
+        assert len(reorder_bodies) == 1
+        assert reorder_bodies[0]["expected_parent"] == ""
 
     def test_an_anchor_alone_reorders_without_moving(self) -> None:
         """The reason an anchor may stand in for ``new_parent``.

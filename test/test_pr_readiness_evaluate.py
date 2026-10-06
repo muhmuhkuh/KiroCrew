@@ -738,7 +738,7 @@ class TestLaneStateIsLoggedNotOnlySummarized:
         # Real lane labels, not just a non-empty bucket -- proves the log line
         # carries the SAME names the summary does, not a placeholder.
         assert "CI" in log_line
-        assert "Opus 5 Review" in log_line
+        assert "Opus 5.5 Review" in log_line
 
     def test_a_stuck_lane_is_named_in_the_log_line(self, runner: Runner):
         # The shape this guards: one lane never completes (still queued),
@@ -1442,12 +1442,12 @@ class _ForkLaneVerdictBinding:
 
 class TestForkOpusVerdictIsBoundToItsPullRequest(_ForkLaneVerdictBinding):
     PREFIX = "opus-pr-"
-    CHECK_NAME = "Opus 5 Review"
+    CHECK_NAME = "Opus 5.5 Review"
 
 
 class TestForkGptVerdictIsBoundToItsPullRequest(_ForkLaneVerdictBinding):
     PREFIX = "gpt-pr-"
-    CHECK_NAME = "GPT 5.6 Review"
+    CHECK_NAME = "GPT 6.1 Review"
 
 
 class TestForkDesignVerdictIsBoundToItsPullRequest(_ForkLaneVerdictBinding):
@@ -1488,12 +1488,13 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert outputs["state"] == "action_required"
         assert outputs["status_state"] == "failure"
         assert outputs["label"] == "readiness: action required"
-        # Four, not three: Fast Gate joined CI, Build and Code Review as a
-        # monitored lane when the cheap blocking gates were split out of ci.yml.
-        # The stub routes every non-ci.yml workflow to green_runs.json, so it is
-        # covered by the same `action_required` fixture as the other two.
+        # Five: Fast Gate joined CI, Build and Code Review as a monitored lane
+        # when the cheap blocking gates were split out of ci.yml, and Issue Gate
+        # joined when every PR had to declare a triaged issue. The stub routes
+        # every non-ci.yml workflow to green_runs.json, so each is covered by
+        # the same `action_required` fixture as the others.
         assert outputs["description"] == (
-            "4 workflow(s) awaiting maintainer approval; none has run yet"
+            "5 workflow(s) awaiting maintainer approval; none has run yet"
         )
         assert len(outputs["description"]) <= 140
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
@@ -1502,9 +1503,9 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert "**Waiting**" in summary
         log_line = self._lane_state(proc)
         assert "failed=[]" in log_line
-        # Fast Gate sits between CI and Build in the spec order, matching the
-        # order pr-readiness.yml appends the lanes.
-        assert "awaiting_approval=[CI Fast Gate Build Code Review]" in log_line
+        # Fast Gate sits between CI and Build and Issue Gate follows Code Review
+        # in the spec order, matching the order pr-readiness.yml appends the lanes.
+        assert "awaiting_approval=[CI Fast Gate Build Code Review Issue Gate]" in log_line
 
     def test_real_failure_and_approval_wait_are_reported_separately(self, runner: Runner):
         (runner.fixtures / "ci_runs.json").write_text(
@@ -1518,10 +1519,10 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
 
         assert proc.returncode == 0, proc.stderr
         assert outputs["status_state"] == "failure"
-        # Three awaiting, not two: ci.yml is the one blocking item here, and
-        # Build, Code Review and Fast Gate are the lanes left waiting.
+        # Four awaiting: ci.yml is the one blocking item here, and Build, Code
+        # Review, Fast Gate and Issue Gate are the lanes left waiting.
         assert outputs["description"] == (
-            "1 blocking readiness item(s); 3 awaiting maintainer approval"
+            "1 blocking readiness item(s); 4 awaiting maintainer approval"
         )
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
         assert "**Blocking**" in summary
@@ -1563,7 +1564,7 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
 
 
 class TestDispositionViolationsBlockTheVerdict:
-    """The disposition rule binds only a writer running the prepare-pr loop
+    """The disposition rule binds only a writer running the kirocrew-prepare-pr loop
     unless readiness enforces it too. Readiness publishes the repository's sole
     required status, so folding the violation list in here binds every
     writer -- including one who never runs that loop."""
@@ -1658,7 +1659,7 @@ def _whole_design_lanes() -> tuple[str, ...]:
         / "kiro_crew"
         / "builtin_skills"
         / "kirocrew-dev"
-        / "prepare-pr"
+        / "kirocrew-prepare-pr"
         / "scripts"
         / "_review_contract.py"
     )

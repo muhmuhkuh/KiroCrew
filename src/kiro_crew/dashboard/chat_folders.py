@@ -16,11 +16,16 @@ from typing import Any
 from aiohttp import web
 
 from kiro_crew import pinned_fs
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import _coerce_requested_mode, save_slot_off_loop
 from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.create_rate_limit import FOLDER_CREATE, allow_create
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.slot_ownership import (
+    audit_app_slot_denial,
+    deny_app_slot_access,
+    slot_not_found,
+)
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.token_auth import (
     KNOWN_INTERNAL_CALLERS,
@@ -404,7 +409,44 @@ def folder_ids_filed_into(state: DashboardState) -> set[str]:
     return set(ids) if isinstance(ids, set) else set()
 
 
-async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
+#: The folder field naming the agent session that created it. Present only on a
+#: folder an agent's MCP call created and the person has not touched since: a
+#: person renaming, moving, restyling or hiding it, filing a session into it, or
+#: nesting a folder under it removes the field, and nothing ever puts it back.
+#: ``chat_folder_delete`` deletes only a folder that still carries the CALLER's
+#: own session key here, so a folder the person made or reused is never removed
+#: by an agent. A row from before this field existed has none, and reads as the
+#: person's.
+CREATED_BY_SESSION = "created_by_session"
+
+#: PATCH fields that change how the sidebar draws a folder rather than what the
+#: folder is. A person changing only these has not claimed the folder:
+#: collapsing it to look past it, or a drag that renumbers its siblings.
+_LAYOUT_ONLY_FIELDS = frozenset({"collapsed", "order"})
+
+
+def agent_creator_key(state: DashboardState, request: web.Request) -> str:
+    """The live session key an agent create is attributed to, or ``""``.
+
+    Only an internal (MCP) request names an agent: the browser never carries
+    ``X-Internal-Secret``, so a person's create is never stamped. The key must
+    name a live dashboard slot, the same key ``chat_folder_delete`` later sends
+    for the same session.
+    """
+    if request_origin(request, what="folder write", log=logger)[0] == "dashboard":
+        return ""
+    key = str(request.headers.get("X-Session-Key") or "").strip()
+    if not key.startswith("dashboard:"):
+        return ""
+    slots = getattr(state, "_slots", None)
+    if not isinstance(slots, dict) or key[len("dashboard:") :] not in slots:
+        return ""
+    return key
+
+
+async def _unhide_folder(
+    state: DashboardState, folder_id: str, *, claim_for_person: bool = False
+) -> bool:
     """Clear a folder's `hidden` flag when a session re-engages it.
 
     Model-B semantics: reviving or moving a session into a folder un-hides it so
@@ -416,6 +458,10 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
     caller that validated against ``state._folders`` beforehand and then assigned
     can have the folder deleted in between, and would persist a placement into a
     folder that is gone.
+
+    ``claim_for_person`` is set when the PERSON filed the session: the folder is
+    then theirs, so its :data:`CREATED_BY_SESSION` mark is removed in the same
+    locked step.
     """
     if not folder_id:
         return True
@@ -423,8 +469,11 @@ async def _unhide_folder(state: DashboardState, folder_id: str) -> bool:
     def _clear(folders: list[dict[str, Any]]) -> tuple[bool, bool]:
         for f in folders:
             if f["id"] == folder_id:
+                claimed = bool(claim_for_person and f.pop(CREATED_BY_SESSION, None))
                 if f.get("hidden"):
                     f["hidden"] = False
+                    return True, True
+                if claimed:
                     return True, True
                 # Present and already visible: report no change so the store is
                 # not rewritten. This runs on every session move, so a needless
@@ -1159,6 +1208,8 @@ async def create_folder_record(
     require_resolved_project_dir: bool = False,
     refuse_duplicate_name: bool = False,
     home_slot: Any = None,
+    created_by_session: str = "",
+    claim_parent_for_person: bool = False,
 ) -> dict[str, Any]:
     """Validate one folder and append it to the store under the folders lock.
 
@@ -1233,6 +1284,12 @@ async def create_folder_record(
     A non-person principal may nest directly under the folder that session is
     filed in, even when the person owns that folder. The slot's ``folder_id``
     is read under the lock, where the parent is decided.
+
+    ``created_by_session`` is the agent session this create is attributed to
+    (see :func:`agent_creator_key`); it is stored as :data:`CREATED_BY_SESSION`
+    on a NEW folder only, never on a reused one. ``claim_parent_for_person`` is
+    set when the person is creating: nesting into a folder claims that parent,
+    so its mark is removed under the same lock as the append.
 
     Raises:
         FolderCreateError: if the folder was refused (unusable name, missing
@@ -1314,6 +1371,8 @@ async def create_folder_record(
         folder["steering_dirs"] = resolved_steering
     if request_app:
         folder["owner_app"] = request_app
+    if created_by_session:
+        folder[CREATED_BY_SESSION] = created_by_session
 
     reused: list[dict[str, Any]] = []
 
@@ -1369,6 +1428,8 @@ async def create_folder_record(
             if twins:
                 return False, "name_exists"
         folder["order"] = len(folders)  # recount under the lock
+        if claim_parent_for_person and parent is not None:
+            parent.pop(CREATED_BY_SESSION, None)
         folders.append(folder)
         return True, ""
 
@@ -1506,6 +1567,8 @@ async def api_chat_folder_create(request: web.Request) -> web.Response:
             # The browser keeps a person's freedom to name two folders alike.
             refuse_duplicate_name=rl_source != "dashboard",
             home_slot=caller_home_slot(state, request, request_app),
+            created_by_session=agent_creator_key(state, request),
+            claim_parent_for_person=rl_source == "dashboard",
         )
     except FolderNameExistsError as exc:
         sel().log_api_access(
@@ -1738,6 +1801,14 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
     # persisted name — never from a pre-lock snapshot a concurrent write may
     # have superseded.
     committed_name: list[str] = []
+    # A person editing anything beyond layout claims the folder: its agent mark
+    # goes, and chat_folder_delete refuses it from then on. ``regenerate_icon``
+    # is not in ``changes`` (the icon lands later, from the generator), so it
+    # is counted here by name. A person moving a folder INTO another also
+    # claims that destination, the same as nesting a new folder under it.
+    by_person = _audit_origin(request)[0] == "dashboard"
+    claims_for_person = by_person and (regenerate_icon or bool(set(changes) - _LAYOUT_ONLY_FIELDS))
+    claims_parent_for_person = by_person and reparenting and bool(new_parent)
 
     def _apply(folders: list[dict[str, Any]]) -> tuple[bool, str]:
         target = next((f for f in folders if f["id"] == fid), None)
@@ -1770,6 +1841,12 @@ async def api_chat_folder_update(request: web.Request) -> web.Response:
             # level too -- "" is still a move.
             return False, "foreign_descendant"
         target.update(changes)
+        if claims_for_person:
+            target.pop(CREATED_BY_SESSION, None)
+        if claims_parent_for_person:
+            dest_row = next((f for f in folders if f["id"] == new_parent), None)
+            if dest_row is not None:
+                dest_row.pop(CREATED_BY_SESSION, None)
         if not target.get("color"):
             target.pop("color", None)
         if not target.get("icon"):
@@ -1916,7 +1993,8 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
     in one ``mutate_folders`` pass under the folder-store lock, all-or-none -- so
     a rejected row leaves the stored order exactly as it was, never half-applied.
 
-    Body: ``{"orders": [{"id": str, "order": int}, ...]}``. Every entry is
+    Body: ``{"orders": [{"id": str, "order": int}, ...]}``, plus the optional
+    request-level ``expected_parent`` described below. Every entry is
     validated into a pending map BEFORE the lock is taken (the same shape
     discipline ``api_chat_folder_update`` uses for its single row), so a
     malformed request is a 400 that never touches the store.
@@ -1935,6 +2013,21 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
     retags. A row naming a folder absent from the store is a 404 for the whole
     batch (the reorder the caller computed describes a tree that has since
     shifted), so no partial renumber lands against a shifted tree.
+
+    ``order`` is a per-container index, so a renumber is only correct for rows
+    still living in the container the caller computed it against. The optional
+    request-level ``expected_parent`` states that container: when the key is
+    present, every written row's stored ``parent_id`` must equal its value
+    (empty string names the root lane), compared under the same lock that does
+    the writing -- checking earlier would reopen the window it closes. A
+    mismatch means a concurrent reparent moved a row between the caller's read
+    and this write, and landing the batch anyway would persist an index
+    computed for the old container onto a row in a new one; the whole batch is
+    refused as 409 ``folder_parent_changed`` with the store untouched. Absence
+    of the key is the one way to make no assumption -- a caller positioning
+    rows by absolute index never read a container, so no claim is demanded of
+    it -- and is told apart from an empty string by the key's presence, never
+    its value. The stored parent is read, never written.
     """
     state: DashboardState = request.app["state"]
     if (refusal := _refuse_unattributable_caller(state, request)) is not None:
@@ -1953,6 +2046,20 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "too many folders in one reorder", "code": "orders_too_many"}, status=400
         )
+    # The container claim is presence-checked, the same idiom the reparent PATCH
+    # uses for ``parent_id``: ``None`` here means the key is absent and no row's
+    # parent is compared. A present value must be a real string -- coercing
+    # (say) a JSON null or 0 through falsiness would silently turn caller junk
+    # into a root claim, so a non-string is a 400 instead.
+    expected_parent: str | None = None
+    if "expected_parent" in body:
+        raw_expected = body["expected_parent"]
+        if not isinstance(raw_expected, str):
+            return web.json_response(
+                {"error": "expected_parent must be a string", "code": "expected_parent_invalid"},
+                status=400,
+            )
+        expected_parent = raw_expected
     # Validate every entry into an id -> order map BEFORE the lock is taken, the
     # same shape discipline api_chat_folder_update applies to its single row: a
     # malformed batch is a 400 that never touches the store. Last-writer-wins on
@@ -2019,6 +2126,17 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
                 folders, root_id=fid, request_app=request_app
             ):
                 return False, "subtree_not_owned"
+            # The container claim is decided last, so authorization always wins
+            # over the precondition: a caller refused a foreign row learns
+            # nothing about where that row now lives. The stored parent is
+            # normalized the way the tree walkers read it (absent and null both
+            # mean the root lane), and one mismatched row refuses the whole
+            # batch -- its order number was computed for a container it has
+            # left, so landing the rest around it renumbers a tree the caller
+            # never saw.
+            if expected_parent is not None:
+                if str(target.get("parent_id") or "") != expected_parent:
+                    return False, "parent_changed"
         changed = False
         for fid, order in pending.items():
             target = by_id[fid]
@@ -2035,6 +2153,19 @@ async def api_chat_folder_reorder(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "a folder in the reorder no longer exists", "code": "folder_not_found"},
             status=404,
+        )
+    if err == "parent_changed":
+        # A row's stored parent differs from the caller's claim: a concurrent
+        # reparent moved it between the caller's read and this write. A benign
+        # race like the deleted-row 404 above, not a violation, so it is not
+        # audited as denied. The 409 tells the caller its cached tree is stale;
+        # refetching and redrawing is the recovery, exactly as for the 404.
+        return web.json_response(
+            {
+                "error": "a folder in the reorder was moved to another parent",
+                "code": "folder_parent_changed",
+            },
+            status=409,
         )
     if err == "not_owned":
         # One row named a folder this app does not own. Refused whole, and
@@ -2124,10 +2255,10 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
     # session closing after the scan and writing its folder_id on the way out.
     # Each was closable in isolation; the class was not.
     #
-    # Nothing shipped loses a capability: no MCP tool exposes folder deletion
-    # (the set is chat_folder_tree / chat_folder_create / chat_folder_move /
-    # chat_folder_move_session), and the only client of this route is the
-    # dashboard UI, which is the person. An app organizes its own work by
+    # Nothing shipped loses a capability: the one MCP tool that reaches this
+    # route, chat_folder_delete, sends ``if_empty`` (below) and is refused here
+    # for an app like any other app caller, so its working callers are the
+    # person's own sessions and the dashboard UI. An app organizes its own work by
     # creating, renaming and reparenting its folders and filing its sessions --
     # cleanup is the person's, who can delete a full folder as they always could.
     if request_app:
@@ -2149,6 +2280,92 @@ async def api_chat_folder_delete(request: web.Request) -> web.Response:
             },
             status=403,
         )
+    # ``?if_empty=true`` is the empty-only delete the chat_folder_delete MCP tool
+    # sends. It never unfiles a slot or lifts a subfolder: occupancy is answered
+    # where the removal happens. Live slots and child folders are re-checked
+    # inside the folder-store callback below, which runs synchronously under the
+    # store lock and removes the row from the live list in the same step, so a
+    # slot PATCH or a child create cannot land between the check and the removal
+    # (both refuse a folder that is absent from the live list). Archived
+    # sessions are counted first, off the loop, because that is a disk scan; a
+    # session that is filed AND closed inside that one scan is the residue, and
+    # its transcript keeps a folder id that every reader renders as unfiled.
+    if_empty = (request.query.get("if_empty") or "").strip().lower() in ("1", "true", "yes")
+    if if_empty:
+        # Only a folder the CALLER's own session created, and the person has not
+        # touched since (see CREATED_BY_SESSION), may go this way. A folder the
+        # person made, reused, renamed, moved, or filed a session into carries
+        # no mark, so an agent never removes a folder the person relies on.
+        # Decided again under the lock below; this read only spares the
+        # archive scan for the common refusal.
+        caller_key = agent_creator_key(state, request)
+        not_yours = not caller_key or str(target.get(CREATED_BY_SESSION) or "") != caller_key
+        loop = asyncio.get_running_loop()
+        archived = (
+            {}
+            if not_yours
+            else await loop.run_in_executor(subprocess_executor(), _folder_history_counts, state)
+        )
+        if archived.get(fid, 0):
+            return web.json_response(
+                {
+                    "error": "folder still holds archived sessions",
+                    "code": "folder_not_empty",
+                },
+                status=409,
+            )
+
+        def _remove_if_empty(folders: list[dict[str, Any]]) -> tuple[bool, str]:
+            row = next((f for f in folders if f.get("id") == fid), None)
+            if row is None:
+                return False, "gone"
+            if not caller_key or str(row.get(CREATED_BY_SESSION) or "") != caller_key:
+                return False, "not_yours"
+            if any(f.get("parent_id") == fid for f in folders):
+                return False, "folder has subfolders"
+            if any(slot.folder_id == fid for slot in state._slots.values()):
+                return False, "folder still holds live sessions"
+            folders[:] = [f for f in folders if f["id"] != fid]
+            return True, ""
+
+        refused = await state.mutate_folders(_remove_if_empty)
+        if refused == "gone":
+            return web.json_response({"error": "not found", "code": "folder_not_found"}, status=404)
+        if refused == "not_yours":
+            sel().log_api_access(
+                caller=_audit_origin(request)[1],
+                operation="chat.folder_delete",
+                outcome="denied",
+                source="folder_origin",
+                resources=fid,
+                error="folder was not created by this session, or the person has used it",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        "only a folder this session created, and the person has not "
+                        "edited or used since, can be deleted this way"
+                    ),
+                    "code": "folder_not_agent_owned",
+                },
+                status=403,
+            )
+        if refused:
+            return web.json_response({"error": refused, "code": "folder_not_empty"}, status=409)
+        _CHAT_FOLDER_ICON_EPOCHS.pop(fid, None)
+        pending_icon = _CHAT_FOLDER_PENDING_ICON_TASKS.pop(fid, None)
+        if pending_icon is not None and not pending_icon.done():
+            pending_icon.cancel()
+        state.push_slots_update()
+        source, caller = _audit_origin(request)
+        sel().log_api_access(
+            caller=caller,
+            operation="chat.folder_delete",
+            outcome="allowed",
+            source=source,
+            resources=fid,
+        )
+        return web.json_response({"ok": True})
     # Unfile the folder's slots first, then commit the folder removal. If that
     # commit fails, put the slots back: otherwise the delete half-lands —
     # conversations persistently unfiled while the folder they came from is
@@ -2351,20 +2568,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_folder")) is not None:
         return refusal
     request_app = _effective_request_app(state, request)
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_folder",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (
+        denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_folder")
+    ) is not None:
+        return denied
     # Capture the transcript key the ownership decision above just covered,
     # BEFORE the body-parse await: ``linked_session_key`` is rebound on
     # already-live slots with no ``running`` gate (cron completions, workflow
@@ -2378,15 +2585,10 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
     # owner's session. Both must resolve to the caller's app (same rule as
     # ``chat_tags.api_chat_slot_tags``), same indistinguishable 404.
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_folder",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_folder", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -2451,7 +2653,13 @@ async def api_chat_slot_folder(request: web.Request) -> web.Response:
         # and here. _unhide_folder re-checks existence under the store lock, which
         # is the only place the answer cannot go stale — reject rather than persist a
         # placement into a folder that no longer exists.
-        if not await _unhide_folder(state, folder_id):
+        if not await _unhide_folder(
+            state,
+            folder_id,
+            # The person filing a session INTO this folder claims it; a re-file
+            # into the folder it already sits in changes nothing.
+            claim_for_person=folder_id != previous and _audit_origin(request)[0] == "dashboard",
+        ):
             slot.folder_id = previous
             slot._folder_changed = previous_changed
             return web.json_response(
@@ -2520,20 +2728,8 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     if (refusal := member_slot_write_refused(state, request, slot, "chat.slot_pin")) is not None:
         return refusal
     request_app = _effective_request_app(state, request)
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_pin",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_pin")) is not None:
+        return denied
     # Capture the transcript key the lookup above just covered, BEFORE the
     # body-parse await — the same rebind window api_chat_slot_folder
     # documents. The re-check below and the save's expected_history_key pin
@@ -2541,15 +2737,10 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     # against.
     authorized_history_key = slot_history_key(slot)
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_pin",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_pin", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
@@ -2637,7 +2828,7 @@ async def api_chat_slot_pin(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "pinned": slot.pinned, "changed": changed})
 
 
-_VALID_MODES = ("", "orchestrator")
+_VALID_MODES = ("",)
 
 
 async def api_chat_slot_mode(request: web.Request) -> web.Response:
@@ -2666,38 +2857,21 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
     if (refusal := refuse_unattributable_caller(state, request, "chat.slot_mode")) is not None:
         return refusal
     request_app = request.get("app", "")
-    if request_app and getattr(slot, "_app", "") != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_mode",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error=(
-                "app cannot access unscoped slots"
-                if not getattr(slot, "_app", "")
-                else "app does not own this slot"
-            ),
-        )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    if (denied := deny_app_slot_access(request_app, slot, slot.key, "chat.slot_mode")) is not None:
+        return denied
     # ``_app`` says who owns the slot OBJECT; the write persists into the
     # TRANSCRIPT ``authorized_history_key`` names. Same rule as the folder and
     # tag writes, same indistinguishable 404.
     if not app_owns_transcript(state._slots, request_app, authorized_history_key):
-        sel().log_api_access(
-            caller=request_app,
-            operation="chat.slot_mode",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={slot.key}",
-            error="app does not own this slot's transcript",
+        audit_app_slot_denial(
+            request_app, "chat.slot_mode", slot.key, "app does not own this slot's transcript"
         )
-        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        return slot_not_found()
     try:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "invalid JSON"}, status=400)
-    mode = body.get("mode", "")
+    mode = _coerce_requested_mode(body.get("mode", ""))
     if mode not in _VALID_MODES:
         return web.json_response({"error": "invalid mode"}, status=400)
     # Member DM threads (mode="member") are pinned to their crew, and every
@@ -2714,9 +2888,8 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
         )
     # A crew-bound (remote) session runs PLAIN chat only — the same rule
     # api_chat_slot_create enforces at birth, applied here to the post-create
-    # switch that would otherwise reopen it. A non-plain mode (orchestrator,
-    # design-critique) is consumed by an earlier dispatch branch in api_chat that
-    # runs its tools and filesystem work on THIS machine, not on the peer the
+    # switch that would otherwise reopen it. A non-plain mode would run
+    # its tools and filesystem work on THIS machine, not on the peer the
     # session is bound to. Keyed on ``executor`` rather than
     # ``is_remote`` so even a half-bound slot can never be switched into one.
     if slot.executor == "remote" and mode:
@@ -2785,12 +2958,7 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
                 {"error": "cannot switch mode while session is running"}, status=409
             )
         prior_mode = slot.mode
-        prior_auto_run = getattr(slot, "_auto_run", False)
         slot.mode = mode
-        # Clear orchestrator auto-run flag when leaving orchestrator mode to
-        # prevent stale "Go All" state from triggering on re-entry.
-        if mode != "orchestrator" and getattr(slot, "_auto_run", False):
-            slot._auto_run = False
         if not await save_slot_off_loop(
             state, slot, force=True, expected_history_key=authorized_history_key
         ):
@@ -2800,7 +2968,6 @@ async def api_chat_slot_mode(request: web.Request) -> web.Response:
             # writer's newer commit is not erased.
             if slot.mode == mode:
                 slot.mode = prior_mode
-                slot._auto_run = prior_auto_run
             # The UNPINNED periodic flush may have persisted the provisional
             # value while this save awaited (review-caught): mark dirty so the
             # next flush reconverges the durable record to the live state.

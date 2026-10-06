@@ -37,7 +37,7 @@ Builds use plain `pip` + `npm`/Vite + `pytest`, driven by the repo-root
 | Requirement | Needed for | Floor |
 |-------------|------------|-------|
 | **Python** | Backend | `>= 3.12` (`requires-python` in `pyproject.toml`; `make build` provisions a 3.12 `.venv` by default) |
-| **Node.js + npm** | Building the dashboard | `>= 22` (`website/package.json` `engines`; Node 24 LTS recommended); on x86_64 Amazon Linux 2, the glibc-217 fallback installs Node 24 because official builds need a newer glibc (no glibc-217 arm64 build is available) |
+| **Node.js + npm** | Building the dashboard | `>= 22.12.0` (`website/package.json` `engines`; Node 24 LTS recommended); on x86_64 Amazon Linux 2, the glibc-217 fallback installs Node 24 because official builds need a newer glibc (no glibc-217 arm64 build is available) |
 | **`kiro-cli`** | Driving the LLM | Required; see below |
 
 Node is only needed to *build* the dashboard. The prebuilt wheel, the DMG, the
@@ -201,6 +201,18 @@ home (`~/.kiro/crew-venv`, override with `KIROCREW_VENV`) and symlinks
 data home, so no whole-home operation can ever delete the live interpreter. The
 selected channel is recorded to `~/.kiro/crew/channel`.
 
+Updates to a managed venv (`kirocrew update`, an approved in-app update, and the
+gateway's automatic update) build each new version as its own tree beside it,
+`crew-venv-<version>` (about 350 MiB with its dependencies), and switch the
+`crew-venv-current` link to it. After each update the engine keeps the current
+tree, the previous one (a recovery target), and any tree a running `kirocrew`
+process still uses; older ones are removed. A direct installer run still
+rebuilds the fixed `crew-venv` in place. On a host that restricts unprivileged user
+namespaces and uses the `kirocrew-userns` AppArmor profile, run
+`kirocrew service install` again after every update so the profile follows the
+new launcher; the gateway's automatic update waits for you instead of applying
+there, and `kirocrew doctor` reports the attachment under Sandbox.
+
 The installer provisions its own Python by default instead of depending on the
 system one: it downloads a SHA-256-pinned [uv](https://docs.astral.sh/uv/)
 binary (an installed `uv` on `PATH` is deliberately never executed -- `PATH`
@@ -215,8 +227,9 @@ choice is sticky: it is recorded in the data home (`python-mode`, next to
 `channel`), so later installer runs keep it without the flag; opt back in
 with `--managed-python`.
 Installs that predate the managed default migrate onto it at their next
-direct installer run — on a managed venv, a staged update applied from the
-dashboard or the CLI's update command keeps its current interpreter — unless
+direct installer run — on a managed venv, an update applied from the
+dashboard, by the CLI's update command or by the gateway's automatic update
+keeps its current interpreter — unless
 they recorded the `--system-python` opt-out. A re-run resolves the
 interpreter through the pinned uv binary; an already-provisioned interpreter
 is reused rather than re-downloaded.
@@ -244,12 +257,12 @@ the packages, instead of failing deep inside a compiler run. Use a newer host,
 or — on a host that does have a toolchain and the headers — opt back into
 compiling with `KIROCREW_ALLOW_SOURCE_BUILDS=1`. The same policy applies to
 `install.sh`'s editable install (the dependency set only; the local kirocrew
-tree is still built) and to the update engine that builds the shadow venv for
-`kirocrew update` on a managed-venv install. The opt-in is not remembered: the
-update engine reads it from the environment the gateway runs under, so a host
-that installed with it must also carry it there (in the service unit for a
-`kirocrew service install`), or its next update that pulls a wheel-less
-dependency refuses with the same platform message.
+tree is still built) and to the update engine that builds the shadow venv on a
+managed-venv install. The opt-in is not remembered. To compile a dependency
+during an update, run `KIROCREW_ALLOW_SOURCE_BUILDS=1 kirocrew update` from a
+shell where the toolchain is on `PATH`: that command builds with the shell's own
+environment, while the gateway's automatic and approved updates run their build
+steps on the trusted system `PATH` only.
 
 ### b. From source (development)
 
@@ -263,10 +276,10 @@ PYTHONPATH=src python -m kiro_crew gateway   # -> http://localhost:5476
 
 On Windows the same targets run through `make.ps1`, because `make` is not part
 of a Windows install and the Makefile's recipes are POSIX-shaped
-(`.venv/bin/pip`, `rm -rf`, `cp -R`, `bash ensure-*.sh`):
+(`.venv/bin/pip`, `rm -rf`, `bash ensure-*.sh`):
 
 ```powershell
-.\make.ps1 build                             # same two steps, same artifacts
+.\make.ps1 build                             # same steps, same artifacts
 $env:PYTHONPATH="src"; .\.venv\Scripts\python.exe -m kiro_crew gateway
 ```
 
@@ -282,15 +295,24 @@ other lacks. Differences are confined to what the platform forces: a Windows
 venv puts its executables in `.venv\Scripts\`, and the macOS-only
 `resign-macos-libs.sh` step has no Windows counterpart.
 
-`make build` runs two steps:
+`make build` runs three steps:
 
 1. **`frontend`**: `npm ci` (or `npm install`) + `npm run build` in `website/`,
-   then copies `website/dist` into `src/kiro_crew/static/dist` so the backend
-   serves the SPA, and installs `website/electron`'s own deps last — it is a
-   separate npm package the `website/` install never reaches, and `npm test`
-   in `website/` needs it.
+   and installs `website/electron`'s own deps last — it is a separate npm
+   package the `website/` install never reaches, and `npm test` in `website/`
+   needs it.
 2. **`backend`**: creates `.venv` and runs an editable install with the `dev`
    extra (`pip install -e ".[dev]"`).
+3. **stage**: `.venv/bin/python -m kiro_crew.frontend stage .` makes
+   `website/dist` the served `src/kiro_crew/static/dist`: a link to
+   `website/dist`, or for an edition a link to a fresh private copy. It waits at
+   most 30 s for the staging lock a Kiro Crew build holds. `make wheel` stages
+   the same way; `make backend-bin` does not, since its bundle copies
+   `website/dist` itself, so it needs no Python for this. `make frontend` alone
+   does not stage either: a checkout whose `static/dist` is still a real
+   directory keeps serving that old copy until a stage turns it into the link.
+   A gateway already running when that happens, one whose build routes were
+   resolved from the directory, needs a restart; the stage says so.
 
 Both targets bootstrap their toolchain first (`ensure-node.sh`,
 `ensure-python.sh`) and fall back to whatever is on `PATH` if that fails. The
@@ -356,11 +378,15 @@ are published, and they serve different needs:
 # 1. Track a channel. A PEP 503 simple index per channel, so pip resolves the
 #    newest version itself. --pre is required: every published version carries a
 #    prerelease suffix on nightly and insider.
+#    NOTE: --extra-index-url ADDS the channel index beside default PyPI, so pip
+#    pools `kirocrew` candidates across both and a higher-versioned public-PyPI
+#    package of the name would win. Prefer form 2 (or verify the installed
+#    artifact) where that exposure matters.
 pip install --pre kirocrew --extra-index-url https://updates.crew.kiro.dev/feed/stable/simple/
 
 # 2. Pin one exact wheel by hash. Every version directory publishes a SHA256SUMS
 #    file beside the wheel; take your wheel's hash from there. pip verifies it and
-#    consults no index for Kiro Crew itself.
+#    consults no index for Kiro Crew itself — so there is no name to squat.
 pip install "https://download.crew.kiro.dev/cli/stable/<version>/kirocrew-<version>-py3-none-any.whl#sha256=<sha256>"
 ```
 
@@ -371,8 +397,15 @@ distribution, which is why `KIROCREW_CDN_BASE` (or `cli.sh --cdn`) overrides bot
 at once. Use the documented name for each class rather than relying on the
 aliasing.
 
-Form 1 is the one to use unless a deployment must pin a byte-exact artifact — a
-locked requirements file, an airgapped mirror, or a reproducible image build.
+Form 2 pins a byte-exact artifact and consults no index for the `kirocrew` name,
+so it is the one to use where a public-PyPI squat of the name is a concern, or
+when a deployment must pin a byte-exact artifact anyway — a locked requirements
+file, an airgapped mirror, or a reproducible image build. The in-place upgrade
+command Kiro Crew emits for a plain-pip install uses the form-2 pinned wheel for
+exactly this reason, and when it cannot fetch or verify the signed wheel it
+reports that and points at the channel's artifact directory rather than fall
+back to the form-1 name-resolving command. Form 1 tracks a channel hands-free
+when that exposure is acceptable.
 
 Installed console script:
 
@@ -431,6 +464,24 @@ under Rosetta 2, so a universal build needs an Apple-Silicon host;
 `UNIVERSAL=0` forces a faster host-arch-only build. Linux is always host-arch,
 and the three Linux formats come from one backend tree packaged three times.
 
+The published, signed apps ([prebuilt downloads](../../README.md#app-downloads))
+update themselves, and the gateway bundled inside them, through the
+app's own updater. By default a new release downloads in the background and
+installs the next time you quit the app (closing the window only hides it to
+the tray; quit from the tray or the menu bar). To be asked first, turn off
+**Install app updates automatically** on the About page (an **Update the gateway
+automatically** switch beside it sets only an attached gateway's `auto_update`); the app then offers each release and
+downloads it when you click Download, in the update popup or on the About page.
+A locally built app is stamped ahead of the stable channel, so on stable it gets
+no update until a newer release ships. The updater is also off when the app runs from the DMG or
+another read-only volume, from a macOS translocated copy (move it to
+Applications), as an AppImage in a directory it cannot write, as an unknown
+package format, under a bare `EXTERNALLY-MANAGED` marker, or as an unpackaged
+build; About then says automatic updates are unavailable, or managed elsewhere,
+instead of showing the switch. Details:
+[release.md → Client auto-update](../build/release.md#client-auto-update) and
+[Updates](../../src/kiro_crew/docs/configuration.md#updates).
+
 #### Installing a Linux desktop package
 
 ```bash
@@ -444,8 +495,8 @@ on a host whose AppArmor supports the bundled profile — installs and loads the
 `userns` profile the agent sandbox needs, so no manual `sandbox install-profile`
 step is required. The fixed install path is what makes all of that durable.
 
-Updates arrive through the app (**About → Check for updates**), which downloads
-the new package and hands it to `dpkg` / `rpm`. That needs root, so expect one
+Updates arrive through the app's updater described above (or **Check for
+updates** on the About page), which hands the package to `dpkg` / `rpm`. That needs root, so expect one
 elevation prompt (`pkexec` or `sudo`) at install time — it is the package
 manager doing the write, not the app. `sudo apt remove kirocrew` /
 `sudo dnf remove kirocrew` uninstalls; see
@@ -488,8 +539,8 @@ Linux, `.\make.ps1 <target>` on Windows.
 
 | Target | What it does |
 |--------|--------------|
-| `make build` | Frontend (npm/Vite) + backend into `.venv` |
-| `make frontend` | Frontend only: npm build staged into `src/kiro_crew/static/dist`, plus `website/electron` deps |
+| `make build` | Frontend (npm/Vite) + backend into `.venv`, then stage `website/dist` as `src/kiro_crew/static/dist` |
+| `make frontend` | Frontend only: npm build into `website/dist`, plus `website/electron` deps. It does not stage; run `python -m kiro_crew.frontend stage .` (or `make build`) for that |
 | `make backend` | Backend only: `.venv` + editable install with the `dev` extra |
 | `make wheel` | Self-contained pip wheel with the dashboard bundled, into `dist/` |
 | `make backend-bin` | Frozen standalone backend binary (host arch only) |
@@ -1113,16 +1164,42 @@ pipx uninstall kirocrew
 ### One-line install via `cli.sh` (managed venv)
 
 If `pipx` was not available, `cli.sh` created a managed venv and a symlink.
-Remove both:
+Updates add versioned trees beside it (`crew-venv-<version>`), the stable link
+`crew-venv-current` that names the live one, the update lock
+`crew-venv.update.lock`, and, after an interrupted update, a hidden
+`.crew-venv-<version>.deleting-<pid>` tree or a `crew-venv-current.<pid>.new`
+link. Remove them (this works the same in `sh`, `bash` and `zsh`, and removes
+nothing when a pattern matches nothing):
 
 ```bash
-rm -f ~/.local/bin/kirocrew
-rm -rf "${KIROCREW_VENV:-${KIROCREW_HOME:-$HOME/.kiro/crew}-venv}"
+VENV="${KIROCREW_VENV:-${KIROCREW_HOME:-$HOME/.kiro/crew}-venv}"
+VENV="${VENV%/}"
+PARENT="$(cd "$(dirname "$VENV")" && pwd -P)"
+NAME="$(basename "$VENV")"
+rm -f ~/.local/bin/kirocrew "$VENV-current" "$VENV.update.lock"
+rm -rf "$VENV"
+find "$PARENT" -maxdepth 1 -type l -name "$NAME-current.*.new" -exec rm -f {} +
+find "$PARENT" -maxdepth 1 -type d \( -name "$NAME-[0-9]*" -o -name ".$NAME-*.deleting-*" \) \
+  -exec sh -c '
+    venv=$1 real=$2; shift 2
+    for tree; do
+      owner="$(cat "$tree/.kirocrew-tree" 2>/dev/null)"
+      if [ -n "$owner" ] && { [ "$owner" = "$venv" ] || [ "$owner" = "$real" ]; }; then
+        rm -rf "$tree"
+      else
+        echo "left in place, check and remove by hand: $tree"
+      fi
+    done' sh "$VENV" "$PARENT/$NAME" {} +
 ```
 
-If you set `KIROCREW_VENV` to a custom path, verify its contents before
-removing it — `cli.sh` overlays that directory with venv files, and an `rm -rf`
-on a path you already used for something else will take that too.
+A versioned tree is removed only when its `.kirocrew-tree` marker names this
+install's venv. Any other match is listed instead: a neighbouring directory that
+merely shares the name prefix (a backup, another install's trees), or a tree an
+earlier release built before it wrote the marker. Remove the ones that are this
+install's by hand. If you set `KIROCREW_VENV` to a custom path, verify its
+contents before removing it — `cli.sh` overlays that directory with venv files,
+and an `rm -rf` on a path you already used for something else will take that
+too.
 
 ### pip / pip wheel install
 

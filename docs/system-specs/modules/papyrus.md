@@ -22,9 +22,10 @@ changed.
 
 All routes live under `/api/apps/papyrus/` and are registered by
 `src/kiro_crew/apps/builtins/papyrus/backend/routes.py:register_routes`. Every handler is
-wrapped in `_require_enabled` (403 while the app is disabled) — pinned by
-`test/test_papyrus_routes.py::TestRouteRegistration`, since routes are registered once at
-gateway startup and an unwrapped one would answer regardless of the opt-in.
+wrapped in `_require_enabled`, which answers 403 `app_disabled` while the app is disabled
+and then 403 `owner_only` to anyone but the dashboard owner (see Caller authorization) —
+pinned by `test/test_papyrus_routes.py::TestRouteRegistration`, since routes are registered
+once at gateway startup and an unwrapped one would answer regardless of the opt-in.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -73,6 +74,30 @@ accepted name — pinned by
 `test/test_papyrus_store.py::TestSafeProjectDir::test_normalize_does_not_make_a_traversal_safe`.
 
 ## Security model
+
+### Caller authorization (owner only)
+
+Every route, reads included, is for the dashboard owner alone. The papers are the
+owner's private drafts, and the git routes run with the owner's own git credentials, so
+a caller who can reach any one route can read, overwrite or publish the owner's work.
+
+`_require_enabled` runs two checks in order. A disabled app answers 403 `app_disabled`
+to everyone. Then `require_owner_dashboard_request` (`dashboard/handlers/_shared.py`)
+lets only the owner through and answers everyone else with 403 `owner_only`, writing a
+SEL denial record named `papyrus.<route>`. The same wrapper covers all 19 routes, so a
+route added to `register_routes` cannot skip the gate.
+
+| Caller | Result |
+|--------|--------|
+| Dashboard owner (session cookie, `app == ""`) | allowed |
+| Non-owner dashboard subject | 403 `owner_only` |
+| Any app token, Papyrus's own included | 403 `owner_only` |
+| Internal caller with no app claim | 403 `owner_only` |
+
+App tokens are refused because nothing calls these routes with one: the page
+(`website/src/apps/papyrus/api.ts`) fetches with the owner's session cookie, and the
+co-author agent edits the project with its own file tools (see Skill). Pinned by
+`test/test_papyrus_routes.py::TestOwnerGate`.
 
 ### Path containment (`store.py` is the gate)
 
@@ -279,7 +304,10 @@ a refused name never reaches `gitops` or the compiler.
 5. Without a bibliography, re-run once if the log says "Rerun to get…" — how a
    table of contents or a `\ref` settles. Not retried when the pass **failed**: a
    failing pass that also asks to rerun is broken, not merely unsettled.
-6. `ok` requires exit 0 **and** a PDF on disk — `pdflatex` can exit 0 having
+6. Both compilers write output in the project root, including when the main
+   document is in a subdirectory. Tectonic receives `--outdir` explicitly so
+   compilation and the PDF-serving path resolve the same file.
+7. `ok` requires exit 0 **and** a PDF on disk — `pdflatex` can exit 0 having
    produced nothing usable.
 
 ### Log parsing

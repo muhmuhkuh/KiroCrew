@@ -54,7 +54,18 @@ from kiro_crew.config.sections import (
 )
 from kiro_crew.decisions import consent as _consent
 from kiro_crew.decisions import log as _log
-from kiro_crew.decisions.types import Answer, Answers, Question, is_model_id
+from kiro_crew.decisions.types import (
+    SCORE_MAX_LEVELS,
+    SCORE_MIN_LEVELS,
+    Answer,
+    Answers,
+    Choice,
+    Noul,
+    Question,
+    Score,
+    is_model_id,
+    question_texts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +226,31 @@ def _answers_are_valid(answers: Answers, questions: list[Question]) -> bool:
             return False
         if not _probability(answer.p):
             return False
-        if not isinstance(answer.value, str) or answer.value not in question.options:
+        if not _value_in_domain(answer.value, question):
             return False
     return True
+
+
+def _value_in_domain(value: object, question: object) -> bool:
+    """Whether *value* lies in *question*'s own domain, by question type.
+
+    One branch per type, so a type with no ``options`` never reaches the
+    ``Choice`` check, and a question of any other class is out of domain rather
+    than an exception: this runs outside ``decide``'s ``try``, so a raise here
+    would reach the caller instead of becoming the ``None`` a refusal is.
+    """
+    if isinstance(question, Choice):
+        return isinstance(value, str) and value in question.options
+    if isinstance(question, Noul):
+        return _probability(value)
+    if isinstance(question, Score):
+        levels = len(question.levels)
+        if not SCORE_MIN_LEVELS <= levels <= SCORE_MAX_LEVELS:
+            return False
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        return math.isfinite(value) and 0.0 <= value <= levels - 1
+    return False
 
 
 def _snapshot() -> Any:
@@ -253,6 +286,12 @@ def configured_endpoint(config: Any | None = None) -> str:
     return raw or DECISION_PROVIDER_ENDPOINT_DEFAULT
 
 
+def configured_provider_model(config: Any | None) -> str:
+    """The configured ``provider.model`` as written, for telling a local preset apart."""
+    provider = getattr(_decisions_config(config), "provider", None)
+    return str(getattr(provider, "model", "") or "")
+
+
 #: Endpoints already warned about, so a mismatch is said once, not once per message.
 _unconsented_warned: set[str] = set()
 
@@ -261,8 +300,12 @@ _unconsented_warned: set[str] = set()
 _capability_denied_warned = False
 
 
-def _capability_denied(session_key: str | None) -> bool:
-    """Whether the ``capabilities.decisions`` ceiling withdraws the seam. Filesystem IO.
+def _capability_denied(session_key: str | None, *, local: bool = False) -> bool:
+    """Whether the governance ceiling withdraws the seam. Filesystem IO.
+
+    *local* adds ``capabilities.decisions_local`` to ``capabilities.decisions``:
+    true when the configured provider is a local preset, so a fleet that permits
+    hosted Jev can still withdraw a model on this machine. A hosted deny covers it.
 
     *session_key* is the turn's own identity, which is what a profile binds on, so a
     profile bound to THIS surface is consulted rather than a dashboard one. It is
@@ -279,13 +322,18 @@ def _capability_denied(session_key: str | None) -> bool:
     global _capability_denied_warned
     from kiro_crew.decisions.capability import DASHBOARD_SURFACE_KEY, is_decisions_denied
 
-    if not is_decisions_denied(session_key or DASHBOARD_SURFACE_KEY):
+    if not is_decisions_denied(session_key or DASHBOARD_SURFACE_KEY, local=local):
         return False
     if not _capability_denied_warned:
         _capability_denied_warned = True
         logger.warning(
-            "decisions: the seam is withdrawn by governance "
-            "(capabilities.decisions); nothing is sent even though consent is on"
+            "decisions: the seam is withdrawn by governance (%s); nothing is sent "
+            "even though consent is on",
+            (
+                "capabilities.decisions or capabilities.decisions_local"
+                if local
+                else "capabilities.decisions"
+            ),
         )
     return True
 
@@ -322,10 +370,24 @@ def _consented_for(
     """
     state = _consent.load_state()
     endpoint = configured_endpoint(config)
+    from kiro_crew.decisions.local_models import ENDPOINT_NONE
+
+    # "No decision model" chosen: nothing to send to, whatever the keystone says.
+    if endpoint == ENDPOINT_NONE:
+        return False
     if _consent.permits(endpoint, state):
         if not _scope_consented(point, state):
             return False
-        return not _capability_denied(session_key)
+        from kiro_crew.decisions.capability import is_local_preset, names_local_preset
+
+        model = configured_provider_model(config)
+        local = is_local_preset(endpoint, model)
+        # A preset's address is sent to only while the runtime attests the server on
+        # it. Until then -- the model downloading, starting, or a program that took
+        # the port -- whatever listens there is not known to be ours.
+        if not local and names_local_preset(endpoint, model):
+            return False
+        return not _capability_denied(session_key, local=local)
     if _consent.is_enabled(state) and endpoint not in _unconsented_warned:
         _unconsented_warned.add(endpoint)
         logger.warning(
@@ -755,8 +817,7 @@ def _scan_text(state: dict | str, questions: list[Question], model: str = "") ->
             rendered = repr(state)
     parts = [rendered, model]
     for question in questions:
-        parts.append(str(getattr(question, "prompt", "") or ""))
-        parts.extend(str(option) for option in getattr(question, "options", ()) or ())
+        parts.extend(question_texts(question))
     return "\n".join(parts)
 
 

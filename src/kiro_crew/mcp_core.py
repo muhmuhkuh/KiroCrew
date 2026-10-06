@@ -38,6 +38,7 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_dir,
     outbox_dir,
+    read_config_text,
     read_local_secret,
     resolve_agent_bindings,
 )
@@ -563,8 +564,10 @@ def _get_knowledge_search(db_path: Path, cfg_path: Path) -> tuple[Any, Any]:
         prev = _KNOWLEDGE_CACHE
         store = KnowledgeStore(str(db_path))
         try:
-            cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+            cfg = json.loads(read_config_text(cfg_path)) if cfg_path.exists() else {}
         except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict):
             cfg = {}
         embedder = create_embedder_from_config(cfg)
         # Close the stale connection only AFTER the full rebuild (store + cfg +
@@ -1768,14 +1771,19 @@ def _put(path: str, body: dict | None = None, session_key: str | None = None) ->
     return _send(path, data=data, headers=headers, method="PUT")
 
 
-def _delete(path: str, body: dict | None = None) -> dict:
+def _delete(path: str, body: dict | None = None, *, session_key: str | None = None) -> dict:
+    """DELETE a loopback gateway path with the internal-secret handshake.
+
+    ``session_key``: as in :func:`_patch`. A caller gated on
+    :func:`_resolve_session_key_strict` must send the key it verified.
+    """
     data = json.dumps(body or {}).encode() if body else None
     headers = {
         "X-Internal-Secret": _internal_secret(),
         **_caller_header(),
         **_session_token_header(),
     }
-    sk = _resolve_session_key()
+    sk = _resolve_session_key() if session_key is None else session_key
     _sk_err = _session_key_header_error(sk)
     if _sk_err:
         return {"error": _sk_err}

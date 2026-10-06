@@ -1877,7 +1877,7 @@ export default function DevFleetPage() {
     if (w.is_main) { variant = 'aim'; label = 'main'; title = i18nT('pages.devFleetPage.the_primary_checkout_this_fleet_is_discovered_fr') }
     else if (w.running) {
       // 200 = open; 401/403 = serving but auth-gated — all mean the pod is up
-      // (matches pod/runtime.py health() contract; anonymous probes get 403).
+      // (matches pod/runtime_client.py health() contract; anonymous probes get 403).
       const healthy = !!w.health && ((w.health >= 200 && w.health < 400) || w.health === 401 || w.health === 403)
       variant = healthy ? 'ok' : 'err'
       label = healthy ? i18nT('pages.devFleetPage.pod_up') : i18nT('pages.devFleetPage.pod_sick')
@@ -2240,6 +2240,12 @@ export default function DevFleetPage() {
   // Rendering those rows with no badge would read as "nothing is live" — the
   // opposite remedy (stage a cutover) from the true one (check the gateway) — so
   // the unknown state is an error notice above the list, never a bare list.
+  // The copy ends by naming the hand-off ("Ask the agent before making a
+  // checkout live"), so the link goes BELOW it, a row of its own inside the
+  // text column: beside, it floats into the copy's first line and the sentence
+  // reads around it at some widths ("use the ✨Ask the agent Ask-the-agent
+  // link…") — #10831. Opt-in on this notice only; every other ErrorNotice keeps
+  // its default layout.
   else body = (
     <div>
       {fleet?.live_state_known === false && (
@@ -2247,6 +2253,7 @@ export default function DevFleetPage() {
           title={i18nT('pages.devFleetPage.live_state_unknown')}
           message={i18nT('pages.devFleetPage.live_state_unknown_help')}
           askAgent
+          actionPlacement="below"
           testId="fleet-live-state-unknown"
         />
       )}

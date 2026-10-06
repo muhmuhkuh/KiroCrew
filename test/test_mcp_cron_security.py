@@ -32,11 +32,15 @@ from conftest import make_dir_link, requires_symlinks
 from kiro_crew import mcp_cron, mcp_shared
 from kiro_crew.mcp_cron import (
     _CRON_MAX_COMMAND_SCAN,
+    _SENSITIVE_HOME_DIRS,
     _call_tool_inner,
     _glob_could_reach_credentials,
     _has_bash_brace_expansion,
+    _matched_sensitive_name,
     _not_found,
+    _protected_path_refusal,
     _quote_states,
+    _shell_quote_removal,
     _substitute_local_assignments,
     _unidentified_caller_refusal,
     _unowned_row_refusal,
@@ -981,6 +985,83 @@ def test_vet_script_contents_allows_benign(body):
     assert _vet_script_contents(body) is None
 
 
+# ── The refusal names the specific matched path and describes it with one
+#    neutral "protected path" wording. The list it classifies mixes credential
+#    stores with paths fenced for other reasons, and the entry strings are not a
+#    reliable credential signal, so no entry is singled out as a "credential
+#    file" -- naming the matched entry is what makes the refusal useful. ──
+
+
+def test_matched_sensitive_name_reports_the_specific_dir():
+    assert _matched_sensitive_name("cat ~/.aws/credentials") == ".aws"
+    assert _matched_sensitive_name("cat ~/.kube/config") == ".kube/config"
+    assert _matched_sensitive_name("echo hi > /tmp/log") is None
+
+
+def test_command_refusal_names_the_matched_path_neutrally():
+    err = _vet_shell_command("cat ~/.aws/credentials")
+    assert err is not None
+    assert ".aws" in err
+    assert "protected path" in err
+    # It must NOT fall back to always citing the example triple.
+    assert "e.g. .aws/.ssh/.netrc" not in err
+
+
+def test_command_refusal_on_a_non_credential_protected_path_is_not_mislabelled():
+    # .kube/config is protected but is NOT a credential file; it is named and
+    # described with the same neutral wording as every other entry.
+    err = _vet_shell_command("cat ~/.kube/config")
+    assert err is not None
+    assert ".kube/config" in err
+    assert "protected path" in err
+    assert "credential file" not in err
+
+
+def test_script_refusal_names_the_matched_path_neutrally():
+    err = _vet_script_contents("open('/home/u/.kube/config').read()\n")
+    assert err is not None
+    assert ".kube/config" in err
+    assert "protected path" in err
+    assert "credential file" not in err
+    cred = _vet_script_contents("open('/home/u/.aws/credentials').read()\n")
+    assert cred is not None
+    assert ".aws" in cred
+    assert "protected path" in cred
+    assert "credential file" not in cred
+
+
+def test_glob_reached_refusal_stays_generic_but_accurate():
+    # A glob match cannot carry back the specific name; the message stays
+    # illustrative but must not single out one entry as a credential file, and
+    # must still start with Error:.
+    err = _vet_shell_command("cat ~/.??h/id_rsa")
+    assert err is not None and err.startswith("Error:")
+    assert "protected path" in err
+    assert "credential file" not in err
+
+
+def test_protected_path_refusal_builder_is_pure():
+    assert "command" in _protected_path_refusal("command", ".aws")
+    assert "script" in _protected_path_refusal("script", ".kube/config")
+    assert _protected_path_refusal("command", None).startswith("Error:")
+
+
+@pytest.mark.parametrize("sensitive", _SENSITIVE_HOME_DIRS)
+def test_every_sensitive_entry_refuses_with_one_neutral_wording(sensitive):
+    # Regression pin: dropping the credential/non-credential split must leave the
+    # refuse/allow outcome unchanged for EVERY list entry -- including the data-
+    # home entries (an SSO cookie dir, a redaction config, an oauth-endpoints
+    # file) where the old substring classifier labelled the wrong ones. A literal
+    # reference to any entry is still refused, is named in the message, and is
+    # described as a "protected path" with no entry singled out as a credential
+    # file.
+    err = _vet_shell_command(f"cat ~/{sensitive}")
+    assert err is not None
+    assert sensitive in err
+    assert "protected path" in err
+    assert "credential file" not in err
+
+
 # A cron script body is PYTHON SOURCE, not a shell command line. Each body below
 # READS NOTHING: it describes, redacts or documents a fenced store. Routing any of
 # them through the shell gate refuses it -- a backslash run read as a collapsible
@@ -1809,3 +1890,112 @@ def test_command_length_ceiling_sits_above_the_storable_maximum():
     at_max = "echo " + "x" * (storable - 5)
     verdict = _vet_shell_command(at_max)
     assert verdict is None, f"a benign command at the storage cap was refused: {verdict}"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Clean at the first two parse levels; only the THIRD shell receives
+        # `.q{s,s}h`, because the escapes sit inside the outer double quotes.
+        '/bin/bash -c "/bin/bash -c cat\\ /tmp/.q{s\\,s}h/notes.txt"',
+        # Four shells deep, with the outer levels alternating quote styles.
+        "bash -c 'bash -c \"bash -c cat\\ /tmp/.q{s\\,s}h/notes.txt\"'",
+    ],
+)
+def test_brace_scan_follows_every_nested_shell_level(command):
+    """A group hidden behind several quote-removal levels is still refused."""
+
+    assert _has_bash_brace_expansion(command) is True
+    verdict = _vet_shell_command(command)
+    assert verdict is not None and "brace expansion" in verdict
+
+
+def test_brace_group_built_from_local_assignments_is_refused():
+    """`A={; B=}` then `${A}s,s${B}` gives a nested shell a group the raw text lacks."""
+
+    command = 'A={; B=}; sh -c "cat /tmp/.q${A}s,s${B}h/notes.txt"'
+    assert _has_bash_brace_expansion(command) is False
+    verdict = _vet_shell_command(command)
+    assert verdict is not None and "brace expansion" in verdict
+
+
+def test_plain_command_with_a_local_assignment_is_stored():
+    """Resolving assignments for the brace scan does not refuse an ordinary command."""
+
+    assert _vet_shell_command("A=hello; echo $A from cron") is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'grep "[0-9]\\{1,3\\}" /tmp/notes.txt',
+        # Argv wrappers exec their argument as words and never parse it, so they
+        # do not open a deeper level, alone or stacked.
+        'timeout 60 grep "[0-9]\\{1,3\\}" /tmp/notes.txt',
+        'flock -n /tmp/x.lock timeout 60 grep "[0-9]\\{1,3\\}" /tmp/notes.txt',
+        'env timeout 5 grep "[0-9]\\{1,3\\}" /tmp/notes.txt',
+        'find /tmp -name "*.log" | xargs grep "[0-9]\\{1,3\\}"',
+        # Inside double quotes the assignment keeps both backslashes, so the
+        # resolved form is the same escaped interval.
+        'PAT="[0-9]\\{1,3\\}"; grep "$PAT" /tmp/notes.txt',
+    ],
+)
+def test_escaped_bre_interval_in_double_quotes_is_stored(command):
+    """The refusal text's own BRE rewrite must still be accepted.
+
+    grep receives `[0-9]\\{1,3\\}` and never re-parses it, so no shell ever sees a
+    brace group. A third quote-removal level would strip those backslashes and
+    refuse it; that level is only taken while a nested re-parser is named.
+    """
+
+    assert _vet_shell_command(command) is None
+
+
+def test_resolved_form_over_the_ceiling_is_refused_fast():
+    """A short command whose local variables multiply its length is refused before scanning."""
+
+    import time
+
+    command = "A=" + "a" * 5000 + "; echo " + "$A" * 1590
+    assert len(command) <= 8192
+    started = time.monotonic()
+    verdict = _vet_shell_command(command)
+    elapsed = time.monotonic() - started
+    assert verdict is not None and "local variables filled in" in verdict
+    assert elapsed < 2.0, f"refusal took {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The second shell is spelled `\bash`, so the level that holds it does not
+        # read it as a word; only the next projection does. Real bash expands the
+        # group at the third parse.
+        'bash -c "\\bash -c cat\\ /tmp/.q{s\\,s}h/notes.txt"',
+        # `$(` exists only once the assignments resolve; the inner shell runs it.
+        'A=$; B="("; sh -c "cat /tmp/.q${A}${B}printf qq)h/notes.txt"',
+    ],
+)
+def test_composition_hidden_from_the_raw_text_is_refused(command):
+    """A re-parser or a `$(` that only appears after one more parse is still seen."""
+
+    assert _vet_shell_command(command) is not None
+
+
+@pytest.mark.parametrize(
+    "word,value",
+    [
+        # Each row is what `A=<word>; printf %s "$A"` prints under bash.
+        ("s\\h", "sh"),
+        ('"s\\h"', "s\\h"),
+        ("'s\\h'", "s\\h"),
+        ('"a\\"b"', 'a"b'),
+        ('"[0-9]\\{1,3\\}"', "[0-9]\\{1,3\\}"),
+        ("a\\\\b", "a\\b"),
+        ("s\\,s", "s,s"),
+    ],
+)
+def test_assignment_values_get_the_shells_quote_removal(word, value):
+    """A resolved value keeps exactly the backslashes the shell keeps."""
+
+    assert _shell_quote_removal(word) == value

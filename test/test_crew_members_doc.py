@@ -82,18 +82,23 @@ def test_the_trigger_overlap_threshold_the_page_quotes_is_the_real_one(doc_text:
     ), f"the page quotes a trigger threshold that is no longer {MIN_TRIGGER_OVERLAP}"
 
 
-def test_empty_triggers_still_refuse_a_delegation_with_that_code(doc_text: str) -> None:
-    """§When not to route names the refusal code a triggerless crewmate returns."""
-    handler = (
-        Path(__file__).parent.parent
-        / "src"
-        / "kiro_crew"
-        / "dashboard"
-        / "handlers"
-        / "messaging.py"
-    ).read_text(encoding="utf-8")
-    assert '"code": "crew_delegation_disabled"' in handler
-    assert "crew_delegation_disabled" in doc_text
+def test_empty_triggers_only_skip_routing_not_named_delegation(doc_text: str) -> None:
+    """§When not to route says a triggerless crewmate can still be named."""
+    from kiro_crew.dashboard.handlers import messaging
+
+    dashboard = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard"
+    # The spawn route runs from a messaging_api owner the facade composes, so the
+    # handler is the facade and every owner, and the scan fails if the route lives
+    # in a file it does not read.
+    owners = sorted((dashboard / "messaging_api").glob("[!_]*.py"))
+    assert owners, "the messaging_api owners were not found"
+    files = [dashboard / "handlers" / "messaging.py", *owners]
+    held = Path(messaging.api_spawn.__code__.co_filename)
+    assert held.parts[-2:] in {path.parts[-2:] for path in files}, held
+    handler = "\n".join(path.read_text(encoding="utf-8") for path in files)
+    assert "crew_delegation_disabled" not in handler
+    assert "crew_delegation_disabled" not in doc_text
+    assert "delegated to by name" in doc_text
 
 
 def test_the_config_fields_the_page_names_are_still_on_the_crew_record(doc_text: str) -> None:

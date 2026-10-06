@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -470,6 +471,33 @@ class TestAcpSessionProviderClientCompat:
         runtime = _make_runtime(acp_backend="kas")
         provider = AcpSessionProvider(handle, runtime)
         assert provider.backend == "kas"
+
+    def test_cwd_reports_the_sessions_bound_dir_not_the_shared_runtimes(self):
+        """A shared runtime carries sessions opened against different projects.
+
+        The task runtime is started once in workspace A; a task session then opens against
+        B. Answering with the runtime's directory reports a workspace this session never
+        bound, so reuse validation reads it as moved and evicts a live session -- losing
+        its conversation for failing to be somewhere it never was.
+        """
+        handle = _make_handle()
+        handle._bound_cwd = "/workspaces/b"
+        runtime = _make_runtime()
+        runtime._work_dir = Path("/workspaces/a")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.cwd == "/workspaces/b", (
+            "the session bound to B must report B; reporting the runtime's A evicts it "
+            f"on every project-scoped claim; got {provider.cwd!r}"
+        )
+
+    def test_cwd_falls_back_to_the_runtime_when_no_bound_dir_was_recorded(self):
+        """A handle predating the record is the single-session case, where they agree."""
+        handle = _make_handle()
+        handle._bound_cwd = ""
+        runtime = _make_runtime()
+        runtime._work_dir = Path("/workspaces/a")
+        provider = AcpSessionProvider(handle, runtime)
+        assert provider.cwd == str(Path("/workspaces/a"))
 
     def test_has_active_turn(self):
         """has_active_turn is a METHOD (parity with AcpClient) delegating to
@@ -969,6 +997,34 @@ class TestAcpSessionProviderContractParity:
         provider = AcpSessionProvider(handle, runtime)
         with pytest.raises(AcpProcessDied):
             await provider.steer("go")
+
+    @pytest.mark.parametrize("own_frame_buffered", [False, True])
+    @pytest.mark.asyncio
+    async def test_a_steer_is_ambiguous_only_when_its_own_frame_was_buffered(
+        self, own_frame_buffered
+    ):
+        """The session's outstanding prompt makes a TURN's death ambiguous, but
+        not a steer that was refused before its first byte: marking that steer
+        possibly delivered would make the next turn skip an instruction the
+        backend never received."""
+        from kiro_crew.acp.client import AcpProcessDied
+        from kiro_crew.acp.runtime import AcpRuntimeStdinStalled
+
+        handle = _make_handle()
+        handle.prompt_outstanding_on_stall = True
+        handle.steer = AsyncMock(
+            side_effect=(
+                AcpRuntimeStdinStalled("stdin stalled", ambiguous_delivery=True)
+                if own_frame_buffered
+                else AcpRuntimeDead("runtime is dead")
+            )
+        )
+        runtime = _make_runtime()
+        runtime.saw_not_logged_in = lambda: False
+        provider = AcpSessionProvider(handle, runtime)
+        with pytest.raises(AcpProcessDied) as ei:
+            await provider.steer("also add tests")
+        assert ei.value.ambiguous_delivery is own_frame_buffered
 
     @pytest.mark.asyncio
     async def test_approve_tool_explicit_option_id(self):

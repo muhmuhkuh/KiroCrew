@@ -518,9 +518,27 @@ function FileArtifactActionButton({ state }: { state: ReturnType<typeof useFileA
 /**
  * Row-2 icon: knowledge library toggle. Hidden by the caller
  * when the file's extension isn't supported (or the library is
- * unconfigured). When already added, renders as a static badge.
+ * unconfigured). When already added, renders as a green badge — removable
+ * (real button) when the source is a per-file local_file, inert otherwise.
  */
 function KnowledgeToggleIconButton({ state }: { state: ReturnType<typeof useFileKnowledgeState> }) {
+  // A per-file local_file source is one this panel created, so the toggle
+  // flips both ways: clicking the green badge removes it again. Folder and
+  // other wider sources keep the inert badge — they are owned by the
+  // Knowledge page's own delete flows, not this file panel.
+  if (state.alreadyAdded && state.sourceType === 'local_file' && state.sourceId) {
+    return (
+      <button
+        className="p-1.5 rounded-md border border-border/40 text-muted hover:text-text hover:border-border-strong cursor-pointer transition-all disabled:opacity-50 inline-flex items-center"
+        onClick={() => state.remove()}
+        disabled={state.removing}
+        title={i18nT('components.markdownPanel.remove_from_knowledge_library')}
+        aria-label={i18nT('components.markdownPanel.remove_from_knowledge_library')}
+      >
+        <BookOpen size={14} style={{ color: 'var(--ok)' }} />
+      </button>
+    )
+  }
   if (state.alreadyAdded) {
     return (
       <span
@@ -728,9 +746,15 @@ export function OverflowMenu({ filePath, content, onError, onRefresh, refreshDis
           )}
           {canAddToKnowledge && (
             knowledge.alreadyAdded ? (
-              <span className="flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-muted">
-                <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.in_library')} <Check size={14} className="lucide-inline" />
-              </span>
+              knowledge.sourceType === 'local_file' && knowledge.sourceId ? (
+                <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => { knowledge.remove(undefined, { onSuccess: delayedClose }) }} disabled={knowledge.removing}>
+                  <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.remove_from_knowledge_library')}
+                </button>
+              ) : (
+                <span className="flex items-center gap-2 w-full px-3 py-1.5 text-[13px] text-muted">
+                  <BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.in_library')} <Check size={14} className="lucide-inline" />
+                </span>
+              )
             ) : (
               <button role="menuitem" data-option tabIndex={-1} className={menuRowCls} onClick={() => knowledge.add(undefined, { onSuccess: delayedClose })} disabled={knowledge.adding}>
                 {knowledge.added ? <><BookOpen size={14} className="lucide-inline" style={{color: 'var(--ok)'}} /> {knowledge.addResult === 'exists' ? i18nT('components.markdownPanel.already_in_library') : i18nT('components.markdownPanel.added')}</> : knowledge.adding ? i18nT('components.markdownPanel.adding_2') : <><BookOpen size={14} className="lucide-inline" /> {i18nT('components.markdownPanel.add_to_knowledge')}</>}
@@ -813,12 +837,65 @@ function useFileKnowledgeState(filePath: string, onError: ReportError) {
       if (!r.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
       const cfg = await r.json()
       const sr = await fetch(`/api/knowledge/sources?uri=${encodeURIComponent(filePath)}`)
-      const sources = sr.ok ? await sr.json() : []
-      return { ...cfg, alreadyAdded: sources.length > 0 }
+      // A failed sources read must not resolve to `[]`: that would read as "not
+      // added" and hide the Remove affordance (and offer Add) for a file that
+      // may already be in the library. Reject like the config read above does,
+      // so the panel's query-error notice renders instead of a wrong state.
+      if (!sr.ok) throw new Error(i18nT('components.markdownPanel.knowledge_status_failed'))
+      const sources: { id?: string; source_type?: string }[] = await sr.json()
+      // sourceId + sourceType back the Remove affordance: only a per-file
+      // local_file source (one the panel itself can create) is removable here —
+      // folder/wider sources belong to the Knowledge page's own delete flows.
+      // A file can match more than one source (e.g. a folder source AND a
+      // local_file source), so look for the removable local_file among all
+      // matches rather than trusting whichever the backend returned first.
+      const localFile = sources.find((s) => s.source_type === 'local_file')
+      return {
+        ...cfg,
+        alreadyAdded: sources.length > 0,
+        sourceId: localFile?.id ?? null,
+        sourceType: localFile?.source_type ?? null,
+      }
     },
   })
   const formats: string[] | null = data?.enabled ? data.supported_formats : null
   const alreadyAdded = data?.alreadyAdded ?? false
+  const sourceId = data?.sourceId ?? null
+  const sourceType = data?.sourceType ?? null
+  // After a remove, the add mutation's `isSuccess` ("added") can still be true
+  // from an earlier add this session, which would paint the Add button that
+  // comes back green ("in library") for a file that was just removed. Hold the
+  // add mutation's reset in a ref so the remove's onSuccess (declared first)
+  // can clear that stale success.
+  const resetAddRef = useRef<() => void>(() => {})
+  const { mutate: remove, isPending: removing } = useMutation({
+    mutationFn: async () => {
+      // Encode the id as a single path segment: a source id originates from an
+      // imported bundle and is otherwise only validated as a non-empty string,
+      // so an id like `../../../sessions` would otherwise resolve to a
+      // different route and land an irreversible DELETE on it.
+      const res = await fetch(`/api/knowledge/sources/${encodeURIComponent(sourceId)}`, { method: 'DELETE' })
+      // 404 just means the source is already gone — removing an absent thing
+      // is success, so the panel falls back to the Add affordance instead of
+      // reporting a failure dressed as an error.
+      if (res.status === 404) return 'gone' as const
+      if (!res.ok) {
+        // The backend's failure bodies ("not found" / "internal server error")
+        // are raw English diagnostics; the panel reports the localized string
+        // instead so the error notice reads consistently in every locale.
+        await res.json().catch(() => null)
+        throw new Error(i18nT('components.markdownPanel.failed_to_remove_source'))
+      }
+      return 'removed' as const
+    },
+    onSuccess: () => {
+      // Clear any stale add-success so the returning Add button is not drawn
+      // green for a file we just removed.
+      resetAddRef.current()
+      queryClient.invalidateQueries({ queryKey: ['knowledge-config', filePath] })
+    },
+    onError: (err) => onError((err as Error).message),
+  })
   const { mutate: add, isPending: adding, isSuccess: added, data: addResult, reset } = useMutation({
     mutationFn: async () => {
       const name = filePath.split('/').pop() || filePath
@@ -839,7 +916,10 @@ function useFileKnowledgeState(filePath: string, onError: ReportError) {
     },
     onError: (err) => onError((err as Error).message),
   })
-  return { formats, alreadyAdded, add, adding, added, addResult, reset, queryError }
+  // Keep the ref pointed at the live add-reset so the remove's onSuccess
+  // (declared above the add mutation) can clear a stale add-success.
+  resetAddRef.current = reset
+  return { formats, alreadyAdded, sourceId, sourceType, add, adding, added, addResult, reset, remove, removing, queryError }
 }
 
 /**

@@ -125,6 +125,22 @@ class TestTheLatchWaitsForAnAnswerWorthKeeping:
         assert repository._REPO_INVALID_MSG is not None
         assert "/somewhere/not-a-checkout" in repository._REPO_INVALID_MSG
 
+    async def test_a_malformed_configured_path_latches_as_unreadable(
+        self, fresh_discovery, monkeypatch
+    ) -> None:
+        """An embedded NUL follows the configured-path refusal, never a 500."""
+        malformed = "/somewhere/kirocrew\x00bad"
+        monkeypatch.setattr(repository, "_configured_main_repo_checked", lambda: (malformed, True))
+        monkeypatch.setattr(repository, "_repo_source_hint", lambda: "set dev_fleet.repo_path")
+        monkeypatch.setattr(runtime, "_trusted_bin", lambda _name: "git")
+
+        await repository.ensure_main_repo_discovered()
+
+        assert repository.MAIN_REPO == malformed
+        assert repository._DISCOVERY_DONE is True
+        with pytest.raises(repository.RepoUnreadable, match="not a Kiro Crew checkout"):
+            repository._repo()
+
 
 class TestNoVerdictOutlivesTheAttemptThatProducedIt:
     async def test_an_attempt_finding_nothing_clears_a_stale_invalid_path_message(
@@ -458,6 +474,33 @@ class TestAConfigReadThatFailedIsNotAConfigChange:
 
         monkeypatch.setattr(loader_mod, "config_dir", _boom)
         assert repository._load_dev_fleet_cfg_checked() == ({}, False)
+
+    async def test_a_non_absent_stat_failure_is_a_partial_read(self, monkeypatch, tmp_path) -> None:
+        """A config whose ``is_file()`` probe raises a non-absent error stays a partial read.
+
+        The function is documented never to raise, and feeds a startup hook with no
+        enclosing ``except``; an access fault on the stat (EACCES after a mode change,
+        or an unreachable network-backed home) must fold into ``whole=False`` rather
+        than propagate.
+        """
+        from kiro_crew.config import loader as loader_mod
+
+        monkeypatch.setattr(loader_mod, "config_dir", lambda: tmp_path)
+        (tmp_path / "config.json").write_text(
+            '{"dev_fleet": {"repo_path": "/opt/kc"}}', encoding="utf-8"
+        )
+
+        real_is_file = type(tmp_path).is_file
+
+        def _stat_fault(self: object) -> bool:
+            if getattr(self, "name", "") == "config.json":
+                raise PermissionError("stat refused")
+            return real_is_file(self)
+
+        monkeypatch.setattr(type(tmp_path), "is_file", _stat_fault)
+        section, whole = repository._load_dev_fleet_cfg_checked()
+        assert section == {}
+        assert whole is False
 
 
 class TestAPartialReadAtDiscoveryLatchesNothing:

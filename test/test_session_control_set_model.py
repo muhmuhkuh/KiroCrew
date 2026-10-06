@@ -415,7 +415,8 @@ def test_the_turn_applies_the_pick_before_it_acquires_a_session():
     body = source[source.index("async def _run_chat(") :]
     apply_at = body.index("apply_pending_model_pick(state, slot)")
     assert apply_at < body.index("await _consume_pending_reset(state, slot)")
-    assert apply_at < body.index("_requested_model = slot.model")
+    assert apply_at < body.index("selection = chat_session_selection(")
+    assert apply_at < body.index('_requested_model = str(selection.pop("model", "") or "")')
 
 
 def test_a_busy_target_is_refused_and_gets_no_pick(tmp_path):

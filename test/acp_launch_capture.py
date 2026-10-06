@@ -87,6 +87,8 @@ VOLATILE_ENV = {
     "PATH": "<augmented-path>",
     "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
     "KIROCREW_PI_GATE_SESSION": "<nonce>",
+    "KIROCREW_PI_STATE": "<state-file>",
+    "KIROCREW_PI_EFFORT": "<effort-file>",
     "KIROCREW_DSH_GATE_SESSION": "<nonce>",
     # Minted from ``secrets`` on every client, so it can never match a golden twice.
     # That a one-session client's child RECEIVES it is the fact being pinned: it is
@@ -97,6 +99,13 @@ VOLATILE_ENV = {
     # /proc to tell the root's own descendants from a fresh runtime's. That the
     # runtime's child RECEIVES it is the fact being pinned.
     KIROCREW_SPAWN_INSTANCE_ENV: "<spawn-instance>",
+    # The spawning gateway's data home, so a reclaim can refuse a sibling install's
+    # runtime. That the child RECEIVES it is the fact pinned; the path is the host's.
+    "KIROCREW_SPAWN_HOME": "<data-home>",
+    # The runtime's per-process scratch directory, under the capture's temp dir.
+    # That the codex child RECEIVES it -- its SQLite home is its own -- is the fact
+    # being pinned; the directory is not.
+    "CODEX_SQLITE_HOME": "<scratch>",
 }
 
 #: The parent environment every capture runs against, whatever the recording host's
@@ -221,8 +230,9 @@ async def _windows_cleanup_passthrough(factory: Any) -> Any:
 def _allocate_capture_scratch(tmp_path: Path, label: str) -> Path:
     """A scratch window for *label*, as a REAL directory under *tmp_path*.
 
-    Stands in for ``agent_scratch.allocate_scratch`` on the one arm that needs a
-    window (DeepSeek, see :func:`_stub_common`). It has to be a directory that
+    Stands in for ``agent_scratch.allocate_scratch`` on the arms that need a
+    window (DeepSeek, see :func:`_stub_common`; the runtime-served codex arm, whose
+    SQLite home is the window). It has to be a directory that
     exists, and it has to be under the test's own temp dir, because the spawn path
     does not stop at reading the path back: ``record_owner`` installs the child's
     pid as ``.owner`` inside the session window from an executor thread, and the
@@ -403,6 +413,26 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
                 client_mod, "_resolve_pi_acp_bin", return_value=(_PI_ACP_ARGV, _SEARCH_PATH)
             ),
             patch.object(client_mod, "_resolve_pi_bin", return_value=(_PI_BIN, _SEARCH_PATH)),
+            # Native Pi preparation writes prompt/MCP files and resolves a host
+            # package; pin its contribution just like scratch_env above.
+            patch.object(
+                client_mod,
+                "prepare_pi_environment",
+                side_effect=_stub_for(
+                    client_mod.prepare_pi_environment,
+                    lambda call: call["env"].update(
+                        {
+                            "PI_ACP_PI_COMMAND": _PI_LAUNCHER,
+                            "KIROCREW_PI_MCP_CONFIG": "/opt/run/pi-mcp.json",
+                            "KIROCREW_PI_MCP_ADAPTER": "/opt/lib/pi-mcp-adapter/index.ts",
+                            "KIROCREW_PI_PROMPT": "/opt/run/pi-prompt.md",
+                            "KIROCREW_PI_STATE": "/opt/run/pi-state.json",
+                            "KIROCREW_PI_EFFORT": "/opt/run/pi-effort.json",
+                            "MCP_UI_VIEWER": "none",
+                        }
+                    ),
+                ),
+            ),
             patch.object(client_mod, "_resolve_claude_code_executable", return_value=""),
             patch.object(AcpClient, "_write_claude_local_settings", return_value=None),
             patch.object(client_mod, "_seal_pi_gate_extension", return_value=_PI_EXTENSION),
@@ -575,9 +605,27 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
             patch.object(runtime_mod, "browser_socket_env", return_value={}),
             patch.object(runtime_mod, "inject_xdist_auto_cap", return_value=None),
             patch.object(runtime_mod, "resolve_krb5_ccname", return_value=None),
-            # No scratch dir: it is a per-process temp root the sandbox masks, not a
-            # launch answer, and allocating one would write outside tmp_path.
-            patch.object(runtime_mod.agent_scratch, "allocate_scratch", return_value=None),
+            # A real scratch dir under ``tmp_path`` (see
+            # :func:`_allocate_capture_scratch`): the codex child's SQLite home is
+            # this window, and that it receives one is a launch answer. Its env
+            # contribution is pinned to the same placeholders as the client arm's,
+            # for the same reasons.
+            patch.object(
+                runtime_mod.agent_scratch,
+                "allocate_scratch",
+                side_effect=lambda label: _allocate_capture_scratch(tmp_path, label),
+            ),
+            patch.object(
+                runtime_mod.agent_scratch,
+                "scratch_env",
+                side_effect=lambda path, shared=None: {
+                    "TMPDIR": "<scratch>",
+                    "TMP": "<scratch>",
+                    "TEMP": "<scratch>",
+                    "KIROCREW_SCRATCH": "<scratch>",
+                    "KIRO_CHAT_LOG_FILE": "<scratch-log>",
+                },
+            ),
             patch.object(
                 client_mod, "_resolve_codex_acp_bin", return_value=(_CODEX_ACP_ARGV, _SEARCH_PATH)
             ),

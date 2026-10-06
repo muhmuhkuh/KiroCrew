@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 ESSENTIAL_MAX_CHARS = 64_000
 _MAX_SOURCE_BYTES = ESSENTIAL_MAX_CHARS * 4
+#: Source label of the in-band notice that names guides left out of the envelope.
+ESSENTIAL_OMISSION_SOURCE = "essential-context#omitted"
 _MAX_DIRECTORY_ENTRIES = 2048
 _MAX_DOCUMENTS = 64
 
@@ -187,6 +189,39 @@ def _read(path: Path, root: Path) -> str:
         return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, ValueError) as exc:
         raise MemberEssentialContextError(f"Essential source {path}: {exc}") from exc
+
+
+def _read_implicit_guide(path: Path, root: Path) -> str | None:
+    """Read a project-root guide the template did not declare, or ``None`` if refused.
+
+    ``AGENTS.md`` and ``SOUL.md`` are picked up because they exist, not because
+    the template names them, so a refused one must not refuse the whole turn:
+    a guide symlinked to a repository outside the project, or a link whose
+    target has gone, would otherwise abort every session start of the agent. The read is
+    the same :func:`_read` every declared source goes through -- containment,
+    managed-state isolation, the no-follow descriptor read -- so nothing it
+    refuses is read here either; only the refusal's consequence differs. A
+    declared source keeps failing closed, and an oversized guide still raises,
+    because that is a guide the user can shorten rather than one this reader
+    may not open.
+    """
+    try:
+        return _read(path, root)
+    except MemberEssentialContextError as exc:
+        reason = str(exc.__cause__ or exc)
+        logger.warning("Project guide %s not loaded: %s", path, reason)
+        return None
+
+
+def _omitted_guide(path: Path, root: Path) -> tuple[str, str]:
+    """The in-band note that stands in for a guide :func:`_read_implicit_guide` refused."""
+    return (
+        f"{path}#omitted",
+        f"PROJECT GUIDE NOT LOADED. {path.name} in {root} could not be read safely: it is "
+        "a link to a file outside this project, a link whose target is missing, a managed "
+        "memory file, a hard link, or otherwise unreadable. Do not assume its contents. "
+        f"If it should apply, ask the user to make {path.name} a regular file inside {root}.",
+    )
 
 
 def _matches(root: Path, pattern: str) -> list[Path]:
@@ -364,6 +399,7 @@ def documents_for_member(
     context_settings: bool = False,
     trigger_text: str = "",
     inherits_default_resources: bool = True,
+    core_sources_out: set[str] | None = None,
 ) -> list[tuple[str, str]]:
     """Read actual project instructions and the owner's declared template sources.
 
@@ -375,6 +411,14 @@ def documents_for_member(
     harness hands the member kiro-cli's default resources (global and workspace
     steering, ``AGENTS.md``). It defaults to inheriting because only a session
     kiro-cli serves can opt out, and only that caller knows which harness it has.
+
+    *core_sources_out*, when given, receives the source label of every returned
+    document that belongs to the member's CORE -- the persona prompt, ``SOUL.md``,
+    the template context settings and any guide-not-loaded note -- so a caller
+    fitting an over-budget envelope knows which documents it must never leave
+    out. Every other returned document (global and project steering, the
+    conditional-guide index, ``AGENTS.md`` and the declared ``file://``
+    resources) is a guide the caller may drop whole.
     """
     from kiro_crew.agent import is_managed_prompt
     from kiro_crew.agent_discovery import _read_agent_spec
@@ -383,10 +427,15 @@ def documents_for_member(
     seen: set[Path] = set()
     project_root = _admitted_project_root(project)
 
-    def add(path: Path, root: Path, *, steering: bool = False) -> None:
+    def _mark_core(source: str) -> None:
+        if core_sources_out is not None:
+            core_sources_out.add(source)
+
+    def add(path: Path, root: Path, *, steering: bool = False, body: str | None = None) -> None:
         if Path(os.path.abspath(path)) in seen:
             return
-        body = _read(path, root)
+        if body is None:
+            body = _read(path, root)
         if steering:
             fields, _ = split_frontmatter(body, STEERING_LOADER)
             inclusion = fields.get("inclusion", "always").strip().casefold()
@@ -468,7 +517,14 @@ def documents_for_member(
         for name in ("AGENTS.md", "SOUL.md") if inherits else ("SOUL.md",):
             path = project_root / name
             if path.exists() or path.is_symlink():
-                add(path, project_root)
+                body = _read_implicit_guide(path, project_root)
+                if body is None:
+                    documents.append(_omitted_guide(path, project_root))
+                    _mark_core(documents[-1][0])
+                else:
+                    add(path, project_root, body=body)
+                    if name == "SOUL.md":
+                        _mark_core(str(path))
         if inherits:
             for path in _matches(project_root, ".kiro/steering/**/*.md"):
                 add(path, project_root, steering=True)
@@ -499,12 +555,15 @@ def documents_for_member(
             path = Path(prompt[7:]).expanduser()
             if path.is_absolute():
                 add(path, absolute_root)
+                _mark_core(str(path))
             else:
                 resolved = resolve_relative_prompt_path(path, spec_path, project)
                 if resolved is not None:
                     add(*resolved)
+                    _mark_core(str(resolved[0]))
         else:
             documents.append((f"{spec_path}#prompt", prompt))
+            _mark_core(documents[-1][0])
     if context_settings and not native_only:
         import json
 
@@ -529,6 +588,7 @@ def documents_for_member(
                 ),
             )
         )
+        _mark_core(documents[-1][0])
     resources = spec.get("resources", [])
     if include_project and (
         not isinstance(resources, list) or any(not isinstance(r, (str, dict)) for r in resources)

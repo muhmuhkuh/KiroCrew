@@ -222,6 +222,8 @@ class TestHistoryPersistence:
             "last_consolidated": 0,
             "memory_mode": "incognito",
             "model": "",
+            "acp_backend": None,
+            "model_backend": None,
             "autocompact_pct": None,
             "tab_id": slot._tab_id,
         }

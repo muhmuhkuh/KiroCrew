@@ -113,7 +113,7 @@ class RecordingSlackClient(SlackClientOps):
         return None
 
     async def fetch_thread_replies(
-        self, channel, thread_ts, limit=200, warn_on_pagination=True
+        self, channel, thread_ts, limit=200, warn_on_pagination=True, **_bounds
     ) -> list[dict]:
         self._rec("fetch_thread_replies", channel=channel, thread_ts=thread_ts)
         return []
@@ -163,7 +163,7 @@ class FakeSessions:
     def get_session_for_thread(self, thread_ts: str):
         return None
 
-    async def get_or_create(self, session_key, agent=None, channel_id=None):
+    async def get_or_create(self, session_key, agent=None, channel_id=None, start_priority=None):
         return self._provider, False, False  # (client, is_new, resumed)
 
     async def set_channel(self, session_key, channel):

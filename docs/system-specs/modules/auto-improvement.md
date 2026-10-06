@@ -808,6 +808,8 @@ audit-or-DENY half of this path is the launch event plus the pre-spawn governanc
 the shell denylist; this is the audit-or-RECORD half. The target hint is agent-influenced
 text landing in a log that is signed as-written, so it is redacted and truncated, and a
 redactor failure emits ``[redaction unavailable]`` rather than raw text.
+GitHub and GitLab ready-for-review failures likewise redact the provider's
+last output line before truncating it for the response.
 
 Review asked for the fallback to be DELETED instead. That is still declined — it is the only
 path that authors fixes when no in-process provider is configured — but the audit gap it named
@@ -1166,7 +1168,14 @@ One transport difference: the upstream served its MCP tools over HTTP on its own
 allocated port. A builtin has no port, and the app bridge deliberately SKIPS a
 URL-based MCP entry when there is no live backend (a dead default-port URL would
 poison every session's provider config), so the tools ship as a **stdio** server
-instead — `backend/mcp_server.py`, six read-only tools, all auto-approvable.
+instead — `backend/mcp_server.py`, six read-only tools, all auto-approvable. Its
+loop reads stdin as bytes through `json_line.parse_json_object_line`, so a line
+that is not UTF-8, not a JSON object, or nested past the decoder's ceiling is
+skipped (a request, one with a top-level `method`, is answered `-32700` under
+its top-level id when one is recoverable at either end of the line, so its
+caller does not wait out its own timeout), and a
+request whose handling raises is answered `-32603`: neither ends the server
+mid-session.
 
 ## Tests
 

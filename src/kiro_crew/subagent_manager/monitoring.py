@@ -11,11 +11,28 @@ from ..session_map import session_files_resumable
 from ..subagent_persistence import (
     _agent_dir,
     _check_result_available,
+    result_is_whole,
     subagent_id_from_conversation_key,
 )
 from ._component import ManagerComponent
 
 _glue_logger = _logging.getLogger(__name__)
+
+#: Longest a start may spend queued for start permits, in total, before it is reaped
+#: as never started. The startup clock pauses while a start is queued, so without a
+#: bound a start parked behind holders that no watchdog bounds would wait forever.
+#: Not ``agent.subagent_queue_max_wait_secs``: that key bounds a spawn deferred for
+#: memory before it starts, and this caps a started run's wait for permits, which is
+#: a capacity wait and is deliberately not counted as a memory wait.
+_START_QUEUE_MAX_SECS = 1800.0
+
+#: Longest a start may stay silent after its runtime is up (``_pid`` is recorded
+#: only once the session exists) with no frame on its own session and no turn,
+#: before it is reaped as never answering its first prompt. Without it, a runtime
+#: that finished its handshake but wedged on the first prompt ran to the full
+#: ``subagent_timeout_secs``: the startup watchdog stops looking once a PID exists.
+_FIRST_PROMPT_SILENT_SECS = 300.0
+
 
 if TYPE_CHECKING:
     from kiro_crew import taskq as _taskq
@@ -27,6 +44,7 @@ if TYPE_CHECKING:
         _SUPPRESS_CEILING,
         OUTCOME_FAILED,
         OUTCOME_INTERRUPTED,
+        OUTCOME_OK,
         SUBAGENT_COMPLETION_PREFIX,
         VERDICT_DEAD,
         VERDICT_STUCK_INPUT,
@@ -42,6 +60,7 @@ if TYPE_CHECKING:
         agent_dir_for_display,
         append_cost_sample,
         asyncio,
+        cap_buckets,
         compact_cost_log,
         consult_offloaded,
         has_dashboard_surface,
@@ -49,6 +68,7 @@ if TYPE_CHECKING:
         logger,
         maintenance_executor,
         prune_stale_tombstones,
+        read_learned_costs_checked,
         sel,
         single_completion_meta,
         subprocess_executor,
@@ -118,17 +138,12 @@ def tombstone_recovery_action(agent_id: str, state: dict) -> str:
 
     ONE rule for every writer, so the two call sites cannot disagree.
 
-    A non-empty ``result.txt`` only means the provider emitted a token:
-    ``write_result_chunk`` appends per streamed chunk. The run records
-    ``result_complete`` when its stream reaches the complete event, so
-    without that flag these bytes are an opening sentence, not an answer.
+    Whole or not is :func:`~kiro_crew.subagent_persistence.result_is_whole`;
+    bytes it does not vouch for are an opening sentence, not an answer.
     """
-    has_result = _check_result_available(_agent_dir(agent_id) / "result.txt")
-    if not has_result:
+    if not _check_result_available(_agent_dir(agent_id) / "result.txt"):
         return "notification_pending"
-    if not state.get("result_complete"):
-        return "partial_result"
-    return "result_available"
+    return "result_available" if result_is_whole(state) else "partial_result"
 
 
 class OrphanStallMonitor(ManagerComponent):
@@ -410,9 +425,9 @@ class OrphanStallMonitor(ManagerComponent):
         - PID dead + result → tombstone (gateway_restart, delivered)
         - PID dead + no result → tombstone (gateway_restart, notification_pending)
 
-        A surviving ``result.txt`` is classified further: only a run that
-        recorded ``result_complete`` has a whole answer on disk, and anything
-        else is a fragment the restart cut off mid-turn.
+        A surviving ``result.txt`` is classified further by
+        :func:`tombstone_recovery_action`: a whole answer, or a fragment the
+        restart cut off mid-turn.
         """
         try:
 
@@ -483,30 +498,32 @@ class OrphanStallMonitor(ManagerComponent):
                                     else None
                                 )
                             try:
+                                # Never ``killed`` for a process the kill
+                                # left standing: the folder is reconciled
+                                # below either way, so this row is the only
+                                # place the process's fate is recorded. A
+                                # refusal and a failed signal are separate
+                                # outcomes because only one of them means
+                                # something tried and could not.
+                                #
+                                # TWO ways to be refused, and both must read as
+                                # one: the gate declining, and the teardown
+                                # barrier declining because a tenant arrived
+                                # after it allowed. The second leaves
+                                # ``kill_failed`` None -- no signal was even
+                                # attempted -- which is indistinguishable from a
+                                # clean kill by that field alone.
+                                if not authorized or not barriered:
+                                    outcome = "refused"
+                                elif kill_failed is None:
+                                    outcome = "killed"
+                                else:
+                                    outcome = "failed"
                                 sel().log_tool_invocation(
                                     session_key=f"subagent:{agent_id}",
                                     source="subagent",
                                     tool_name="orphan_reconcile_kill",
-                                    # Never ``killed`` for a process the kill
-                                    # left standing: the folder is reconciled
-                                    # below either way, so this row is the only
-                                    # place the process's fate is recorded. A
-                                    # refusal and a failed signal are separate
-                                    # outcomes because only one of them means
-                                    # something tried and could not.
-                                    #
-                                    # TWO ways to be refused, and both must read as
-                                    # one: the gate declining, and the teardown
-                                    # barrier declining because a tenant arrived
-                                    # after it allowed. The second leaves
-                                    # ``kill_failed`` None -- no signal was even
-                                    # attempted -- which is indistinguishable from a
-                                    # clean kill by that field alone.
-                                    outcome=(
-                                        "refused"
-                                        if not authorized or not barriered
-                                        else ("killed" if kill_failed is None else "failed")
-                                    ),
+                                    outcome=outcome,
                                     error=kill_failed or "",
                                     metadata={"subagent_id": agent_id, "pid": pid},
                                 )
@@ -525,6 +542,9 @@ class OrphanStallMonitor(ManagerComponent):
                             pid=pid,
                             turns=state.get("turns", 0),
                             last_tool=state.get("last_tool", ""),
+                            # A run that finished is completed, whichever reader
+                            # asks: the panel, this notice and the task queue.
+                            **({"outcome": "completed"} if result_is_whole(state) else {}),
                         )
                     except Exception:
                         logger.debug("Failed to tombstone orphan %s", agent_id, exc_info=True)
@@ -547,7 +567,7 @@ class OrphanStallMonitor(ManagerComponent):
                     # failures queue); DM fallback is deferred to the digest.
                     try:
                         undelivered = await self._manager._notify_orphan(
-                            agent_id, state, recovery, has_result
+                            agent_id, state, has_result
                         )
                         if undelivered:
                             dm_pending.append(undelivered)
@@ -577,65 +597,47 @@ class OrphanStallMonitor(ManagerComponent):
         except Exception:
             logger.warning("Orphan reconciliation failed", exc_info=True)
 
-    async def _notify_orphan_impl(
-        self, agent_id: str, state: dict, recovery: str, has_result: bool
-    ) -> str | None:
+    async def _notify_orphan_impl(self, agent_id: str, state: dict, has_result: bool) -> str | None:
         """Notify user about an orphaned subagent.
 
         1. Try session injection if parent session still exists (delivered
            messages return ``None``).
         2. Otherwise return the redacted message so the caller can batch all
            undelivered notifications into a SINGLE digest DM — never N pings.
+
+        Which notice is decided by the run's own record (``result_is_whole``)
+        and whether ``result.txt`` holds text (*has_result*): the same facts
+        ``tombstone_recovery_action`` and the task queue's boot probe read, so
+        the three cannot disagree.
         """
         task_preview = (state.get("task", "") or "")[:100]
         parent_session = state.get("parent_session", "")
         result_path = str(agent_dir_for_display(agent_id) / "result.txt")
 
-        if has_result and recovery == "partial_result":
-            msg = (
-                f"{SUBAGENT_COMPLETION_PREFIX}\n"
-                f"Agent `{agent_id}` ⚠️ cut off mid-turn by gateway restart\n"
-                f"Task: {task_preview}\n"
-                f"Partial output saved at: `{result_path}`\n"
-                f"It stops wherever the restart landed — read it as an unfinished "
-                f"fragment, not as the agent's answer."
-            )
-            # Same interrupted outcome as a whole result, but the note has to
-            # carry the difference: the wording above is all that stops a parent
-            # from acting on an opening sentence as though it were a finding.
-            row_meta = single_completion_meta(
-                agent_id=agent_id,
-                outcome=OUTCOME_INTERRUPTED,
-                task=task_preview,
-                note="cut off mid-turn by gateway restart",
-                requested_model=str(state.get("requested_model") or ""),
-                resolved_model=str(state.get("resolved_model") or ""),
+        if result_is_whole(state):
+            # A run that finished before the restart, caught before delivery:
+            # completed (ok, and the ✅ the prose carries is derived from that),
+            # as its tombstone and task row record it. The note says why it
+            # arrives late.
+            glyph, note, outcome = "✅", "finished before gateway restart", OUTCOME_OK
+            lines = (
+                [f"Result saved at: `{result_path}`", "Use the read tool to retrieve it."]
+                if has_result
+                else ["It finished before the restart without writing any text."]
             )
         elif has_result:
-            msg = (
-                f"{SUBAGENT_COMPLETION_PREFIX}\n"
-                f"Agent `{agent_id}` ⚠️ orphaned by gateway restart\n"
-                f"Task: {task_preview}\n"
-                f"Result saved at: `{result_path}`\n"
-                f"Use the read tool to retrieve it."
-            )
-            # A restart orphan whose result survived on disk: interrupted, not a
-            # plain failure. The note is the only explanation the header carries.
-            row_meta = single_completion_meta(
-                agent_id=agent_id,
-                outcome=OUTCOME_INTERRUPTED,
-                task=task_preview,
-                note="orphaned by gateway restart",
-                requested_model=str(state.get("requested_model") or ""),
-                resolved_model=str(state.get("resolved_model") or ""),
-            )
+            # Interrupted, and the note has to carry it: the wording is all that
+            # stops a parent from acting on an opening sentence as though it
+            # were a finding.
+            glyph, note, outcome = "⚠️", "cut off mid-turn by gateway restart", OUTCOME_INTERRUPTED
+            lines = [
+                f"Partial output saved at: `{result_path}`",
+                "It stops wherever the restart landed — read it as an unfinished "
+                "fragment, not as the agent's answer.",
+            ]
         else:
-            msg = (
-                f"{SUBAGENT_COMPLETION_PREFIX}\n"
-                f"Agent `{agent_id}` ❌ lost to gateway restart\n"
-                f"Task: {task_preview}\n"
-                f"No result was captured before the restart."
-            )
+            glyph, note, outcome = "❌", "lost to gateway restart", OUTCOME_FAILED
+            lines = ["No result was captured before the restart."]
             # No result is not no work: when the run's conversation is still on
             # disk the parent is told how far it got and how to resume it. The
             # probe stats session files under KIRO_HOME, which can be network-
@@ -644,15 +646,23 @@ class OrphanStallMonitor(ManagerComponent):
                 maintenance_executor(), orphan_resume_hint, agent_id, state
             )
             if resume:
-                msg += f"\n{resume}"
-            row_meta = single_completion_meta(
-                agent_id=agent_id,
-                outcome=OUTCOME_FAILED,
-                task=task_preview,
-                note="lost to gateway restart",
-                requested_model=str(state.get("requested_model") or ""),
-                resolved_model=str(state.get("resolved_model") or ""),
-            )
+                lines.append(resume)
+        msg = "\n".join(
+            [
+                SUBAGENT_COMPLETION_PREFIX,
+                f"Agent `{agent_id}` {glyph} {note}",
+                f"Task: {task_preview}",
+                *lines,
+            ]
+        )
+        row_meta = single_completion_meta(
+            agent_id=agent_id,
+            outcome=outcome,
+            task=task_preview,
+            note=note,
+            requested_model=str(state.get("requested_model") or ""),
+            resolved_model=str(state.get("resolved_model") or ""),
+        )
 
         # Redact before any delivery path (injection or Slack DM)
         msg = _redact(msg)
@@ -776,6 +786,10 @@ class OrphanStallMonitor(ManagerComponent):
         """
         now = time.monotonic()
         agents = list(self._manager._agents.values())
+        # Sessions that shared children run on, by their parent's session key: a
+        # dedicated run that is one of these carries its children's sessions --
+        # and their per-session MCP servers -- in its own process tree.
+        hosting = {a.parent_session_key for a in agents if not a.done and a._session_sharing}
         for info in agents:
             if info.done or not info._pid:
                 continue
@@ -793,7 +807,34 @@ class OrphanStallMonitor(ManagerComponent):
                 self._manager._live_shared_count(info._pid, agents) if info._session_sharing else 1
             )
             generation = info._rss_generation
-            sample = _proc_subtree_sample(info._pid)
+            # Settled-runtime reading (dynamic-subagent-sizing.md §4.1): the first
+            # quiet sample of a DEDICATED process once its own session has
+            # answered (``_first_stream_started``), with no tool in flight before
+            # the read, none after it, and no activity during it (``_stall_gen``
+            # unchanged; snapshot BEFORE the off-loop read, so a tool that started
+            # or came and went during it voids the reading). That subtree is the
+            # runtime itself -- kiro-cli and the MCP servers up at that moment --
+            # not the builds or tests a tool launches, which is what
+            # ``peak_rss_gb`` follows. Never a shared run (its pid's tree holds the
+            # other tenants and the parent's own tools) nor a dedicated run whose
+            # own children share its runtime (its tree holds theirs). Read in PSS
+            # from the same walk, the unit the unlearned price is measured in:
+            # summed RSS counts pages a tree of processes shares once per process.
+            # Keyed on the LOCAL generation the recheck below proves current, so a
+            # respawn re-captures for its fresh process and a reading of the dead
+            # one is never stamped as the new one's. ``_inflight_tool`` holds one
+            # tool, so a second overlapping tool still running can pass; that
+            # over-counts, which errs toward reserving more.
+            tool_before = info._inflight_tool
+            stall_before = info._stall_gen
+            want_settled = (
+                not info._session_sharing
+                and info._settled_rss_generation != generation
+                and info._first_stream_started is not None
+                and tool_before is None
+                and (info.conversation_key or f"subagent:{info.id}") not in hosting
+            )
+            sample = _proc_subtree_sample(info._pid, **({"pss": True} if want_settled else {}))
             if info._rss_generation != generation:
                 # The run was respawned while this off-loop read was in flight:
                 # the reading describes the dead process and must not settle
@@ -805,6 +846,9 @@ class OrphanStallMonitor(ManagerComponent):
                 info._rss_samples += 1
                 if gb > info.peak_rss_gb:
                     info.peak_rss_gb = gb
+                if want_settled and info._inflight_tool is None and info._stall_gen == stall_before:
+                    info.settled_rss_gb = sample.pss_kb / (1024 * 1024) if sample.pss_kb > 0 else gb
+                    info._settled_rss_generation = generation
             info.last_procs = _attributed_count(sample.procs, shared_n, info.last_procs)
             info.last_stubs = _attributed_count(sample.matched, shared_n, info.last_stubs)
             jiffies = sample.jiffies
@@ -828,9 +872,37 @@ class OrphanStallMonitor(ManagerComponent):
                 info.peak_rss_gb,
                 info.peak_cpu_cores,
                 shared=bool(info._session_sharing),
+                settled_gb=info.settled_rss_gb,
             )
+            if info.settled_rss_gb > 0:
+                self._manager._learned_settled_dirty = True
         except Exception:
             logger.debug("Failed to record subagent cost for %s", info.id, exc_info=True)
+
+    def _refresh_learned_settled_impl(self) -> None:
+        """Re-read the learned settled RSS per bucket into the manager's map.
+
+        BLOCKING (it streams the cost log), so it runs on
+        :func:`maintenance_executor` -- at reaper start and after every cost
+        sweep -- and the admission gate only ever reads the map it leaves. The
+        map is replaced whole, never mutated, so a reader on the loop sees one
+        consistent version. An incomplete read (a refused or unreadable record)
+        keeps every figure it did not see, folded under the bucket bound. Runs
+        only after a run recorded a settled reading (or once at start): nothing
+        else changes what the per-bucket window holds.
+        """
+        if not self._manager._learned_settled_dirty:
+            return
+        self._manager._learned_settled_dirty = False
+        try:
+            costs, complete = read_learned_costs_checked("settled_gb", dedicated_only=True)
+        except Exception:
+            logger.debug("learned settled RSS unreadable; keeping the previous map", exc_info=True)
+            return
+        held = self._manager._learned_settled_gb
+        self._manager._learned_settled_gb = (
+            dict(costs) if complete else cap_buckets({**held, **costs})
+        )
 
     async def _reaper_loop_impl(self) -> None:
         """Periodically force-kill subagents that exceed the timeout.
@@ -843,6 +915,14 @@ class OrphanStallMonitor(ManagerComponent):
             compact_cost_log()  # startup FIFO trim (§4.2)
         except Exception:
             logger.debug("Reaper: startup cost-log compaction failed", exc_info=True)
+        # Seed the dedicated start projection before the first sweep, off-loop,
+        # so the first interval after boot does not price at the start cost only.
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                maintenance_executor(), self._manager._refresh_learned_settled
+            )
+        except Exception:
+            logger.debug("Reaper: learned settled RSS seed failed", exc_info=True)
         while True:
             await asyncio.sleep(_REAPER_INTERVAL)
             now = time.time()
@@ -869,6 +949,12 @@ class OrphanStallMonitor(ManagerComponent):
                 )
             except Exception:
                 logger.debug("Reaper: live-cost sample failed", exc_info=True)
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    maintenance_executor(), self._manager._refresh_learned_settled
+                )
+            except Exception:
+                logger.debug("Reaper: learned settled RSS refresh failed", exc_info=True)
             # Wave liveness backstop: reconcile waves wedged by submissions
             # lost before the process boundary (see _sweep_stuck_waves).
             try:
@@ -900,12 +986,23 @@ class OrphanStallMonitor(ManagerComponent):
                 self._manager._admission.taskq_reopen_if_due()
             except Exception:
                 logger.debug("Reaper: task-store re-open failed", exc_info=True)
+            # An owed-report replay the store refused is retried here; a no-op
+            # once one replay has read every owed row.
+            try:
+                self._manager._admission.taskq_schedule_owed_replay()
+            except Exception:
+                logger.debug("Reaper: owed-report replay failed", exc_info=True)
+            # A parent-end teardown whose store read was refused is swept again.
+            try:
+                await self._manager.retry_owed_teardown_sweeps()
+            except Exception:
+                logger.debug("Reaper: teardown store-sweep retry failed", exc_info=True)
             try:
                 compact_cost_log()  # periodic FIFO trim (also bounds a long-running gateway)
             except Exception:
                 logger.debug("Reaper: cost-log compaction failed", exc_info=True)
             for agent_id, info in list(self._manager._agents.items()):
-                if info.done:
+                if info.done or info._ending_claimed:
                     continue
                 elapsed = now - info.started
                 # Startup watchdog: a subagent that entered execution but is
@@ -914,10 +1011,28 @@ class OrphanStallMonitor(ManagerComponent):
                 # never launches the child process). Reap it fast with a clear
                 # "failed to start" error instead of burning the full deadline
                 # and surfacing a misleading 30-minute turn-0 timeout.
+                queued_for = self._start_queue_saturated_secs(info, now)
+                if queued_for:
+                    logger.warning(
+                        "Reaper: subagent %s never started: start queues saturated for %.0fs, "
+                        "force-killing",
+                        agent_id,
+                        queued_for,
+                    )
+                    try:
+                        await self._manager._force_reap(
+                            agent_id,
+                            info,
+                            now - (info._exec_started or now),
+                            reason="start_queue_saturated",
+                        )
+                    except Exception:
+                        logger.exception("Reaper: failed to reap %s", agent_id)
+                    continue
                 if self._manager._is_startup_stalled(info, now):
                     # The in-startup population is diagnostic only: the
                     # deadline is the fixed ``_startup_deadline`` whatever the
-                    # crowd, measured from gate exit (``_gate_exit_reset``).
+                    # crowd, on a clock paused while queued (``_gate_exit_reset``).
                     logger.warning(
                         "Reaper: subagent %s failed to start within %ds "
                         "(turn 0, no runtime launched; %d other agent(s) in startup; "
@@ -926,6 +1041,26 @@ class OrphanStallMonitor(ManagerComponent):
                         self._stamped_startup_deadline(info),
                         self._manager._startup_population(exclude=info),
                         info._startup_cotenant_frames,
+                    )
+                    try:
+                        await self._manager._force_reap(
+                            agent_id,
+                            info,
+                            now - (info._exec_started or now),
+                            reason="startup_timeout",
+                        )
+                    except Exception:
+                        logger.exception("Reaper: failed to reap %s", agent_id)
+                    continue
+                if self._is_first_prompt_silent(info, now):
+                    # Imported here: this ``_impl`` resolves globals in ``subagent``.
+                    from kiro_crew.subagent_manager.monitoring import _FIRST_PROMPT_SILENT_SECS
+
+                    logger.warning(
+                        "Reaper: subagent %s launched its runtime but nothing "
+                        "answered its first prompt for %ds (turn 0), force-killing",
+                        agent_id,
+                        int(_FIRST_PROMPT_SILENT_SECS),
                     )
                     try:
                         await self._manager._force_reap(
@@ -986,15 +1121,20 @@ class OrphanStallMonitor(ManagerComponent):
         is never caught here.
 
         The deadline is the fixed ``_startup_deadline`` however many other
-        agents are in startup, and the clock it is measured on does not run
-        while the run is queued for a ``SessionStartGate`` permit: the clock
-        freezes at gate entry (``_gate_wait_mark`` stamps
-        ``_gate_wait_started``, which stands in for *now* here) and restarts at
-        acquisition (``_gate_exit_reset``). So the clock measures time spent
-        STARTING -- before the gate, and from gate exit until the start's exit
-        (a runtime PID, or its first answer) -- never time queued
-        behind other starts, on both start paths, and the in-startup population
-        is bounded separately by ``_startup_cap`` at admission. The deadline does not grow with the
+        agents are in startup, and the clock it is measured on PAUSES while the
+        run is queued for a start-queue permit: at queue entry
+        ``_gate_wait_mark`` stamps ``_gate_wait_started``, which stands in for
+        *now* here, and at acquisition ``_gate_exit_reset`` adds the wait to
+        ``_start_queue_wait_ms``, which is subtracted. The dedicated path pauses
+        at all three start queues (cold-start semaphore, spawn admission,
+        ``session/new`` gate), the shared path at the ``session/new`` gate and,
+        while it waits for the parent's companion runtime
+        (``START_QUEUE_COMPANION``), at that runtime's per-parent lock and its
+        spawn's admission; the companion spawn's own work runs on the clock. So
+        the clock measures time spent STARTING since ``_exec_started`` -- never
+        time queued behind other starts -- and the in-startup population is
+        bounded separately by ``_startup_cap`` at admission. The paused total is
+        bounded too, by :meth:`_start_queue_saturated_secs`. The deadline does not grow with the
         population: a term sampled at sweep time against a clock spanning the
         whole crowded period would not be monotonic -- it would shrink as the
         crowd drained and could reap at one sweep an agent the sweep before had
@@ -1005,12 +1145,55 @@ class OrphanStallMonitor(ManagerComponent):
             return False
         # Queued for a permit: the clock reads as it stood when the wait began.
         clock_now = info._gate_wait_started if info._gate_wait_started is not None else now
+        starting = clock_now - exec_started - info._start_queue_wait_ms / 1000.0
         return (
             info.turns == 0
             and info._pid is None
             and info._first_stream_started is None
-            and (clock_now - exec_started) > self._stamped_startup_deadline(info)
+            and starting > self._stamped_startup_deadline(info)
         )
+
+    def _is_first_prompt_silent(self, info: SubagentInfo, now: float) -> bool:
+        """True if *info* launched its runtime but nothing answered its first prompt.
+
+        The complement of :meth:`_is_startup_stalled_impl`, which needs ``_pid is
+        None``: here the PID is recorded (the session exists), yet there is still
+        no turn and no frame addressed to this session, and the activity clock
+        (restarted when the PID is recorded, ``_note_startup_progress``) has
+        not moved for :data:`_FIRST_PROMPT_SILENT_SECS`, so handshake time is
+        never charged to the window. A start queued for a permit or
+        parked on an approval is not silent; it is waiting.
+        """
+        # Out of startup with no turn and no answer leaves one way out: the
+        # runtime PID is recorded (``_in_startup``), read without touching it.
+        return (
+            info._exec_started is not None
+            and not info._reap_started
+            and info.turns == 0
+            and info._first_stream_started is None
+            and not self._manager._in_startup(info)
+            and info._gate_wait_started is None
+            and not info._awaiting_approval
+            and now - info.last_activity > _FIRST_PROMPT_SILENT_SECS
+        )
+
+    def _start_queue_saturated_secs(self, info: SubagentInfo, now: float) -> float:
+        """Seconds *info* has spent queued for start permits, when that is past
+        :data:`_START_QUEUE_MAX_SECS` and it has still not started; else 0.
+
+        The startup clock pauses while a start is queued, so a start parked behind
+        holders that no watchdog bounds (a cron run, a workflow stage, the task
+        runner, a pool fill) would otherwise sit there until the run's own
+        ``subagent_timeout_secs`` ended it, reporting the turn deadline instead of
+        the queue that held it. A run whose ``subagent_timeout_secs`` is at or
+        under the cap (the default is above it) still ends on that deadline first.
+        """
+        if not self._manager._in_startup(info):
+            return 0.0
+        queued = info._start_queue_wait_ms / 1000.0
+        if info._gate_wait_started is not None:
+            queued += max(0.0, now - info._gate_wait_started)
+        return queued if queued > _START_QUEUE_MAX_SECS else 0.0
 
     def _stamped_startup_deadline(self, info: SubagentInfo) -> int:
         """*info*'s startup deadline, fixed per start clock so a config write

@@ -67,7 +67,7 @@ BASE_SURFACE: dict[str, str] = {
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 9ef89fe81974156e",
     "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 0b859d2b54e84503",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str 34c8df9885581875",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str 1148876f3591630e",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -126,7 +126,7 @@ BASE_SURFACE: dict[str, str] = {
     "_SAFE_PATH_RE": "value platform",
     "_SECURITY_CONDUCTOR_AGENT_FILENAME": "value str ea0f45466289114a",
     "_SECURITY_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 4f02f1db82a878ee",
-    "_SECURITY_CONDUCTOR_SYSTEM_PROMPT": "value str 896e45b01ff0646e",
+    "_SECURITY_CONDUCTOR_SYSTEM_PROMPT": "value str b62418d54ab8fe24",
     "_SOURCE_OWNED_MCP_KEYS": "value tuple b13c0a56645cc511",
     "_VALID_HOOK_EVENTS": "value frozenset 2b7aa96bff704c33",
     "_WORKER_AGENT_FILENAME": "value str e6d5cee102d8cbdf",
@@ -235,7 +235,7 @@ BASE_SURFACE: dict[str, str] = {
     "_project_dir": "callable _project_dir() -> 'Path | None'",
     "_project_shadow_of": "callable _project_shadow_of(agent: 'str', work_dir: 'str | Path | None', *, markdown_specs: 'bool' = True, dispatchable_only: 'bool' = False) -> 'Path | None'",
     "_projected_ceiling_generation": "value state",
-    "_prompt_path": "callable _prompt_path(mode: 'str' = '') -> 'Path'",
+    "_prompt_path": "callable _prompt_path() -> 'Path'",
     "_read_agent_spec": "callable _read_agent_spec(path: 'Path', *, operation: 'str' = 'list_agents', source: 'str' = 'list_agents') -> 'dict[str, Any] | None'",
     "_read_spec_capped": "callable _read_spec_capped(path: 'Path') -> 'dict | None'",
     "_reconcile_tool_aliases_from_disk": "callable _reconcile_tool_aliases_from_disk(path: 'Path', config: 'dict') -> 'bool'",
@@ -344,7 +344,7 @@ BASE_SURFACE: dict[str, str] = {
     "reset_agent_model": "callable reset_agent_model(name: 'str') -> 'tuple[Path, str]'",
     "run_first_run_setup": "callable run_first_run_setup() -> 'None'",
     "safe_context_call": "callable safe_context_call(fn: \"'Callable[[], _T]'\", *, fallback: '_T' = <object object at 0x>, fallback_factory: \"'Optional[Callable[[], _T]]'\" = None, log_message: \"'str | None'\" = None) -> '_T'",
-    "safe_read_file_bytes_nolink": "callable safe_read_file_bytes_nolink(raw: 'str', within_root: 'str | None' = None, *, max_bytes: 'int | None' = None, allow_truncate: 'bool' = False, within_root_is_canonical: 'bool' = False) -> 'bytes | None'",
+    "safe_read_file_bytes_nolink": "callable safe_read_file_bytes_nolink(raw: 'str', within_root: 'str | None' = None, *, max_bytes: 'int | None' = None, allow_truncate: 'bool' = False, within_root_is_canonical: 'bool' = False, admit_hardlinked: 'Callable[[str, bytes], bool] | None' = None) -> 'bytes | None'",
     "sanitize_spec_env": "callable sanitize_spec_env(pairs: 'Iterable[tuple[str, str]]') -> 'dict[str, str]'",
     "sel": "callable sel() -> 'SecurityEventLog'",
     "shared_kiro_agents_writable": "callable shared_kiro_agents_writable() -> 'bool'",
@@ -939,3 +939,4 @@ def test_no_conductor_is_granted_a_fleet_write_or_a_model_switch() -> None:
             assert f"@kirocrew-dashboard/{verb}" not in grants
     every = conductor_tuples + (agent._MEMBER_DASHBOARD_GRANTS, agent._MEMBER_PANEL_GRANTS)
     assert all("@kirocrew-dashboard/session_set_model" not in grants for grants in every)
+    assert all("@kirocrew-dashboard/session_reload" not in grants for grants in every)

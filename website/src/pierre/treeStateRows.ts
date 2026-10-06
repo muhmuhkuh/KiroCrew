@@ -8,8 +8,8 @@
  * childless is a folder that is
  *
  *  - `empty`: listed as a directory with no file and no subfolder in it;
- *  - `hidden-only`: not empty on disk, but every entry in it is a folder the
- *    listing filters out by nature (a dot-directory, a tooling cache) -- the
+ *  - `hidden-only`: not empty on disk, but every entry in it is one the
+ *    listing filters out by nature (a tooling folder, a protected entry) -- the
  *    server names these in `hiddenOnlyDirectories`, and without that signal
  *    `_bg/` holding only `.kiro/` would be called empty;
  *  - `linked`: it is a symlink to a directory. A visible, navigable entry, so
@@ -17,11 +17,12 @@
  *    for holding it), but the walk never follows a link, so nothing beneath it
  *    is listed -- the server names these in `linkedDirectories`, and without
  *    that signal the link would be called empty;
- *  - `truncated`: it has files, but the workspace file cap left it none --
- *    the server names these in `truncatedDirectories`.
+ *  - `truncated`: it has contents, but the workspace row cap (files and
+ *    folders together) left it none, or the server stopped reading before it
+ *    reached the folder -- the server names these in `truncatedDirectories`.
  *
  * A folder the server could not read (`unreadableDirectories`) gets NO state
- * row: that value is the outcome of a failed `scandir`, and an error is
+ * row: that value is the outcome of a failed read, and an error is
  * reported to the user only through `ErrorNotice` with the agent hand-off (the
  * wrapper renders one above the tree naming the folders) -- a status line
  * inside the widget can carry neither. The folder is still a row of its own

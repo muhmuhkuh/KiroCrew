@@ -126,12 +126,59 @@ def _url_payload_command(n: int) -> str:
 #: Three incomplete dumps in a row log one warning, so a host whose table never
 #: reads can be told apart from a target that is really this machine.
 #:
+#: Re-pinned from 27,942 for the NUL blanking in ``inline_payload._lex``: one line
+#: that swaps each NUL for a space before tokenizing, plus the docstring saying why.
+#: CPython 3.12 raises ``SystemError`` for a NUL after an indented block, which
+#: escaped the lexer and crashed the gate on an ordinary ``b'\0'`` in a payload.
+#: No new rule and no new matching pass.
+#: Raised again, from 27,948, by one line: the ``vouched-executions`` entry in
+#: ``_SENSITIVE_HOME_DIRS``. Each file there is the gateway's restart-surviving
+#: word that a session may reach its member's private store, so no file tool may
+#: write it. The fuller reason lives beside its ``sandbox._CREW_HIDDEN_LEAVES`` mask.
+#:
+#: Re-pinned from 27,949 for ``redaction._DOCUMENT_LINK_RE``: pass 3 skips a run
+#: wholly inside a Google Docs, Drive or Confluence link of a fixed route, because a
+#: document id is the same random base64 a key is and no gate can split the two.
+#: One route regex, one span helper, a four-line check in pass 3, and the comment
+#: naming the residual. No pass widened and no threshold moved.
+#:
+#: Raised again, from 28,025, for the ssh self-target floor's boot-time warm-up: the
+#: own-address table is read at gateway startup and published before the DNS
+#: lookups, and background threads parse the hosts-file table (in bounded chunks,
+#: keyed on the own-address set it was judged by). On a miss the gate path parses
+#: only a file that fits in one read chunk; a larger file is refused as pending
+#: until the background parse is cached. On Windows, where ``st_ctime`` is creation
+#: time, the key also carries a content digest (``hosts_file.py``, which holds the
+#: line parser and digest helpers apart from ``argv_floor``'s per-module cap). A
+#: Windows file too large to hash on the gate is never served, so a dotless target
+#: there is pending, and the ssh self-target refusal note says so.
+#:
+#: Raised again, from 28,399, by two lines: case (1) of the ssh self-target refusal
+#: note names a dotless target refused while a hosts file over 64 KiB is still read
+#: in the background, so a caller retries it rather than treating it as settled.
+#:
+#: Raised again, from 28,401, for the containment gate's ``pre_resolved`` keyword:
+#: one keyword on ``path_contains_sensitive``, forwarded to the two helpers that
+#: already take it, plus the preconditions it carries written on the keyword
+#: itself. The claim is ``is_sensitive_resolved_path``'s, unchanged: the caller
+#: holds the canonical spelling and is off the event loop, so the anchors resolve
+#: inline. No new entry point, no target, no matching rule and no threshold moved.
+#:
 #: The number IS the package's measured total, carrying no spare room: a ratchet with
 #: headroom admits exactly the unreviewed growth it exists to catch, so the next line
 #: added here fails this gate and has to be re-pinned deliberately, with its reason
 #: written above. The guards that detect a monolith growing back are the per-file cap
 #: and the facade's share below, and both must stay untouched.
-_PACKAGE_LINE_BUDGET = 27_942
+#:
+#: Raised for the ``registry_trust.json`` leaf added to ``_CREW_SECRET_LEAVES`` in
+#: ``paths.py``: the operator's grants of ``owner`` trust to a hand-configured app
+#: registry live in a keystone file on the same read+write floor as
+#: ``denied_commands.json``, so the leaf and its two-line reason are three lines the gate
+#: cannot avoid.
+#:
+#: Raised for the read-only bash gate's refusal of variable-assigning expansions
+#: (`$[...]`, an `=` after `${`): one pattern alternative plus its reason comment.
+_PACKAGE_LINE_BUDGET = 28_428
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

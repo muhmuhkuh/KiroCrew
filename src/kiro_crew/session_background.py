@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from kiro_crew.agent_discovery import warm_agent_specs
 from kiro_crew.agent_scratch import SharedScratchJoinError
 from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
 from kiro_crew.kiro_prerequisite import (
@@ -37,10 +38,18 @@ from kiro_crew.metrics.sessions import (
     record_session_ended,
     record_session_started,
 )
+from kiro_crew.start_priority import PrioritySemaphore, StartPriority
 
 if TYPE_CHECKING:
     from kiro_crew.acp.types import AcpEvent
     from kiro_crew.providers.base import LLMProvider
+
+#: Tree-RSS ceiling (MiB) for the persistent background runtime when
+#: ``session.watchdog_rss_max_mb`` is 0. Its turns are tiny text prompts, so a
+#: transcript of oversized records grows the tree long before the context or
+#: prompt criteria fire; observed at 1.9 GB. Recycling it spawns the replacement
+#: first, so no user sees it.
+BACKGROUND_RSS_FALLBACK_MB = 1536
 
 
 class _BackgroundSessionEntry(Protocol):
@@ -71,7 +80,9 @@ class _BackgroundRuntime(Protocol):
 
     async def kill(self, expected: bool = False, reason: str = "") -> None: ...
 
-    async def create_session(self, *, agent: str) -> object: ...
+    async def create_session(
+        self, *, agent: str, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> object: ...
 
 
 class _BackgroundOwner(Protocol):
@@ -87,13 +98,15 @@ class _BackgroundOwner(Protocol):
     _sessions: MutableMapping[str, _BackgroundSessionEntry]
     _lock: asyncio.Lock
     _closing: bool
-    _start_sem: asyncio.Semaphore
+    _start_sem: PrioritySemaphore
     #: The facade's start-to-registration PID guard (see ``spawn_pid``):
     #: freshly-started background providers/runtimes are shielded here while
     #: the spawn-identity stamp read suspends before registration.
     _starting_pids: set[int]
 
-    async def _ensure_background(self) -> None: ...
+    async def _ensure_background(
+        self, *, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> None: ...
 
     def _advance_session_generation(self, key: str) -> int: ...
 
@@ -116,7 +129,9 @@ class _BackgroundOwner(Protocol):
 
     async def _retire_stale_backend_bg_runtime(self) -> None: ...
 
-    async def _provider_backed_bg_session(self) -> object: ...
+    async def _provider_backed_bg_session(
+        self, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> object: ...
 
     def get_pid(self, key: str) -> int | None: ...  # pid-owner-ok: _bg runtime owner
 
@@ -162,7 +177,7 @@ class BackgroundRuntimeDeps:
     bg_blind_recycle_prompts: int
     #: ``session.watchdog_rss_max_mb`` read live, off the same state the cleanup
     #: sweep's RSS check reads, so a config change applies on the next
-    #: background turn. ``0`` disables the RSS criterion, as it does there.
+    #: background turn. ``0`` means ``BACKGROUND_RSS_FALLBACK_MB`` here.
     rss_max_mb: Callable[[], int]
     #: Resident MiB of a pid's whole process tree, or ``None`` when unreadable.
     tree_rss_mb: Callable[[int], int | None]
@@ -206,13 +221,15 @@ class _ProviderBgSession:
         self,
         message: str,
         timeout: float | None = None,
+        *,
+        allow_image: bool = True,
     ) -> AsyncIterator[AcpEvent]:
         # timeout is accepted for AcpSessionHandle signature parity; the
         # underlying provider/client manages its own stale-turn watchdog.
         await self._sess.semaphore.acquire()
         self._sem_held = True
         try:
-            async for event in self._sess.provider.stream(message):
+            async for event in self._sess.provider.stream(message, allow_image=allow_image):
                 yield event
         finally:
             self._release()
@@ -261,8 +278,14 @@ class BackgroundSessionRuntime:
     def _draining_bg_runtimes(self, runtimes: list[_BackgroundRuntime]) -> None:
         self.state.draining = runtimes
 
-    async def _ensure_background(self) -> None:
-        """Create the persistent background session if it doesn't exist."""
+    async def _ensure_background(
+        self, *, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> None:
+        """Create the persistent background session if it doesn't exist.
+
+        ``start_priority`` is the cold start's place in the queues: a caller a
+        person is waiting on (``get_bg_session``) names its own.
+        """
         background_key = self._deps.background_key
         background_agent = self._deps.background_agent
         logger = self._deps.logger
@@ -272,6 +295,18 @@ class BackgroundSessionRuntime:
         # Create outside lock
         if not self._owner._provider_factory:
             return
+        # The factory resolves the background agent's model pin SYNCHRONOUSLY
+        # on the loop from the agent-spec snapshot, which at gateway start has
+        # not been published yet (the first ``mc-discovery`` refresh is still
+        # in flight): a cold snapshot answers "no pin", the session would be
+        # created on the chat model, and it is persistent, so it would stay
+        # there for the gateway's lifetime. This is the one caller that reaches
+        # the lookup cold AND is async, so warm the snapshot here, off the loop,
+        # and the factory's unchanged lookup finds the rows. Once, awaited, no
+        # retry: a failed warm-up costs this session the cold answer only.
+        # Before the permit, so the identity-sweep barrier below covers the
+        # spawn alone, not a directory parse.
+        await warm_agent_specs(operation="ensure_background", source="unknown")
         # The permit is retained through stamping AND registration, not just
         # the process start: the identity sweep drains every cold-start permit
         # as its quiescence barrier, so releasing the permit while this
@@ -285,10 +320,11 @@ class BackgroundSessionRuntime:
         # exception semantics while the registration section (whose failures
         # must PROPAGATE, per the rollback handler below) also stays under the
         # permit. Lock order matches the sweep's own (permit -> owner._lock).
-        await self._owner._start_sem.acquire()
+        await self._owner._start_sem.acquire(start_priority)
         try:
             try:
                 provider = self._owner._provider_factory(background_key, agent=background_agent)
+                provider.start_priority = start_priority
                 pre_spawn = await pre_spawn_identity(
                     getattr(self._owner, "spawn_identity_reader", None)
                 )
@@ -345,7 +381,7 @@ class BackgroundSessionRuntime:
                 if starting_pid is not None:
                     self._owner._starting_pids.discard(starting_pid)
         finally:
-            self._owner._start_sem.release()
+            self._owner._start_sem.release(start_priority)
         # Racing registration lost, or shutdown began while we were starting:
         # tear the fresh provider down instead of registering it.
         await provider.shutdown()
@@ -567,7 +603,9 @@ class BackgroundSessionRuntime:
             )
             return True
 
-    async def _provider_backed_bg_session(self) -> object:
+    async def _provider_backed_bg_session(
+        self, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> object:
         """Return the shared provider-backed background-session adapter."""
         if self._owner._closing:
             # Typed for the same reason as get_bg_session's gates: a shutdown
@@ -576,19 +614,30 @@ class BackgroundSessionRuntime:
             raise self._deps.session_closing_error(
                 "session manager is closing; no background session"
             )
-        await self._owner._ensure_background()
+        await self._owner._ensure_background(start_priority=start_priority)
         sess = self._owner._sessions.get(self._deps.background_key)
         if sess is None:
             raise RuntimeError("background session unavailable for non-kiro _bg provider")
         return self._deps.provider_bg_session_factory(sess)
 
-    async def get_bg_session(self) -> object:
+    async def get_bg_session(
+        self, start_priority: StartPriority = StartPriority.BACKGROUND
+    ) -> object:
         """Acquire a background handle, dispatching by configured backend.
 
         Runtime-capable backends receive an ephemeral handle on the shared
         multiplexed runtime. Other backends receive a provider-backed adapter
         over the persistent background registry entry. The caller must destroy
         the returned handle in a ``finally`` block.
+
+        ``start_priority`` reaches this call's own ``session/new`` on the shared
+        runtime, that runtime's (re)spawn admission when this call is the one
+        that respawns it, and -- on a backend with no shared runtime -- the
+        provider-backed entry's cold start. A respawn runs under
+        ``_bg_runtime_lock`` at the priority of the caller holding the lock, so a
+        FOREGROUND caller that arrives during a BACKGROUND caller's respawn waits
+        on the lock for that whole spawn (a known residual, acp-client.md
+        § Start priority).
         """
         logger = self._deps.logger
         if self._owner._closing:
@@ -601,7 +650,7 @@ class BackgroundSessionRuntime:
             # is unreachable from the branch below, so finish any deferred
             # retirement before serving the provider path.
             await self._owner._retire_stale_backend_bg_runtime()
-            return await self._owner._provider_backed_bg_session()
+            return await self._owner._provider_backed_bg_session(start_priority)
 
         # Supplied lazily by the facade to preserve the existing import cycle.
         AcpRuntime, AcpRuntimeDead = self._deps.runtime_types()
@@ -719,7 +768,7 @@ class BackgroundSessionRuntime:
                         getattr(self._owner, "spawn_identity_reader", None)
                     )
                     try:
-                        await replacement.spawn()
+                        await replacement.spawn(start_priority=start_priority)
                     except SharedScratchJoinError:
                         # Only the INHERITED tree's marker: the spawner raises
                         # this subclass at its adopt site alone, so a failure on
@@ -754,7 +803,7 @@ class BackgroundSessionRuntime:
                         pre_spawn = await pre_spawn_identity(
                             getattr(self._owner, "spawn_identity_reader", None)
                         )
-                        await replacement.spawn()
+                        await replacement.spawn(start_priority=start_priority)
                     # Best-effort spawn-account record on the runtime object
                     # itself (the registry gate reads ``runtime.spawn_identity``
                     # directly); see flag_identity_stamp_mismatches. A
@@ -799,9 +848,11 @@ class BackgroundSessionRuntime:
                 selected = self._bg_runtime if runtime_capable else None
             if selected is None:
                 await self._owner._retire_stale_backend_bg_runtime()
-                return await self._owner._provider_backed_bg_session()
+                return await self._owner._provider_backed_bg_session(start_priority)
             try:
-                return await selected.create_session(agent=self._deps.runtime_agent)
+                return await selected.create_session(
+                    agent=self._deps.runtime_agent, start_priority=start_priority
+                )
             except AcpRuntimeDead:
                 if attempt >= max_retries:
                     raise
@@ -827,7 +878,10 @@ class BackgroundSessionRuntime:
     async def _rss_recycle_reason(self, background_key: str) -> str | None:
         """The recycle reason when the background tree is at or over its ceiling.
 
-        The ceiling is ``session.watchdog_rss_max_mb``; ``0`` disables the check.
+        The ceiling is ``session.watchdog_rss_max_mb`` when it is positive, else
+        ``BACKGROUND_RSS_FALLBACK_MB``: the per-session knob is off by default,
+        and this internal runtime is the one tree a transcript of oversized
+        records grows without bound, so it keeps a ceiling either way.
         The RSS sweep in ``session_cleanup`` skips persistent keys and the
         background key is one, so this is the only path that compares this
         runtime's tree against that number. It belongs here rather than there
@@ -839,7 +893,7 @@ class BackgroundSessionRuntime:
         """
         ceiling = self._deps.rss_max_mb()
         if ceiling <= 0:
-            return None
+            ceiling = BACKGROUND_RSS_FALLBACK_MB
         # This module owns the background runtime: it spawns the provider, is the
         # one place that retires it, and the background key is a pool of one, so
         # the reading below attributes the tree to the session that alone holds it.
@@ -915,7 +969,7 @@ class BackgroundSessionRuntime:
             # and adoption so the identity sweep's permit barrier covers the
             # whole started-but-not-yet-adopted window (permit -> owner._lock,
             # the sweep's own lock order).
-            await self._owner._start_sem.acquire()
+            await self._owner._start_sem.acquire(StartPriority.BACKGROUND)
             try:
                 try:
                     replacement = self._owner._provider_factory(
@@ -962,7 +1016,7 @@ class BackgroundSessionRuntime:
                     if starting_pid is not None:
                         self._owner._starting_pids.discard(starting_pid)
             finally:
-                self._owner._start_sem.release()
+                self._owner._start_sem.release(StartPriority.BACKGROUND)
 
             doomed = provider if adopted else replacement
             try:

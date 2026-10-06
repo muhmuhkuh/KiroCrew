@@ -54,6 +54,29 @@ alone so the warm-pool re-apply and the slot backfill still read "inherit". The
 dashboard carries the corrected id as the slot's `served_model` so the composer
 chip names the model a turn will run on instead of `auto`.
 
+The claude backend has a different gap on the same exits: the model it reports is
+not always the model Claude Code runs. claude-agent-acp resolves an inheriting
+session's model from `ANTHROPIC_MODEL` or the user's `settings.model` and reports it
+as the `model` option's current value. When that value is the setting verbatim, the
+adapter does not pass it on and trusts Claude Code to have read the same setting.
+After a resume, Claude Code can instead run its own built-in default while the
+report still names the settings model. A custom gateway that does not serve that
+default then refuses every turn until the user runs `/model`.
+`AcpClient._reassert_adapter_resolved_model` runs from `_ensure_served_default` on
+the claude backend. It sends the reported id back over `session/set_config_option`,
+the same write the picker and `/model` make, which the adapter always passes on.
+
+- **When nothing is sent.** The reported id is the head of the advertised list (the
+  adapter's `default` pseudo-model, reported when no setting applies), or the list
+  does not carry it.
+- **What stays unchanged.** As with the kiro check, `_model` keeps `""`/`"auto"`.
+  An explicit pin never reaches this path: it is pushed as the pin.
+- **Failure handling.** It is best effort: a refused value or a failed request only
+  logs, and a dead process still fails the session.
+
+The INFO line on the inherit exit names the model the backend reports, so a log
+shows what an `auto` session was started on.
+
 ## A pin belongs to the harness it was chosen in
 
 A stored pin records WHAT was picked and never WHERE. Switching `agent.acp_backend`
@@ -126,6 +149,9 @@ records the namespace used for that slot's pin. When the effective backend chang
 chat allocation discards the stale pin and starts on `auto` rather than applying an
 id selected in another harness. The chat composer obtains model options from
 `GET /api/models?backend=…`, and its cache/degraded state is backend-keyed.
+The backend-switch handler uses the shared slot-ownership gate and turn-busy
+probe, plus queued messages and eager allocation; it does not depend on the
+retired orchestrator's stage-execution fields.
 
 Both resolvers scope EVERY tier and let an out-of-scope tier defer to the next, so
 an out-of-scope pin reads exactly like an unset one:
@@ -195,6 +221,41 @@ handle dates the snapshot it stores by the answer's own clock (the runtime's
 result clock, `entitlement_probe_result_at`), not by its call time, so its floor
 never rises above the data it holds and a replayed answer is never re-dated out
 of the spawn-race window it was captured in.
+
+The same snapshot judges three more decisions, and all revalidate before they
+trust a denial or a narrowing. A direct-spawn `AcpClient` (one kiro-cli process
+per session, no shared runtime) refuses an explicit `set_model` pick and withholds
+a startup pin only after `AcpClient.refresh_available_models` agrees, and the
+picker read on that same dedicated transport (`AcpProvider.maybe_refresh_available_models`
+with a plain kiro `AcpClient`) is served by the same method whenever the snapshot
+would drop a catalog row (`catalog_row_would_drop`): that client has no shared
+probe cache, so its own snapshot is the cache -- a snapshot a probe confirmed
+within `_ENTITLEMENT_PROBE_TTL_SECS` is fresh and is not re-probed, anything else
+(a `session/new` capture, an older confirmation) earns one throwaway `session/new`
+on a dedicated short-lived probe process of its own (never this session's stream,
+so none of its frames can reach this session), overlapping callers share one
+in-flight probe, and a failed probe keeps the snapshot's verdict. The picker read
+honours `_READ_PATH_REPROBE_MIN_INTERVAL_SECS` against a probe-confirmed list, and
+is bounded by the same `_READ_PATH_PROBE_DEADLINE_SECS` (3s) shielded deadline the
+shared read path uses: past it the read raises `EntitlementRevalidating` (the
+endpoint's degraded response; the probe keeps running and the next read serves its
+landed answer) rather than holding a picker poll or a pin-save for the probe's full
+`initialize`+`session/new` timeout. A role pin
+(`agent.role_models.*`, `agent.fallback_model`, `agent.refusal_fallback_model`,
+the `decisions.*` model pins, a crew's `model`) is judged by the synchronous
+`_validate_role_model` against the NEWEST live session in the target namespace
+(always scoped: the PATCH path resolves the default harness `agent.acp_backend`
+and the crew handlers the member's, so a newer session on another harness can
+neither admit nor reject the pin)
+-- the same session `_entitled_kiro_models` reads, so a session started before a
+downgrade cannot keep admitting the model the account lost. Its callers first
+await `_revalidate_role_pin_evidence`, which hands that session to the same
+`maybe_refresh_available_models` seam the picker uses (the pin judged beside the
+rows the snapshot already serves, so a lone pin never reads as the fail-open
+namespace mismatch). The seam heals the snapshot in place, so the validator reads
+the fresh answer; a deadline miss is a retryable 400, never an acceptance on no
+evidence, and a probe failure proceeds on the snapshot as it was. The crew
+handlers run it before taking the config lock, so no probe holds the lock.
 
 The vocabulary side and the spelling side fold ids with ONE function. A pin can be
 native to a harness while spelled in another namespace's provider-id form:

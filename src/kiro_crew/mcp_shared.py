@@ -8,16 +8,28 @@ import json
 import logging
 import os
 import select
+import signal
 import sys
 import threading
 import time
 import urllib.request
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, Literal, NamedTuple, Optional
 
 from kiro_crew import platform_compat
 from kiro_crew.acp.types import JSONRPC_METHOD_NOT_FOUND
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_local_secret  # noqa: F401
 from kiro_crew.dashboard.origin import parse_dashboard_url  # noqa: F401
+from kiro_crew.install_liveness import (
+    INSTALL_PRUNED_EXIT_CODE,
+    install_pruned,
+    respawned_by_pool,
+)
+from kiro_crew.json_line import (
+    ID_PROBE_BYTES,
+    parse_json_object_line,
+    recover_line_id,
+    recover_top_level_id,
+)
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_caller import (
     CallerContext,
@@ -34,6 +46,11 @@ from kiro_crew.sel import sel
 from kiro_crew.session_directive import neutralize_markers
 from kiro_crew.session_token_sig import session_key_from_env_token
 from kiro_crew.validation import (
+    JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST,
+    JSONRPC_PARSE_ERROR,
+    JsonRpcEnvelopeError,
     ValidationError,
     build_tool_response,
     validate_jsonrpc_request,
@@ -80,6 +97,17 @@ PENDING_CALLS_MAX = 32
 # process; retaining them in an unbounded set leaks one entry per cancel. Once
 # this cap is reached the oldest ids are evicted FIFO.
 CANCELLED_IDS_MAX = 1024
+
+#: Largest Content-Length body :func:`_read_message` reads whole: the gateway's
+#: default per-line read limit (``mcp_gateway.pool._DEFAULT_READ_BUFFER_LIMIT``,
+#: pinned equal by a test so this server need not import the gateway). A larger
+#: body is drained in bounded chunks and answered as too large, so a corrupt
+#: header can neither allocate it nor desync the framing.
+MAX_CONTENT_LENGTH_BYTES = 64 * 1024 * 1024
+#: A declared length past this is no body any sender drains to: the header is
+#: corrupt, and draining to it would swallow every later request.
+_MAX_DRAINABLE_LENGTH_BYTES = 16 * MAX_CONTENT_LENGTH_BYTES
+_DRAIN_CHUNK_BYTES = 1024 * 1024
 
 
 def _evict_oldest_evictable(
@@ -173,8 +201,25 @@ class ToolCancelled(Exception):
     pass
 
 
-# Module-level flag: set True once we detect Content-Length framing from client.
-_use_content_length = False
+# The framing the client's first accepted message used, and so the framing of
+# every response. ``None`` until then. On a bare stream a ``Content-Length:``
+# line is noise: honouring it would read the requests behind it as a body.
+_framing: Literal["bare", "content-length"] | None = None
+
+
+class _Skipped:
+    """What :func:`_read_message` returns for one frame it dropped. Not EOF."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SKIP"
+
+
+#: One dropped frame. Distinct from ``None`` (EOF) so a ``null`` line cannot end
+#: the loop, and returned per frame so a busy loop gets back to delivering a
+#: finished tool's result instead of blocking on the next line.
+SKIP = _Skipped()
 
 # ── Private stdout descriptor for JSON-RPC responses ───────────────────────
 # The vendored llama-cpp runtime wraps its multi-second GGUF model load in
@@ -695,7 +740,49 @@ def _resolve_tool_policy(
         if not _tok:
             _ctx = current_caller()
             _tok = _ctx.session_token if _ctx is not None and _ctx.from_gateway else ""
-        headers: dict[str, str] = {"X-Internal-Secret": secret, **session_token_header(_tok)}
+        token_header = session_token_header(_tok)
+
+        # A key resolved LOCALLY (``not caller_session``) from the lenient tail of
+        # :func:`_policy_session_key` -- the unsigned ``session_pid`` read reached
+        # through ``KIROCREW_HOST_PID`` and the ancestor walk -- carries no
+        # attestation the gateway can check: ``session_token_header`` found no token
+        # to send with it, and the key is not the gateway-injected
+        # ``KIROCREW_SESSION_KEY``. Dialled anyway, that request is answered
+        # ``member_identity_unavailable`` on EVERY call, so the round-trip is futile
+        # and its ``identity_unattested`` refusal text misreports a dial that never
+        # needed to happen. Skip the dial and return a reason WITHOUT the key on the
+        # wire -- but a fail-CLOSED one.
+        #
+        # Fail closed is required, not optional: a session key DID resolve, so an
+        # operator ``managedToolPolicy.exclude`` may exist for it, and an exclusion
+        # this process could not read is an unknown deny, never a permission.
+        # ``identity_unattestable`` is therefore in ``_UNRESOLVED_REFUSES_CALL``
+        # beside ``identity_unattested``: ``tools/list`` still lists everything
+        # (kiro-cli caches one listing, so hiding tools there is unrecoverable) and
+        # ``tools/call`` refuses until a real identity channel (a gateway caller
+        # block, a signed token) makes the key attestable. It is a distinct reason
+        # from ``identity_unattested`` only so the refusal text does not claim a
+        # gateway read that never happened.
+        #
+        # Two sources are deliberately NOT withheld. A gateway-stamped
+        # ``caller_session`` is the gateway's own per-call identity -- it named this
+        # caller, so the key is vouched for even when the per-call block carried no
+        # token. ``KIROCREW_SESSION_KEY`` is the identity the gateway injects into its
+        # own processes, which the attested topologies accept; a bare declared key
+        # that the current transport cannot attest is the gateway's boundary to hold
+        # on the dial, not a resolution this client should pre-empt.
+        _has_env_key = bool(os.environ.get("KIROCREW_SESSION_KEY", ""))
+        if not caller_session and "X-Session-Token" not in token_header and not _has_env_key:
+            sel().log_api_access(
+                caller=session_key,
+                operation="tool_policy.unattestable_key",
+                outcome="unresolved",
+                source="mcp_shared",
+                resources=f"session_key={session_key}",
+            )
+            return ToolPolicy(frozenset(), "identity_unattestable")
+
+        headers: dict[str, str] = {"X-Internal-Secret": secret, **token_header}
         headers["X-Session-Key"] = session_key
 
         req = urllib.request.Request(
@@ -742,12 +829,22 @@ def _resolve_tool_policy(
                     # call" from "the operator's spec is malformed". Not
                     # negative-cached, for the same reason as the spec case:
                     # the answer is immediate and specific to this caller.
+                    # ``pid``/``ppid`` name WHICH process asked: a server
+                    # launched without the token often lives for one
+                    # ``tools/list`` and is gone before anyone can look, and
+                    # its parent (gatewayd for a pooled backend, the harness
+                    # for a server it launched itself) is what tells the
+                    # launch paths apart afterwards.
                     sel().log_api_access(
                         caller=session_key,
                         operation="tool_policy.unattested",
                         outcome="unresolved",
                         source="mcp_shared",
-                        resources=f"session_key={session_key},token={'present' if _tok else 'absent'}",
+                        resources=(
+                            f"session_key={session_key},"
+                            f"token={'present' if _tok else 'absent'},"
+                            f"pid={os.getpid()},ppid={os.getppid()}"
+                        ),
                     )
                     return ToolPolicy(frozenset(), "identity_unattested")
                 # The gateway read a spec for this session and could not
@@ -931,7 +1028,7 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 #
 # The test is not how bad the reason sounds. It is whether the reason means ONE
 # thing, because a security decision derived from an ambiguous reason is wrong
-# for half the callers it hits. Three reasons qualify, and each means "an operator
+# for half the callers it hits. Four reasons qualify, and each means "an operator
 # exclusion may exist and this system could not read it":
 #
 # * ``policy_unreadable`` -- the gateway found a spec for this session and could
@@ -944,6 +1041,14 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 #   separate so the refusal names the missing token, not the agents directory.
 #   A legitimate pooled backend never lands here: it is handed the token per
 #   frame in the caller block and ``_resolve_tool_policy`` sends it.
+# * ``identity_unattestable`` -- a session key resolved from the lenient tail of
+#   ``_policy_session_key`` (the unsigned ``session_pid`` read, the ancestor walk)
+#   with no token to carry it and no gateway-injected ``KIROCREW_SESSION_KEY``.
+#   The dial is skipped because the gateway would refuse it, so the exclusion
+#   list is unread for a key that DID resolve -- the same unknown-deny as
+#   ``identity_unattested``, before the request rather than after it. Kept
+#   separate only so the refusal text does not claim a gateway read that never
+#   happened.
 # * ``resolution_failed`` -- no usable answer reached this process: nothing came
 #   back, the gateway answered ``5xx`` to say it is broken, or the resolve itself
 #   raised. Every ``4xx`` returns before that arm, decided by status CLASS, so this
@@ -977,7 +1082,7 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 # the 404 to distinguish registering from unmappable, which is a change to the
 # endpoint's contract rather than to this read.
 _UNRESOLVED_REFUSES_CALL = frozenset(
-    {"policy_unreadable", "identity_unattested", "resolution_failed"}
+    {"policy_unreadable", "identity_unattested", "identity_unattestable", "resolution_failed"}
 )
 
 
@@ -999,7 +1104,7 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
             "error": {"code": -32603, "message": "Internal error"},
         }
     body = json.dumps(resp)
-    if _use_content_length:
+    if _framing == "content-length":
         payload = body.encode("utf-8")
         frame = f"Content-Length: {len(payload)}\r\n\r\n".encode("utf-8") + payload
     else:
@@ -1038,7 +1143,7 @@ def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
                         exc.__class__.__name__,
                     )
                     return
-    if _use_content_length:
+    if _framing == "content-length":
         sys.stdout.buffer.write(frame)
         sys.stdout.buffer.flush()
     else:
@@ -1124,61 +1229,198 @@ def call_tool_with_logging(
     return result
 
 
-def _read_message(stdin) -> dict[str, Any] | None:
-    """Read one JSON-RPC message, auto-detecting Content-Length vs bare JSON framing.
+def _read_message(stdin) -> dict[str, Any] | _Skipped | None:
+    """Read one JSON-RPC frame, auto-detecting Content-Length vs bare JSON framing.
 
-    Uses stdin.buffer (binary mode) for all reads so that Content-Length byte
-    counts are honoured correctly for multi-byte UTF-8 content.
+    Returns the message, ``None`` at end of stream, or :data:`SKIP` for one
+    frame that was dropped: a line or body that is not valid UTF-8, not JSON,
+    not a JSON object, or nested past the decoder's ceiling (see
+    :func:`kiro_crew.json_line.parse_json_object_line`), which is answered as
+    a parse error when it is a request whose top-level id is recoverable
+    (:func:`_answer_unparseable`), a header-shaped line on a bare-JSON stream,
+    and a body over :data:`MAX_CONTENT_LENGTH_BYTES`, which is drained and
+    answered as too large when its id is recoverable. A Content-Length header
+    whose length cannot be read, or one past any drainable size, ends the
+    stream (``None``, logged at ERROR): the body behind an unreadable one
+    cannot be delimited, so every later frame would be read joined to it, and
+    draining to an absurd one would swallow every later request.
+
+    Uses stdin.buffer (binary mode) for all reads, and keeps the frame as
+    bytes until it is parsed, so Content-Length byte counts are honoured
+    correctly for multi-byte UTF-8 content.
     """
-    global _use_content_length
+    global _framing
     raw = stdin.buffer
+    line = raw.readline()
+    if not line:
+        return None  # EOF
+    stripped = line.strip()
+    if stripped[:15].lower() != b"content-length:":
+        # Bare JSON line (backwards compat).
+        msg = parse_json_object_line(line)
+        if msg is None:
+            _answer_unparseable(line)
+            return SKIP
+        _framing = _framing or "bare"
+        return msg
+    if _framing == "bare":
+        return SKIP
+    try:
+        length = int(stripped[15:])
+    except ValueError:
+        length = -1
+    if length < 0:
+        logger.error(
+            "unreadable Content-Length header %r; the framing is lost, ending the stream",
+            stripped[:80],
+        )
+        return None
+    if length > _MAX_DRAINABLE_LENGTH_BYTES:
+        logger.error(
+            "Content-Length %d is past any drainable size; the framing is lost, "
+            "ending the stream",
+            length,
+        )
+        return None
+    _framing = "content-length"
+    # Consume the blank line separator
     while True:
-        line = raw.readline()
-        if not line:
-            return None  # EOF
-        line_str = line.decode("utf-8").strip()
-        if not line_str:
+        sep = raw.readline()
+        if sep.strip() == b"":
+            break
+    # Read exactly `length` bytes, in bounded reads: a single raw.read(length)
+    # may return fewer bytes than requested on a partial read (the
+    # RawIOBase/socket contract permits short reads), which would truncate the
+    # body and desync the stream for every subsequent message. A body over the
+    # cap is drained the same way, keeping only its two ends for the id.
+    keep = length <= MAX_CONTENT_LENGTH_BYTES
+    chunks: list[bytes] = []
+    head = tail = b""
+    remaining = length
+    while remaining > 0:
+        chunk = raw.read(min(remaining, _DRAIN_CHUNK_BYTES))
+        if not chunk:
+            # EOF before the declared body fully arrived — the message is
+            # incomplete. Discard it explicitly rather than parsing a
+            # truncated body, which could otherwise return a message the
+            # sender never finished transmitting if the partial bytes happen
+            # to be valid JSON (e.g. a well-formed prefix).
+            return None
+        remaining -= len(chunk)
+        if keep:
+            chunks.append(chunk)
             continue
-        if line_str.lower().startswith("content-length:"):
-            try:
-                length = int(line_str.split(":", 1)[1].strip())
-                _use_content_length = True
-                # Consume the blank line separator
-                while True:
-                    sep = raw.readline()
-                    if sep.strip() == b"":
-                        break
-                # Read exactly `length` bytes. A single raw.read(length) may
-                # return fewer bytes than requested on a partial read (the
-                # RawIOBase/socket contract permits short reads), which would
-                # truncate the body, fail json.loads, and desync the stream for
-                # every subsequent message. Loop until we have the full body or
-                # hit EOF. (io.BufferedReader blocks for the full count today, so
-                # this is robustness hardening for non-buffered/custom streams.)
-                chunks: list[bytes] = []
-                remaining = length
-                while remaining > 0:
-                    chunk = raw.read(remaining)
-                    if not chunk:
-                        break  # EOF before the full body arrived
-                    chunks.append(chunk)
-                    remaining -= len(chunk)
-                if remaining > 0:
-                    # EOF before the declared body fully arrived — the message is
-                    # incomplete. Discard it explicitly rather than handing a truncated
-                    # body to json.loads, which could otherwise return a message the
-                    # sender never finished transmitting if the partial bytes happen to
-                    # be valid JSON (e.g. a well-formed prefix).
-                    continue
-                body = b"".join(chunks)
-                return json.loads(body.decode("utf-8"))
-            except ValueError:
-                continue
-        # Bare JSON line (backwards compat)
+        if len(head) < ID_PROBE_BYTES:
+            head += chunk[: ID_PROBE_BYTES - len(head)]
+        tail = (tail + chunk[-ID_PROBE_BYTES:])[-ID_PROBE_BYTES:]
+    if not keep:
+        req_id = recover_top_level_id(head, tail, requests_only=True)
+        logger.warning(
+            "Content-Length %d is over the %d-byte cap; body discarded (id %r)",
+            length,
+            MAX_CONTENT_LENGTH_BYTES,
+            req_id,
+        )
+        if req_id is not None:
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_INVALID_REQUEST,
+                    "message": f"Request over the {MAX_CONTENT_LENGTH_BYTES}-byte limit",
+                },
+            )
+        return SKIP
+    body = b"".join(chunks)
+    msg = parse_json_object_line(body)
+    if msg is None:
+        _answer_unparseable(body)
+        return SKIP
+    return msg
+
+
+def _answer_unparseable(frame: bytes) -> None:
+    """Answer a request frame that does not parse, when its id is recoverable.
+
+    Unanswered, its caller would wait for its own timeout while pings are
+    still answered, so nothing would see the server as wedged.
+    Only a request (a top-level ``method``) is answered, under the top-level
+    object's own id found at either end
+    (:func:`kiro_crew.json_line.recover_line_id`); a log line, a response or a
+    frame with no recoverable id is just dropped.
+    """
+    if not frame.lstrip().startswith(b"{"):
+        return
+    req_id = recover_line_id(frame, requests_only=True)
+    logger.warning("unparseable JSON-RPC frame dropped (id %r)", req_id)
+    if req_id is not None:
+        respond(req_id, None, error={"code": JSONRPC_PARSE_ERROR, "message": "Parse error"})
+
+
+def _stdin_holds_a_line(stdin) -> bool:
+    """True when *stdin*'s buffer already holds a complete line.
+
+    ``select`` polls the descriptor, which cannot see bytes the buffered reader
+    has already pulled off it: a request that arrived in the same read as the
+    line just handled is invisible to it until the client writes again. The
+    peek runs with the descriptor non-blocking, so an empty buffer costs one
+    refused read rather than a wait. ``False`` for a stream with no peek or
+    descriptor (nothing it holds is hidden from ``select``).
+    """
+    raw: Any = getattr(stdin, "buffer", None)
+    peek = getattr(raw, "peek", None)
+    if peek is None:
+        return False
+    try:
+        fd = raw.fileno()
+        was_blocking = os.get_blocking(fd)
+    except (AttributeError, OSError, ValueError):
+        return False
+    try:
+        os.set_blocking(fd, False)
         try:
-            return json.loads(line_str)
-        except json.JSONDecodeError:
-            continue
+            held = peek(1)
+        except (BlockingIOError, OSError, ValueError):
+            return False
+    finally:
+        with contextlib.suppress(OSError, ValueError):
+            os.set_blocking(fd, was_blocking)
+    return b"\n" in held
+
+
+def _tool_call_name(params: dict[str, Any]) -> str | None:
+    """The tool a ``tools/call`` names, or ``None`` when it names none usable."""
+    name = params.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def _hard_exit_on_signal(_signum: int, _frame: Any) -> None:
+    """Exit at once on SIGTERM/SIGINT, skipping interpreter finalization.
+
+    Tool work runs on a daemon thread, so a normal exit finalizes the stdio
+    streams under it and can abort with ``_enter_buffered_busy`` (SIGABRT, a
+    crash dialog on macOS) during a provider's group teardown. Same fix as the
+    gateway stub's ``_hard_exit``: drain logging, flush stderr, ``os._exit``.
+    stdout is NOT flushed: another thread may hold its lock, and waiting on it
+    here would keep the process from ever exiting.
+    """
+    try:
+        logging.shutdown()
+    except Exception:  # pragma: no cover - never block exit on log teardown
+        pass
+    try:
+        sys.stderr.flush()
+    except (OSError, ValueError, RuntimeError):  # RuntimeError: reentrant flush
+        pass
+    os._exit(0)
+
+
+def _install_hard_exit_handlers() -> dict[int, Any]:
+    """Install the handler for SIGTERM/SIGINT; return the ones it replaced."""
+    if threading.current_thread() is not threading.main_thread():
+        return {}  # signal.signal only works on the main thread
+    sigs = (signal.SIGTERM, signal.SIGINT)
+    return {sig: signal.signal(sig, _hard_exit_on_signal) for sig in sigs}
 
 
 def run_mcp_stdio_loop(
@@ -1221,8 +1463,10 @@ def run_mcp_stdio_loop(
     _prior_caller = internal_caller()
     set_internal_caller(server_name)
     snapshot_stdout_fd()
+    prior_handlers = _install_hard_exit_handlers()
+    pruned = False
     try:
-        _run_stdio_dispatch_loop(
+        pruned = _run_stdio_dispatch_loop(
             server_name,
             server_version,
             list_tools_fn,
@@ -1233,6 +1477,14 @@ def run_mcp_stdio_loop(
     finally:
         set_internal_caller(_prior_caller)
         release_stdout_fd()
+        # Restore, so repeated loops in one process (the test suite) do not
+        # leave a later Ctrl-C or SIGTERM exiting 0 through this handler.
+        for sig, handler in prior_handlers.items():
+            signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+    if pruned:
+        # Non-zero so the pool records a death and the next call respawns this
+        # server from the current install's launch command.
+        sys.exit(INSTALL_PRUNED_EXIT_CODE)
 
 
 def _run_stdio_dispatch_loop(
@@ -1243,12 +1495,15 @@ def _run_stdio_dispatch_loop(
     *,
     advertise_caller_identity: bool = False,
     error_prefix_is_error: bool = False,
-) -> None:
+) -> bool:
     """Read/dispatch body of :func:`run_mcp_stdio_loop`.
 
     Split out so the public entry point can own the stdout-snapshot lifecycle
     (capture before the first request, release on exit) without indenting the
     whole dispatch loop under a ``try``.
+
+    Returns True when it stopped because this process's install was pruned
+    (see :func:`_refuse_from_pruned_install`), False on an ordinary EOF.
     """
     # In-flight tool execution state: at most one at a time (sequential dispatch).
     _current_req_id: Any = None
@@ -1269,6 +1524,9 @@ def _run_stdio_dispatch_loop(
     _worker_audited: list = [False]  # [bool], guarded by _result_lock
     # tools/call requests received while a worker was busy, dispatched FIFO.
     _pending_calls: collections.deque[dict[str, Any]] = collections.deque()
+    # Set by ``_dispatch`` when a pruned install answered every call and the
+    # loop must stop so the pool respawns this server.
+    _pruned_exit = False
 
     def _live_request_ids() -> set[str]:
         """Ids of the active + still-queued requests whose cancellation flags
@@ -1317,16 +1575,27 @@ def _run_stdio_dispatch_loop(
                 sel_exc,
             )
 
-    def _req_caller(request: dict) -> "CallerContext | None":
-        """Current request identity, without borrowing the active worker's caller."""
-        try:
-            return CallerContext.from_meta(request.get("params", {}).get("_meta"))
-        except Exception:
-            return None
+    def _req_caller(params: dict[str, Any]) -> "CallerContext | None":
+        """A request's own identity, from its normalized ``params``.
 
-    def _req_caller_key(request: dict) -> str:
-        ctx = _req_caller(request)
+        Never the active worker's caller. ``from_meta`` returns ``None`` for
+        any malformed block, so this cannot raise.
+        """
+        return CallerContext.from_meta(params.get("_meta"))
+
+    def _req_caller_key(params: dict[str, Any]) -> str:
+        ctx = _req_caller(params)
         return ctx.session_key if ctx is not None else ""
+
+    def _answer_internal_error(method: str, req_id: Any) -> None:
+        """One message's dispatch raised: log it, answer it, keep serving."""
+        logger.exception("%s: dispatching %r failed; the loop continues", server_name, method)
+        if req_id is not None:
+            respond(
+                req_id,
+                None,
+                error={"code": JSONRPC_INTERNAL_ERROR, "message": "Internal error"},
+            )
 
     def _caller_tool_policy(caller: "CallerContext | None") -> ToolPolicy:
         """This request's exclusion set AND whether the policy was readable.
@@ -1453,130 +1722,109 @@ def _run_stdio_dispatch_loop(
                 _worker_audited[0] = True
         _result_ready.set()
 
-    while True:
-        # If a worker is running, poll for completion while also reading stdin
-        if _worker_thread is not None and _worker_thread.is_alive():
-            # Non-blocking stdin read with short timeout to interleave
-            readable, _, _ = select.select([sys.stdin], [], [], 0.1)
-            if not readable:
-                if _result_ready.is_set():
-                    _worker_thread.join(timeout=1.0)
-                    _worker_thread = None
-                    with _result_lock:
-                        if _result_box and str(_current_req_id) not in _cancelled_ids:
-                            respond(_current_req_id, _result_box[0])
-                        elif _result_box and not _worker_audited[0]:
-                            # Boxed result dropped due to cancellation (cancel
-                            # arrived after the worker delivered) -- audit it.
-                            _sel_audit(
-                                "cancelled",
-                                _current_tool_name,
-                                _current_req_id,
-                                _current_caller_key,
-                            )
-                        _result_box.clear()
-                        # Consumed: drop the id so a completed request never
-                        # lingers in the cancelled set.
-                        _cancelled_ids.discard(str(_current_req_id))
-                    _current_req_id = None
-                    _cancel_event = None
-                    _result_ready.clear()
+    def _refuse_from_pruned_install(first_req_id: Any, tool_name: str) -> None:
+        """Answer this call and every queued one, so none is left waiting.
+
+        The process is about to exit: anything it lazily imports would fail
+        with ``No module named 'kiro_crew.<x>'`` until it is replaced, and the
+        caller should hear "retry" rather than that error.
+        """
+        logger.warning(
+            "%s: the install this process runs from was removed by an update; "
+            "refusing %s and exiting so it is respawned from the current install",
+            server_name,
+            tool_name,
+        )
+        error = {
+            "code": -32000,
+            "message": (
+                f"{server_name} is running from an install that an update removed "
+                "and is restarting from the current one; retry the call"
+            ),
+        }
+        respond(first_req_id, None, error=error)
+        while _pending_calls:
+            queued = _pending_calls.popleft()
+            queued_id = queued.get("id")
+            queued_params = queued.get("params")
+            queued_params = queued_params if isinstance(queued_params, dict) else {}
+            queued_tool = _tool_call_name(queued_params) or ""
+            if queued_id is not None and str(queued_id) in _cancelled_ids:
+                # Same contract as the ordinary dispatch path: a request
+                # cancelled while it waited gets no response, only its audit.
+                _sel_audit("cancelled", queued_tool, queued_id, _req_caller_key(queued_params))
                 continue
-            req = _read_message(sys.stdin)
-            if req is None:
-                # EOF: wait for worker then exit
-                if _worker_thread:
-                    _worker_thread.join(timeout=5.0)
-                break
-            # Process only cancel notifications while tool is running
-            try:
-                method, req_id, _params = validate_jsonrpc_request(req)
-            except ValidationError:
-                continue
-            if method == "notifications/cancelled":
-                params = req.get("params", {})
-                cancelled_rid = params.get("requestId")
-                if cancelled_rid is not None:
-                    _remember_cancelled_id(
-                        _cancelled_ids,
-                        _cancelled_order,
-                        str(cancelled_rid),
-                        protected=_live_request_ids(),
-                    )
-                    if str(cancelled_rid) == str(_current_req_id) and _cancel_event:
-                        _cancel_event.set()
-                        logger.info("cancel received for in-flight request %s", cancelled_rid)
-            # Answer gateway pings even while a tool is in-flight so the
-            # ping-gated wedge detector sees the backend as responsive.
-            elif method == "ping" and req_id is not None:
-                respond(req_id, {})
-            # Buffer tools/call requests that arrive while busy so they get a
-            # response when the worker frees (dropping them left the
-            # client waiting forever). Cancels against queued ids are honored
-            # at dispatch time via _cancelled_ids.
-            elif method == "tools/call" and req_id is not None:
-                if len(_pending_calls) >= PENDING_CALLS_MAX:
-                    # Rejection is a tool-invocation decision -- audit it
-                    # (security-controls: all invocation decisions emit SEL).
-                    _sel_audit(
-                        "rejected_busy",
-                        req.get("params", {}).get("name", ""),
-                        req_id,
-                        _req_caller_key(req),
-                    )
-                    respond(
-                        req_id,
-                        None,
-                        error={
-                            "code": -32000,
-                            "message": "Server busy: pending tool-call queue is full; retry",
-                        },
-                    )
-                else:
-                    _pending_calls.append(req)
-            # Other messages while busy: drop gracefully. Notifications are
-            # fine to drop; initialize/initialized never arrive mid-tool.
-            elif method == "tools/list" and req_id is not None:
-                respond(req_id, {"tools": _listable_tools(_req_caller(req))})
-            continue
+            # Each refusal is its own invocation decision and gets its own SEL
+            # record, like the first call's (security-controls: every
+            # invocation decision is audited).
+            _sel_audit(
+                "rejected_install_pruned",
+                queued_tool,
+                queued_id,
+                _req_caller_key(queued_params),
+            )
+            respond(queued_id, None, error=error)
 
-        # Check if worker just finished
-        if _worker_thread is not None:
-            _worker_thread.join(timeout=0.1)
-            _worker_thread = None
-            with _result_lock:
-                if _result_box and str(_current_req_id) not in _cancelled_ids:
-                    respond(_current_req_id, _result_box[0])
-                elif _result_box and not _worker_audited[0]:
-                    # Boxed result dropped due to cancellation (cancel arrived
-                    # after the worker delivered) -- audit it.
-                    _sel_audit(
-                        "cancelled",
-                        _current_tool_name,
-                        _current_req_id,
-                        _current_caller_key,
-                    )
-                _result_box.clear()
-                # Consumed: drop the id so a completed request never lingers
-                # in the cancelled set.
-                _cancelled_ids.discard(str(_current_req_id))
-            _current_req_id = None
-            _cancel_event = None
-            _result_ready.clear()
+    def _refuse_tool_call(req_id: Any, caller_key: str, detail: str) -> None:
+        """Answer a ``tools/call`` that names no usable tool, and audit the refusal.
 
-        # Dispatch a queued tools/call (FIFO) before reading new input.
-        if _pending_calls:
-            req = _pending_calls.popleft()
-        else:
-            req = _read_message(sys.stdin)
-            if req is None:
-                break
-
+        Never dispatched, and never audited as an invocation of a tool: the SEL
+        record is the refusal decision, with the shape of what was sent in
+        place of a name.
+        """
         try:
-            method, req_id, _params = validate_jsonrpc_request(req)
-        except ValidationError:
-            continue
+            sel().log_api_access(
+                caller=caller_key or _ambient_audit_session(),
+                operation="tool_call.invalid_params",
+                outcome="rejected",
+                source="mcp",
+                resources=f"server={server_name},{detail}",
+            )
+        except Exception as sel_exc:
+            logger.warning("SEL audit failed for a refused tool call: %s", sel_exc)
+        if req_id is not None:
+            respond(
+                req_id,
+                None,
+                error={
+                    "code": JSONRPC_INVALID_PARAMS,
+                    "message": "Invalid params: tools/call takes an object params "
+                    "with a non-empty string name",
+                },
+            )
 
+    def _servable(req: dict[str, Any]) -> tuple[str, Any, dict[str, Any]] | None:
+        """``(method, id, params)`` of a request this loop serves, else ``None``.
+
+        Runs once per message, before the busy/idle split, so a request either
+        path cannot serve is refused the same way under load as at rest: a
+        malformed envelope is answered ``-32600``, params that are not an
+        object ``-32602``, and a ``tools/call`` with no usable tool name is
+        refused through :func:`_refuse_tool_call`. A notification is never
+        answered.
+        """
+        try:
+            method, req_id, params = validate_jsonrpc_request(req)
+        except JsonRpcEnvelopeError as exc:
+            if exc.method == "tools/call" and exc.invalid_params:
+                _refuse_tool_call(exc.req_id, "", f"params_type={type(req.get('params')).__name__}")
+            elif exc.req_id is not None:
+                code = JSONRPC_INVALID_PARAMS if exc.invalid_params else JSONRPC_INVALID_REQUEST
+                respond(exc.req_id, None, error={"code": code, "message": f"Invalid {exc}"})
+            return None
+        except ValidationError:
+            return None
+        if method == "tools/call" and _tool_call_name(params) is None:
+            _refuse_tool_call(
+                req_id, _req_caller_key(params), f"name_type={type(params.get('name')).__name__}"
+            )
+            return None
+        return method, req_id, params
+
+    def _dispatch(method: str, req_id: Any, params: dict[str, Any]) -> None:
+        """Serve one request while no tool is running (the idle path)."""
+        nonlocal _worker_thread, _current_req_id, _current_tool_name
+        nonlocal _current_caller_key, _cancel_event, _pruned_exit
         if method == "initialize":
             _caps: dict[str, Any] = {"tools": {"listChanged": False}}
             if advertise_caller_identity:
@@ -1607,7 +1855,6 @@ def _run_stdio_dispatch_loop(
             # ``_cancelled_order`` in lockstep -- a raw add would grow the set
             # past the cap while the deque lagged, later crashing the eviction
             # loop with an empty-deque popleft.
-            params = req.get("params", {})
             cancelled_rid = params.get("requestId")
             if cancelled_rid is not None:
                 _remember_cancelled_id(
@@ -1617,11 +1864,10 @@ def _run_stdio_dispatch_loop(
                     protected=_live_request_ids(),
                 )
         elif method == "tools/list":
-            respond(req_id, {"tools": _listable_tools(_req_caller(req))})
+            respond(req_id, {"tools": _listable_tools(_req_caller(params))})
         elif method == "ping":
             respond(req_id, {})
         elif method == "tools/call":
-            params = req.get("params", {})
             tool_name = params.get("name", "")
             tool_args = params.get("arguments", {})
             if not isinstance(tool_args, dict):
@@ -1630,7 +1876,7 @@ def _run_stdio_dispatch_loop(
             # any client-forged ``kirocrew.caller`` block and injects its own
             # on every forwarded call, so a block present here is
             # gateway-authored. None in the non-pooled stdio topology.
-            _caller_ctx = CallerContext.from_meta(params.get("_meta"))
+            _caller_ctx = _req_caller(params)
             # The connection's namespace separator. Parsed separately because it
             # arrives WITHOUT an identity for a caller the gateway could not
             # name — the case it exists for — so it cannot be folded
@@ -1645,7 +1891,45 @@ def _run_stdio_dispatch_loop(
                     req_id,
                     _caller_ctx.session_key if _caller_ctx else "",
                 )
-                continue
+                return
+            # Checked before the policy read and the dispatch: both import
+            # lazily, so on a pruned install they fail with an import error
+            # instead of a refusal the caller can retry.
+            if install_pruned():
+                _sel_audit(
+                    "rejected_install_pruned",
+                    tool_name,
+                    req_id,
+                    _caller_ctx.session_key if _caller_ctx else "",
+                )
+                if respawned_by_pool():
+                    _refuse_from_pruned_install(req_id, tool_name)
+                    _pruned_exit = True
+                    return
+                # Launched directly by kiro-cli, or pooled with a respawn
+                # command that went with the prune: nothing would bring this
+                # process back, so exiting would take every tool away for the
+                # rest of the session. Keep the transport and refuse each call
+                # with the action that actually recovers it.
+                logger.warning(
+                    "%s: the install this process runs from was removed by an "
+                    "update; refusing %s until Kiro Crew is restarted",
+                    server_name,
+                    tool_name,
+                )
+                respond(
+                    req_id,
+                    None,
+                    error={
+                        "code": -32000,
+                        "message": (
+                            f"{server_name} is running from an install that an "
+                            "update removed; restart Kiro Crew (kirocrew restart) "
+                            "to load the current install"
+                        ),
+                    },
+                )
+                return
             # Defense-in-depth: reject calls to excluded tools even if
             # the LLM somehow attempts to call them (hallucination).
             # Per-call caller identity keys the policy in pooled backends.
@@ -1736,6 +2020,26 @@ def _run_stdio_dispatch_loop(
                         # missing token; this reader has nowhere to get one, and
                         # the note says so. A server the gateway did spawn keeps
                         # the wording above (token present, or the denial arm).
+                        _refusal += external_client_identity_note(server_name)
+                elif _policy.unresolved == "identity_unattestable":
+                    # The key resolved from a lenient source with no attestation
+                    # to carry it, so the gateway was never dialled -- a dial
+                    # could only be refused. The remedy is the same channel the
+                    # ``identity_unattested`` arm names (a session token on the
+                    # element, or a gateway caller block), stated without claiming
+                    # a gateway read that did not happen.
+                    _refusal = (
+                        f"Error: tool '{tool_name}' is unavailable because this "
+                        f"server could not prove which session it acts for "
+                        f"(identity_unattestable): session {_policy_session} "
+                        f"resolved only from a source the gateway cannot attest "
+                        f"(no session token on this server, no gateway-injected "
+                        f"session key), so the tool policy was not read. Refusing "
+                        f"the call rather than ignoring an operator's exclusion "
+                        f"list; it succeeds once this server is started by a Kiro "
+                        f"Crew session that gives it a signed session token."
+                    )
+                    if _caller_ctx is None and spawned_without_gateway_identity():
                         _refusal += external_client_identity_note(server_name)
                 elif _policy.unresolved == "resolution_failed":
                     # A DIFFERENT diagnosis and a different remedy from the branch
@@ -1850,7 +2154,18 @@ def _run_stdio_dispatch_loop(
                     ),
                     daemon=True,
                 )
-                _worker_thread.start()
+                try:
+                    _worker_thread.start()
+                except Exception:
+                    # Nothing runs (out of threads under the scope's task
+                    # ceiling): the next pass must not take an unstarted
+                    # thread for a running or a finished one. The call is
+                    # still an invocation decision, so it is audited as failed.
+                    _sel_audit("failed", tool_name, req_id, _current_caller_key)
+                    _worker_thread = None
+                    _current_req_id = None
+                    _cancel_event = None
+                    raise
         elif req_id is not None:
             respond(
                 req_id,
@@ -1860,3 +2175,129 @@ def _run_stdio_dispatch_loop(
                     "message": f"Unknown method: {method}",
                 },
             )
+
+    def _deliver_finished_worker(join_timeout: float) -> None:
+        """Join the finished worker and deliver its result, or audit its cancel."""
+        nonlocal _worker_thread, _current_req_id, _cancel_event
+        if _worker_thread is not None:
+            _worker_thread.join(timeout=join_timeout)
+        _worker_thread = None
+        with _result_lock:
+            if _result_box and str(_current_req_id) not in _cancelled_ids:
+                respond(_current_req_id, _result_box[0])
+            elif _result_box and not _worker_audited[0]:
+                # Boxed result dropped due to cancellation (cancel arrived
+                # after the worker delivered) -- audit it.
+                _sel_audit(
+                    "cancelled",
+                    _current_tool_name,
+                    _current_req_id,
+                    _current_caller_key,
+                )
+            _result_box.clear()
+            # Consumed: drop the id so a completed request never lingers
+            # in the cancelled set.
+            _cancelled_ids.discard(str(_current_req_id))
+        _current_req_id = None
+        _cancel_event = None
+        _result_ready.clear()
+
+    while True:
+        # If a worker is running, poll for completion while also reading stdin
+        if _worker_thread is not None and _worker_thread.is_alive():
+            # Non-blocking stdin read with short timeout to interleave. A line
+            # already buffered is read first: select cannot see it.
+            readable = _stdin_holds_a_line(sys.stdin) or select.select([sys.stdin], [], [], 0.1)[0]
+            if not readable:
+                if _result_ready.is_set():
+                    _deliver_finished_worker(1.0)
+                continue
+            req = _read_message(sys.stdin)
+            if req is None:
+                # EOF: wait for worker then exit
+                if _worker_thread:
+                    _worker_thread.join(timeout=5.0)
+                break
+            if isinstance(req, _Skipped):
+                # One iteration per dropped frame, so a finished worker's
+                # result is delivered before the next blocking read.
+                continue
+            envelope = _servable(req)
+            if envelope is None:
+                continue
+            method, req_id, params = envelope
+            # Process only cancel notifications while tool is running
+            try:
+                if method == "notifications/cancelled":
+                    cancelled_rid = params.get("requestId")
+                    if cancelled_rid is not None:
+                        _remember_cancelled_id(
+                            _cancelled_ids,
+                            _cancelled_order,
+                            str(cancelled_rid),
+                            protected=_live_request_ids(),
+                        )
+                        if str(cancelled_rid) == str(_current_req_id) and _cancel_event:
+                            _cancel_event.set()
+                            logger.info("cancel received for in-flight request %s", cancelled_rid)
+                # Answer gateway pings even while a tool is in-flight so the
+                # ping-gated wedge detector sees the backend as responsive.
+                elif method == "ping" and req_id is not None:
+                    respond(req_id, {})
+                # Buffer tools/call requests that arrive while busy so they get a
+                # response when the worker frees (dropping them left the
+                # client waiting forever). Cancels against queued ids are honored
+                # at dispatch time via _cancelled_ids.
+                elif method == "tools/call" and req_id is not None:
+                    if len(_pending_calls) >= PENDING_CALLS_MAX:
+                        # Rejection is a tool-invocation decision -- audit it
+                        # (security-controls: all invocation decisions emit SEL).
+                        _sel_audit(
+                            "rejected_busy",
+                            params.get("name", ""),
+                            req_id,
+                            _req_caller_key(params),
+                        )
+                        respond(
+                            req_id,
+                            None,
+                            error={
+                                "code": -32000,
+                                "message": "Server busy: pending tool-call queue is full; retry",
+                            },
+                        )
+                    else:
+                        _pending_calls.append(req)
+                # Other messages while busy: drop gracefully. Notifications are
+                # fine to drop; initialize/initialized never arrive mid-tool.
+                elif method == "tools/list" and req_id is not None:
+                    respond(req_id, {"tools": _listable_tools(_req_caller(params))})
+            except Exception:  # noqa: BLE001 - one message must not end the server
+                _answer_internal_error(method, req_id)
+            continue
+
+        # Check if worker just finished
+        if _worker_thread is not None:
+            _deliver_finished_worker(0.1)
+
+        # Dispatch a queued tools/call (FIFO) before reading new input.
+        if _pending_calls:
+            req = _pending_calls.popleft()
+        else:
+            req = _read_message(sys.stdin)
+            if req is None:
+                break
+            if isinstance(req, _Skipped):
+                continue
+
+        envelope = _servable(req)
+        if envelope is None:
+            continue
+        method, req_id, params = envelope
+        try:
+            _dispatch(method, req_id, params)
+        except Exception:  # noqa: BLE001 - one message must not end the server
+            _answer_internal_error(method, req_id)
+        if _pruned_exit:
+            return True
+    return False

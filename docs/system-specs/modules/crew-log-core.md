@@ -48,10 +48,10 @@ Line 1 is the header; every later line is an entry. This section is the part tha
 
 | Field | Meaning |
 |---|---|
-| `type` | `domain/action`, or the one guest form `app:<name>/<action>`. A type carries the FACT; who wrote it is `src`. |
+| `type` | `domain/action`, or the one guest form `app:<name>/<action>`. Each name is anchored at `\Z`, so a name carrying a trailing newline is `bad_type` rather than an accepted plain name. A type carries the FACT; who wrote it is `src`. |
 | `seq` | Contiguous from 1 after the header. Writer-assigned. |
 | `time` | Epoch milliseconds. Writer-assigned. |
-| `src` | The emitter. Which names a kind accepts is per kind: 4a through 4c. |
+| `src` | The emitter. Which names a kind accepts is per kind: 4a through 4c. A guest's name is anchored at `\Z` too, so `crew:qa\n` is `bad_src`. |
 | `thread` | Optional. The seq of an earlier entry in this same file -- a grouping key, like a chat thread id. |
 | `ref` | Optional. `{unit, id, from, to?}`, a pointer to a segment of another (or the same) crew log. `to` absent means one line. |
 | `ignorable` | Optional, `true` only. The writer's promise that a reader which does not know this `type` may skip the line. Absent on every entry that does not set it. |
@@ -286,9 +286,10 @@ subject -- this entry is that history (`monitor-architecture.md`).
 
 | Type | `data` | Emitter |
 |---|---|---|
-| `background/completed` | `{kind: title \| memory_consolidation \| summary, model?, provider?, tokens?, credits?, ms?}` | yes |
-| `subagent/spawned` | `{turn?, agent_id, agent?, model?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
+| `background/completed` | `{kind: title \| memory_consolidation \| summary \| dynamic_card, model?, provider?, tokens?, credits?, ms?}` | yes |
+| `subagent/spawned` | `{turn?, agent_id, agent?, model?, task?, scope:{memory, lessons, project}}` — no `ref` yet, see below | yes |
 | `subagent/steered` | `{agent_id, mode: interrupt \| follow_up}` | yes |
+| `subagent/dismissed` | `{agent_id}` — the user cleared that child's card; neither an opener nor a closer | yes |
 | `subagent/completed` | `{agent_id, ms?}` — no `tokens`/`credits`, see below | yes |
 | `subagent/failed` | `{agent_id, reason?, outcome: failed \| stopped \| unknown, ms?}` — `unknown` is written only by the interrupted-tail repair | yes |
 
@@ -493,6 +494,8 @@ After locking, the held inode is compared with the file now at the lease path, a
 
 A crew log is one or more SEGMENT files. `log.jsonl` is the segment beginning at seq 1; a later
 segment is `log.<first_seq>.jsonl`, with its first seq in the name so ordering needs no file read.
+The first seq is spelled canonically, in ASCII digits with no leading zero. Any other name
+(`log.².jsonl`, `log.١٢.jsonl`, `log.05.jsonl`) is a stray file, not a segment, and a reader ignores it.
 A reader walks segments in ascending first-seq order and requires seq to stay contiguous ACROSS each
 boundary (`segment_gap`), because two files are independent objects: a half-finished copy or a
 deleted middle segment is invisible unless it is checked. Inside one file a missing seq is a damaged

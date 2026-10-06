@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
 from kiro_crew import agent_state
 from kiro_crew.agent_discovery import AgentInfo, list_agents
 from kiro_crew.agent_files import AGENT_FILENAME, GUEST_AGENT_FILENAME, LITE_AGENT_FILENAME
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import (
+    KiroCrewConfig,
+    dispatch_kiro_agent,
+    refresh_materialized_agents,
+)
 from kiro_crew.dashboard.handlers._shared import _read_session_key, requesting_slot_project
 from kiro_crew.dashboard.handlers.agents import (
     _agent_roster_row,
@@ -20,7 +24,9 @@ from kiro_crew.dashboard.handlers.agents import (
     _roster_mask,
 )
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.executors import discovery_executor
+from kiro_crew.platform import current_context, safe_context_call
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +48,16 @@ def _is_background_only(agent: AgentInfo) -> bool:
     the user's file, an ordinary choice like any other project template.
     """
     return agent.kirocrew_owned and agent.filename in _BACKGROUND_ONLY_FILES
+
+
+def _agent_runtime_policy(name: str, engine_identity: str) -> dict[str, Any] | None:
+    """Return companion-owned UI policy without making it an enforcement boundary."""
+    policy = safe_context_call(
+        lambda: current_context().providers.agent_runtime_policy(engine_identity),
+        fallback=None,
+        log_message=f"Failed to read runtime policy for crew {name}",
+    )
+    return policy if isinstance(policy, dict) else None
 
 
 def _templates(project_dir: Path | None) -> list[AgentInfo]:
@@ -97,24 +113,35 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
     if state is not None and session_key:
         slot_name = session_key.split(":", 1)[-1]
         slot = state._slots.get(slot_name)
+        # One body for a missing slot and a refused one, so an app cannot tell them apart.
         if slot is None:
-            return web.json_response(
-                {"error": "Conversation not found", "code": "slot_not_found"}, status=404
-            )
-        from kiro_crew.dashboard.chat_handlers import _deny_cross_app_slot_access
-
-        denied = _deny_cross_app_slot_access(request, slot, slot_name, "agents.catalog")
+            return slot_not_found()
+        denied = deny_app_slot_access(request.get("app", ""), slot, slot_name, "agents.catalog")
         if denied is not None:
             return denied
         # No single-project fallback: an unscoped chat must not acquire choices
         # that only a different conversation's working directory can resolve.
         project_dir = requesting_slot_project(state, session_key)
 
+    # The reset below writes the owner's config, so only the owner's own fetch
+    # may run it; anyone else's still gets a freshly scanned template list.
+    owner = state is not None and is_owner_dashboard_request(request)
     try:
-        config = await asyncio.to_thread(KiroCrewConfig.load)
+        # The picker's fetch is the one moment, after boot, that an agent removed
+        # OUTSIDE the gateway (a package uninstall, a hand-deleted file) is
+        # certain to be noticed: it already rescans the directory off the loop
+        # for the template rows, so the snapshot refresh -- whose landed scan
+        # resets a default agent whose template is gone -- rides the same
+        # executor call, and the config is read AFTER it so the response names
+        # the default the user will actually get.
+        def _refreshed_templates() -> list[AgentInfo]:
+            refresh_materialized_agents(heal_default=owner)
+            return _templates(project_dir)
+
         templates = await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), functools.partial(_templates, project_dir)
+            discovery_executor(), _refreshed_templates
         )
+        config = await asyncio.to_thread(KiroCrewConfig.load)
     except Exception:
         logger.warning("Agent execution catalog could not be loaded", exc_info=True)
         return web.json_response(
@@ -125,11 +152,18 @@ async def api_agent_catalog(request: web.Request) -> web.Response:
             status=503,
         )
 
-    redact = state is None or not is_owner_dashboard_request(request)
+    redact = not owner
     rows = []
     for name, member in config.agents.items():
         row = _agent_roster_row(name, "global", member, redact=redact)
         row["selection_kind"] = "member"
+        if not redact:
+            # The companion keys its policy on the agent that RUNS, which for a
+            # row that recorded a file name is the agent that file declares.
+            engine_identity = dispatch_kiro_agent(member.kiro_agent) or name
+            policy = _agent_runtime_policy(name, engine_identity)
+            if policy is not None:
+                row["runtime_policy"] = policy
         rows.append(row)
     rows.extend(_template_row(agent) for agent in templates)
     return web.json_response(

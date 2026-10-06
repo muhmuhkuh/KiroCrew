@@ -61,12 +61,13 @@ from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable, lookup_cron_folde
 from kiro_crew.cron_script import resolve_script_path
 from kiro_crew.env import emit_env
 from kiro_crew.executors import maintenance_executor
-from kiro_crew.gateway_lock import GatewayLock, GatewayLockError
+from kiro_crew.gateway_lock import GatewayLock, GatewayLockError, LockFileError
 from kiro_crew.history import ConversationLog
 from kiro_crew.platform.governance import may_skip_gate_now, strip_ungoverned_auto_approve
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 from kiro_crew.session_map import SUPPRESS_REPLAY_FLAG, SessionMap
+from kiro_crew.user_json import loads_mcp_config, loads_user_json
 from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
 
 #: Absolute path of the stdlib-only launch shim, for interpreters whose
@@ -233,7 +234,7 @@ def _global_mcp_specs() -> dict[str, Any]:
     that cannot read it neutralizes nothing rather than failing app enable.
     """
     try:
-        raw = json.loads(
+        raw = loads_user_json(
             (Path.home() / ".kiro" / "settings" / "mcp.json").read_text(encoding="utf-8")
         )
         specs = raw.get("mcpServers")
@@ -354,11 +355,11 @@ def _ceiling_filtered_allowed(refs: object, agent_name: str = "") -> list[Any]:
     The decision itself is NOT made here. It is
     :func:`~kiro_crew.platform.governance.may_skip_gate`, because this is one of
     two places that write an ``allowedTools`` list — the host agent's shared-MCP
-    sync in ``agent.py`` is the other — and the earlier revision reimplemented
-    the rule locally, including a private copy of the builtin-tool→scope map. One
-    copy meant one write point was protected and the other was not, and a newly
-    governed scope silently re-opened the shortcut for the copy that had not heard
-    of it.
+    sync (``sync_shared_server_refs`` in ``agent_materialization/mcp_sources.py``)
+    is the other — so the rule is not reimplemented here. A local copy, including
+    a private builtin-tool→scope map, would protect one write point and not the
+    other, and a newly governed scope would silently re-open the shortcut for the
+    copy that had not heard of it.
     """
     out: list[Any] = []
     withheld: list[str] = []
@@ -744,7 +745,7 @@ _FRAMEWORK_OWNED_AGENT_KEYS = frozenset(
 def _read_agent_config(path: Path) -> dict[str, Any] | None:
     """The agent JSON currently on disk, or None when there is nothing usable."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = loads_user_json(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
@@ -2092,7 +2093,7 @@ def _read_mcp_json_unlocked(*, strict: bool = False) -> dict[str, Any]:
     if not _mcp_json_path().is_file():
         return {}
     try:
-        return json.loads(_mcp_json_path().read_text(encoding="utf-8"))
+        return loads_mcp_config(_mcp_json_path().read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         if strict:
             raise
@@ -2918,12 +2919,21 @@ def _register_mcp_servers(
     a hard error — breaking ALL kiro requests, not just this app's. (An alternate ACP
     backend reads a different config file, so it was unaffected — the asymmetry in the
     report.)
-    So: an HTTP server with NO resolvable LIVE port is NOT written at all (and any stale
-    entry for it is scrubbed) — never a dead URL the kiro binary might still dial whether
-    or not it honours a ``disabled`` flag. The boot/enable path calls
-    :func:`reregister_app_mcp_servers` with the real ``live_port`` once the backend is up,
-    which writes the entry with the correct, reachable port. stdio/command servers (no
-    ``url``) are always registered — they have no port to be dead.
+    So: a GATEWAY-MANAGED backend's HTTP server (``backend.entryPoint`` set) with NO
+    resolvable LIVE port is NOT written at all (and any stale entry for it is scrubbed) —
+    never a dead URL the kiro binary might still dial whether or not it honours a
+    ``disabled`` flag. The boot/enable path calls :func:`reregister_app_mcp_servers` with
+    the real ``live_port`` once the backend is up, which writes the entry with the
+    correct, reachable port.
+
+    A SELF-MANAGED app (empty ``backend.entryPoint``) is the exception: the gateway
+    launches no backend for it, so its ``url`` is an AUTHORITATIVE fixed endpoint, not an
+    illustrative port awaiting resolution. It never gets a live registration, so its url
+    is preserved rather than scrubbed — mirroring :func:`_collect_app_mcp_servers`
+    (``agent_materialization/mcp_sources.py``), the other writer of this config. The two
+    writers must agree, or one scrubs an entry the other immediately writes back.
+
+    stdio/command servers (no ``url``) are always registered — they have no port to be dead.
     """
     if not manifest.mcpServers:
         return []
@@ -2942,16 +2952,31 @@ def _register_mcp_servers(
             if isinstance(cfg, dict):
                 cfg = _pin_host_cli_command(app_name, cfg)
             is_http = isinstance(cfg, dict) and bool(cfg.get("url"))
-            if is_http and not resolved_port:
-                # No live backend → registering the manifest's dead default-port URL would
-                # break every kiro session. Skip it AND scrub any stale entry so a prior
-                # (now-dead) registration can't keep poisoning the provider path.
+            if is_http and not resolved_port and manifest.backend.entryPoint:
+                # GATEWAY-MANAGED backend (backend.entryPoint set) with no live port: the
+                # manifest's url carries only an ILLUSTRATIVE fixed port, so writing it
+                # verbatim is a dead default-port URL that breaks every kiro session. Skip
+                # it AND scrub any stale entry so a prior (now-dead) registration can't keep
+                # poisoning the provider path. The boot/enable path re-registers with the
+                # live port once the backend is up.
+                #
+                # A SELF-MANAGED app (empty backend.entryPoint) is the opposite case: it has
+                # no backend the gateway launches, so its url is an AUTHORITATIVE fixed
+                # endpoint that never gets a live registration — preserve it instead of
+                # dropping it. This mirrors ``_collect_app_mcp_servers`` in
+                # ``agent_materialization/mcp_sources.py`` (the other writer of this config),
+                # which keeps a self-managed url for exactly this reason. The two writers
+                # must agree, or registration scrubs the entry and the next rebuild writes
+                # it straight back.
                 servers.pop(namespaced, None)
                 skipped.append(namespaced)
                 continue
             if is_http:
+                # _resolve_live_mcp_url is a no-op without a live port, so a self-managed
+                # app's authoritative url is written through unchanged here.
                 cfg["url"] = _resolve_live_mcp_url(app_name, cfg["url"], live_port=resolved_port)
-                cfg.pop("disabled", None)  # backend is live — ensure enabled
+                if resolved_port:
+                    cfg.pop("disabled", None)  # backend is live — ensure enabled
             else:
                 # A stdio entry: resolve a bare interpreter to an absolute one — the
                 # app's venv python when present, else the running interpreter (see
@@ -3150,7 +3175,7 @@ def _scrub_legacy_shared_mcp(app_name: str) -> int:
         # rename. It is a DIFFERENT sidecar than _mcp_lock's default (that guards
         # kirocrew.json), so pass the legacy path explicitly.
         with _mcp_lock(target=_LEGACY_SHARED_MCP_PATH):
-            data = json.loads(_LEGACY_SHARED_MCP_PATH.read_text(encoding="utf-8"))
+            data = loads_mcp_config(_LEGACY_SHARED_MCP_PATH.read_text(encoding="utf-8"))
             servers = data.get("mcpServers", {})
             stale = [k for k in servers if k.startswith(prefix)]
             if not stale:
@@ -3586,7 +3611,11 @@ class SessionPointerCleanup:
     ``failed`` covers the case the clear could not PERSIST: the sid clear and the
     suppression flag are both mutations of a file that has to be written, so an
     ENOSPC or a permission error leaves the pointer on disk while the count says
-    nothing was owned. Reported rather than raised — the uninstall itself already
+    nothing was owned. It also covers a lock that could not be used at all
+    (:class:`~kiro_crew.gateway_lock.LockFileError`: ``gateway.lock`` is not a
+    regular file, or it or the home could not be opened, created or measured),
+    because no gateway owns the map then and stopping one would not help. Reported
+    rather than raised — the uninstall itself already
     succeeded, and bookkeeping must not fail it — but not reported as clean either.
     """
 
@@ -3659,6 +3688,13 @@ def discard_app_session_pointers(app_name: str) -> SessionPointerCleanup:
             # property inherited from being off the loop, which a later refactor
             # could change without noticing this depends on it.
             smap.flush()
+    except LockFileError as exc:
+        # Not a gateway owning the map: the lock file itself could not be used
+        # (not a regular file, or an open/create/stat failure), and stopping a
+        # gateway would not help. ``failed`` sends the operator to the log, where
+        # this names the path and the cause.
+        logger.warning("session pointer cleanup for %r could not lock: %s", app_name, exc)
+        return SessionPointerCleanup(failed=True)
     except GatewayLockError:
         logger.info(
             "Left %s's conversation pointers in place: a gateway owns session_map.json "

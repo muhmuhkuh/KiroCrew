@@ -397,6 +397,16 @@ class _WaitsMixin(ManagerComponent):
             )
         except RuntimeError:
             pass
+        # A granted resume is a point the parent's wave settles, so it re-publishes
+        # the parent's queued depth like a terminal does. The resume entry itself
+        # was never counted (``entry_is_resident_resume``), but the wait that just
+        # ended -- a dependency, a permission answer, an input -- has no terminal of
+        # its own to answer a card that missed a frame. Guarded: an advisory emit
+        # must never cost the run its slot.
+        try:
+            self._manager._emit_queue_depth(info.parent_session_key, info.batch_id)
+        except Exception:
+            _glue_logger.debug("queue-depth re-emit failed after a resume grant", exc_info=True)
         _glue_logger.info("Subagent %s: resumed (slot re-admitted)", info.id)
         return True
 
@@ -674,7 +684,9 @@ class _WaitsMixin(ManagerComponent):
         if outcome.fail_parent:
             for sibling in outcome.cancel_siblings:
                 self._cancel_live_or_row(sibling, reason=_waits.WAIT_REASON_CHILD_FAILED)
-            if parent is not None and not parent.done:
+            # A parent that claimed its completed ending is ``done`` here too:
+            # its success is already counted, so no error is stamped on it.
+            if parent is not None and not parent.done and not parent._ending_claimed:
                 parent.error = parent.error or (
                     f"child {child.id} {state} (on_child_failure=fail_parent)"
                 )
@@ -813,6 +825,7 @@ class _WaitsMixin(ManagerComponent):
         expired waits belonged to (schedules tasks, so it runs on the loop)."""
         for agent_id in expired:
             info = self._manager._agents.get(agent_id)
-            if info is not None and not info.done:
+            # A claimed completed ending is ``done`` here, as on every stop path.
+            if info is not None and not info.done and not info._ending_claimed:
                 info.error = info.error or "wait deadline passed"
                 self._schedule_cancel(agent_id)

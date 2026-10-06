@@ -990,6 +990,27 @@ def test_streaming_run_emits_activity_audits_tools_and_returns_the_result(monkey
     assert [c["tool_name"] for c in fake_sel.calls] == ["claude-cli", "Edit"]
 
 
+def test_streaming_run_skips_a_line_that_is_not_a_json_object(monkeypatch, fake_sel):
+    """A line nested past the decoder raised ``RecursionError``, which the
+    ``JSONDecodeError`` arm missed, and ended the whole run; a scalar line
+    reached ``.get`` the same way."""
+    from stray_line_helpers import STRAY_LINES
+
+    runner = R.AgentRunner(on_activity=lambda ev: None)
+    popen = _StreamPopen(
+        [
+            *(make().decode("utf-8", "replace") for make in STRAY_LINES.values()),
+            '{"type": "result", "result": "done", "total_cost_usd": 0.5}\n',
+        ]
+    )
+    _wire_spawn(monkeypatch, runner, popen)
+
+    res = runner.run("prompt")
+
+    assert res.ok is True
+    assert res.text == "done"
+
+
 def test_streaming_run_unlinks_the_launcher_temp_file(monkeypatch, fake_sel, tmp_path):
     launcher = tmp_path / "launcher.sh"
     launcher.write_text("#!/bin/sh\n", newline="\n")
@@ -1498,7 +1519,7 @@ async def test_run_async_treats_an_exhausted_stream_as_success(fake_sel):
 @pytest.mark.asyncio
 async def test_reject_audits_the_refusal_and_tells_the_provider(fake_sel):
     provider = _FakeProvider()
-    await R.SessionAgentRunner._reject(provider, "r9", tool="bash", session_key="s")
+    await R.SessionAgentRunner._reject(provider, "r9", tool="bash", session_key="s", cause=None)
     assert provider.rejected == ["r9"]
     (call,) = fake_sel.calls
     assert call["outcome"] == "denied"
@@ -1508,7 +1529,7 @@ async def test_reject_audits_the_refusal_and_tells_the_provider(fake_sel):
 @pytest.mark.asyncio
 async def test_reject_still_refuses_when_the_audit_cannot_be_written(broken_sel):
     provider = _FakeProvider()
-    await R.SessionAgentRunner._reject(provider, "r9", tool="bash")
+    await R.SessionAgentRunner._reject(provider, "r9", tool="bash", cause=None)
     assert provider.rejected == ["r9"]
 
 
@@ -1518,7 +1539,7 @@ async def test_reject_tolerates_a_provider_that_cannot_be_told(fake_sel):
         async def reject_tool(self, rid):
             raise RuntimeError("stdin closed")
 
-    await R.SessionAgentRunner._reject(_Deaf(), "r9", tool="bash")  # must not raise
+    await R.SessionAgentRunner._reject(_Deaf(), "r9", tool="bash", cause=None)  # must not raise
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,13 @@ outcome. Every state write goes through the transition table in ``model``.
 
 The store keeps no dispatch state in memory: the bounded dispatch window is the
 CALLER's list (``TaskStore.window`` is the size it should be bounded to), and
-:meth:`fetch_dispatchable` refills it from the rows on disk in FIFO order.
+:meth:`fetch_dispatchable` refills it from the rows on disk in FIFO order. The
+one in-memory fact it does keep is an index, not a decision: the ids of the
+rows that are accepted and not yet started (:meth:`is_unstarted`), written
+through after every committed write that moves a row into or out of that set
+and loaded at :meth:`open`, so an
+event-loop caller can ask "is this id still pending?" without the SQLite read
+the loop must never take.
 
 WAL is the default journal. A data home on a network filesystem gets
 ``journal_mode=DELETE`` instead -- WAL relies on shared memory the NFS/SMB
@@ -99,15 +105,19 @@ STRICT_ON_LOOP_ENV = "KIROCREW_STRICT_ON_LOOP_TASK_STORE"
 #    and a dropped terminal write leaves the row active for the next boot's
 #    reconciler (see ``Admitted.settle_async``).
 # 2. ``subagent_manager.admission.taskq_cancel_queued``, reached from
-#    ``_unqueue`` on the Stop-all path: the row has to be cancelled before a
+#    a single ``cancel`` (``cancel_impl``): the row has to be cancelled before a
 #    drain can claim it AND out of the in-memory window before a stagger timer
 #    can start it, and an await between those two is a race in either order.
+#    Stop all is restructured out of this class: it queues one writer-thread job
+#    for every row's cancel and only then drops the window entries, both before
+#    its first await (``taskq_post_cancel_queued``).
 #
 # Those takes are on-loop and cannot simply be offloaded, so arming this from
-# ``KIROCREW_DEV_MODE`` would raise on a cancel or a Stop-all and the developer's
-# rational response -- unsetting that variable -- silences every OTHER surface's
-# guard too. Flip it back to True once both classes are either restructured or
-# inside a vetted ``allow_on_loop()`` block.
+# ``KIROCREW_DEV_MODE`` would raise on a cancel -- an unqueue that raises leaves
+# that row waiting and fails the request -- and the developer's rational
+# response, unsetting that variable, silences every OTHER surface's guard too.
+# Flip it back to True once both classes are either restructured or inside a
+# vetted ``allow_on_loop()`` block.
 _ON_LOOP_DB_GUARD = OnLoopDBGuard(
     label="task store",
     remedy=(
@@ -155,6 +165,20 @@ _SQL_CLAIMABLE = "(" + ",".join(f"'{s}'" for s in sorted(CLAIMABLE)) + ")"
 _SQL_TERMINAL = "(" + ",".join(f"'{s}'" for s in sorted(TERMINAL)) + ")"
 _SQL_ACTIVE = "(" + ",".join(f"'{s}'" for s in sorted(ACTIVE)) + ")"
 _SQL_WAITING = "(" + ",".join(f"'{s}'" for s in sorted(WAITING)) + ")"
+#: Claimable rows plus ``admitted`` ones: every row accepted and not yet started.
+#: A caller that subtracts the rows this process has registered as runs is left
+#: with exactly the accepted work no run exists for yet (``include_admitted``).
+_UNSTARTED: frozenset[str] = CLAIMABLE | {ADMITTED}
+_SQL_UNSTARTED = "(" + ",".join(f"'{s}'" for s in sorted(_UNSTARTED)) + ")"
+#: The ``children_only`` filter the dispatch reads and their wake share: nested rows.
+_SQL_CHILD_ONLY = " AND parent_id IS NOT NULL AND parent_id <> ''"
+#: Ids per ``IN (...)`` list in a multi-row event read: under the 999
+#: host-parameter ceiling of an older SQLite build.
+_EVENT_ID_CHUNK = 500
+#: The key a terminal ``transition`` event carries when its writer still owes
+#: the row a report (``finish(report_owed=True)``), and the event that clears it.
+_REPORT_OWED_BY = "report_owed_by"
+_EVENT_REPORTED = "reported"
 
 
 class _CorruptStore(Exception):
@@ -433,6 +457,15 @@ class TaskStore:
         #: no counter and a test asserting "this path took NO on-loop call"
         #: needs a number, not the absence of a log line.
         self.loop_thread_calls = 0
+        #: Ids of the rows in an :data:`_UNSTARTED` state as of the last commit
+        #: on this connection: :meth:`is_unstarted`'s answer. Written through by
+        #: :meth:`_note_state` after every committed write that can move a row
+        #: into or out of that set (all of them run in this class) and reloaded
+        #: by :meth:`open`. Guarded by its own
+        #: lock, never ``_lock``, for the reason ``_executor_lock`` gives: the
+        #: reader is the event loop, and ``_lock`` is held across the busy wait.
+        self._unstarted_ids: set[str] = set()
+        self._unstarted_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -510,7 +543,51 @@ class TaskStore:
                     raise TaskStoreUnavailable(
                         f"task store {self._path} is corrupt after quarantine: {again}"
                     ) from again
+            self._load_unstarted_ids(self._conn)
             return self
+
+    def _load_unstarted_ids(self, conn: sqlite3.Connection) -> None:
+        """Seed :meth:`is_unstarted` from the rows already on disk.
+
+        A row accepted by an earlier incarnation, or imported at boot, is
+        pending work too; the write-through in :meth:`_note_state` only sees
+        this connection's own writes from here on. A read that fails leaves the
+        index empty rather than refusing the open: the index is an answer for a
+        probe, and an open that refused over it would refuse every spawn.
+        """
+        try:
+            rows = conn.execute(f"SELECT id FROM tasks WHERE state IN {_SQL_UNSTARTED}").fetchall()
+        except sqlite3.Error:
+            logger.warning("taskq: could not load the unstarted-row index", exc_info=True)
+            rows = []
+        with self._unstarted_lock:
+            self._unstarted_ids = {str(row["id"]) for row in rows}
+
+    def _note_state(self, task_id: str, state: str) -> None:
+        """Record *task_id*'s committed *state* in the unstarted-row index.
+
+        Called after the ``COMMIT`` of every write that can move a row into or
+        out of :data:`_UNSTARTED`, and only then, so a rolled-back write never
+        reaches the index. :meth:`claim` is the one state write that skips it:
+        claimable to ``admitted`` stays inside the set.
+        """
+        with self._unstarted_lock:
+            if state in _UNSTARTED:
+                self._unstarted_ids.add(task_id)
+            else:
+                self._unstarted_ids.discard(task_id)
+
+    def is_unstarted(self, task_id: str) -> bool:
+        """Whether *task_id* is accepted and not yet started (claimable or admitted).
+
+        Safe ON the event loop: an in-memory set read under a lock no I/O is
+        ever done under -- it never takes ``_lock`` or reaches :meth:`_c`, so
+        it neither waits out ``busy_timeout`` nor trips the on-loop guard. The
+        answer is this process's committed view: a write by another connection
+        on the same file is not seen until the next :meth:`open`.
+        """
+        with self._unstarted_lock:
+            return task_id in self._unstarted_ids
 
     def _open_connection(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = None
@@ -653,10 +730,18 @@ class TaskStore:
         single worker keeps writes serialized without the loop thread ever
         holding the connection lock.
         """
+        return await self.post(fn, *args, **kwargs)
+
+    def post(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> "asyncio.Future[Any]":
+        """Queue ``fn(*args, **kwargs)`` on the writer thread NOW; return its future.
+
+        :meth:`run` without the wait, for a caller that must not await before
+        the job is queued: the single worker runs jobs in submission order, so
+        a write posted here lands ahead of any job queued after this call
+        returns -- whichever task queues it, and however soon.
+        """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            self._writer_executor(), functools.partial(fn, *args, **kwargs)
-        )
+        return loop.run_in_executor(self._writer_executor(), functools.partial(fn, *args, **kwargs))
 
     @staticmethod
     def _on_running_loop_thread() -> bool:
@@ -794,6 +879,130 @@ class TaskStore:
             )
         return out
 
+    @_typed_read
+    def latest_events(
+        self, task_ids: Sequence[str], kinds: Sequence[str]
+    ) -> dict[tuple[str, str], TaskEvent]:
+        """The newest event of each of *kinds* for each of *task_ids*, in ONE query.
+
+        Keyed ``(task_id, kind)``; a pair with no such event is absent. For a
+        reader that needs one fact per row of a page (the queued listing),
+        where one :meth:`events` call per row would serialize a query per row
+        on the writer thread.
+        """
+        ids = [str(i) for i in task_ids if i]
+        if not ids or not kinds:
+            return {}
+        id_marks = ", ".join("?" for _ in ids)
+        kind_marks = ", ".join("?" for _ in kinds)
+        with self._lock:
+            # SQLite fills the bare columns of a MAX() aggregate from the row
+            # holding that maximum, so each group yields its newest event.
+            rows = (
+                self._c()
+                .execute(
+                    "SELECT task_id, MAX(seq) AS seq, ts, kind, data_json FROM task_events "
+                    f"WHERE task_id IN ({id_marks}) AND kind IN ({kind_marks}) "
+                    "GROUP BY task_id, kind",
+                    [*ids, *kinds],
+                )
+                .fetchall()
+            )
+        out: dict[tuple[str, str], TaskEvent] = {}
+        for r in rows:
+            try:
+                data = json.loads(r["data_json"])
+            except (TypeError, ValueError):
+                data = {}
+            out[(str(r["task_id"]), str(r["kind"]))] = TaskEvent(
+                task_id=str(r["task_id"]),
+                seq=int(r["seq"]),
+                ts=float(r["ts"]),
+                kind=str(r["kind"]),
+                data=data if isinstance(data, dict) else {},
+            )
+        return out
+
+    @_typed_read
+    def deferred_longer_than(
+        self,
+        kind: str,
+        bound: float,
+        *,
+        exclude_ids: Sequence[str] = (),
+        limit: int = 64,
+    ) -> list[TaskRecord]:
+        """Waiting rows of *kind* parked by :meth:`defer` NOW that have spent *bound* seconds parked.
+
+        Waiting means any state :meth:`defer` parks (``CLAIMABLE``: ``queued``,
+        ``retry_wait``, ``recovering``), so a restart survivor or a retried run
+        the memory gates keep deferring is bounded too. Oldest first, at most *limit*. Parked now means ``next_run_at`` is still
+        in the future: a row whose deferral has lapsed is eligible again and waits
+        for whatever picks it, which is not a deferral.
+
+        The time counted is the time the row was actually PARKED in its current
+        wait: each ``deferred`` event after the row's last ``claimed`` or
+        ``transition`` event (the closers the queued listing applies too,
+        ``_defer_details`` in the admission bridge) parks it from its ``ts`` to
+        its ``until``, cut short by the next deferral or by now. A gap between a
+        lapsed deferral and the next one is NOT counted: the row was eligible
+        then and waited for a slot to be re-checked in, not for memory. So a row
+        that was held back once and then queued behind a full cap is measured by
+        its parked time alone, while a row the host keeps short (re-checked every
+        admit wait) accrues almost all of its wall-clock time. Every re-check
+        appends one more event, so the clock is never restarted by one; a claim
+        or a re-queue ends the wait and the next deferral starts a new one.
+        """
+        excl_sql, excl_args = self._exclusion(exclude_ids)
+        now = self.now()
+        cutoff = now - float(bound)
+        with self._lock:
+            conn = self._c()
+            # The SQL keeps only rows whose current wait BEGAN at or before the
+            # cutoff -- necessary, since parked time never exceeds the time since
+            # the first deferral -- so the event walk below reads only rows that
+            # could be past the bound.
+            rows = conn.execute(
+                f"SELECT * FROM tasks WHERE kind=? AND state IN {_SQL_CLAIMABLE} AND next_run_at>?"
+                f"{excl_sql} AND (SELECT MIN(d.ts) FROM task_events d "
+                "WHERE d.task_id=tasks.id AND d.kind='deferred' AND d.seq > "
+                "COALESCE((SELECT MAX(c.seq) FROM task_events c WHERE c.task_id=tasks.id "
+                "AND c.kind IN ('claimed', 'transition')), 0)) <= ? "
+                "ORDER BY created_at, rowid",
+                [kind, now, *excl_args, cutoff],
+            ).fetchall()
+            records = [TaskRecord.from_row(r) for r in rows]
+            parked: dict[str, list[tuple[float, float]]] = {rec.id: [] for rec in records}
+            ids = list(parked)
+            for i in range(0, len(ids), _EVENT_ID_CHUNK):
+                chunk = ids[i : i + _EVENT_ID_CHUNK]
+                marks = ", ".join("?" for _ in chunk)
+                for ev in conn.execute(
+                    "SELECT e.task_id, e.ts, e.data_json FROM task_events e "
+                    f"WHERE e.task_id IN ({marks}) AND e.kind='deferred' AND e.seq > "
+                    "COALESCE((SELECT MAX(c.seq) FROM task_events c WHERE c.task_id=e.task_id "
+                    "AND c.kind IN ('claimed', 'transition')), 0) ORDER BY e.task_id, e.seq",
+                    chunk,
+                ).fetchall():
+                    try:
+                        data = json.loads(ev["data_json"])
+                        until = float(data["until"])
+                    except (TypeError, ValueError, KeyError):
+                        until = float(ev["ts"])
+                    parked[str(ev["task_id"])].append((float(ev["ts"]), until))
+        out: list[TaskRecord] = []
+        for rec in records:
+            spans = parked[rec.id]
+            total = 0.0
+            for n, (ts, until) in enumerate(spans):
+                end = spans[n + 1][0] if n + 1 < len(spans) else now
+                total += max(0.0, min(until, end, now) - ts)
+            if total >= float(bound):
+                out.append(rec)
+                if len(out) >= int(limit):
+                    break
+        return out
+
     @staticmethod
     def _rollback(conn: sqlite3.Connection) -> None:
         try:
@@ -839,6 +1048,8 @@ class TaskStore:
             except (sqlite3.Error, OSError, ValueError) as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task store write failed: {exc}") from exc
+        for rec in batch:
+            self._note_state(rec.id, rec.state)
         return [rec.id for rec in batch]
 
     def accept_one(self, record: TaskRecord) -> str:
@@ -870,6 +1081,8 @@ class TaskStore:
             except (sqlite3.Error, OSError) as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task store write failed: {exc}") from exc
+        if inserted:
+            self._note_state(record.id, record.state)
         return inserted
 
     # -- claim / lease -------------------------------------------------------
@@ -913,6 +1126,8 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task claim failed: {exc}") from exc
+        # No index write: a claim moves a claimable row to ``admitted``, and
+        # both are unstarted.
         return ClaimResult(record=rec)
 
     def claim_next(
@@ -1065,6 +1280,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task transition failed: {exc}") from exc
+        self._note_state(task_id, new_state)
         if new_state in TERMINAL:
             # The completion-rate series: the one funnel every terminal write
             # crosses (finish/cancel route here). ``outcome`` is a state name
@@ -1114,14 +1330,63 @@ class TaskStore:
         generation: int | None = None,
         result_ref: str | None = None,
         error: str | None = None,
+        report_owed: bool = False,
     ) -> bool:
-        """Write a terminal state; a stale generation or an already-terminal row is a no-op."""
+        """Write a terminal state; a stale generation or an already-terminal row is a no-op.
+
+        *report_owed* records, in the same transaction, that the writer still
+        owes this terminal a report it has not made yet: the row is named by
+        :meth:`owed_reports` until :meth:`mark_reported` clears it, so a process
+        lost between this commit and the report leaves the next one the work.
+        """
         if not is_terminal(state):
             raise InvalidTransition("?", state)
-        detail = {"error": error[:500]} if error else None
+        detail: dict[str, Any] = {"error": error[:500]} if error else {}
+        if report_owed:
+            detail[_REPORT_OWED_BY] = self.incarnation
         return self.transition(
-            task_id, state, generation=generation, result_ref=result_ref, detail=detail
+            task_id, state, generation=generation, result_ref=result_ref, detail=detail or None
         )
+
+    def mark_reported(self, task_id: str) -> None:
+        """Clear the report a :meth:`finish` with ``report_owed`` left owing."""
+        self.append_event(task_id, _EVENT_REPORTED)
+
+    @_typed_read
+    def owed_reports(
+        self, kind: str, *, limit: int = 256, after: tuple[float, str] | None = None
+    ) -> list[TaskRecord]:
+        """Terminal rows of *kind* an EARLIER incarnation owed a report it never made.
+
+        A row whose terminal ``transition`` carries the owing incarnation, with no
+        ``reported`` event after it, oldest terminal first (``updated_at``, then
+        ``id``). This incarnation's own rows are left out: their reports are in
+        flight in this process. *after* is the ``(updated_at, id)`` of the last
+        row of the previous page; only rows ordered after it are named, so a
+        caller pages through every owed row without re-reading one whose clear
+        has not landed yet.
+        """
+        cursor_sql = ""
+        args: list[Any] = [self.incarnation, kind, _EVENT_REPORTED]
+        if after is not None:
+            cursor_sql = "AND (t.updated_at>? OR (t.updated_at=? AND t.id>?)) "
+            args += [float(after[0]), float(after[0]), str(after[1])]
+        with self._lock:
+            rows = (
+                self._c()
+                .execute(
+                    "SELECT t.* FROM tasks t JOIN task_events e ON e.task_id=t.id "
+                    "AND e.kind='transition' "
+                    f"AND json_extract(e.data_json, '$.{_REPORT_OWED_BY}') IS NOT NULL "
+                    f"AND json_extract(e.data_json, '$.{_REPORT_OWED_BY}')<>? "
+                    f"WHERE t.kind=? AND t.state IN {_SQL_TERMINAL} AND NOT EXISTS ("
+                    "SELECT 1 FROM task_events r WHERE r.task_id=t.id AND r.kind=? "
+                    f"AND r.seq>e.seq) {cursor_sql}ORDER BY t.updated_at, t.id LIMIT ?",
+                    [*args, int(limit)],
+                )
+                .fetchall()
+            )
+        return [TaskRecord.from_row(r) for r in rows]
 
     def cancel(
         self,
@@ -1196,6 +1461,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task cancel failed: {exc}") from exc
+        self._note_state(task_id, CANCELLED)
         emit_counter(TASKQ_COMPLETIONS, {"outcome": CANCELLED})
         return old
 
@@ -1387,6 +1653,7 @@ class TaskStore:
             except sqlite3.Error as exc:
                 self._rollback(conn)
                 raise TaskStoreUnavailable(f"task wake failed: {exc}") from exc
+        self._note_state(task_id, to)
         return gen + 1
 
     @_typed_read
@@ -1489,6 +1756,16 @@ class TaskStore:
         return str(row["state"]) if row is not None else None
 
     @staticmethod
+    def _admitted_exclusion(ids: Sequence[str]) -> tuple[str, list[Any]]:
+        ids = [str(i) for i in ids if i]
+        if not ids:
+            return "", []
+        return (
+            f" AND NOT (state='{ADMITTED}' AND id IN ({', '.join('?' for _ in ids)}))",
+            ids,
+        )
+
+    @staticmethod
     def _exclusion(exclude_ids: Sequence[str]) -> tuple[str, list[Any]]:
         ids = [str(i) for i in exclude_ids if i]
         if not ids:
@@ -1528,7 +1805,7 @@ class TaskStore:
         """Eligible (claimable now) row count per lane, for the fair dispatcher."""
         ts = self.now()
         excl_sql, excl_args = self._exclusion(exclude_ids)
-        child_sql = " AND parent_id IS NOT NULL AND parent_id <> ''" if children_only else ""
+        child_sql = _SQL_CHILD_ONLY if children_only else ""
         with self._lock:
             rows = (
                 self._c()
@@ -1571,7 +1848,7 @@ class TaskStore:
             return []
         ts = self.now()
         excl_sql, excl_args = self._exclusion(exclude_ids)
-        child_sql = " AND parent_id IS NOT NULL AND parent_id <> ''" if children_only else ""
+        child_sql = _SQL_CHILD_ONLY if children_only else ""
         lane_sql, lane_args = ("", [])
         if lanes is not None:
             lane_sql = f" AND lane IN ({', '.join('?' for _ in lanes)})"
@@ -1634,6 +1911,9 @@ class TaskStore:
         session_key: str | None = None,
         exclude_ids: Sequence[str] = (),
         limit: int | None = None,
+        include_admitted: bool = False,
+        exclude_admitted_ids: Sequence[str] = (),
+        app: str | None = None,
     ) -> list[TaskRecord]:
         """Every waiting row of *kind* (deferred ones included), oldest first.
 
@@ -1644,21 +1924,32 @@ class TaskStore:
         nothing else -- so a row past a cap is one the user stopped that stays
         queued and dispatchable. A caller that wants a page (a listing, a probe)
         passes *limit* and gets the oldest that many.
+
+        *include_admitted* adds ``admitted`` rows (claimed, not started); see
+        :data:`_SQL_UNSTARTED`, and *exclude_admitted_ids* drops the ``admitted``
+        ones among those ids (a claim whose run is registered). *app* keeps only
+        rows whose params name that owning app, applied before *limit* so a page
+        is that app's own rows.
         """
         excl_sql, excl_args = self._exclusion(exclude_ids)
+        adm_sql, adm_args = self._admitted_exclusion(exclude_admitted_ids)
         sess_sql, sess_args = ("", [])
         if session_key is not None:
             sess_sql, sess_args = " AND session_key=?", [session_key]
+        app_sql, app_args = ("", [])
+        if app is not None:
+            app_sql, app_args = " AND COALESCE(json_extract(params_json, '$.app'), '')=?", [app]
         lim_sql, lim_args = ("", [])
         if limit is not None:
             lim_sql, lim_args = " LIMIT ?", [int(limit)]
+        states = _SQL_UNSTARTED if include_admitted else _SQL_CLAIMABLE
         with self._lock:
             rows = (
                 self._c()
                 .execute(
-                    f"SELECT * FROM tasks WHERE kind=? AND state IN {_SQL_CLAIMABLE}"
-                    f"{sess_sql}{excl_sql} ORDER BY created_at, rowid{lim_sql}",
-                    [kind, *sess_args, *excl_args, *lim_args],
+                    f"SELECT * FROM tasks WHERE kind=? AND state IN {states}"
+                    f"{sess_sql}{app_sql}{excl_sql}{adm_sql} ORDER BY created_at, rowid{lim_sql}",
+                    [kind, *sess_args, *app_args, *excl_args, *adm_args, *lim_args],
                 )
                 .fetchall()
             )
@@ -1684,15 +1975,37 @@ class TaskStore:
         return [TaskRecord.from_row(r) for r in rows]
 
     @_typed_read
-    def next_eligible_at(self, kind: str) -> float | None:
-        """Earliest ``next_run_at`` among waiting rows of *kind*; None when none wait."""
+    def next_eligible_at(
+        self,
+        kind: str,
+        *,
+        exclude_ids: Sequence[str] = (),
+        children_only: bool = False,
+    ) -> float | None:
+        """When the earliest waiting row of *kind* that time alone holds back
+        becomes claimable; None when no row is held by time.
+
+        A row is held by time while it is deferred (``next_run_at``) or leased
+        (``lease_expires_at``), and claimable at the later of the two -- the
+        same eligibility the dispatch reads apply (``pending_lanes``,
+        ``fetch_dispatchable_fair``), over the same rows: one they may not
+        claim (excluded, or not a child on a ``children_only`` pass) has no
+        wake to offer them. A row with neither is not a wake: no time has to
+        pass for it, so a pass that found nothing left it out for a reason the
+        clock does not change. Read as "due at 0", it would re-arm that empty
+        pass at once, on every pass, for as long as the row is held.
+        """
+        excl_sql, excl_args = self._exclusion(exclude_ids)
+        child_sql = _SQL_CHILD_ONLY if children_only else ""
         with self._lock:
             row = (
                 self._c()
                 .execute(
-                    f"SELECT MIN(COALESCE(next_run_at, 0)) FROM tasks WHERE kind=? "
-                    f"AND state IN {_SQL_CLAIMABLE}",
-                    (kind,),
+                    "SELECT MIN(MAX(COALESCE(next_run_at, 0), COALESCE(lease_expires_at, 0))) "
+                    f"FROM tasks WHERE kind=? AND state IN {_SQL_CLAIMABLE} "
+                    "AND (next_run_at IS NOT NULL OR lease_expires_at IS NOT NULL)"
+                    f"{child_sql}{excl_sql}",
+                    [kind, *excl_args],
                 )
                 .fetchone()
             )
@@ -1708,14 +2021,27 @@ class TaskStore:
         exclude_ids: Sequence[str] = (),
         session_key: str | None = None,
         eligible_only: bool = False,
+        include_admitted: bool = False,
+        exclude_admitted_ids: Sequence[str] = (),
+        include_recovering: bool = True,
     ) -> int:
         """Rows waiting for dispatch (claimable states), optionally per session.
 
         ``eligible_only`` drops rows deferred past now; the default counts a
         deferred row too, because it is still accepted work the parent is owed.
+        ``include_admitted`` counts claimed, not started rows as well
+        (:data:`_SQL_UNSTARTED`), less the ``admitted`` ones among
+        *exclude_admitted_ids*. ``include_recovering=False`` drops
+        ``recovering`` rows: claimable, but each one a run that had started and
+        lost its owner (a restart) and is being rebuilt, so a count of spawns
+        waiting for their FIRST start -- the queue-depth chip's -- leaves them
+        out, while every count of work still owed keeps them.
         """
         excl_sql, excl_args = self._exclusion(exclude_ids)
-        where = [f"state IN {_SQL_CLAIMABLE}"]
+        adm_sql, adm_args = self._admitted_exclusion(exclude_admitted_ids)
+        where = [f"state IN {_SQL_UNSTARTED if include_admitted else _SQL_CLAIMABLE}"]
+        if not include_recovering:
+            where.append(f"state <> '{RECOVERING}'")
         args: list[Any] = []
         if kind is not None:
             where.append("kind=?")
@@ -1730,8 +2056,8 @@ class TaskStore:
             row = (
                 self._c()
                 .execute(
-                    f"SELECT COUNT(*) FROM tasks WHERE {' AND '.join(where)}{excl_sql}",
-                    [*args, *excl_args],
+                    f"SELECT COUNT(*) FROM tasks WHERE {' AND '.join(where)}{excl_sql}{adm_sql}",
+                    [*args, *excl_args, *adm_args],
                 )
                 .fetchone()
             )

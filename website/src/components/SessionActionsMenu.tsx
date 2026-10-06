@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Zap, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles } from 'lucide-react'
+import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -52,6 +52,12 @@ export interface SessionActionsMenuProps {
    * and not internalised: there is no store-wide "tabs" the menu could reach.
    */
   onOpenInNewTab?: () => void
+  /**
+   * Fork this chat (labelled "Fork chat"). Passed only by the sidebar row's
+   * single-menu form, where the menu replaces the hover cluster that otherwise
+   * hosts the fork button.
+   */
+  onDuplicate?: () => void
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
@@ -110,19 +116,19 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  * Canonical order, five groups (each renders only if it has surviving items,
  * with dividers auto-collapsing between them):
  *   [informational]  MCP servers ▸  (header only)
- *   [tab modifiers]  Rename · Mark read/unread · Pin · Switch to Autopilot/Chat · Move to folder ▸ · Tags…
+ *   [tab modifiers]  Rename · Mark read/unread · Pin · Move to folder ▸ · Tags…
  *   [nav / access]   Reveal in sidebar (header only) · Crew board (conductors only) · Copy link · Send a copy ▸ · Export to a file · Connected surfaces
  *   [colour]         colour swatches
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
+  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
 
   // Generic, surface-agnostic actions — one definition, wired straight to the store.
-  const { toggleRead, togglePin, toggleMode, copyLink, move, reload, close } = useSessionActions(mode)
+  const { toggleRead, togglePin, copyLink, move, reload, close } = useSessionActions(mode)
   // Popped-out window coordination (shared singleton — one channel for all menus).
   const { isPoppedOut, isSelfPopout, open: openPopout, focus: focusPopout, bringBack, returnSelfToMain } = useChatPopouts()
   // This menu also renders INSIDE a popout window (via the header). There the
@@ -188,9 +194,6 @@ export default function SessionActionsMenu({
       </Item>,
       <Item key="pin" onSelect={() => togglePin(slotKey)}>
         <Pin size={13} className="shrink-0 text-muted" /> {isPinned ? i18nT('components.sessionActionsMenu.unpin') : i18nT('components.sessionActionsMenu.pin')}
-      </Item>,
-      <Item key="mode" onSelect={() => toggleMode(slotKey)}>
-        <Zap size={13} className="shrink-0 text-muted" /> {slot?.mode === 'orchestrator' ? i18nT('components.sessionActionsMenu.switch_to_chat') : i18nT('components.sessionActionsMenu.switch_to_autopilot')}
       </Item>,
       folders.length > 0 && (
         <FolderMoveSubmenu
@@ -267,6 +270,11 @@ export default function SessionActionsMenu({
       onOpenInNewTab && (
         <Item key="open-in-tab" onSelect={onOpenInNewTab}>
           <PanelTop size={13} className="shrink-0 text-muted" /> {i18nT('components.sessionActionsMenu.open_in_new_tab')}
+        </Item>
+      ),
+      onDuplicate && (
+        <Item key="duplicate" onSelect={onDuplicate}>
+          <GitFork size={13} className="shrink-0 text-muted" /> {i18nT('pages.chatSidebar.duplicate')}
         </Item>
       ),
       // This session's work-item board, when it conducts one. Sits with the

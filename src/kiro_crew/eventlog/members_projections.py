@@ -30,6 +30,18 @@ _CONFIG_FIELDS = (
 
 _ACTIVITY_RING = 50
 
+# The furthest ahead of the fold's own wall clock a `member/message` timestamp
+# may push `last_active_ts`. The monotone rule (see `RosterProjection.apply`)
+# has no upper bound of its own: it latches the greatest `ts` it has ever seen
+# and, being an append-only fold, has nothing that can ever walk that value
+# back down. A `ts` from a jumped-forward clock -- a VM resume, an NTP step, a
+# hand-edited ISO string -- is therefore permanent, and pins its member above
+# every genuinely-active crewmate for the life of the store. A small tolerance
+# absorbs ordinary clock skew between the hosts that stamp and fold the event;
+# anything past it is clamped down to the ceiling so the member still reads as
+# active now (the event did happen) without ranking ahead of the present.
+_FUTURE_TS_SKEW = 300.0
+
 
 def scope_activity_view(view: dict, owner: str) -> dict:
     """An activity view holding only *owner*'s records, with counts to match.
@@ -91,7 +103,17 @@ def _parse_ts(ts: Any) -> float | None:
 # ---------------------------------------------------------------------------
 class RosterProjection:
     key = types.PROJ_ROSTER
-    state_version = 1
+    #: 2 because `last_active_ts` is MONOTONE (see `apply`), which is bookkeeping
+    #: a savepoint written by a fold WITHOUT that rule can contradict. Such a
+    #: savepoint can hold a recency a preview correction walked backwards, and
+    #: resuming it applies only the events after it -- so the regressed value
+    #: would stand for the life of the store, or until the member next spoke,
+    #: and the Recent order would still be wrong after the upgrade. A bump is
+    #: what discards it (`projection/checkpoint.py`: a `state_version` mismatch
+    #: refuses the payload), after which the member's own log is re-folded from
+    #: the start under the monotone rule. Cheap, and the only lossless answer:
+    #: the events the bad savepoint consumed are the ones that hold the truth.
+    state_version = 2
 
     def init(self) -> dict:
         return {}
@@ -113,9 +135,35 @@ class RosterProjection:
                 return new
             return state
         if etype == types.MEMBER_MESSAGE:
-            ts = data.get("ts")
             new = dict(state)
-            new["last_active_ts"] = ts
+            # MONOTONE, unlike every other field here. "When was this member last
+            # active" is an answer time only ever moves forward, so a fold that
+            # took each event's `ts` last-wins could only ever be wrong when it
+            # moved down -- and one writer moves it down by design.
+            # `reconcile_member_preview` corrects a stale quote by appending a
+            # `member/message` carrying the TRANSCRIPT's epoch, which is the last
+            # thing SAID and is therefore older than any machinery turn since. A
+            # last-wins fold let that correction reset recency to the last
+            # speech, on every roster read, in an append-only log with nothing to
+            # reopen it -- so a crewmate the user had just messaged sank back to
+            # where the quote was from. Taking the greater keeps both writers
+            # honest: the correction still lands its quote, and no writer has to
+            # know what the recency was before it.
+            #
+            # CEILING. Monotone-greatest has no upper bound of its own, so a `ts`
+            # from a jumped-forward clock would latch permanently and pin the
+            # member atop Recent for good (see `_FUTURE_TS_SKEW`). Clamp the
+            # candidate to the fold's own wall clock plus a skew tolerance before
+            # the monotone compare: a future `ts` still advances a staler recency
+            # to now (the activity is real) but can never rank ahead of it.
+            ts = _parse_ts(data.get("ts"))
+            if ts is not None and ts > 0:
+                now = datetime.now(timezone.utc).timestamp()
+                ceiling = now + _FUTURE_TS_SKEW
+                if ts > ceiling:
+                    ts = ceiling
+                held = _parse_ts(state.get("last_active_ts")) or 0.0
+                new["last_active_ts"] = ts if ts > held else state.get("last_active_ts")
             # A machinery row (tool call, patrol turn) bumps recency but carries
             # no preview; the last thing SAID stays on the row.
             if "preview" in data:

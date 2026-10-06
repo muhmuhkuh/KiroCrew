@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.dashboard.chat_persistence import _restore_dismissed_source_links
 from kiro_crew.dashboard.chat_utils import redact_display_content
+from kiro_crew.dashboard.slot_ownership import app_holds_gateway_key
 from kiro_crew.dashboard.state import (
     DashboardState,
     SlotOrigin,
@@ -541,7 +542,7 @@ def _bind_cron_slot(
     job: "CronJob",
     history: list[dict[str, Any]] | None,
     dismissed: object = _DISMISSED_UNREAD,
-) -> Any:
+) -> Any | None:
     """Create-or-find the job's dashboard slot, bind its identity, publish it.
 
     The single shared core for BOTH creator paths — the result injection below
@@ -553,6 +554,10 @@ def _bind_cron_slot(
     the one unlink guard makes every caller after the first an idempotent
     no-op, which is what lets the injection run unchanged after a pre-create.
     """
+    # An app-owned slot under the job's key is never adopted: linking it would
+    # hand the app the job's transcript. Nothing is bound or surfaced instead.
+    if app_holds_gateway_key(state, f"cron-{job.id}", "cron.bind_slot"):
+        return None
     # Whether this call MINTS the tab decides whether it is filed into the job's
     # chat folder (see the end): a tab found in the table -- filed, unfiled or
     # dragged somewhere by the reader -- is left exactly where it is.
@@ -625,6 +630,7 @@ def inject_cron_result_to_dashboard(
     history: list[dict[str, Any]] | None,
     dismissed: object = _DISMISSED_UNREAD,
     context_reading: dict[str, Any] | None = None,
+    turn_stats: dict[str, Any] | None = None,
 ) -> None:
     """Inject cron result into linked dashboard chat slot (shared by to-chat and auto-inject).
 
@@ -670,17 +676,28 @@ def inject_cron_result_to_dashboard(
     can serve it after the executor resets the session. ``None`` (the to-chat
     replay path, or a run that measured nothing) records nothing and keeps
     whatever snapshot an earlier run stored.
+
+    ``turn_stats`` is the run's ``meta.turn_stats`` (``chat_runner.turn_stats_meta``),
+    stamped on the result row so the chat footer shows the run's usage the same
+    way it does for a chat turn. ``None`` (the to-chat replay path) stamps nothing.
     """
     slot = _bind_cron_slot(state, job, history, dismissed)
+    if slot is None:
+        return
     safe_name = _safe_job_name(job)
 
     # Rows this call owes the durable transcript, in the order they happened.
     # Collected rather than written per row: the pair is flushed once, below,
     # under a single ``atomic_appends`` hold -- see the flush for why.
     durable_rows: list[tuple[str, str, str, str | None]] = []
+    durable_meta: list[dict[str, Any] | None] = []
 
-    def _reflect(role: str, content: str, cls: str) -> None:
-        """Put one row in the live slot and queue it for the durable write."""
+    def _reflect(role: str, content: str, cls: str, meta: dict[str, Any] | None = None) -> None:
+        """Put one row in the live slot and queue it for the durable write.
+
+        ``meta`` rides the append itself, so the live broadcast carries it too,
+        and the durable copy, so a restart before the slot save keeps it.
+        """
         if any(msg.get("content") == content for msg in slot.messages):
             return
         # The durable copy must carry the SAME ``meta.mid`` the window copy is
@@ -688,8 +705,9 @@ def inject_cron_result_to_dashboard(
         # durable row cannot be matched by the bounded read's identity walk,
         # which then treats the window copy as still owed and re-appends the
         # injection.
-        window_mid = row_mid(slot.append(role, content, cls))
+        window_mid = row_mid(slot.append(role, content, cls, meta=meta))
         durable_rows.append((role, content, cls, window_mid))
+        durable_meta.append(meta)
 
     def _flush_durable_rows() -> None:
         """Write the queued rows to the canonical log as ONE grouped append.
@@ -726,6 +744,7 @@ def inject_cron_result_to_dashboard(
             f"cron:{job.id}",
             durable_rows,
             agent=job.agent_id or None,
+            row_meta=durable_meta,
         )
 
     if result_text:
@@ -779,6 +798,7 @@ def inject_cron_result_to_dashboard(
             "assistant",
             f"# Cron Job Result: {safe_name}{stamp}{marker}\n\n{safe_result}",
             "msg msg-a",
+            meta={"turn_stats": dict(turn_stats)} if turn_stats else None,
         )
         # After BOTH rows are queued, so the pair lands as one write.
         _flush_durable_rows()
@@ -797,6 +817,12 @@ def inject_cron_result_to_dashboard(
     state.push_slots_update()
 
 
+def _app_owned(slot: Any) -> bool:
+    """Whether *slot* carries an owner app, which the cron binder never adopts."""
+    owner = getattr(slot, "_app", "") if slot is not None else ""
+    return isinstance(owner, str) and bool(owner)
+
+
 async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict[str, Any]] | None:
     """Off-loop read of the ``cron:{id}`` transcript for the injection above.
 
@@ -810,12 +836,14 @@ async def prefetch_cron_history(state: DashboardState, job_id: str) -> list[dict
     slot already exists AND is already linked, because that is exactly the state
     in which the injection does not consume ``history`` at all. ``None`` is a
     legal value for the parameter, so the skip needs no special handling at the
-    call site.
+    call site. Also skipped when an app owns the slot under that key: the binder
+    stands down there (``slot_ownership.app_holds_gateway_key``) and consumes
+    nothing either.
     """
     if state.conversation_log is None:
         return None
     slot = state.get_slot(f"cron-{job_id}")
-    if slot is not None and slot.linked_session_key:
+    if slot is not None and (slot.linked_session_key or _app_owned(slot)):
         return None
     return await asyncio.to_thread(state.conversation_log.read_messages, f"cron:{job_id}")
 
@@ -844,6 +872,9 @@ async def prefetch_cron_dismissed(state: DashboardState, job_id: str) -> object:
     slot_name = f"cron-{job_id}"
     history_key = f"cron:{job_id}"
     slot = state.get_slot(slot_name)
+    if _app_owned(slot):
+        # The binder stands down on an app-owned slot; nothing to restore into.
+        return _DISMISSED_UNREAD
     binding = slot.linked_session_key if slot is not None else ""
     if slot is not None and binding and (binding != history_key or slot._dismissed_hydrated):
         return _DISMISSED_UNREAD
@@ -905,6 +936,10 @@ async def ensure_cron_slot(state: DashboardState, job: "CronJob") -> None:
     if not (job.persistent_session and not job.hide_in_chat):
         return
     slot = state.get_slot(f"cron-{job.id}")
+    if _app_owned(slot):
+        # Never adopted (see _bind_cron_slot). Returned before any read, and with
+        # no audit row: the result injection records the one refusal per run.
+        return
     if slot is not None and slot.linked_session_key:
         await prefetch_cron_dismissed(state, job.id)
         return

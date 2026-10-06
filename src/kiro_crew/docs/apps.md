@@ -2,7 +2,7 @@
 
 An **app** is a feature that ships as its own unit: it brings its own pages in the
 dashboard, and it may also bring agents, skills, MCP tools, scheduled jobs and a
-backend process. Twenty-four apps ship inside the Kiro Crew package — Meetings,
+backend process. Twenty-five apps ship inside the Kiro Crew package — Meetings,
 Papyrus, Mochi, Dev Fleet, Notes and the rest — and almost all of them are **off
 until you turn them on**. The App Store is where you turn them on, and where you
 install apps that did not ship with your build.
@@ -76,6 +76,7 @@ Each line below is drawn from the app's own manifest description.
 
 | App | What it does |
 |---|---|
+| **Goal Owner** (`goal-owner`) | A bounded, resumable Project Owner for goals you choose to run autonomously. |
 | **Task Runner** (`projects`) | Hand over a multi-step job and let it run to completion unattended. See [task-runner.md](task-runner.md). |
 | **Workflows** (`workflows`) | Author, run and watch multi-phase agent runs written from a plain-language goal. See [workflows.md](workflows.md). |
 | **Research Lab** (`auto-research`) | Multi-cycle research campaigns that keep working after you walk away. See [research-lab.md](research-lab.md). |

@@ -35,7 +35,7 @@ from kiro_crew.agent_discovery import (
 )
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
+from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState, _normalize_slot_key
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
     MEMBER_CHAT_PRINCIPAL_KEY,
@@ -991,8 +991,159 @@ async def internal_memory_scope(
     )
 
 
+#: The two chat routes a script cron opens and seeds sessions on. Session control
+#: is what ``agent.session_control`` switches off, and these are its writes.
+_CRON_SESSION_CONTROL_PATHS = frozenset(
+    {"/api/chat", "/api/chat/", "/api/chat/slots", "/api/chat/slots/"}
+)
+
+
+async def _cron_session_control_refusal(request: web.Request) -> web.Response | None:
+    """Refuse a cron's session-control write while ``agent.session_control`` is off.
+
+    This sits in :func:`private_chat_route_refusal` because that is the one gate
+    every internal chat-route call passes after the internal secret validates.
+    Only a ``cron:`` key is checked, because the switch gates a cron caller the
+    same way the session-control routes do. Owner and member callers keep their
+    own gates. Only the two routes a script cron writes to are checked. The
+    folder routes are not session control.
+    """
+    if request.method != "POST" or request.path not in _CRON_SESSION_CONTROL_PATHS:
+        return None
+    if not request.headers.get("X-Session-Key", "").startswith("cron:"):
+        return None
+    from kiro_crew.dashboard.session_control import session_control_enabled
+
+    # The config read can touch the disk, so it runs off the loop.
+    if await asyncio.to_thread(session_control_enabled):
+        return None
+    message = "session control is disabled in config (agent.session_control)"
+
+    def _write() -> None:
+        from kiro_crew.sel import sel as _sel
+
+        _sel().log_api_access(
+            caller="internal",
+            operation="chat.control",
+            outcome="denied",
+            source="session_control",
+            resources=request.path,
+            error="session_control_disabled",
+        )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception:
+        logger.debug("SEL audit for a switched-off cron chat call failed", exc_info=True)
+    return web.json_response({"error": message, "code": "session_control_disabled"}, status=403)
+
+
+async def cron_slot_creator(request: web.Request) -> str:
+    """The attested ``cron:<job id>`` key of the caller, or ``""`` for anyone else.
+
+    The two slot-creating chat routes stamp a slot a cron opens with it: origin
+    CRON and ``_created_by`` set, so the slot is neither counted nor exposed as a
+    person's own tab. Read from the scope the chat-route gate already resolved
+    for this request, so only a key the transport attests is given a cron's
+    attribution; a caller that merely asserts the header gets none.
+    """
+    if request.get("internal_auth") is not True:
+        return ""
+    scope = await member_request_scope(request)
+    session = scope.session or ""
+    if not scope.verified or not session.startswith("cron:"):
+        return ""
+    return session
+
+
+async def cron_creator_refusal(
+    request: web.Request, state: Any, slot_name: str | None, cron_creator: str
+) -> web.Response | None:
+    """The creator fence for a ``cron:`` caller on the two chat routes, or ``None``.
+
+    A script cron opens a slot with ``POST /api/chat/slots`` and seeds it with
+    ``POST /api/chat``. Both routes mint a fresh slot under any key that is not
+    live, and both act on whatever live slot a key names. This mirrors
+    session-control's ``_created_by_other`` fence, so a cron reaches only slots
+    it created: a live slot is judged on its ``_created_by``, and a key with no
+    live slot is judged on the ``created_by`` its persisted metadata line
+    records. Reading that line is what keeps a cron from minting a closed
+    session's key as its own. A key with no live slot and no transcript is left
+    to mint, as it is for any caller, and the new slot carries the cron as its
+    creator. A transcript that cannot be read refuses. Like the switch check,
+    this keys on the session key the caller presents.
+
+    The persisted read runs off the loop. The live slot is judged again after
+    that read, so a slot opened while it ran is judged as live. The caller
+    therefore makes its mint decision with no await after this returns.
+    """
+    if not cron_creator or not slot_name:
+        return None
+    key = _normalize_slot_key(str(slot_name))
+    if not key:
+        return None
+    from kiro_crew.dashboard.session_control import _created_by_other
+
+    slot = state._slots.get(key)
+    if slot is None:
+        log = getattr(state, "conversation_log", None)
+        if log is None:
+            return None
+        from kiro_crew.dashboard.chat_utils import slot_transcript_key
+
+        history_key = slot_transcript_key(key)
+
+        def _persisted_creator() -> str | None:
+            if not log.has_log(history_key):
+                return None
+            meta = log.get_metadata(history_key)
+            return str(meta.get("created_by") or "")
+
+        try:
+            persisted = await asyncio.to_thread(_persisted_creator)
+        except Exception:
+            logger.debug("persisted creator of slot %s unreadable", key, exc_info=True)
+            refused = True
+        else:
+            refused = persisted is not None and _created_by_other(
+                SimpleNamespace(_created_by=persisted), cron_creator
+            )
+        slot = state._slots.get(key)
+        if slot is None and not refused:
+            return None
+    if slot is not None and not _created_by_other(slot, cron_creator):
+        return None
+
+    def _write() -> None:
+        from kiro_crew.sel import sel as _sel
+
+        _sel().log_api_access(
+            caller="internal",
+            operation="chat.control",
+            outcome="denied",
+            source="session_control",
+            resources=f"{request.path} slot={key}",
+            error="not_creator",
+        )
+
+    try:
+        await asyncio.to_thread(_write)
+    except Exception:
+        logger.debug("SEL audit for a cron chat call on another's slot failed", exc_info=True)
+    return web.json_response(
+        {
+            "error": "a scheduled run can only control sessions it created itself",
+            "code": "not_creator",
+        },
+        status=403,
+    )
+
+
 async def private_chat_route_refusal(request: web.Request) -> web.Response | None:
     """Keep member tools within their admitted chat controls."""
+    switched_off = await _cron_session_control_refusal(request)
+    if switched_off is not None:
+        return switched_off
     scope, refusal = await internal_memory_scope(request, "chat.control")
     if refusal is not None:
         # Let the ordinary internal-auth middleware produce its established
@@ -1048,7 +1199,8 @@ async def private_chat_route_refusal(request: web.Request) -> web.Response | Non
 #: The path is matched STRUCTURALLY by :func:`_admitted_chat_route_methods`
 #: against the exact registered patterns, never by a raw prefix, so a sibling
 #: literal that shares a prefix (``/api/chat/folders/reorder``,
-#: ``/api/chat/tag-columns``) is NOT admitted and keeps the owner-only refusal.
+#: ``/api/chat/tag-columns/order``) is NOT admitted and keeps the owner-only
+#: refusal.
 #:
 #: The admitted VERBS are exactly the ones a member may actually do -- a verb
 #: whose handler has no member fence is not admitted here, so the gate can never
@@ -1058,7 +1210,12 @@ async def private_chat_route_refusal(request: web.Request) -> web.Response | Non
 #: every agent principal); it READS the shared tag vocabulary (GET) but does NOT
 #: coin/rename/delete tags (``chat_tags.api_chat_tag_delete`` has no
 #: vocabulary fence at all, so admitting DELETE would let a member remove a
-#: shared tag); it files/tags only its own or created sessions. The per-handler
+#: shared tag); it files/tags only its own or created sessions, and a tag it
+#: assigns is still subject to the agent tag-grants policy
+#: (``chat_tags.agent_tag_change_refusal``): it may apply a tag the owner opened
+#: to agents (``add-only``/``add-remove``) or any rowless ordinary label, but a
+#: tag the owner reserved (a protected ``none`` row) is refused the same as for
+#: any other agent. The per-handler
 #: ownership fence (``owner_app``/``folder_principal`` for the tree,
 #: ``member_owns_slot`` for filing/tagging, ``_refuse_vocabulary_write`` for tag
 #: creation/rename) is still the authoritative gate; this set just refuses to
@@ -1069,6 +1226,11 @@ _MEMBER_CHAT_FOLDER_ID_METHODS = frozenset({"PATCH"})
 #: row to the caller's own folder, so a member renumbers only what it owns.
 _MEMBER_CHAT_FOLDER_REORDER_METHODS = frozenset({"POST"})
 _MEMBER_CHAT_TAGS_METHODS = frozenset({"GET"})
+#: The board's column list is admitted READ-only, like the tag vocabulary: it
+#: names tags and live-state lanes, never a session. Its writes (POST, and the
+#: ``/{id}`` and ``/order`` routes, which are not matched at all) stay refused;
+#: ``_refuse_vocabulary_write`` in each write handler refuses a member too.
+_MEMBER_CHAT_TAG_COLUMNS_METHODS = frozenset({"GET"})
 _MEMBER_CHAT_SLOT_FOLDER_METHODS = frozenset({"PATCH"})
 _MEMBER_CHAT_SLOT_TAGS_METHODS = frozenset({"PUT"})
 #: Pinning a session (``chat_session_pin``); ``api_chat_slot_pin`` applies the
@@ -1088,8 +1250,9 @@ def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
     Structural, path-shape matching that mirrors the routes registered in
     ``routes/sessions.py`` / ``routes/chat.py`` EXACTLY. A trailing single
     segment on ``/folders/`` is a folder id (``{id}``); the reserved literal
-    ``/api/chat/folders/reorder`` and every ``/api/chat/tag-*`` are deliberately
-    excluded. ``/api/chat/tags/{id}`` is NOT admitted for any method -- a member
+    ``/api/chat/folders/reorder`` and every ``/api/chat/tag-*`` except the
+    read-only column list ``/api/chat/tag-columns`` are deliberately excluded.
+    ``/api/chat/tags/{id}`` is NOT admitted for any method -- a member
     neither renames nor deletes shared tags -- so its DELETE (which has no
     vocabulary fence) is refused at the gate. ``/api/chat/slots`` is the session
     LIST only; a deeper ``/api/chat/slots/<slot>/...`` sub-resource other than
@@ -1099,6 +1262,8 @@ def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
         return _MEMBER_CHAT_FOLDERS_METHODS
     if path in ("/api/chat/tags", "/api/chat/tags/"):
         return _MEMBER_CHAT_TAGS_METHODS
+    if path in ("/api/chat/tag-columns", "/api/chat/tag-columns/"):
+        return _MEMBER_CHAT_TAG_COLUMNS_METHODS
     if path in ("/api/chat/slots", "/api/chat/slots/"):
         return _MEMBER_CHAT_SLOTS_METHODS
     if path == "/api/chat/folders/reorder":
@@ -1110,7 +1275,7 @@ def _admitted_chat_route_methods(path: str) -> frozenset[str] | None:
         # own folders.
         return _MEMBER_CHAT_FOLDER_REORDER_METHODS
     id_part = _single_id_segment(path, "/api/chat/folders/")
-    if id_part is not None and id_part != "reorder":
+    if id_part is not None and id_part not in ("reorder", "cleanup"):
         return _MEMBER_CHAT_FOLDER_ID_METHODS
     slot = _single_id_segment(path, "/api/chat/slots/", suffix="/folder")
     if slot is not None:

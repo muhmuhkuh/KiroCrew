@@ -1,14 +1,12 @@
-/** Creating sessions from the sidebar: the New chat variants (local, autopilot, crew,
- *  plain, ephemeral) and a new chat inside a folder. */
+/** Creating sessions from the sidebar: the New chat variants (local, crew,
+ *  ephemeral) and a new chat inside a folder. */
 import { useState, useRef, useCallback, type Dispatch, type SetStateAction } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { type ErrorReport, findReport } from '../../utils/errorReport'
-import { resolveFolderAgent, resolveFolderProjectDir } from '../../utils/folderAgent'
-import { loadChatConfig } from '../chat/ChatSettings'
+import { isStaleProjectDirError, resolveFolderAgent, resolveFolderProjectDir } from '../../utils/folderAgent'
 import { createSlot } from '../../store/chatSlice'
 import { focusComposer } from '../chat/composerFocus'
-import { ApiError } from '../../api/apiError'
 import { i18nT } from '../../i18n/t'
 import type { Slot } from './types'
 import type { AppDispatch } from '../../store'
@@ -20,6 +18,12 @@ import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW, PREVIEW_REMOTE_CREW_CHAT } from '../../utils/previewFlags'
 import { settingsPath } from '../../components/settingsPath'
 import { SETTINGS_CREW_MEMBERS_PREVIEW_ID } from '../../hooks/useSettingHighlight'
+import { api } from '../../api/client'
+import { resolveDefaultMemoryMode } from '../../api/queryClient'
+import { fetchDashboardConfig } from '../../api/dashboardConfigQuery'
+import { currentCrewWindow, openCrewWindow } from '../chat/crew-window/crewWindowStore'
+import { useStore } from 'react-redux'
+import type { RootState } from '../../store'
 
 /** New chat inside a folder, with its inline failure line. */
 export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dropSlotMutation, onOpenSlotInNewTab, updateFolderMutation, clearBoardCollapse }: {
@@ -57,9 +61,6 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
   const createChatInFolderMutation = useMutation({
     mutationFn: ({ folderId, memoryMode, inNewTab }: CreateChatInFolderVars) => {
       const agent = resolveFolderAgent(folders, folderId, defaultAgent)
-      // A mode-specific create pins plain mode, not the defaultAutopilot preference.
-      const ephemeral = !!memoryMode
-      const effectiveMode = (!ephemeral && loadChatConfig().defaultAutopilot) ? 'orchestrator' : (mode || '')
       // Carry folder membership in the create payload so createSlot publishes
       // the new slot to Redux in its final location. Assigning it after create
       // lets the sidebar render one frame at root before moving it.
@@ -71,7 +72,7 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
       const project = resolveFolderProjectDir(folders, folderId)
       // The tab gesture registers the slot without stealing focus -- same
       // `activate: false` contract as the header New button's gesture.
-      return dispatch(createSlot({ agent, mode: effectiveMode, folder_id: folderId, project, activate: !inNewTab, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
+      return dispatch(createSlot({ agent, mode: mode || '', folder_id: folderId, project, activate: !inNewTab, ...(memoryMode ? { memory_mode: memoryMode } : {}) })).unwrap()
     },
     onSuccess: (slot: Slot, { folderId, columnId, focus, attempt, inNewTab }: CreateChatInFolderVars) => {
       // A create that went through supersedes an earlier failure notice for
@@ -105,18 +106,10 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
       // eslint-disable-next-line no-console -- surface chat-creation failures for diagnostics
       console.error('Failed to create chat in folder:', err)
       if (attempt !== folderCreateAttemptRef.current) return
-      // The backend refusing the folder's project directory (HTTP 400
-      // "Not a directory" from the slot-project endpoint) is the one failure
+      // The backend refusing the folder's project directory is the one failure
       // the user can fix themselves, so it gets a specific message naming the
-      // stale path and where to change it. createSlot rethrows the ApiError,
-      // but createAsyncThunk serializes thrown errors down to
-      // {name, message, stack} — the instance and its `status` are gone by the
-      // time `.unwrap()` delivers it here — so match the live instance when
-      // present and fall back to the serialized shape.
-      const isStaleProjectDir = err instanceof ApiError
-        ? err.status === 400 && err.message === 'Not a directory'
-        : (err as { name?: unknown } | null)?.name === 'ApiError'
-          && (err as { message?: unknown }).message === 'Not a directory'
+      // stale path and where to change it (see isStaleProjectDirError).
+      const isStaleProjectDir = isStaleProjectDirError(err)
       const raw = (err as { message?: unknown } | null)?.message
       const message = isStaleProjectDir
         ? i18nT('pages.chatSidebar.folder_project_dir_missing', { path: resolveFolderProjectDir(folders, folderId) ?? '' })
@@ -160,7 +153,9 @@ export function useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dro
 }
 
 /** The New chat variants and the Crew Members door. */
-export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen }: {
+export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen, onOpenPeerSession }: {
+  /** Where a crew window opens on a host with no chat pane (see ChatSidebar). */
+  onOpenPeerSession?: (instanceId: string, key: string) => void
   setNewChatError: Dispatch<SetStateAction<string>>
   dispatch: AppDispatch
   defaultAgent: string
@@ -169,8 +164,6 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   setRemoteCrewError: Dispatch<SetStateAction<string>>
   setNewChatMenuOpen: Dispatch<SetStateAction<boolean>>
 }) {
-  // Create autopilot session mutation (consistent with useMutation pattern)
-  //
   // Every local create below reports through `newChatError`. `createSlot(...)
   // .unwrap()` rejects with RTK's SerializedError — a PLAIN object carrying
   // `message`, not an Error instance — so the reader accepts both shapes (same
@@ -179,15 +172,6 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   // the failed click a silent no-op again, which is the defect being fixed.
   // `errMessage` already reads the RTK SerializedError a rejected thunk carries.
   const onNewChatError = (err: unknown) => setNewChatError(errMessage(err) || i18nT('pages.chatSidebar.folder_create_failed'))
-  const createAutopilotMutation = useMutation({
-    mutationFn: () => {
-      setNewChatError('')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: 'orchestrator' })).unwrap()
-    },
-    onSuccess: focusComposer,
-    onError: onNewChatError,
-  })
-
   // Crew Members: the create menu's crew entry no longer creates anything. Crew
   // Mode (a `mode: 'crew'` session fanning topics out to sub-sessions) is
   // retired in favour of the Crew Members page, where each member is a
@@ -212,6 +196,8 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   // crews rather than Settings > Developer > Feature Previews, because it only means
   // anything to someone who already has a crew connected.
   const remoteCrewChatPreview = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
+  const queryClient = useQueryClient()
+  const store = useStore<RootState>()
 
   // Create default chat session mutation.
   //
@@ -228,8 +214,7 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
   const createChatMutation = useMutation({
     mutationFn: ({ inNewTab }: { inNewTab: boolean }) => {
       setNewChatError('')
-      const effectiveMode = loadChatConfig().defaultAutopilot ? 'orchestrator' : (mode || '')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: effectiveMode, activate: !inNewTab })).unwrap()
+      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '', activate: !inNewTab })).unwrap()
     },
     onSuccess: (slot, { inNewTab }) => {
       if (inNewTab && onOpenSlotInNewTab) {
@@ -243,86 +228,52 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
     onError: onNewChatError,
   })
 
-  // Create a PLAIN chat, ignoring the `defaultAutopilot` preference.
-  // The caret menu lists "New chat" and "New autopilot chat" side by side, so
-  // each must name exactly what it makes. Routing the plain entry through
-  // createChatMutation would hand an autopilot session to anyone who turned the
-  // default on — the one case where they picked the non-default on purpose.
-  // The button's main segment keeps honouring the preference; only this explicit
-  // entry pins the mode.
-  // Create a LOCAL session whose turns run on a peer crew. The session belongs to
-  // this machine — local sidebar row, local transcript, local history and search —
-  // and only its execution moves, so this goes through the ordinary `createSlot`
-  // thunk with `instanceId` attached rather than reaching for the peer directly.
+  // Mint a session ON a connected crew and open it as a window (CrewChatWindow).
+  // The peer owns it: nothing is created on this machine, so there is no local
+  // row, transcript or history for it, and the crew's group lists it from the
+  // peer's own slot list.
   //
-  // This replaced an earlier shape that POSTed straight to the peer and then
-  // switched to that crew's iframe pane. The session then existed only over
-  // there, so the pane switch was not a choice: the local list had nowhere to
-  // show it. Now it does, and staying put is the whole point — the user asked for
-  // a session on that crew, not for a trip to that crew's dashboard.
+  // Deliberately NO `agent`: `defaultAgent` names a crew from THIS machine's
+  // roster, so the peer applies its own default. `memory_mode` always rides the
+  // create, because it is the user's privacy boundary. The version check runs
+  // first because the window talks to the peer's chat API directly, and a peer a
+  // release apart can lack a route or a frame the window reads.
   //
-  // Deliberately NO `agent`, unlike every sibling entry below. `defaultAgent`
-  // names a crew from THIS machine's roster, and the backend forwards any agent
-  // it is given straight to the peer: sending it would either be refused over
-  // there or bind a different crew than the name implies. Omitting it lets the
-  // peer apply its own default — which is the point of the session running on it,
-  // and what the header then reads back from the peer's `default_agent`.
-  // A crew create fails more often than a local one — the backend opens the
-  // peer's session BEFORE creating the local one, and refuses on a version-series
-  // mismatch or an unreachable tunnel — and on failure leaves NOTHING behind (no
-  // local row, no peer session). Without an onError the react-query rejection is
-  // swallowed and the click reads as a silent no-op, so surface the backend's
-  // reason inline in the submenu instead. `err.message` carries it: apiFailure
-  // builds the ApiError message from the 502 body's `error` field, and the thunk's
-  // `.unwrap()` rethrows that message.
+  // Errors surface inline in the submenu (rows use `onSelect preventDefault`, so
+  // a failed create keeps the menu open long enough to read the reason).
   const createRemoteChatMutation = useMutation({
-    mutationFn: (instanceId: string) => {
+    mutationFn: async (instanceId: string) => {
       setRemoteCrewError('')
-      return dispatch(createSlot({ instanceId })).unwrap()
+      const originSlot = store.getState().chat?.activeSlot ?? null
+      const originWindow = currentCrewWindow()
+      const caps = await api.instancesCapabilities(instanceId)
+      if (!caps.version_match) {
+        throw new Error(i18nT('pages.chat.crewWindow.version_mismatch', { peer: caps.version || '?', local: caps.local_version }))
+      }
+      const memory_mode = await resolveDefaultMemoryMode(fetchDashboardConfig)
+      const created = await api.crewPeerPost(instanceId, 'api/chat/slots', { memory_mode }) as { key?: unknown }
+      if (typeof created?.key !== 'string' || !created.key) throw new Error(i18nT('pages.chat.crewWindow.create_unnamed'))
+      // The crew's group re-reads the peer list so the new row shows at once.
+      void queryClient.invalidateQueries({ queryKey: ['instance-slots', instanceId] })
+      // Same rule as createSlot.fulfilled: a user who moved during the
+      // round-trip is not yanked onto the new session.
+      const moved = (store.getState().chat?.activeSlot ?? null) !== originSlot || currentCrewWindow() !== originWindow
+      if (moved) return
+      if (onOpenPeerSession) onOpenPeerSession(instanceId, created.key)
+      else openCrewWindow({ instanceId, key: created.key })
     },
     onSuccess: () => {
-      // Close the menu explicitly: the crew rows use `onSelect preventDefault`
-      // (so a FAILED create keeps the menu open long enough to read the error),
-      // which also removed the auto-close on SUCCESS — a modal Radix menu is not
-      // dismissed by `focusComposer` alone, so without this the session is created
-      // behind the still-open menu and a second pick makes a duplicate (opus #8543).
-      // `mutationFn` already cleared remoteCrewError, and onOpenChange clears it on
-      // close, so no reset is needed here.
+      // Close the menu explicitly: the crew rows use `onSelect preventDefault`,
+      // which also removed the auto-close on success.
       setNewChatMenuOpen(false)
-      focusComposer()
     },
     onError: (err: unknown) => {
-      // `createSlot(...).unwrap()` rejects with RTK's SerializedError — a PLAIN
-      // object carrying `message`, NOT an Error instance — so read `.message`
-      // off the object rather than gating on `instanceof Error` (which would be
-      // false here and drop the backend's reason). apiFailure already localizes
-      // and puts the 502 body's `error` text into that message, so it is shown
-      // verbatim; the crew submenu's errRow is gated on truthiness, so the unreachable
-      // empty-message case simply renders nothing rather than a bare fallback.
-      const msg =
-        err instanceof Error
-          ? err.message
-          : err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string'
-            ? (err as { message: string }).message
-            : ''
-      setRemoteCrewError(msg)
+      setRemoteCrewError(errMessage(err))
     },
-  })
-
-  const createPlainChatMutation = useMutation({
-    mutationFn: () => {
-      setNewChatError('')
-      return dispatch(createSlot({ agent: defaultAgent || undefined, mode: mode || '' })).unwrap()
-    },
-    onSuccess: focusComposer,
-    onError: onNewChatError,
   })
 
   // Create an ephemeral chat — incognito (memory reads, no writes) or temporary
-  // (neither). The mode is pinned plain for the same reason the plain entry
-  // above pins it: these entries name the MEMORY mode, so routing them through
-  // the `defaultAutopilot` preference would hand an autopilot session to
-  // someone who came to this submenu to choose something else.
+  // (neither).
   const createEphemeralChatMutation = useMutation({
     mutationFn: (memoryMode: 'incognito' | 'temporary') => {
       setNewChatError('')
@@ -332,7 +283,7 @@ export function useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode
     onError: onNewChatError,
   })
   return {
-    createAutopilotMutation, crewPreview, openCrewMembers, remoteCrewChatPreview,
-    createChatMutation, createRemoteChatMutation, createPlainChatMutation, createEphemeralChatMutation,
+    crewPreview, openCrewMembers, remoteCrewChatPreview,
+    createChatMutation, createRemoteChatMutation, createEphemeralChatMutation,
   }
 }

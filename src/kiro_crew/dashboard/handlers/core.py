@@ -6,7 +6,6 @@ import asyncio
 import copy
 import difflib
 import functools
-import hmac
 import json
 import logging
 import math
@@ -25,7 +24,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 import kiro_crew
 import kiro_crew.config.resolution as _resolution
-from kiro_crew import beacon, platform_compat, stt
+from kiro_crew import aws_consent, beacon, platform_compat, stt
 from kiro_crew.acp_backends import selectable_backend_values
 from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX as _CU_MAX_SCREENSHOT_MAX_PX
 from kiro_crew.computer_use.types import MAX_TREE_NODES_LIMIT as _CU_MAX_TREE_NODES_LIMIT
@@ -55,8 +54,12 @@ from kiro_crew.config.loader import (
     SUBAGENT_AUTO_MAX_CEILING,
     SUBAGENT_MAX_TURNS_CEILING,
     SWEEP_CHUNK_BUDGET_MAX,
+    ConfigReadError,
+    ConfigWriteRefused,
     KiroCrewConfig,
+    coerce_dict_section,
     config_path,
+    update_config_locked,
 )
 from kiro_crew.config.sections import (
     DECISION_BUCKET_MAX,
@@ -65,9 +68,10 @@ from kiro_crew.config.sections import (
     FOLDER_SORT_MODES,
     JUDGE_PROVIDERS,
     STT_LANGUAGE_AUTO,
+    transcribe_vocabulary_name,
 )
 from kiro_crew.context_management import RESULT_FILE_MAX_BYTES
-from kiro_crew.dashboard.chat_utils import drained_to_thread
+from kiro_crew.dashboard.chat_utils import drained_to_thread, run_config_write
 from kiro_crew.dashboard.handlers._shared import (
     _pip_install_channel_available,
     guard_owner_surface_routes,
@@ -80,6 +84,7 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.dashboard.stt_stream import _STREAMING_PROVIDERS, PROVIDER_LOCAL
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
+    _ct_eq,
     _unix_request_socket,
     generate_token,
     parse_duration,
@@ -104,6 +109,10 @@ from kiro_crew.stt.limits import (
     MIN_SILENCE_MS,
 )
 from kiro_crew.transcribe import (
+    VOCABULARIES_ACCESS_DENIED,
+    VOCABULARIES_LIST_FAILED,
+    VOCABULARIES_LIST_PERMISSION,
+    VocabularyListError,
     _find_ffmpeg,
     _whisper_language,
     audio_exceeds_secs,
@@ -111,7 +120,7 @@ from kiro_crew.transcribe import (
     batch_duration_cap_secs,
     ensure_ffmpeg_in_path,
     ffmpeg_source,
-    is_available,
+    list_custom_vocabularies,
 )
 
 logger = logging.getLogger(__name__)
@@ -641,7 +650,18 @@ async def api_theme_config(request: web.Request) -> web.Response:
 
     GET returns the current config. PUT accepts
     {mode?, color?, language?, onboarded?, import_onboarded?, privacy_acked?,
-    crewmates_onboarded?} and persists to the workspace config file.
+    crewmates_onboarded?} and persists ONLY those ``dashboard.*`` keys.
+
+    The PUT is a locked delta read-modify-write, never a whole-document
+    ``KiroCrewConfig.save()``. A momentarily unreadable ``config.json`` (a torn
+    read, a sharing violation, an empty file) makes ``load()`` answer
+    pure defaults, and the SPA fires this PUT on its own at boot (the legacy
+    theme migration, triggered by the ``onboarded=false`` such a load reports),
+    so publishing the loaded snapshot erased every setting in the file. Even a
+    healthy snapshot carried load-time coercions back to disk and lost a
+    concurrent CLI write. Writing only the requested keys under both config
+    locks leaves the rest of the file as it was, and an unreadable file is
+    refused (500 ``config_unreadable``) with its bytes untouched.
     """
     if request.method == "GET":
         cfg = KiroCrewConfig.load()
@@ -654,69 +674,73 @@ async def api_theme_config(request: web.Request) -> web.Response:
     body = await request.json()
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="request body must be an object")
-    from kiro_crew.dashboard.handlers.agents import _get_config_lock
 
-    async with _get_config_lock():
-        cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        changed = False
-        if "mode" in body:
-            mode = body["mode"]
-            if mode not in ("", "dark", "light", "system"):
-                raise web.HTTPBadRequest(text="mode must be '', 'dark', 'light', or 'system'")
-            if cfg.dashboard.theme_mode != mode:
-                cfg.dashboard.theme_mode = mode
-                changed = True
-        if "color" in body:
-            color = body["color"]
-            if not isinstance(color, str) or len(color) > 64:
-                raise web.HTTPBadRequest(text="color must be a string (max 64 chars)")
-            if cfg.dashboard.theme_color != color:
-                cfg.dashboard.theme_color = color
-                changed = True
-        if "language" in body:
-            language = body["language"]
-            # "" is the explicit "follow the browser" sentinel, so it must stay
-            # writable — a user returning to Auto has to be able to clear the
-            # stored choice.
-            if not isinstance(language, str):
-                raise web.HTTPBadRequest(text="language must be a string")
-            if language and not _LANGUAGE_TAG_RE.match(language):
-                raise web.HTTPBadRequest(
-                    text="language must be '' or a BCP-47 tag (e.g. 'en', 'zh-CN')"
-                )
-            if cfg.dashboard.language != language:
-                cfg.dashboard.language = language
-                changed = True
-        if "onboarded" in body:
-            onboarded = bool(body["onboarded"])
-            if cfg.dashboard.onboarded != onboarded:
-                cfg.dashboard.onboarded = onboarded
-                changed = True
-        if "import_onboarded" in body:
-            import_onboarded = body["import_onboarded"]
-            if not isinstance(import_onboarded, bool):
-                raise web.HTTPBadRequest(text="import_onboarded must be a boolean")
-            if cfg.dashboard.import_onboarded != import_onboarded:
-                cfg.dashboard.import_onboarded = import_onboarded
-                changed = True
-        if "privacy_acked" in body:
-            privacy_acked = body["privacy_acked"]
-            if not isinstance(privacy_acked, bool):
-                raise web.HTTPBadRequest(text="privacy_acked must be a boolean")
-            if cfg.dashboard.privacy_acked != privacy_acked:
-                cfg.dashboard.privacy_acked = privacy_acked
-                changed = True
-        if "crewmates_onboarded" in body:
-            crewmates_onboarded = body["crewmates_onboarded"]
-            if not isinstance(crewmates_onboarded, bool):
-                raise web.HTTPBadRequest(text="crewmates_onboarded must be a boolean")
-            if cfg.dashboard.crewmates_onboarded != crewmates_onboarded:
-                cfg.dashboard.crewmates_onboarded = crewmates_onboarded
-                changed = True
+    # Validate the WHOLE body before anything is written, so a 400 is a no-op.
+    updates: dict[str, object] = {}
+    if "mode" in body:
+        mode = body["mode"]
+        if mode not in ("", "dark", "light", "system"):
+            raise web.HTTPBadRequest(text="mode must be '', 'dark', 'light', or 'system'")
+        updates["theme_mode"] = mode
+    if "color" in body:
+        color = body["color"]
+        if not isinstance(color, str) or len(color) > 64:
+            raise web.HTTPBadRequest(text="color must be a string (max 64 chars)")
+        updates["theme_color"] = color
+    if "language" in body:
+        language = body["language"]
+        # "" is the explicit "follow the browser" sentinel, so it must stay
+        # writable — a user returning to Auto has to be able to clear the
+        # stored choice.
+        if not isinstance(language, str):
+            raise web.HTTPBadRequest(text="language must be a string")
+        if language and not _LANGUAGE_TAG_RE.match(language):
+            raise web.HTTPBadRequest(
+                text="language must be '' or a BCP-47 tag (e.g. 'en', 'zh-CN')"
+            )
+        updates["language"] = language
+    # A real bool only: ``bool("false")`` is True, so a string here is a client bug
+    # this endpoint must answer 400, not persist inverted.
+    for flag in ("onboarded", "import_onboarded", "privacy_acked", "crewmates_onboarded"):
+        if flag in body:
+            if not isinstance(body[flag], bool):
+                raise web.HTTPBadRequest(text=f"{flag} must be a boolean")
+            updates[flag] = body[flag]
 
-        if changed:
-            await asyncio.to_thread(cfg.save)
+    if updates:
 
+        def _apply_theme(doc: dict) -> dict | None:
+            dashboard = coerce_dict_section(doc, "dashboard")
+            changed = False
+            for key, value in updates.items():
+                current = dashboard.get(key)
+                # ``type`` too: ``1 == True``, and a hand-written 1 is not the
+                # bool the loader reads back.
+                if key in dashboard and current == value and type(current) is type(value):
+                    continue
+                dashboard[key] = value
+                changed = True
+            return doc if changed else None
+
+        try:
+            await run_config_write(update_config_locked, config_path(), mutate=_apply_theme)
+        except ConfigReadError:
+            logger.warning("theme config PUT: config.json is unreadable", exc_info=True)
+            return web.json_response(
+                {"error": "failed to read config file", "code": "config_unreadable"}, status=500
+            )
+        except ConfigWriteRefused as exc:
+            return web.json_response(
+                {"error": str(exc), "code": "config_write_refused"}, status=400
+            )
+        except OSError:
+            logger.warning("theme config PUT: config.json write failed", exc_info=True)
+            return web.json_response(
+                {"error": "failed to write config file", "code": "config_write_failed"},
+                status=500,
+            )
+
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
     return web.json_response(_theme_payload(cfg))
 
 
@@ -912,6 +936,13 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt_section["transcribe_region"] = body["transcribe_region"]
             if "transcribe_profile" in body and isinstance(body["transcribe_profile"], str):
                 stt_section["transcribe_profile"] = body["transcribe_profile"]
+            # Through the loader's own rule, so a name accepted here is never one the
+            # next load drops. ``""`` clears it; an unusable name is skipped like any
+            # other malformed field, leaving the stored vocabulary in force.
+            if "transcribe_vocabulary" in body:
+                vocabulary = transcribe_vocabulary_name(body["transcribe_vocabulary"])
+                if vocabulary is not None:
+                    stt_section["transcribe_vocabulary"] = vocabulary
             if "language_code" in body and isinstance(body["language_code"], str):
                 stt_section["language_code"] = body["language_code"]
             if "streaming" in body and isinstance(body["streaming"], bool):
@@ -987,7 +1018,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
     # set outside the thread that exists to hold the lighter ones. Windows was
     # where this first showed up, as "event-loop heartbeat: lag".
 
-    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool, bool]:
+    def _prereqs_and_probes() -> tuple[list[str], bool, bool, bool, bool, str]:
         cmds = _stt_prereq_commands(provider)
         ensure_ffmpeg_in_path()
         # `_find_ffmpeg`, not a bare `which`: the settings panel must report on the
@@ -998,7 +1029,11 @@ async def api_stt_config(request: web.Request) -> web.Response:
         # user guidance (no Python environment of the user's own to fix), so
         # the UI needs to distinguish it from the pip-less/PEP 668 causes.
         bundled = platform_compat.is_bundled_interpreter()
-        return cmds, no_ffmpeg, unsupported, bundled, is_available(cfg.stt)
+        # Derive both `available` and `code` from the SAME detail (the same probe
+        # api_stt_status uses) so the two fields cannot disagree, and the chat
+        # modal can render the precise per-code reason from this one query.
+        detail = availability_detail(cfg.stt)
+        return cmds, no_ffmpeg, unsupported, bundled, detail.ok, detail.code
 
     (
         prereqs,
@@ -1006,6 +1041,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
         transcribe_unsupported,
         bundled_app,
         available,
+        availability_code,
     ) = await asyncio.to_thread(_prereqs_and_probes)
     return web.json_response(
         {
@@ -1013,12 +1049,14 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "provider": provider,
             "model": cfg.stt.model,
             "available": available,
+            "code": availability_code,
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
             "dictation_panel": cfg.stt.dictation_panel,
             "polish": cfg.stt.polish,
             "transcribe_region": cfg.stt.transcribe_region,
             "transcribe_profile": cfg.stt.transcribe_profile,
+            "transcribe_vocabulary": cfg.stt.transcribe_vocabulary,
             "language_code": cfg.stt.effective_language_code,
             "silence_ms": cfg.stt.silence_ms,
             "partial_interval_ms": cfg.stt.partial_interval_ms,
@@ -1196,6 +1234,84 @@ async def api_stt_status(request: web.Request) -> web.Response:
                 "arch": platform.machine(),
                 "download": dict(stt_decoder.store().status),
             },
+        }
+    )
+
+
+#: Whole-request ceiling on the vocabulary listing. The worker thread carries its
+#: own per-attempt bounds; this one keeps a settings panel from waiting on every
+#: page and retry of a slow or unreachable endpoint in sequence.
+_STT_VOCABULARIES_TIMEOUT_SECS = 30
+
+
+async def api_stt_vocabularies(request: web.Request) -> web.Response:
+    """GET /api/stt/vocabularies — the Amazon Transcribe custom vocabularies on offer.
+
+    Feeds the Voice panel's picker for ``stt.transcribe_vocabulary``. Read from the
+    live configuration, never from the request, so the list is always the one the
+    configured profile and region would really use. Both are echoed back: a client
+    that changed either since asking can tell the list describes the old target.
+
+    Two gates come before AWS, and both answer 200 with ``listed: false`` and an
+    empty list, so the panel can tell "AWS was not asked" from "AWS has none" and
+    judges the stored name only against a listed answer. Neither gate may be
+    dropped, because the frontend declining to ask is not a gate:
+
+    1. ``transcribe`` is not the selected provider: nothing has business calling it.
+    2. Amazon Transcribe is not confirmed for this profile and region. Listing bills
+       nothing, but no request reaches a paid service's account without the
+       operator's recorded consent, and the consent card already explains the gap.
+
+    A failure returns a ``code`` and never the service's message, which names the
+    caller's ARN on an access denial.
+    """
+    denied = _deny_app_token(request, "stt.vocabularies")
+    if denied is not None:
+        return denied
+    cfg = KiroCrewConfig.load()
+    profile, region = cfg.stt.transcribe_profile, cfg.stt.transcribe_region
+    target = {"profile": profile, "region": region}
+    if cfg.stt.provider != "transcribe":
+        return web.json_response({**target, "listed": False, "vocabularies": []})
+    if not await aws_consent.refuse_and_log(
+        aws_consent.SERVICE_TRANSCRIBE, profile=profile, region=region
+    ):
+        return web.json_response({**target, "listed": False, "vocabularies": []})
+    try:
+        listing = await asyncio.wait_for(
+            asyncio.to_thread(list_custom_vocabularies, profile, region),
+            timeout=_STT_VOCABULARIES_TIMEOUT_SECS,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Listing custom vocabularies in %s timed out", region)
+        return web.json_response(
+            {"error": "listing custom vocabularies timed out", "code": VOCABULARIES_LIST_FAILED},
+            status=502,
+        )
+    except VocabularyListError as exc:
+        if exc.code == VOCABULARIES_ACCESS_DENIED:
+            # The one fact the fix needs, as data rather than inside a sentence.
+            return web.json_response(
+                {
+                    "error": "not allowed to list custom vocabularies",
+                    "code": VOCABULARIES_ACCESS_DENIED,
+                    "permission": VOCABULARIES_LIST_PERMISSION,
+                },
+                status=502,
+            )
+        return web.json_response(
+            {"error": "could not list custom vocabularies", "code": VOCABULARIES_LIST_FAILED},
+            status=502,
+        )
+    return web.json_response(
+        {
+            **target,
+            "listed": True,
+            "truncated": listing.truncated,
+            "vocabularies": [
+                {"name": v.name, "language_code": v.language_code, "state": v.state}
+                for v in listing.vocabularies
+            ],
         }
     )
 
@@ -1739,16 +1855,16 @@ def _ffmpeg_install_commands() -> list[str]:
 def _stt_prereq_commands(provider: str = "local") -> list[str]:
     """Shell commands the user has to run themselves (they need sudo, a GUI, or a shell).
 
-    Deliberately short, and there is no install button behind it any more. Desktop
-    releases already include both runtime pieces. A source install may need the
-    optional ``voice`` extra plus system ffmpeg for batch WebM/voice-memo input,
-    while ``local`` fetches its own model.
+    Returns the actionable commands the UI surfaces (Settings -> Voice and the
+    microphone modal): the ``pip`` command for the missing ``voice``/``voice-aws``
+    extra when that extra is absent and a pip channel into this interpreter
+    exists, plus the system ffmpeg install command(s) for batch WebM/voice-memo
+    input. The extra to name depends on the provider, because an extra resolves
+    atomically and advising the full local set to a cloud-only user can fail the
+    whole install.
 
-    Desktop builds bundle the extra and must never suggest installing a system
-    dependency. A source install using Apple's OS recogniser can still use a
-    system ffmpeg as a fallback when it did not install the voice extra.
-
-    An empty list means "nothing to do", which is the steady state.
+    Desktop builds bundle both runtime pieces and run on a frozen interpreter, so
+    they return an empty list -- the steady state, meaning "nothing to do".
     """
     cmds: list[str] = []
     # Which extra to name depends on the provider, because the two halves are
@@ -1969,8 +2085,12 @@ async def api_sel_verify(request: web.Request) -> web.Response:
     # Same offload rationale as api_sel_events, including deferring _sel() into
     # the callable: verify_integrity() reads the whole log file to check the HMAC
     # chain end to end and must not run on the event loop.
-    result = await asyncio.get_running_loop().run_in_executor(
-        discovery_executor(), lambda: _sel().verify_integrity(detailed=True)
+    def _verify():
+        log = _sel()
+        return log.verify_integrity(detailed=True), log.dropped_events
+
+    result, dropped = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(), _verify
     )
     if not result.history_verifiable:
         integrity = "unverifiable"
@@ -1985,6 +2105,7 @@ async def api_sel_verify(request: web.Request) -> web.Response:
             "integrity": integrity,
             "tampered": result.total - result.valid,
             "detail": result.reason,
+            "dropped_events": dropped,
         }
     )
 
@@ -2293,15 +2414,20 @@ def _provider_backend(provider: object) -> str | None:
     return backend if isinstance(backend, str) else None
 
 
-def _active_advertised_ids(request: web.Request, *, backend: str | None = None) -> list[str] | None:
-    """Advertised model ids for a backend namespace, or None if unknown.
+def _advertised_evidence_provider(
+    request: web.Request, *, backend: str | None = None
+) -> tuple[Any, list[str]] | None:
+    """The live provider whose advertised list judges a pin, with its ids.
 
-    Uses the shared :func:`advertised_model_ids` shape parser so this
-    validation sees exactly what the session-init withhold check sees. Returns
-    ``None`` when no session has initialized / nothing was advertised, so callers
-    treat entitlement as UNKNOWN rather than denying on no evidence. When
-    *backend* is supplied, providers for other namespaces cannot supply evidence
-    about the target agent's entitlement.
+    NEWEST session first, the same order :func:`_entitled_kiro_models` reads the
+    picker's evidence in: ``active_providers()`` walks live sessions in creation
+    order, and a session started BEFORE a plan change still holds the list it
+    captured at its own ``session/new``. Reading the oldest one would judge a pin
+    against pre-downgrade entitlements -- accepting exactly the model the account
+    lost -- and would let the pin validator and the picker disagree about which
+    session speaks for the account. When *backend* is supplied, providers for
+    other namespaces cannot supply evidence about the target agent's entitlement.
+    Returns ``None`` when no matching session advertised anything.
     """
     from kiro_crew.acp.client import advertised_model_ids
     from kiro_crew.agent_sdk.backends import model_registry_namespace
@@ -2310,7 +2436,7 @@ def _active_advertised_ids(request: web.Request, *, backend: str | None = None) 
         providers = request.app["state"].sessions.active_providers()
     except (KeyError, AttributeError):
         return None
-    for provider in providers:
+    for provider in reversed(list(providers)):
         pb = _provider_backend(provider)
         if backend is not None and (
             pb is None or model_registry_namespace(pb) != model_registry_namespace(backend)
@@ -2324,7 +2450,96 @@ def _active_advertised_ids(request: web.Request, *, backend: str | None = None) 
         except Exception:
             continue
         if ids:
-            return ids
+            return provider, ids
+    return None
+
+
+def _active_advertised_ids(request: web.Request, *, backend: str | None = None) -> list[str] | None:
+    """Advertised model ids for a backend namespace, or None if unknown.
+
+    Uses the shared :func:`advertised_model_ids` shape parser so this
+    validation sees exactly what the session-init withhold check sees. Returns
+    ``None`` when no session has initialized / nothing was advertised, so callers
+    treat entitlement as UNKNOWN rather than denying on no evidence. When
+    *backend* is supplied, providers for other namespaces cannot supply evidence
+    about the target agent's entitlement. The session read is the newest one
+    (:func:`_advertised_evidence_provider`).
+    """
+    found = _advertised_evidence_provider(request, backend=backend)
+    return found[1] if found is not None else None
+
+
+# Answer while a role-pin revalidation is still in flight past the read deadline.
+# A denial, not an acceptance: the snapshot in hand would refuse the pin and the
+# fresh answer has not landed, so accepting would write a pin on no evidence. The
+# probe keeps running and heals the snapshot in place, so a retry is answered by it.
+_ROLE_PIN_REVALIDATING = (
+    "Model availability for this account is being re-checked; try again in a few seconds."
+)
+
+# Bound on how many times the role-pin revalidation reselects the newest evidence
+# provider when a newer session registers mid-await. Small: normal churn settles
+# in one or two, and the cap only stops a pathological session-churn storm from
+# spinning -- it never rejects a pin, it just stops re-probing and proceeds.
+_ROLE_PIN_REVALIDATION_MAX_RESELECTS = 4
+
+
+async def _revalidate_role_pin_evidence(
+    value: str, request: web.Request, *, backend: str | None = None
+) -> str | None:
+    """Revalidate the advertised snapshot a role pin is about to be judged by.
+
+    :func:`_validate_role_model` is synchronous (it runs as a ``validate_fn`` and
+    under the crew handlers' config lock), so it cannot probe. It judges the pin
+    against the newest live session's ``session/new`` snapshot -- one unconfirmed
+    answer that a startup race can leave at the free-tier default, which would
+    deny a pin the account is entitled to. This is the awaited step its callers
+    run FIRST: it hands the same provider the validator will read to the read-path
+    revalidation ``/api/models`` uses (``maybe_refresh_available_models``, declared
+    on the provider ABC). That seam owns every decision -- whether the pin would
+    drop at all (``catalog_row_would_drop``), whether the snapshot is suspect or
+    was probe-confirmed recently (a fresh list is not re-probed), and the probe
+    itself with its freshness floor at the snapshot's capture time -- and heals
+    the snapshot IN PLACE, so the validator that follows reads the fresh answer.
+
+    Returns ``None`` to proceed, or a denial reason while the probe is still in
+    flight past its deadline. A probe that FAILS proceeds on the snapshot as it
+    was (fail open, as on the picker read path).
+    """
+    if not value or value == "auto":
+        return None
+    from kiro_crew.agent_sdk.drivers.acp import EntitlementRevalidating
+
+    # Reselect the newest evidence provider after each refresh: a newer
+    # startup-race session can register DURING the await, and the validator that
+    # follows reads whichever session is newest THEN -- so a provider refreshed
+    # here must still be the newest when the await returns, or its fresh answer is
+    # not the evidence that gets used. Loop until the newest provider is unchanged
+    # across its own refresh (bounded, so a session-churn storm cannot spin here);
+    # each iteration only re-probes when the newest actually moved.
+    seen: set[int] = set()
+    for _ in range(_ROLE_PIN_REVALIDATION_MAX_RESELECTS):
+        found = _advertised_evidence_provider(request, backend=backend)
+        if found is None:
+            return None
+        provider, ids = found
+        if id(provider) in seen:
+            # Already refreshed this newest provider and nothing newer displaced
+            # it: its fresh answer is the evidence the validator will read.
+            return None
+        seen.add(id(provider))
+        try:
+            # The pin is judged as a one-row catalog beside the rows the snapshot
+            # already serves. Those extra rows never drop, so they cannot trigger
+            # a probe; they only keep the seam's fail-open rule (no surviving row =
+            # a namespace mismatch, not an entitlement answer) from reading a lone
+            # pin as that mismatch and skipping the revalidation.
+            await provider.maybe_refresh_available_models([value, *ids])
+        except EntitlementRevalidating:
+            return _ROLE_PIN_REVALIDATING
+        except Exception:
+            logger.debug("role-pin entitlement revalidation failed", exc_info=True)
+            return None
     return None
 
 
@@ -2345,6 +2560,26 @@ def _active_provider_name() -> str:
         return KiroCrewConfig.load().agent.provider
     except Exception:  # pragma: no cover - config load is resilient
         return ""
+
+
+def _active_provider_and_pin_backend() -> tuple[str, str]:
+    """``(agent.provider, agent.acp_backend)`` in one read. FILESYSTEM IO -- off the loop.
+
+    The role, fallback and decision pins ``api_kirocrew_config_patch`` validates
+    run on the DEFAULT harness (``agent.acp_backend``; ``""`` is kiro), so that
+    harness is the one whose live catalog may judge them. Resolved beside the
+    provider so the request pays one config read, not two, and handed to both
+    the revalidation and the validator: the newest-first evidence scan keeps
+    only providers in that harness's model-registry namespace. Without the
+    scope, a member DM session on another harness (``agent.member_acp_backend``)
+    created AFTER the default-harness session would be the newest evidence and
+    its catalog would deterministically reject every id of the default harness.
+    """
+    try:
+        agent = KiroCrewConfig.load().agent
+    except Exception:  # pragma: no cover - config load is resilient
+        return "", ""
+    return str(getattr(agent, "provider", "") or ""), str(getattr(agent, "acp_backend", "") or "")
 
 
 def _validate_role_model(
@@ -2419,6 +2654,11 @@ def _selectable_acp_backends() -> list[str]:
     return selectable_backend_values()
 
 
+_MODEL_PIN_PATTERN = (
+    r"(?:[A-Za-z0-9][A-Za-z0-9._\-\[\]]*|"
+    r"[A-Za-z0-9][A-Za-z0-9._\-]*(?:/[A-Za-z0-9][A-Za-z0-9._\-]*)+)?\Z"
+)
+
 _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.provider": {"type": "enum", "values": ["acp"]},
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
@@ -2433,11 +2673,11 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # fixed list: the real vocabulary is whatever the live kiro-cli advertises
     # (/api/models spawns it to find out), and it spans both canonical registry
     # keys ("opus-4.8-1m") and kiro's own ids ("claude-opus-4.8"). So this is a
-    # grammar check instead — model-id charset only, no separators or shell
-    # metacharacters — and an unknown-but-well-formed id is rejected downstream
+    # grammar check instead — provider-qualified ids with nonempty alphanumeric-led
+    # segments, no traversal or shell metacharacters. An unknown id is rejected downstream
     # by kiro itself rather than silently accepted here. "auto"/"" = defer to
     # the agent config / kiro's own default.
-    "agent.model": {"type": "str", "max_len": 64, "pattern": r"^[A-Za-z0-9._\-/\[\]]*$"},
+    "agent.model": {"type": "str", "max_len": 64, "pattern": _MODEL_PIN_PATTERN},
     # Per-task-class model overrides. Same grammar as agent.model (the real
     # vocabulary is whatever the backend advertises). "" / "auto" defers to the
     # chat default. `validate_fn` additionally rejects a well-formed id the
@@ -2445,13 +2685,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.role_models.background": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.role_models.subagent": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Throttle-exhaustion fallback model. Single value: "auto" (default) defers
@@ -2462,7 +2702,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     # Content-filter (refusal) fallback model. Single value: "" (default)
@@ -2473,7 +2713,7 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     "agent.refusal_fallback_model": {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-/\[\]]*$",
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     },
     "agent.reasoning_effort": {"type": "enum", "values": ["", *EFFORT_LEVELS]},
@@ -2577,6 +2817,13 @@ _EDITABLE_CONFIG: dict[str, dict] = {
     # stays config-file-only: it also kills the PTY, which is not a display
     # preference.
     "dashboard.terminal.completion.enabled": {"type": "bool"},
+    # Run-in-terminal focuses the selected terminal tab and copies the command
+    # for a manual paste instead of minting a fresh PTY (Settings → Display →
+    # Terminal). Off by default so the fresh-shell default is unchanged; read by
+    # the dashboard's run-in-terminal handler, so a toggle takes effect on the
+    # next click with no restart. Only a literal `true` turns it on — a
+    # hand-edited non-boolean stays off.
+    "dashboard.terminal.reuse_current": {"type": "bool"},
     # Keep the host awake while the agent is running a task. Gateway-host
     # behavior (not a display pref), read by the prevent-sleep poll in
     # dashboard/server.py; off by default.
@@ -2738,7 +2985,9 @@ for _tier in DECISION_MODEL_ROUTE_TIERS:
     _EDITABLE_CONFIG[f"decisions.model_route.{_tier}"] = {
         "type": "str",
         "max_len": 64,
-        "pattern": r"^[A-Za-z0-9._\-\[\]]*$",
+        # OpenCode's picker advertises provider/model ids. Allow those while
+        # retaining the empty INHERIT value and rejecting malformed segments.
+        "pattern": _MODEL_PIN_PATTERN,
         "validate_fn": _validate_role_model,
     }
 
@@ -2923,8 +3172,21 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
             # keys that carry a hook. One hop per request, and only for a key that has
             # a validator at all. A ``validate_fn`` added later takes the provider as
             # its third argument for this reason.
-            provider = await asyncio.to_thread(_active_provider_name)
-            reason = validate_fn(value, request, provider)
+            if validate_fn is _validate_role_model:
+                # The validator is synchronous and judges the pin against the live
+                # snapshot as it stands; revalidate that snapshot first so a
+                # startup-race answer cannot deny a pin the account is entitled to.
+                # Both steps are scoped to the default harness the pin runs on, so
+                # the newest live session of ANOTHER harness (a member DM) is never
+                # the evidence that judges it.
+                provider, pin_backend = await asyncio.to_thread(_active_provider_and_pin_backend)
+                pending = await _revalidate_role_pin_evidence(value, request, backend=pin_backend)
+                if pending:
+                    return _deny(pending, f"{path_key}={value}")
+                reason = validate_fn(value, request, provider, backend=pin_backend)
+            else:
+                provider = await asyncio.to_thread(_active_provider_name)
+                reason = validate_fn(value, request, provider)
             if reason:
                 return _deny(reason, f"{path_key}={value}")
     elif spec["type"] == "dict":
@@ -3152,6 +3414,26 @@ async def api_kirocrew_config_patch(request: web.Request) -> web.Response:
     applied = live.snapshot()
     if applied is None:
         applied = await asyncio.to_thread(KiroCrewConfig.load)
+    if path_key == "agent.acp_backend":
+        from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
+
+        prerequisite = request.app.get("kiro_prerequisite_service")
+        if (
+            isinstance(prerequisite, KiroPrerequisiteService)
+            and not prerequisite.initial_setup_complete
+        ):
+            try:
+                await prerequisite.record_independent_backend_setup(applied.agent.acp_backend)
+            except Exception:
+                logger.warning("Could not record independent backend setup", exc_info=True)
+                return web.json_response(
+                    {
+                        "error": "Agent selection was saved, but setup completion could not be recorded. Try again.",
+                        "code": "setup_marker_write_failed",
+                        "config_saved": True,
+                    },
+                    status=503,
+                )
     return web.json_response(_masked_config_dict(applied))
 
 
@@ -3218,7 +3500,7 @@ async def api_token_local(request: web.Request) -> web.Response:
     if not expected:
         return web.json_response({"error": "not available"}, status=503)
     provided = request.headers.get("X-Local-Secret", "")
-    if not provided or not hmac.compare_digest(expected, provided):
+    if not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="token.local",
@@ -3427,7 +3709,7 @@ async def api_logout(request: web.Request) -> web.Response:
 
     expected = request.app.get("local_secret", "")
     provided = request.headers.get("X-Local-Secret", "")
-    if not expected or not provided or not hmac.compare_digest(expected, provided):
+    if not expected or not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="logout",
@@ -3499,7 +3781,7 @@ async def api_shutdown(request: web.Request) -> web.Response:
 
     expected = request.app.get("local_secret", "")
     provided = request.headers.get("X-Local-Secret", "")
-    if not expected or not provided or not hmac.compare_digest(expected, provided):
+    if not expected or not provided or not _ct_eq(expected, provided):
         _sel().log_api_access(
             caller=request.remote or "unknown",
             operation="shutdown",

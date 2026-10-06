@@ -46,7 +46,11 @@ instead of a reduced embed.
 
 All routes live under `/api/apps/pptx-maker/` and are registered by
 `apps/builtins/pptx_maker/backend/routes.py:register_routes`. Every handler is
-wrapped in `_require_enabled` (403 when the app is disabled).
+wrapped in `_require_enabled` (403 when the app is disabled). Every PUT, POST
+and DELETE handler is also owner only (`_refuse_non_owner`): a dashboard caller
+that is not the owner, or a request with no app claim, gets the shared 403
+`owner_only` before the body is read. An app token keeps its manifest-scoped
+access.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -271,6 +275,12 @@ place, so no source marker survives to make `is_installed()` short-circuit the r
 **editable** (a normal install drops its sibling data dirs, so bundled styles and
 templates would silently vanish), stages this app's prompt files into the
 install dir, and renders the agent templates against the resolved engine paths.
+
+Prompt staging repairs owner directory permissions on the existing copy before
+forced removal, then normalizes the fresh copy's directories to owner rwx.
+This replaces copies inherited from read-only packaged sources on POSIX and
+Windows while preserving copied file modes. A failed removal raises an `OSError`
+that staging records in its log; it never copies over a surviving stale tree.
 
 **It does NOT register those resources.** The enable path and the boot reconcile both
 call `bridges.register_app`, and `bridges._placeholder_values` computes this app's
@@ -727,6 +737,11 @@ sensitive-path check and the governance ceiling — would never be reached.
   the engine's analyzer.
 - **Deny-by-default.** All handlers wrapped in `_require_enabled`; the gate runs
   BEFORE the handler body, so a disabled app does not even walk the deck tree.
+- **Owner-only mutations.** `PUT /config`, the style and template
+  import/rename/pin/delete routes, and both provision routes call
+  `require_owner_dashboard_request` first unless an app token calls. A
+  non-owner could otherwise repoint the deck root and read files through
+  `/preview`, or pin a style the owner's next deck uses.
 - **SEL audit.** Every mutating action (engine/asset provisioning, deck-root
   writes, library import/rename/delete) and every refused artifact read emits an
   SEL `pptx_maker.*` event.

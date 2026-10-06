@@ -12,6 +12,8 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.messaging.commands import compact_refusal_plain_text
 from kiro_crew.messaging.driver import APPROVAL_AUTO
@@ -22,6 +24,7 @@ from kiro_crew.whatsapp.commands import (
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
     COMPACT_NOTHING_TEXT,
+    COMPACT_TIMED_OUT_TEXT,
     COMPACTED_TEXT,
     CONTEXT_LONG_TEXT,
 )
@@ -64,6 +67,7 @@ class FakeProvider:
         self.compacts = 0
         self.waits = 0
         self.compact_raises = False
+        self.compact_result: dict[str, str] = {"type": "completed", "summary": ""}
 
     async def stream(self, message: str):
         self.prompts.append(message)
@@ -80,7 +84,7 @@ class FakeProvider:
 
     async def wait_for_compaction(self, *a: Any, **kw: Any) -> dict:
         self.waits += 1
-        return {}
+        return self.compact_result
 
 
 class FakeSessions:
@@ -142,7 +146,7 @@ class FakeSessions:
         self.generation_lookups.append(bucket)
         return self.persisted_generations.get(bucket, 0)
 
-    async def get_or_create(self, key, agent=None, channel_id=None):
+    async def get_or_create(self, key, agent=None, channel_id=None, start_priority=None):
         return self.provider, True, False
 
     def begin_turn(self, key: str) -> None:
@@ -168,6 +172,10 @@ class FakeSessions:
 
     def get_pid(self, key):
         return None  # skip identity publication in tests
+
+    def compact_wait_budget_secs(self) -> float:
+        """The real manager's resolved ``session.compact_wait_secs`` (unset: 300 s)."""
+        return 300.0
 
 
 class FakeHooks:
@@ -455,6 +463,33 @@ def test_stop_acts_on_the_members_bucket_when_that_is_the_live_one():
     asyncio.run(d._handle_stop(_GROUP))
     assert stopped == [member_key]
     assert [t for _, t in transport.sent] == [STOPPED_TEXT]
+
+
+def test_a_repeat_stop_while_compacting_forces_and_keeps_the_shared_queue():
+    """The first /stop during a compaction is declined; the second inside the
+    window forces. The force keeps the queue: under a unified ``dm_scope`` it
+    holds other channels' messages, and ``stop_turn`` parks them for the
+    successor rather than letting the reset drop them."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.whatsapp.transport_dispatch import STOP_DECLINED_COMPACTING_TEXT, STOPPED_TEXT
+
+    sl._stop_declined_markers.clear()
+    d, _client, sessions, transport = _make()
+    sessions.is_compacting = lambda key: True  # type: ignore[attr-defined]
+    calls: list[dict] = []
+
+    async def stop_turn(key, **kw):
+        calls.append(kw)
+        return "compacting" if not kw.get("force") else "hard"
+
+    sessions.stop_turn = stop_turn  # type: ignore[attr-defined]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}]
+    assert [t for _, t in transport.sent] == [STOP_DECLINED_COMPACTING_TEXT]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls[-1] == {"force": True, "preserve_queue": True}
+    assert [t for _, t in transport.sent][-1] == STOPPED_TEXT
+    sl._stop_declined_markers.clear()
 
 
 def test_busy_session_folds_into_current_reply_when_steerable():
@@ -989,6 +1024,21 @@ def test_compact_command_reports_a_failure_and_still_releases():
     assert sessions.released == 1, "a failed compaction must not strand the semaphore"
 
 
+@pytest.mark.parametrize(
+    ("kind", "reply"),
+    [("failed", COMPACT_FAILED_TEXT), ("timeout", COMPACT_TIMED_OUT_TEXT)],
+)
+def test_compact_command_reports_an_unsuccessful_result(kind: str, reply: str):
+    """``wait_for_compaction()`` reports these as a returned type, not an
+    exception, so the receipt must read the result instead of assuming it."""
+    provider = FakeProvider()
+    provider.compact_result = {"type": kind, "summary": ""}
+    d, _client, sessions, transport = _make(provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert [t for _, t in transport.sent] == [reply]
+    assert sessions.released == 1
+
+
 # ── post-turn context accounting (ChannelTurn.notice) ───────────────────────
 def test_every_turn_reaches_context_accounting():
     """``notice`` is the channel's ONLY reach into ``check_context_usage``.
@@ -1016,6 +1066,16 @@ def test_a_failed_hard_threshold_compaction_claims_nothing():
     provider.compact_raises = True
     d, _client, _sessions, transport = _make(provider=provider, context_pct=96.0)
     asyncio.run(d.handle_message(_msg("a long conversation")))
+    assert [t for _, t in transport.sent] == ["answered"]
+
+
+@pytest.mark.parametrize("kind", ["failed", "timeout"])
+def test_an_unsuccessful_hard_threshold_result_claims_nothing(kind: str):
+    provider = FakeProvider("answered")
+    provider.compact_result = {"type": kind, "summary": ""}
+    d, _client, _sessions, transport = _make(provider=provider, context_pct=96.0)
+    asyncio.run(d.handle_message(_msg("a long conversation")))
+    assert (provider.compacts, provider.waits) == (1, 1)
     assert [t for _, t in transport.sent] == ["answered"]
 
 
@@ -1217,3 +1277,54 @@ def test_a_scope_seeds_from_the_member_bucket_when_it_is_ahead():
     assert d._conv.current_gen(_GROUP) == 5
     # The seeded generation is what the member's key is then built with.
     assert d._session_key(_GROUP, is_operator=False) != member_bucket
+
+
+def test_a_decline_whose_reply_never_sends_leaves_the_next_press_a_first_press():
+    """``_say`` logs its own send error rather than raising, so the decline must
+    read its answer: an operator who saw nothing presses again within seconds,
+    and that press must be declined again rather than reset their session."""
+    from kiro_crew import session_lifecycle as sl
+    from kiro_crew.whatsapp.transport_dispatch import STOP_DECLINED_COMPACTING_TEXT
+
+    sl._stop_declined_markers.clear()
+    d, _client, sessions, transport = _make()
+    sessions.is_compacting = lambda key: True  # type: ignore[attr-defined]
+    calls: list[dict] = []
+
+    async def stop_turn(key, **kw):
+        calls.append(kw)
+        return "compacting" if not kw.get("force") else "hard"
+
+    sessions.stop_turn = stop_turn  # type: ignore[attr-defined]
+
+    working = transport.send_message
+    down = True
+
+    async def _flaky(jid, text):
+        if down:
+            raise RuntimeError("whatsapp 503")
+        return await working(jid, text)
+
+    transport.send_message = _flaky  # type: ignore[assignment]
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}]
+    assert sl._stop_declined_markers == {}, "an undelivered warning arms nothing"
+    # Delivery works again; the retry is still a first press, declined.
+    down = False
+    asyncio.run(d._handle_stop(_GROUP))
+    assert calls == [{}, {}], "no force on a press the operator was never warned about"
+    assert [t for _, t in transport.sent] == [STOP_DECLINED_COMPACTING_TEXT]
+    sl._stop_declined_markers.clear()
+
+
+def test_say_reports_whether_the_message_landed():
+    d, _client, _sessions, transport = _make()
+    assert asyncio.run(d._say(_GROUP, "hi")) is True
+
+    async def _down(_jid, _text):
+        raise RuntimeError("whatsapp 503")
+
+    transport.send_message = _down  # type: ignore[assignment]
+    assert asyncio.run(d._say(_GROUP, "hi")) is False
+    d.transport = None
+    assert asyncio.run(d._say(_GROUP, "hi")) is False

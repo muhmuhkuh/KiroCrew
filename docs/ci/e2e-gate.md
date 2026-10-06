@@ -516,8 +516,9 @@ INSTALLED interpreter, so readiness needs no model, no network and no sign-in.
 ceiling.
 
 Two ceilings became load-bearing with that change and were not before. The
-install-duration ceiling (120 s) previously measured the extraction of a 40-byte
-batch file, so it proved nothing about a real install; it now measures one.
+install-duration ceiling previously measured the extraction of a 40-byte batch
+file, so it proved nothing about a real install; it now measures one, at 200 s,
+about twice the slowest measured green install.
 `MinStartupPycs` is passed as 750 rather than the script's 1000 default, because
 the default describes the full release bundle and this job omits the voice
 extras: the core closure of `kiro_crew.cli_server` measures about 990 sources, so
@@ -1054,8 +1055,9 @@ and the plane's `a/**` artifacts and `h/**/*.log` pod logs from under that
 basetemp; on a default run the scenario globs simply match nothing.
 
 Three facts about WHEN the label takes effect, all consequences of `ci.yml`
-listening only for `push` and `pull_request` (`opened`, `synchronize`,
-`reopened`) and deliberately not for `labeled` -- the same choice `ci-full-run`
+listening only for `push`, `pull_request` (`opened`, `synchronize`,
+`reopened`) and `merge_group` -- on which a run has no PR labels, so the suite
+stays off -- and deliberately not for `labeled` -- the same choice `ci-full-run`
 makes, because a `labeled` trigger re-runs the whole workflow on every bot label:
 
 - The label must be on the PR BEFORE the `opened` or `synchronize` event that

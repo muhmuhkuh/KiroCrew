@@ -334,6 +334,8 @@ class TestClientTracking:
         client._cancelled = False
         client._resumed = False
         client._sandbox_cleanup = None
+        client._pi_state_path = None
+        client._pi_effort_path = None
         client._child_pids = {}
         client._stderr_lines = deque(maxlen=20)
         client._stderr_task = None

@@ -7,11 +7,11 @@
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "postinstall": "node scripts/patch-happy-dom-iframe.mjs",
-    "clean": "rm -rf dist && rm -rf node_modules",
+    "clean": "rm -rf dist .dist*.next-* .dist*.ready-* .dist*.prev-* && rm -rf node_modules",
     "dev": "vite",
     "build": "tsc -p tsconfig.app.json && node --max-old-space-size=6144 ./node_modules/vite/bin/vite.js build",
     "preview": "vite preview",
@@ -190,6 +190,7 @@
       "@radix-ui/react-focus-guards": "1.1.6",
       "@radix-ui/react-focus-scope": "1.1.16",
       "nanoid": "3.3.18",
+      "sass": "1.105.0",
       "@excalidraw/mermaid-to-excalidraw": {
         "nanoid": "5.1.16"
       }

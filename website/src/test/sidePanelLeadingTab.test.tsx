@@ -308,6 +308,24 @@ describe('SidePanel leading tab', () => {
     expect(JSON.parse(raw as string).activeId).toBe(LEADING_ID)
   })
 
+  it('the DERIVED default focus is never persisted: a fresh strip stores no focus at all', async () => {
+    // `syncPinned` reconciles the pinned block on mount and used to write its
+    // fallback focus into the bucket. That froze whichever tab led on the build
+    // that first opened the strip: changing the default later would reach only
+    // strips nobody had opened. The default is resolved on READ instead, so the
+    // strip renders the leading tab while the bucket stays unfocused.
+    renderPanel({ closable: false })
+    // Rendered focus IS the leading tab; the BUCKET is what must stay unwritten.
+    expect(ctl?.activeId).toBe(LEADING_ID)
+    await new Promise(r => setTimeout(r, 400))
+    const raw = localStorage.getItem('mc-panel-tabs:member-radar')
+    if (raw !== null) expect(JSON.parse(raw).activeId).toBeNull()
+    // A CLICK is a choice, and that is what gets stored.
+    act(() => { ctl!.setActive(LEADING_ID) })
+    await new Promise(r => setTimeout(r, 400))
+    expect(JSON.parse(localStorage.getItem('mc-panel-tabs:member-radar') as string).activeId).toBe(LEADING_ID)
+  })
+
   it('a withheld body-owning tab (Browser) stays MOUNTED and hidden, not unmounted', () => {
     const first = renderPanel({ closable: false })
     act(() => { ctl!.openView('browser') })
@@ -381,6 +399,30 @@ describe('SidePanel leading tabs — three host tabs', () => {
     expect(leadingBody()).toBeInTheDocument()
     expect(shown).toBe(LEADING_ID)
     expect(screen.queryByTestId('side-panel-leading-tab-crew-dashboard')).toBeNull()
+  })
+
+  it('the fixed-chip group scrolls instead of pushing its own chips and the strip controls off the edge', () => {
+    // At 320px the Crewmates overlay is handed the whole window, and the panel
+    // root clips (`overflow-hidden`). A `shrink-0` group of leading + pinned
+    // chips would then carry its last chip and the trailing controls (+ menu,
+    // dock toggle, close) past that edge with no way back at that width. The
+    // group must therefore be allowed to shrink and to scroll, exactly like the
+    // dynamic tablist — while the chips inside it stay unsqueezed.
+    renderPanel({ closable: true, leading: THREE_LEADING })
+    const fixed = screen.getByTestId('side-panel-fixed-tabs')
+    // Every non-closable chip lives in this one group: three leading + pinned.
+    expect(fixed.querySelectorAll('[role="tab"]')).toHaveLength(3 + PINNED_VIEWS.length)
+    expect(fixed.className).toContain('overflow-x-auto')
+    expect(fixed.className).toContain('min-w-0')
+    expect(fixed.className).not.toContain('shrink-0')
+    // Same overflow contract as the dynamic group it sits beside.
+    expect(screen.getByRole('tablist').className).toContain('overflow-x-auto')
+    // The chips themselves do not squeeze — they scroll.
+    expect(screen.getByTestId('side-panel-leading-tabs').className).toContain('shrink-0')
+    // The trailing controls are still rendered as siblings of the group, not
+    // inside the scroller where they would scroll away with the chips.
+    const close = screen.getByRole('button', { name: 'Close panel' })
+    expect(fixed.contains(close)).toBe(false)
   })
 
   it('closing the last dynamic tab lands on the first leading tab, whichever was focused before', () => {

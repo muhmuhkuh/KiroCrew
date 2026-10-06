@@ -41,6 +41,7 @@ import os
 import shutil
 import signal
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -127,6 +128,23 @@ def _tick():
     not renew" test would pass with the guard deleted.
     """
     time.sleep(0.004)
+
+
+@contextmanager
+def _eager_folder_held():
+    """Settle the eager folder and hold it between batches for the body.
+
+    The folder reads the store on its own thread after every entry, including the slot
+    index scan. A test that patches a store read and then inspects the index has to
+    keep that thread out: a scan it started before the patch can assign the index
+    after the test's own read and replace what the test is about to check.
+    """
+    from kiro_crew.crew_log import eager
+
+    assert eager.drain(timeout=10.0), "the eager folder never settled"
+    with eager.paused() as held:
+        assert held, "the eager folder could not be held between batches"
+        yield
 
 
 # ── crews ───────────────────────────────────────────────────────────────────
@@ -2239,21 +2257,24 @@ def test_a_unit_holding_entries_it_cannot_prove_refuses_the_write(tmp_path, monk
             raise OSError("the header will not read right now")
         return real_read(path)
 
-    monkeypatch.setattr(crew_log_store, "_read_header_line", header_will_not_read)
-    monkeypatch.setattr(crew_log_store, "_slot_index", None)
-    crew_log_projection.forget_slot_folds()
+    # Held so an eager-fold scan that read the retired header before the patch cannot
+    # assign the index while this body inspects it (see ``_eager_folder_held``).
+    with _eager_folder_held():
+        monkeypatch.setattr(crew_log_store, "_read_header_line", header_will_not_read)
+        monkeypatch.setattr(crew_log_store, "_slot_index", None)
+        crew_log_projection.forget_slot_folds()
 
-    # A READ takes the shorter listing: it says nothing false about what it could read.
-    assert crew_log_store.session_units_for_slot(slot) == (live,)
-    # A validating caller is refused instead, naming the unit it could not account for.
-    monkeypatch.setattr(crew_log_store, "_slot_index", None)
-    with pytest.raises(crew_log_store.CrewLogError, match="cannot prove"):
-        crew_log_store.session_units_for_slot(slot, strict=True)
+        # A READ takes the shorter listing: it says nothing false about what it could read.
+        assert crew_log_store.session_units_for_slot(slot) == (live,)
+        # A validating caller is refused instead, naming the unit it could not account for.
+        monkeypatch.setattr(crew_log_store, "_slot_index", None)
+        with pytest.raises(crew_log_store.CrewLogError, match="cannot prove"):
+            crew_log_store.session_units_for_slot(slot, strict=True)
 
-    # Through the crew store: issue 8 entering an editing phase is the second editor.
-    monkeypatch.setattr(crew_log_store, "_slot_index", None)
-    with pytest.raises(cs.CrewLedgerNotRecorded):
-        _record(tmp_path, cid, live, 8, {"phase": "implementing"}, "implement", "on #8")
+        # Through the crew store: issue 8 entering an editing phase is the second editor.
+        monkeypatch.setattr(crew_log_store, "_slot_index", None)
+        with pytest.raises(cs.CrewLedgerNotRecorded):
+            _record(tmp_path, cid, live, 8, {"phase": "implementing"}, "implement", "on #8")
 
 
 def test_a_unit_directory_with_nothing_in_it_yet_does_not_refuse_the_write(tmp_path):
@@ -2296,19 +2317,24 @@ def test_a_cached_listing_that_is_short_a_unit_still_refuses_the_write(tmp_path,
             raise OSError("the header will not read right now")
         return real_read(path)
 
-    monkeypatch.setattr(crew_log_store, "_read_header_line", header_will_not_read)
-    monkeypatch.setattr(crew_log_store, "_slot_index", None)
-    crew_log_projection.forget_slot_folds()
+    # The eager folder scans the slot index on its own thread. A scan that read the
+    # retired header before the patch and assigns the map after the read below would
+    # replace the cached map with one that proves every unit. Held between batches,
+    # no fold scans until the body is done.
+    with _eager_folder_held():
+        monkeypatch.setattr(crew_log_store, "_read_header_line", header_will_not_read)
+        monkeypatch.setattr(crew_log_store, "_slot_index", None)
+        crew_log_projection.forget_slot_folds()
 
-    # The read scans and CACHES the map, naming the child it could not prove.
-    assert crew_log_store.session_units_for_slot(slot) == (live,)
-    cached = crew_log_store._slot_index
-    assert cached is not None and cached[2] == (retired_dir.name,), "cached, short a unit"
+        # The read scans and CACHES the map, naming the child it could not prove.
+        assert crew_log_store.session_units_for_slot(slot) == (live,)
+        cached = crew_log_store._slot_index
+        assert cached is not None and cached[2] == (retired_dir.name,), "cached, short a unit"
 
-    # No scan runs now: same fingerprint, still unprovable. The refusal must still fire.
-    with pytest.raises(crew_log_store.CrewLogError, match="cannot prove"):
-        crew_log_store.session_units_for_slot(slot, strict=True)
-    assert crew_log_store._slot_index is cached, "served from the cache, not re-scanned"
+        # No scan runs now: same fingerprint, still unprovable. The refusal must still fire.
+        with pytest.raises(crew_log_store.CrewLogError, match="cannot prove"):
+            crew_log_store.session_units_for_slot(slot, strict=True)
+        assert crew_log_store._slot_index is cached, "served from the cache, not re-scanned"
 
 
 def test_a_begun_marker_that_cannot_be_written_refuses_the_write_before_any_carry(
@@ -3090,6 +3116,7 @@ def test_a_unit_recreated_under_its_id_folds_cold_however_far_its_seq_climbed(tm
     log's seq was still below the cached one, and the stale checkpoint would never be
     offered to the comparison this pins.
     """
+    from kiro_crew.crew_log import eager
     from kiro_crew.crew_log.store import segment_paths
 
     crew, sid = _live_crew(tmp_path)
@@ -3100,8 +3127,15 @@ def test_a_unit_recreated_under_its_id_folds_cold_however_far_its_seq_climbed(tm
     retired_seq = cs._unit_last_seq(sid)
 
     crew_log_emit.reset_caches()
-    for path in segment_paths(KIND_SESSION, sid):
-        path.unlink()
+    # Removed the way retention removes a unit: with the eager folder held between
+    # batches, so none of its folds has a segment open. Windows refuses to unlink a
+    # file any handle holds, and the folder reads this unit on its own thread after
+    # every entry.
+    assert eager.drain(timeout=10.0), "the eager folder never settled"
+    with eager.paused() as held:
+        assert held, "the eager folder could not be held between batches"
+        for path in segment_paths(KIND_SESSION, sid):
+            path.unlink()
     _tick()
     _unit(cid, session_id=sid)
     for number in (11, 13, 15, 17):
@@ -4547,3 +4581,60 @@ def test_the_walk_will_not_run_without_a_declared_bound(tmp_path):
 
     with pytest.raises(TypeError):
         cs._hold_chain_for_by_name_use(tmp_path)  # type: ignore[call-arg]
+
+
+def test_a_read_back_that_misses_the_written_entry_warns_with_seq_unit_and_path(caplog):
+    """The writer said the entry was written, and the read-back does not find it: that
+    is "written but not readable", so it says so at WARNING with the seq it read
+    after, the unit and the file it looked in. A DEBUG line hides the only cause a
+    CI red can show."""
+    import logging
+
+    from kiro_crew.crew_log.schema import Entry
+
+    data = {"crew_id": "c_0a1b2c3d", "owner": OWNER, "repo": REPO, "number": 7}
+    other = Entry(
+        type=cs.LEDGER_ENTRY_TYPE,
+        seq=6,
+        time=1_789_000_000_000,
+        src="gateway",
+        data={**data, "number": 8},
+    )
+    written = Entry(
+        type=cs.LEDGER_ENTRY_TYPE, seq=7, time=1_789_000_000_000, src="gateway", data=data
+    )
+
+    class _Handle:
+        path = Path("crew-log") / "session" / "unit-x.jsonl"
+
+        def iter_from(self, seq, known=None):
+            # The read skips the written entry's seq.
+            return iter(e for e in (other, written) if e.seq >= seq and e.seq != 7)
+
+    class _Projection:
+        KNOWN_TYPES = None
+
+        @staticmethod
+        def open_session_log(session_id):
+            assert session_id == "unit-x"
+            return _Handle()
+
+    with caplog.at_level(logging.WARNING, logger=cs.logger.name):
+        since, landed = cs._landed_since(_Projection(), "unit-x", 5, data)
+    assert landed is False
+    assert since is not None and [e.seq for e in since] == [6]
+    (record,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    text = record.getMessage()
+    assert "seq 5" in text and "unit-x" in text and "unit-x.jsonl" in text
+
+    # Control: the same read without the skip finds the entry and warns nothing.
+    caplog.clear()
+
+    class _Whole(_Handle):
+        def iter_from(self, seq, known=None):
+            return iter(e for e in (other, written) if e.seq >= seq)
+
+    _Projection.open_session_log = staticmethod(lambda session_id: _Whole())
+    with caplog.at_level(logging.WARNING, logger=cs.logger.name):
+        assert cs._landed_since(_Projection(), "unit-x", 5, data)[1] is True
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]

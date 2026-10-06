@@ -64,19 +64,22 @@ slot, so it lives here instead of weakening the guard.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
 import re
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, BinaryIO
 
-from aiohttp import web
+from aiohttp import hdrs, web
 
 from kiro_crew.config.loader import _raw_config
 from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.session_transfer import (
+    _CHUNK_BYTES,
     SnapshotUnstable,
     TranscriptBusy,
     TranscriptWithheld,
@@ -85,6 +88,7 @@ from kiro_crew.dashboard.session_transfer import (
     release_bundle_files,
     write_bundle_file,
 )
+from kiro_crew.dashboard.slot_ownership import deny_app_slot_access, slot_not_found
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.sel import sel
 
@@ -173,7 +177,56 @@ def _stage_export(bundle: dict[str, Any]) -> Path:
     return write_bundle_file(bundle, compress=True)
 
 
-class _StagedExport(web.FileResponse):
+#: Releases still running after their send, or the refused commit that never
+#: handed the file to one, was cancelled. A shielded task needs a strong
+#: reference or it can be collected before it finishes.
+_PENDING_RELEASES: set[asyncio.Task[None]] = set()
+
+
+async def _shielded_release(release: Awaitable[None]) -> None:
+    """Await a staged file's release so a cancellation cannot withdraw it.
+
+    Cancelling an ``asyncio.to_thread`` that no worker has started withdraws the
+    job, so an unshielded release is skipped whenever the cancellation wins the
+    race for a worker. The task is held in :data:`_PENDING_RELEASES` until done.
+    """
+    task = asyncio.ensure_future(release)
+    _PENDING_RELEASES.add(task)
+    task.add_done_callback(_PENDING_RELEASES.discard)
+    await asyncio.shield(task)
+
+
+def _open_staged(path: Path) -> tuple[BinaryIO, int]:
+    """Open a staged export and read its size. **Blocking.**"""
+    fobj = path.open("rb")
+    try:
+        return fobj, os.fstat(fobj.fileno()).st_size
+    except BaseException:
+        fobj.close()
+        raise
+
+
+def _close_and_remove(fobj: BinaryIO | None, path: Path) -> None:
+    """Close the send's handle, then remove its file. **Blocking.**
+
+    The close comes first because Windows refuses to delete a file while any
+    handle on it is open.
+    """
+    if fobj is not None:
+        with contextlib.suppress(OSError):
+            fobj.close()
+    _rm_import_temps(path)
+
+
+async def _release_staged(opening: asyncio.Future[tuple[BinaryIO, int]], path: Path) -> None:
+    """Remove a staged export once the open it may still be waiting on settles."""
+    fobj: BinaryIO | None = None
+    with contextlib.suppress(Exception):
+        fobj, _size = await opening
+    await asyncio.to_thread(_close_and_remove, fobj, path)
+
+
+class _StagedExport(web.StreamResponse):
     """An export served from its staged file, which is removed once sent.
 
     The file is streamed to the socket a chunk at a time, so a session of any
@@ -181,13 +234,31 @@ class _StagedExport(web.FileResponse):
     memory. It is removed when the send ends, whether it completed or the
     client went away; a response that is never sent leaves its file under the
     egress staging directory.
+
+    The response owns its file handle and closes it before the removal, since
+    a handle still open makes the delete fail on Windows. The removal is
+    shielded: a client that goes away cancels the send, and cancelling an
+    ``asyncio.to_thread`` that no worker has started withdraws the job.
     """
 
+    def __init__(self, path: Path, *, headers: dict[str, str]) -> None:
+        super().__init__(headers=headers)
+        self._path = path
+
     async def prepare(self, request: web.BaseRequest) -> Any:
+        loop = asyncio.get_running_loop()
+        opening = loop.run_in_executor(None, _open_staged, self._path)
         try:
-            return await super().prepare(request)
+            fobj, size = await asyncio.shield(opening)
+            self.content_length = size
+            writer = await super().prepare(request)
+            if request.method != hdrs.METH_HEAD:
+                while chunk := await loop.run_in_executor(None, fobj.read, _CHUNK_BYTES):
+                    await self.write(chunk)
+            await self.write_eof()
+            return writer
         finally:
-            await asyncio.to_thread(_rm_import_temps, self._path)
+            await _shielded_release(_release_staged(opening, self._path))
 
 
 #: Whether the operator has granted STANDING PERMISSION for the file export to
@@ -258,6 +329,9 @@ async def api_chat_slot_export(request: web.Request) -> web.StreamResponse:
     slot = state._slots.get(slot_key)
     if slot is None:
         _audit("denied", error="slot not found")
+        if request_app:
+            # The per-slot checkpoint's body: an app gets one 404 on this route.
+            return slot_not_found()
         return web.json_response(
             {"error": "session not found", "code": "export_slot_not_found"}, status=404
         )
@@ -268,12 +342,12 @@ async def api_chat_slot_export(request: web.Request) -> web.StreamResponse:
     # exfiltration path straight out of the app sandbox. 404 rather than 403: a
     # slot owned by another app has to be indistinguishable from one that does not
     # exist, or the status code itself enumerates slots across the isolation
-    # boundary (CWE-204). The real reason is recorded server-side instead.
-    if request_app and (not getattr(slot, "_app", "") or slot._app != request_app):
-        _audit("denied", error=f"app {request_app!r} does not own this slot")
-        return web.json_response(
-            {"error": "session not found", "code": "export_slot_not_found"}, status=404
-        )
+    # boundary (CWE-204). The real reason is recorded server-side instead. The
+    # body is the per-slot checkpoint's, which has already refused such a caller
+    # before this handler runs; this catches the handler mounted outside the chain.
+    denied = deny_app_slot_access(request_app, slot, slot_key, "chat.slot_export")
+    if denied is not None:
+        return denied
     # Owning the SLOT is not owning the TRANSCRIPT. A channel-linked slot displays
     # a conversation that lives on the channel's own session, and
     # ``get_or_create_slot`` auto-binds that link from a channel-shaped NAME --
@@ -283,13 +357,11 @@ async def api_chat_slot_export(request: web.Request) -> web.StreamResponse:
     # closed, because the cost of being wrong is a foreign conversation leaving the
     # sandbox. The dashboard owner is unaffected -- they are entitled to both.
     #
-    # Same 404 as above, for the same reason: a distinguishable code would let an
-    # app learn which of its slots carry a channel link.
+    # The checkpoint's 404, for the same reason: a distinguishable body would let
+    # an app learn which of its slots carry a channel link.
     if request_app and getattr(slot, "linked_session_key", ""):
         _audit("denied", error=f"app {request_app!r} may not export a channel-linked slot")
-        return web.json_response(
-            {"error": "session not found", "code": "export_slot_not_found"}, status=404
-        )
+        return slot_not_found()
 
     def _refuse_restricted(reason: str) -> web.Response:
         # An incognito or temporary transcript is kept for the user's own History
@@ -459,7 +531,7 @@ async def api_chat_slot_export(request: web.Request) -> web.StreamResponse:
     # Response construction is synchronous, so the publication lock covers the
     # commit without crossing an await. The socket write happens after the handler
     # returns and is the unavoidable residual transmit window. Until the response
-    # owns the staged file, every exit here removes it.
+    # owns the staged file, every exit here removes it, shielded like the send's.
     handed_off = False
     try:
         response, size = await asyncio.to_thread(_commit_response)
@@ -477,7 +549,7 @@ async def api_chat_slot_export(request: web.Request) -> web.StreamResponse:
         return _refuse_restricted(f"on-disk line at response commit: {exc}")
     finally:
         if not handed_off:
-            await asyncio.to_thread(_rm_import_temps, staged)
+            await _shielded_release(asyncio.to_thread(_rm_import_temps, staged))
     # Recorded only once the commit has taken the response: an ``allowed`` written
     # before the revalidation above would name a byte count that was never
     # transmitted whenever the line tightened during the build, and sit right

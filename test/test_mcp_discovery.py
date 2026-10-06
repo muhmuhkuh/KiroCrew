@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from stray_line_helpers import STRAY_LINES, too_deep_line
 
 from conftest import host_abs
 from kiro_crew import mcp_cleanup, platform_compat
@@ -2848,6 +2849,21 @@ class TestReadJsonrpcResponse:
         assert result["result"] == {"ok": True}
 
     @pytest.mark.asyncio
+    async def test_sse_a_stray_data_line_is_skipped(self) -> None:
+        """``RecursionError`` is not a ``JSONDecodeError``: unlisted, one data
+        line nested past the decoder failed the whole probe."""
+        strays = "".join(
+            "data: " + make().decode("utf-8", "replace") for make in STRAY_LINES.values()
+        )
+        resp = MagicMock()
+        resp.content_type = "text/event-stream"
+        resp.text = AsyncMock(
+            return_value=strays + 'data: {"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}\n'
+        )
+        result = await _read_jsonrpc_response(resp)
+        assert result["result"] == {"ok": True}
+
+    @pytest.mark.asyncio
     async def test_sse_empty_returns_empty_dict(self) -> None:
         resp = MagicMock()
         resp.content_type = "text/event-stream"
@@ -4716,11 +4732,36 @@ class TestFixStaleManagedCommand:
         from kiro_crew.mcp_discovery import _fix_stale_managed_command
 
         with patch(
-            "kiro_crew.agent._kirocrew_mcp_invocation", return_value=("/bin/kirocrew", ["mcp-core"])
+            "kiro_crew.agent._kirocrew_mcp_invocation", return_value=(sys.executable, ["mcp-core"])
         ) as inv:
             _fix_stale_managed_command("kirocrew-core", {"command": "x", "args": []})
             _fix_stale_managed_command("kirocrew-core", {"command": "y", "args": []})
         inv.assert_called_once()  # cached after the first resolve
+
+    def test_a_cached_command_from_a_pruned_install_is_re_resolved(self, tmp_path):
+        """A cached launcher whose install an update removed is not served
+        again: it is evicted and the spec is re-resolved to the current one."""
+        import shutil as _shutil
+
+        from kiro_crew.mcp_discovery import _fix_stale_managed_command
+
+        old_install = tmp_path / "0.8.0.4"
+        old_bin = old_install / "bin" / "kirocrew"
+        old_bin.parent.mkdir(parents=True)
+        old_bin.write_text("#!/bin/sh\n")
+        new_bin = tmp_path / "0.8.0.6" / "bin" / "kirocrew"
+        with patch(
+            "kiro_crew.agent._kirocrew_mcp_invocation",
+            side_effect=[(str(old_bin), ["mcp-core"]), (str(new_bin), ["mcp-core"])],
+        ) as inv:
+            first = {"command": "x", "args": []}
+            _fix_stale_managed_command("kirocrew-core", first)
+            assert first["command"] == str(old_bin)
+            _shutil.rmtree(old_install)  # the update's prune
+            second = {"command": str(old_bin), "args": ["mcp-core"]}
+            _fix_stale_managed_command("kirocrew-core", second)
+        assert inv.call_count == 2
+        assert second["command"] == str(new_bin)
 
     def test_resolution_failure_leaves_spec_untouched(self):
         """If invocation resolution raises, the spec is left as-is (no crash)."""
@@ -5371,6 +5412,30 @@ class TestReadStdioJsonrpcResponse:
         assert resp["id"] == 1
 
     @pytest.mark.asyncio
+    async def test_skips_a_line_nested_past_the_decoder(self) -> None:
+        """``RecursionError`` is not a ``JSONDecodeError``: unlisted, one such
+        line failed the probe instead of being skipped."""
+        stream = asyncio.StreamReader(limit=1 << 20)
+        stream.feed_data(too_deep_line())
+        stream.feed_data(b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        stream.feed_eof()
+        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
+        assert resp is not None
+        assert resp["id"] == 1
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_lines_do_not_count_toward_cap(self) -> None:
+        """A server printing a JSON progress counter before it answers is not a
+        flood: valid JSON is bounded by the timeout, like a notification."""
+        from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
+
+        progress = [f"{n}\n".encode() for n in range(1, 2 * _MAX_BANNER_LINES + 1)]
+        stream = _make_stream([*progress, b'{"jsonrpc":"2.0","id":1,"result":{}}\n'])
+        resp = await _read_stdio_jsonrpc_response(stream, timeout=5)
+        assert resp is not None
+        assert resp["id"] == 1
+
+    @pytest.mark.asyncio
     async def test_notifications_do_not_count_toward_cap(self) -> None:
         """>_MAX_BANNER_LINES JSON-RPC notifications must NOT trip the banner cap."""
         from kiro_crew.mcp_discovery import _MAX_BANNER_LINES
@@ -5906,7 +5971,9 @@ class TestFirstPartyManagedArgv:
     scope could pair with user-config command text.
     """
 
-    _INVOCATION = ("/opt/kirocrew/bin/kirocrew", ["mcp-core"])
+    # An EXISTING file: the cache evicts an invocation whose command is gone
+    # (a pruned install), so a made-up path would never be served from it.
+    _INVOCATION = (sys.executable, ["mcp-core"])
 
     def _patch_invocation(self, monkeypatch) -> None:
         import kiro_crew.mcp_discovery as md

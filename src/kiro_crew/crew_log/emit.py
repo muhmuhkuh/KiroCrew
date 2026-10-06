@@ -97,6 +97,7 @@ import hashlib
 import json
 import logging
 import math
+import sys
 import threading
 import time
 import traceback
@@ -147,13 +148,20 @@ _CHUNK_TEXT_CHARS = 8 * 1024
 #: log, and the cost of over-reserving is one extra chunk.
 _ENVELOPE_HEADROOM = 4 * 1024
 
-#: The label a block with no marker of its own is reported under. ``split_blocks``
-#: classifies by opening marker, and three blocks the design names -- steering,
-#: tool specs, injected crew log context -- have none, so their characters land in
-#: its unclassified bucket. Renaming that bucket here keeps the entry honest
-#: about being a remainder rather than inventing three zeroed sources.
+#: The label a source with NO NAME AT ALL is reported under. ``split_blocks``
+#: classifies by opening marker, and three blocks the design names -- steering, tool
+#: specs, injected crew log context -- have none, so their characters land in its
+#: ``unclassified`` bucket.
+#:
+#: That bucket keeps its own name and is NOT renamed here. It is a label the readers
+#: already know: the Context panel carries a translated string for ``unclassified``
+#: and none for ``other``, so folding the two together made a named remainder render
+#: as an untranslated word in every shipped locale -- visible the moment that panel
+#: started reading these sources instead of the token row's own ``split_blocks``
+#: output. Only the empty label lands here, because an empty label names nothing and
+#: a reader cannot be given a translation for it.
 _OTHER_SOURCE = "other"
-_UNCLASSIFIED_LABELS = frozenset({"unclassified", ""})
+_UNCLASSIFIED_LABELS = frozenset({""})
 
 #: Who caused a turn to run. Every value names a STRUCTURAL producer the
 #: dispatch layer identifies; ``user`` means a person typed the message,
@@ -2102,6 +2110,41 @@ def _drain_inline_until(deadline: float) -> bool:
 
 
 def drain_for_shutdown(timeout: float = _SHUTDOWN_DRAIN_SECONDS) -> bool:
+    """Write out everything buffered, then let the eager folder finish what it was handed.
+
+    Returns what :func:`_drain_writer_for_shutdown` returns -- whether the LOG is
+    complete, which is the record. The fold step after it is part of the quiescence
+    barrier and not of that answer: the eager folder runs on its own thread and writes
+    savepoints into the data home, so a caller that tears the home down (a test's temp
+    directory, a gateway exiting) right after this call would otherwise race a fold still
+    reading or writing there. It is waited for within what is left of *timeout*, with a
+    short floor so a writer that spent the whole budget does not skip it entirely, and
+    only when that module is loaded -- a process that never folded eagerly pays nothing.
+    A fold that does not settle in time costs a savepoint, never an entry.
+    """
+    started = time.monotonic()
+    drained = _drain_writer_for_shutdown(timeout)
+    eager = sys.modules.get("kiro_crew.crew_log.eager")
+    settle = getattr(eager, "drain", None)
+    if settle is not None:
+        budget = max(started + timeout - time.monotonic(), _EAGER_SETTLE_FLOOR_SECONDS)
+        try:
+            if not settle(budget):
+                logger.debug("crew log eager folds still in flight %.1fs into shutdown", budget)
+        except Exception:  # pragma: no cover - a fold must not cost the shutdown
+            # Rendered text, never ``exc_info``, for the reason ``_note_eager`` gives.
+            logger.debug(
+                "crew log eager settle failed at shutdown:\n%s", traceback.format_exc().rstrip()
+            )
+    return drained
+
+
+#: The least time :func:`drain_for_shutdown` gives the eager folder to settle, even when
+#: the writer spent the whole budget: one batch of folds over a busy session's tail.
+_EAGER_SETTLE_FLOOR_SECONDS: Final[float] = 1.0
+
+
+def _drain_writer_for_shutdown(timeout: float) -> bool:
     """Write out everything buffered, then stop accepting batching pauses.
 
     The quiescence barrier a restart needs: entries live in memory until the
@@ -2899,6 +2942,7 @@ def _write(
     src: str = _SRC_ACP,
     after: Callable[[], None] | None = None,
     on_permanent_drop: Callable[[], None] | None = None,
+    on_settled: "Callable[[bool], None] | None" = None,
     ignorable: bool = False,
 ) -> None:
     """Queue one entry.
@@ -2917,29 +2961,52 @@ def _write(
 
     ``after`` runs once the append lands or the writer definitively drops it. A
     retryable failure leaves it attached to the retained job.
+
+    ``on_settled`` is handed the same answer with the OUTCOME attached: True only
+    when this entry's ``append`` returned. It is for a caller that must not
+    publish before the append commits, and it carries :class:`_TreeSettle`'s
+    reasoning -- absence of a permanent drop is not success, because an entry
+    rejected at the buffer's memory ceiling finishes with no drop hook at all,
+    which is precisely the wedged-writer condition the ceiling exists for.
     """
     if not session_id or not enabled():
         if after is not None:
             after()
+        if on_settled is not None:
+            # No record was asked for, so none is owed. A caller that must not
+            # publish without one reads False and says so.
+            on_settled(False)
         return
+
+    settle = _tree_settle_hooks(on_settled) if on_settled is not None else None
 
     def _job() -> None:
         log = _handle(session_id)
         if log is None:
+            if settle is not None:
+                settle.fail()
             return
         entry = log.append(entry_type, data, src=src, ignorable=ignorable)
+        if settle is not None:
+            settle.wrote()
         # Here rather than at each emitter: this is the append every ordinary entry type
         # goes through, so an entry type that becomes eager later is covered without a
         # second edit. The hook's own membership test drops the types no eager fold
         # names, which is nearly all of them.
         _note_eager(entry, entry_type, session_id, data)
 
+    def _after() -> None:
+        if settle is not None:
+            settle.after()
+        if after is not None:
+            after()
+
     _submit(
         _job,
         f"appending {entry_type}",
         session_id,
-        after=after,
-        on_permanent_drop=on_permanent_drop,
+        after=_after if (settle is not None or after is not None) else None,
+        on_permanent_drop=settle.fail if settle is not None else on_permanent_drop,
     )
 
 
@@ -3073,6 +3140,63 @@ def _tree_settle_hooks(on_settled: "Callable[[bool], None] | None") -> _TreeSett
     """One :class:`_TreeSettle` per emitted entry. Trivial, and named so the two tree
     emitters share the wiring rather than repeating it."""
     return _TreeSettle(on_settled)
+
+
+#: How long :func:`awaiting_commit` waits before it answers False. Bounded because a
+#: retryable write stays queued against a filesystem that may never answer, and the
+#: callers are user-facing requests. Matched to :func:`flush`'s own default, the other
+#: place that waits on this writer.
+COMMIT_WAIT_SECONDS = 5.0
+
+
+async def awaiting_commit(
+    emit_one: "Callable[[Callable[[bool], None]], None]",
+    *,
+    what: str,
+    timeout: float = COMMIT_WAIT_SECONDS,
+) -> bool:
+    """Queue one append through *emit_one* and wait, bounded, for it to COMMIT.
+
+    For a caller that will PUBLISH on the strength of the append -- tell a user the
+    card is gone, drop a run from live state. This queue returns as soon as the
+    entry is handed over, so publishing on the handover publishes a record the
+    writer may still drop, and when the log is the only record of the fact there is
+    then nothing left to explain the reversal and nothing for a retry to act on.
+
+    *emit_one* is handed the ``on_settled`` callback and must pass it to exactly one
+    emitter call, or invoke it itself when it decides there is nothing to queue --
+    otherwise this waits out the whole bound for an answer that is not coming.
+
+    False on a drop AND on a timeout, which are the same thing to the caller: the
+    record is not there to publish from. A timeout is not a failure of the append,
+    which may still land later, so the caller's own answer should be retryable
+    rather than final.
+
+    Must be called from a running loop: the callback arrives on the writer's thread
+    and is marshalled back onto this one.
+    """
+    loop = asyncio.get_running_loop()
+    settled: "asyncio.Future[bool]" = loop.create_future()
+
+    def _settle(wrote: bool) -> None:
+        def _resolve() -> None:
+            # Guarded because the timeout can win the race, and setting a result on
+            # a future that already has one raises.
+            if not settled.done():
+                settled.set_result(wrote)
+
+        loop.call_soon_threadsafe(_resolve)
+
+    emit_one(_settle)
+    try:
+        return await asyncio.wait_for(settled, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "crew log: %s was not committed within %.1fs; reporting it as not recorded",
+            what,
+            timeout,
+        )
+        return False
 
 
 def on_session_adopted(
@@ -4090,8 +4214,35 @@ def on_turn_completed(
     model: str = "",
     provider: str = "",
     depth: int = 0,
+    context_used: int = 0,
+    context_window: int = 0,
 ) -> None:
-    """Record a turn's terminal event and what it cost."""
+    """Record a turn's terminal event and what it cost.
+
+    ``context_used`` / ``context_window`` are the PROVIDER's own occupancy reading
+    for this turn, and they are a different quantity from ``tokens`` beside them.
+    ``tokens`` is what was BILLED: it is summed over every model call the turn made,
+    so it answers what the turn cost. Occupancy answers how full the window was, and
+    a reader wanting "how close to full did this session get" needs the second --
+    dividing a billed total by a window size is not that number, and on a
+    tool-using turn it is larger than the window it is divided by.
+
+    The pair travels TOGETHER on one entry for the same reason: a used count from one
+    turn over a window size from another describes no turn at all, and a model switch
+    moves the window. Both are absent when the provider reports neither, so an
+    unmeasured turn reads as unmeasured rather than as an empty window.
+
+    ``tokens`` and ``credits`` follow the same rule, one field at a time: each is
+    written only when the provider actually reported it. ``TurnUsage`` zero-fills
+    every dimension a provider does not report, so at this seam a zero is "nothing
+    was reported", not a measurement of nothing -- and a zero written as a
+    measurement is what the ``usage`` fold would count as a reporting turn, putting
+    a measured ``0 tokens`` beside a real bill. A present ``tokens`` keeps all FOUR
+    dimensions, zeros included, because its schema requires each member and a zero
+    INSIDE a reported block is a real zero; ``background/completed`` drops the zero
+    members instead. The two writers agree on what an unreported count looks like
+    -- absent -- and differ only in the shape of a reported one.
+    """
     data = _turn_closer(
         turn,
         duration_ms=duration_ms,
@@ -4100,13 +4251,26 @@ def on_turn_completed(
         provider=provider,
         depth=depth,
     )
-    data["credits"] = float(credits)
-    data["tokens"] = {
+    # Positive and finite, or absent: the guard the two subagent closers use. A
+    # provider that does not bill in credits reports 0.0 through ``TurnUsage``,
+    # which is indistinguishable here from a free turn, so the zero is dropped and
+    # absent keeps meaning unmetered.
+    charge = float(credits)
+    if charge > 0 and math.isfinite(charge):
+        data["credits"] = charge
+    tokens = {
         "input": int(input_tokens),
         "output": int(output_tokens),
         "cache_read": int(cache_read_tokens),
         "cache_write": int(cache_write_tokens),
     }
+    if any(count > 0 for count in tokens.values()):
+        data["tokens"] = tokens
+    # Written only when the provider actually reported them. ``read_context_tokens``
+    # answers (0, 0) for a provider without the accessors, and a stored zero would
+    # be indistinguishable from a window of nothing.
+    if int(context_used) > 0 or int(context_window) > 0:
+        data["context"] = {"used": int(context_used), "window": int(context_window)}
     _write(
         session_id,
         "turn/completed",
@@ -4140,8 +4304,9 @@ def on_turn_failed(
 
     ``tokens`` and ``credits`` are ABSENT rather than zeroed, and that absence is
     the record: no usage event arrived, so nothing was measured, and a turn that
-    streamed real text does not get a durable line claiming it cost nothing. Their
-    absence also tells this synthesized closer from a provider-reported one.
+    streamed real text does not get a durable line claiming it cost nothing. The
+    measured closer omits them too when its provider reported nothing, so absence
+    does not tell this closer from a provider-reported one; ``stop_reason`` does.
     ``duration_ms`` IS measured -- the turn's own elapsed time -- and ``error``
     names the exception CLASS when one was caught, never its message, which can
     carry a path or a credential.
@@ -4550,6 +4715,7 @@ def on_context_composed(
     step: int = 0,
     blocks: "dict[str, int] | None" = None,
     total_chars: int = 0,
+    phase: str = "",
 ) -> None:
     """Record what the gateway put in front of the model, block by block.
 
@@ -4560,11 +4726,22 @@ def on_context_composed(
     spec says so. The one tokenizer available is the wrong one for the served
     model, and a fabricated exact count would be worse than an admitted estimate.
 
-    Every label ``split_blocks`` does not classify is folded into a single
-    ``other`` source. Three blocks the design names -- steering, tool specs and
-    injected crew log context -- have no opening marker, so their characters are
-    genuinely in that remainder; reporting them as three zeroed sources would
-    claim a measurement that was never taken.
+    Labels pass through as ``split_blocks`` named them, including its
+    ``unclassified`` remainder -- three blocks the design names (steering, tool specs
+    and injected crew log context) have no opening marker, so their characters are
+    genuinely in that bucket, and reporting them as three zeroed sources would claim a
+    measurement nobody took. Only a source whose label is EMPTY is renamed, to
+    :data:`_OTHER_SOURCE`; see there for why the named remainder keeps its name.
+
+    ``phase`` says which POPULATION this composition belongs to
+    (:data:`~kiro_crew.context_blocks.PHASE_SESSION_START` or
+    :data:`~kiro_crew.context_blocks.PHASE_PER_TURN`). A session-start injection is
+    many times the size of a per-turn one, so a reader that cannot separate them
+    either pools two populations into one meaningless distribution or lets the
+    single largest composition set the scale for every other. Only the composer
+    knows which it built, so the field is recorded here and DERIVED nowhere: an
+    unstated phase is left absent, because the nearest available guess -- the first
+    composition in a unit -- is wrong for the rebuild a replay triggers mid-session.
     """
     if not session_id or not enabled() or not blocks:
         return
@@ -4594,6 +4771,8 @@ def on_context_composed(
     }
     if step:
         data["step"] = int(step)
+    if phase:
+        data["phase"] = str(phase)
     _write(session_id, "context/composed", data, src=_SRC_GATEWAY)
 
 
@@ -5138,6 +5317,28 @@ def child_origin(agent_id: str) -> "tuple[str, int]":
         return (found[0], found[1])
 
 
+def dispatch_origin(agent_id: str) -> "tuple[str, int]":
+    """*agent_id*'s pinned origin whether or not its spawn was recorded.
+
+    The one reader that is correct BEFORE the opener exists. :func:`child_origin`
+    refuses an unopened pin because a fact about a child that never started would
+    have no cause in the log; a spawn approval is the exception, because the wait
+    for it is the cause of the gap. It happens between the dispatch being accepted
+    and the run starting, and on two of its three exits no run ever starts -- so
+    gating it on opened would lose exactly the prompt a reader is looking for.
+
+    Answers ``("", 0)`` for a child with no pin at all, which is what a caller
+    needs to skip the write rather than guess a parent.
+    """
+    if not agent_id:
+        return ("", 0)
+    with _lock:
+        found = _child_origin.get(agent_id)
+        if found is None:
+            return ("", 0)
+        return (found[0], found[1])
+
+
 def forget_child_origin(agent_id: str) -> "tuple[str, int]":
     """Release *agent_id*'s origin and return it, or ``("", 0)``.
 
@@ -5288,6 +5489,7 @@ def on_subagent_spawned(
     agent_id: str,
     agent: str = "",
     model: str = "",
+    task: str = "",
     scope: Any = None,
 ) -> None:
     """Record a child this session dispatched.
@@ -5314,6 +5516,19 @@ def on_subagent_spawned(
     turn that never existed and match no ``turn/started``. The child is still
     recorded: it is a real child of that session, and losing it to keep a field
     populated would be the worse trade.
+
+    ``task`` is what the child was asked to do, redacted and clipped on the same
+    terms as ``plan/updated``'s item text -- the other place this module records
+    text a person wrote. It is the one thing a reader needs to tell two children
+    apart that is not derivable from anything else in the entry, and a surface
+    rebuilding a child's card after the dispatching process is gone has nowhere
+    else to read it from.
+
+    It is written only when non-empty, so a dispatch that carried no task text
+    leaves the field ABSENT rather than present-and-empty. The two are different
+    facts to a reader: absent is "this log does not say", which is also what every
+    log written before the field reads as, and a surface draws no task line for
+    it. An empty string would claim the dispatch asked for nothing.
     """
     data: dict[str, Any] = {"agent_id": agent_id}
     if turn:
@@ -5322,6 +5537,9 @@ def on_subagent_spawned(
         data["agent"] = agent
     if model:
         data["model"] = model
+    asked = _clip(_safe_text(task), _MAX_SHORT_TEXT)
+    if asked:
+        data["task"] = asked
     if isinstance(scope, dict):
         data["scope"] = {
             "memory": bool(scope.get("memory")),
@@ -5341,6 +5559,74 @@ def on_subagent_steered(session_id: str, *, agent_id: str, mode: str = "") -> No
     if mode:
         data["mode"] = mode
     _write(session_id, "subagent/steered", data, src=_SRC_GATEWAY)
+
+
+def on_subagent_dismissed(
+    session_id: str,
+    *,
+    agent_id: str,
+    on_settled: "Callable[[bool], None] | None" = None,
+) -> None:
+    """Record that the user cleared a child's card from the panel.
+
+    Written into the PARENT's log, like a steer, and for the same reason: the
+    child has no crew log of its own and the act belongs to the session the panel
+    was showing.
+
+    It lives in the log rather than in a registry beside it because the panel's
+    durable half is a FOLD of this log. A dismissal held anywhere else is a second
+    record of a fact about this session, and the two are reclaimed on different
+    schedules -- which is not hypothetical: the registry that held it was keyed on
+    the run's folder at both ends, so a dismissed card came back the moment that
+    folder was pruned while the log still carried the child.
+
+    ``on_settled`` is handed True only once the append has COMMITTED. A caller that
+    will tell the user the card is gone needs that, because this is the only record
+    of the dismissal when the run's folder has already been reclaimed: the queue
+    returns as soon as the entry is handed over, so publishing on the handover
+    reports a dismissal the next reconnect can undo, with nothing left to explain
+    it and nothing for a retry to act on.
+
+    Opens and closes nothing. A dismissal is not an ending, and the child keeps
+    whatever outcome its own closer recorded; a user may also clear a card while
+    the child is still running, so this can precede any closer.
+    """
+    _write(
+        session_id,
+        "subagent/dismissed",
+        {"agent_id": agent_id},
+        src=_SRC_GATEWAY,
+        on_settled=on_settled,
+    )
+
+
+def dismiss_child(agent_id: str, *, on_settled: "Callable[[bool], None] | None" = None) -> str:
+    """Record a dismissal against the session this process dispatched *agent_id* from.
+
+    Returns that session's id, or ``""`` when this process cannot name one -- the
+    emitter is off, or the spawn pin for this child is gone, which is what a
+    gateway restart leaves behind. A caller that must record the dismissal some
+    other way reads the empty answer as "nothing was written here".
+
+    The pin rather than a lookup, for the reason it exists: it is the session the
+    child's own ``subagent/spawned`` was written to, so the dismissal lands in the
+    log that holds the row it is about. :func:`child_origin` is gated on that entry
+    having been opened, so a child whose spawn was never recorded answers ``""``
+    rather than putting a dismissal in a log with no dispatch to match it.
+
+    ``on_settled`` is passed to :func:`on_subagent_dismissed` and so reports
+    whether the append COMMITTED. The returned session id says only that one was
+    queued: a caller publishing a dismissal to the user needs the callback, since
+    the empty-string answer and a queued-then-dropped append are the same outcome
+    from the user's side and only one of them is visible in the return value.
+    """
+    if not enabled():
+        return ""
+    session_id, _turn = child_origin(agent_id)
+    if not session_id:
+        return ""
+    on_subagent_dismissed(session_id, agent_id=agent_id, on_settled=on_settled)
+    return session_id
 
 
 def on_subagent_completed(

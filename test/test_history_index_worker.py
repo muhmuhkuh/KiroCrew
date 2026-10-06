@@ -739,14 +739,23 @@ def test_a_contended_write_waits_instead_of_failing(tmp_path):
     db_path = tmp_path / "session_index.db"
     holder = SessionSearchIndex(db_path)
     writer = SessionSearchIndex(db_path)
-    assert holder.available and writer.available
-
-    hold_secs = 0.3
+    ready = threading.Event()
+    start_write = threading.Event()
+    attempted = threading.Event()
+    completed = threading.Event()
+    released = threading.Event()
     outcome: dict[str, object] = {}
+
+    def observe_statement(statement: str) -> None:
+        if statement.lstrip().upper().startswith("BEGIN IMMEDIATE"):
+            attempted.set()
 
     def contended_write() -> None:
         # Its own thread, so it gets its own connection (they are thread-local).
         try:
+            writer._ensure_open().set_trace_callback(observe_statement)
+            ready.set()
+            assert start_write.wait(10), "the holder never released the start barrier"
             writer.sync(
                 "contended",
                 mtime_ns=1,
@@ -755,33 +764,43 @@ def test_a_contended_write_waits_instead_of_failing(tmp_path):
                 ino=1,
                 texts=["a write that had to wait for the other writer"],
             )
-            outcome["ok"] = True
+            outcome["finished_after_release"] = released.is_set()
         except Exception as exc:  # pragma: no cover - would be a real regression
             outcome["error"] = repr(exc)
+        finally:
+            writer.close()
+            completed.set()
 
+    conn = holder._ensure_open()
+    thread = threading.Thread(target=contended_write, name="contended-writer")
     try:
-        # Take the database's write lock and hold it.
-        conn = holder._ensure_open()
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("SELECT 1").fetchone()
-
-        thread = threading.Thread(target=contended_write, name="contended-writer")
-        started = time.monotonic()
+        assert holder.available and writer.available
         thread.start()
-        time.sleep(hold_secs)
+        assert ready.wait(10), f"writer connection never opened: {outcome}"
+        # Open the writer first, then hold the lock at its actual write attempt.
+        conn.execute("BEGIN IMMEDIATE")
+        start_write.set()
+        assert attempted.wait(10), f"the writer never attempted BEGIN IMMEDIATE: {outcome}"
+        assert not completed.wait(0.1), "the write returned while the holder owned the lock"
+        # Record the release before unlocking, so the writer proves the ordering.
+        released.set()
         conn.execute("COMMIT")
-        thread.join(timeout=30.0)
-        elapsed = time.monotonic() - started
 
-        assert not thread.is_alive(), "the contended write never finished"
+        assert completed.wait(10), "the contended write never finished after lock release"
         assert "error" not in outcome, f"contended write raised: {outcome.get('error')}"
-        assert elapsed >= hold_secs, "the write did not actually contend"
+        assert outcome.get("finished_after_release") is True, "the write did not actually contend"
         # The proof: the row is there, so the write waited out the lock rather
         # than being swallowed as a failure.
         assert "contended" in writer.indexed_keys()
     finally:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        start_write.set()
+        if thread.ident is not None:
+            thread.join(timeout=15)
         holder.close()
         writer.close()
+        assert not thread.is_alive(), "the contended writer survived cleanup"
 
 
 # ----------------------------------------------- delete vs reindex, two processes

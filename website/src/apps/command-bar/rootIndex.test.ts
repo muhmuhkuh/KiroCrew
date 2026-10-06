@@ -75,6 +75,25 @@ describe('rankRootRows', () => {
     expect(rankRootRows(rows, 'restart', {}, 0).map(r => r.id)).toEqual(['a'])
   })
 
+  it("ranks a row with its own matcher by that matcher alone", () => {
+    const own = row({ id: 'own', title: 'Restart', keywords: ['reboot'], match: q => (q === 'zzq' ? { score: 7, indices: [1], field: 'title' } : null) })
+    expect(rankRootRows([own], 'restart', {}, 0)).toEqual([])
+    expect(rankRootRows([own], 'reboot', {}, 0)).toEqual([])
+    const [hit] = rankRootRows([own], 'zzq', {}, 0)
+    expect([hit.score, hit.indices, hit.matchField]).toEqual([7, [1], 'title'])
+  })
+
+  it('prices and draws an own-matcher hit off the title like any other row', () => {
+    const viaSynonym = row({ id: 'kw', title: 'Mode', match: () => ({ score: 100, indices: [], field: 'keyword', matchedKeyword: 'theme' }) })
+    const [kw] = rankRootRows([viaSynonym], 'theme', {}, 0)
+    expect([kw.score, kw.matchField, kw.matchedKeyword]).toEqual([60, 'keyword', 'theme'])
+
+    const viaDetail = row({ id: 'sub', title: 'Mode', subtitle: 'Display · Light or dark', match: () => ({ score: 30, indices: [], field: 'subtitle', discounted: true }) })
+    const [sub] = rankRootRows([viaDetail], 'Dark', {}, 0)
+    // Already discounted by the matcher, so not discounted twice.
+    expect([sub.score, sub.matchField, sub.subtitleIndices]).toEqual([30, 'subtitle', [19, 20, 21, 22]])
+  })
+
   it('returns highlight indices for a title match and none for an alias match', () => {
     const rows = [row({ id: 'a', title: 'Restart', keywords: ['reboot'] })]
     expect(rankRootRows(rows, 'res', {}, 0)[0].indices).toEqual([0, 1, 2])
@@ -254,15 +273,58 @@ describe('rankRootRows', () => {
     expect(rankRootRows(rows, '', usage, now).map(r => r.id)).toEqual(['hot', 'cold'])
   })
 
-  it('holds settings back on an empty query but not on a real one', () => {
+  it('holds settings back on an empty query AND holds WEAK matches back under a query', () => {
     const rows: RootRow[] = []
     for (let i = 0; i < 8; i++) {
       rows.push(row({ id: `set${i}`, title: `Setting ${i}`, group: 'settings' }))
     }
     // Idle: settings are a searchable tail, not what the bar opens on.
     expect(rankRootRows(rows, '', {}, 0)).toHaveLength(2)
-    // Typed: they rank normally, up to the usual per-group cap.
-    expect(rankRootRows(rows, 'setting', {}, 0)).toHaveLength(6)
+    // Typed: `set` is a substring of every title, so these are DIRECT hits — the
+    // user is naming the group — and rank up to the ordinary per-group cap.
+    expect(rankRootRows(rows, 'set', {}, 0)).toHaveLength(6)
+  })
+
+  it('caps WEAK settings matches under a query so recovery rows keep their room', () => {
+    // The reproduction from #14927: a query that merely scatters across six long
+    // setting titles as a subsequence — naming none of them — must not spend six
+    // rows and bury the rows beneath settings. The recovery rows the overlay appends
+    // after the ranked block live past the fold at the default popup height when
+    // settings fill it. Here `archi` subsequence-matches eight settings but names
+    // none, so the ranked block keeps only two of them, and the session row that
+    // actually carries the typed word is not crowded out.
+    const rows: RootRow[] = [
+      row({ id: 'sess', title: 'archivist chat', group: 'recent' }),
+      ...[
+        'Reply threads on crewmate chat messages',
+        'Earlier conversation one decision may carry, in characters',
+        'Run a local gateway and reach it here',
+        'Link Previews on chat history',
+        'Auto-Open Git in Side Panel',
+        'Notify when a background chat finishes',
+        'Share crash reports to improve the app',
+        'Reach the dashboard over a tunnel',
+      ].map((title, i) => row({ id: `set${i}`, title, group: 'settings' })),
+    ]
+    const out = rankRootRows(rows, 'archi', {}, 0)
+    // None of the eight settings contains "archi" as a substring, so all are weak
+    // and the cap holds them to two regardless of how many fuzzily match.
+    expect(out.filter(r => r.group === 'settings')).toHaveLength(2)
+    // The row that actually names the typed word survives — not evicted by the tail.
+    expect(out.some(r => r.id === 'sess')).toBe(true)
+  })
+
+  it('lets a DIRECT settings search surface every matching row under a query', () => {
+    // The other half of the weak cap: a query that is a substring of the titles is
+    // the user naming the setting, not a scattered miss, so those rows rank up to the
+    // ordinary per-group cap. Searching settings on their own name must not be capped
+    // to two — e.g. the three Voice "Speed" selects a reader types `speed` to find.
+    const rows: RootRow[] = []
+    for (let i = 0; i < 5; i++) {
+      rows.push(row({ id: `spd${i}`, title: `Speed (provider ${i})`, group: 'settings' }))
+    }
+    const out = rankRootRows(rows, 'speed', {}, 0)
+    expect(out.filter(r => r.group === 'settings')).toHaveLength(5)
   })
 
   it('opens on commands and apps, with settings behind them', () => {

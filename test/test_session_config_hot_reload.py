@@ -45,6 +45,7 @@ def _make_cfg(
     cfg.session.timeout_secs = timeout_secs
     cfg.session.watchdog_rss_max_mb = rss_max_mb
     cfg.agent.default_agent = ""
+    cfg.agent.acp_backend = ""
     cfg.agent.model = "auto"
     cfg.agent.reasoning_effort = ""
     # A clean document; a test that wants a torn one sets this to its sections.
@@ -91,6 +92,7 @@ _TICK_SWEEPS = (
     "_sweep_session_roots",
     "_sweep_sandbox_artifacts",
     "_sweep_session_pid_mappings",
+    "_sweep_shell_audit_log",
     "_maybe_prune_pycache",
     "_sweep_periodic_pids",
     "_sweep_untracked_mcps",

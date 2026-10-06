@@ -1,16 +1,17 @@
-"""Regression tests for the prepare-pr aggregate readiness policy."""
+"""Regression tests for the kirocrew-prepare-pr aggregate readiness policy."""
 
 from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 
-from skill_script_helpers import load_skill_script
+from skill_script_helpers import is_rollup_graphql_read, load_skill_script, rollup_graphql_response
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "prepare-pr" / "scripts" / "pr_status.py"
+SCRIPT = ROOT / "src" / "kiro_crew" / "builtin_skills" / "kirocrew-dev" / "kirocrew-prepare-pr" / "scripts" / "pr_status.py"
 
 
 def _load_script() -> ModuleType:
@@ -96,6 +97,13 @@ def _install_fake_gh(
             return 0, payload, ""
         if args[:3] == ["gh", "repo", "view"]:
             return 0, "example/repo", ""
+        # The rollup is read through GraphQL, in its own call, because the run
+        # fields the collapse keys on are not in `gh pr view --json`'s rows. The
+        # fake answers from the same flat fixtures the payload carries.
+        if is_rollup_graphql_read(args):
+            core = json.loads(payload)
+            checks = core.get("statusCheckRollup") or []
+            return 0, rollup_graphql_response(checks, core.get("headRefOid") or ""), ""
         if args[:2] == ["gh", "api"] and "/collaborators/" in args[2]:
             if permissions is None:
                 raise AssertionError("unexpected command: {}".format(args))
@@ -169,6 +177,9 @@ def test_bare_json_flag_is_not_read_as_the_pr_number() -> None:
             return 0, payload, ""
         if args[:3] == ["gh", "repo", "view"]:
             return 0, "example/repo", ""
+        if is_rollup_graphql_read(args):
+            core = json.loads(payload)
+            return 0, rollup_graphql_response(core["statusCheckRollup"], core["headRefOid"]), ""
         if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
             return 0, "[]", ""
         if args[:2] == ["gh", "api"] and "/actions/runs" in args[2]:
@@ -589,122 +600,377 @@ def test_open_pull_request_with_unknown_mergeability_still_waits() -> None:
     assert module.main(["pr_status.py", "42"]) == 10
 
 
-def test_superseded_cancelled_run_does_not_count_as_a_failure() -> None:
-    """A re-run leaves the CANCELLED attempt in the rollup; newest run wins."""
-    module = _load_script()
-    payload = _pr_payload(
-        [
-            {
-                "name": "GPT Review",
-                "workflowName": "review.yml",
-                "status": "COMPLETED",
-                "conclusion": "CANCELLED",
-                "startedAt": "2026-08-06T01:00:00Z",
-            },
-            {
-                "name": "GPT Review",
-                "workflowName": "review.yml",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-08-06T02:00:00Z",
-            },
-        ]
-    )
-    _install_fake_gh(module, payload)
+def _check(
+    name, conclusion, run, *, definition=7, event="pull_request", workflow="ci.yml", **extra
+):
+    """A COMPLETED CheckRun row of workflow run ``run``, in the flat shape the
+    scripts read. The run's own conclusion defaults to the row's: a one-row run
+    concludes as its job did. Pass ``run_conclusion`` to model a run whose
+    verdict differs from this row's, e.g. a FAILURE run holding a CANCELLED row."""
+    row = {
+        "name": name,
+        "workflowName": workflow,
+        "status": "COMPLETED",
+        "conclusion": conclusion,
+        "workflowRunId": run,
+        "workflowRunEvent": event,
+        "workflowDefinitionId": definition,
+        "workflowRunConclusion": extra.pop("run_conclusion", conclusion),
+    }
+    if run is not None:
+        # A job start that follows the run order, so a rule ordering rows by
+        # startedAt reaches the SAME answer as one ordering by run id here; the
+        # tests that separate the two pass their own startedAt.
+        started = datetime(2026, 8, 6, tzinfo=timezone.utc) + timedelta(seconds=run)
+        row["startedAt"] = started.strftime("%Y-%m-%dT%H:%M:%SZ")
+    row.update(extra)
+    return row
 
-    assert module.main(["pr_status.py", "42"]) == 0
+
+def _exit_for(checks: list[dict]) -> int:
+    module = _load_script()
+    _install_fake_gh(module, _pr_payload(checks))
+    return module.main(["pr_status.py", "42"])
+
+
+def test_superseded_cancelled_run_does_not_count_as_a_failure() -> None:
+    """A re-run leaves the CANCELLED attempt in the rollup; its run concluded
+    CANCELLED (the concurrency group displaced it) and a newer run of the same
+    check exists, so the row is dropped and the newest run's verdict stands."""
+    assert (
+        _exit_for([_check("GPT Review", "CANCELLED", 100), _check("GPT Review", "SUCCESS", 200)])
+        == 0
+    )
 
 
 def test_superseded_success_does_not_mask_a_newer_failure() -> None:
-    """Newest-wins must work in both directions: a fresh failure stays red."""
-    module = _load_script()
-    payload = _pr_payload(
-        [
-            {
-                "name": "Backend Tests",
-                "workflowName": "ci.yml",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-08-06T01:00:00Z",
-            },
-            {
-                "name": "Backend Tests",
-                "workflowName": "ci.yml",
-                "status": "COMPLETED",
-                "conclusion": "FAILURE",
-                "startedAt": "2026-08-06T02:00:00Z",
-            },
-        ]
+    """A fresh failure stays red whatever the older run concluded."""
+    assert (
+        _exit_for(
+            [_check("Backend Tests", "SUCCESS", 100), _check("Backend Tests", "FAILURE", 200)]
+        )
+        == 20
     )
-    _install_fake_gh(module, payload)
 
-    assert module.main(["pr_status.py", "42"]) == 20
+
+def test_two_live_rows_of_one_run_both_survive_in_either_arrival_order() -> None:
+    """A workflow can publish a check run under its own job's name,
+    so ONE run emits two rows of one identity. They are not retries of each other.
+    Both orders are exercised because one order passes for the wrong reason: a
+    last-writer-wins collapse keeps whichever row arrived last."""
+    live_failure = _check("Fork PR Description", "FAILURE", 300, startedAt="2026-09-18T11:22:36Z")
+    live_success = _check("Fork PR Description", "SUCCESS", 300, startedAt="2026-09-18T11:22:38Z")
+    assert _exit_for([live_failure, live_success]) == 20
+    assert _exit_for([live_success, live_failure]) == 20
+
+
+def test_two_rows_of_one_run_are_both_reported_not_only_counted() -> None:
+    """Identity-level pin, independent of the exit code: neither row of a
+    same-run pair is removed, in either arrival order."""
+    module = _load_script()
+    a = _check("Fork PR Description", "FAILURE", 300, startedAt="2026-09-18T11:22:36Z")
+    b = _check("Fork PR Description", "SUCCESS", 300, startedAt="2026-09-18T11:22:38Z")
+    assert module.collapse_superseded([a, b]) == [a, b]
+    assert module.collapse_superseded([b, a]) == [b, a]
 
 
 def test_same_check_name_in_different_workflows_stays_distinct() -> None:
-    """Identity is workflow-qualified: two workflows may share a job name."""
-    module = _load_script()
-    payload = _pr_payload(
-        [
-            {
-                "name": "build",
-                "workflowName": "linux.yml",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-08-06T02:00:00Z",
-            },
-            {
-                "name": "build",
-                "workflowName": "windows.yml",
-                "status": "COMPLETED",
-                "conclusion": "FAILURE",
-                "startedAt": "2026-08-06T01:00:00Z",
-            },
-        ]
-    )
-    _install_fake_gh(module, payload)
+    """Identity is the workflow DEFINITION: two files may declare one `name:`
+    and each publish a check of the same name. The older run below was cancelled
+    whole -- the one shape the collapse may drop -- but it belongs to an
+    unrelated workflow, so nothing superseded it and its row stays."""
+    older_cancelled = _check("build", "CANCELLED", 100, definition=1, workflow="Code Review")
+    newer_success = _check("build", "SUCCESS", 200, definition=2, workflow="Code Review")
+    assert _exit_for([older_cancelled, newer_success]) == 20
 
-    assert module.main(["pr_status.py", "42"]) == 20
+
+def test_two_triggers_of_one_workflow_are_concurrent_dispatches_not_attempts() -> None:
+    """One file on `push` and `pull_request` dispatches two runs for one commit.
+    Neither replaces the other: the cancelled push run below is the one shape
+    the collapse may drop, yet a later pull_request run of the same definition
+    did not supersede it, so its row stays and still counts."""
+    push_cancelled = _check("Backend Tests", "CANCELLED", 100, event="push")
+    pr_success = _check("Backend Tests", "SUCCESS", 200, event="pull_request")
+    assert _exit_for([push_cancelled, pr_success]) == 20
+
+
+def test_rows_without_a_run_identity_are_exempt_not_grouped_together() -> None:
+    """A check run created outside Actions has no workflowRun. Two such rows must
+    not be grouped under a missing key, which would drop all but the newest; each
+    stays, so the older failure is still reported."""
+    app_failure = {
+        "name": "CodeQL",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "startedAt": "2026-08-06T01:00:00Z",
+    }
+    app_success = {
+        "name": "CodeQL",
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "startedAt": "2026-08-06T02:00:00Z",
+    }
+    assert _exit_for([app_failure, app_success]) == 20
+    assert _exit_for([app_success, app_failure]) == 20
+
+
+def test_rows_missing_only_the_event_are_exempt_not_merged() -> None:
+    """The event is non-null on the wire, so its absence is a truncated response.
+    Keying on what is left would merge two triggers into one group and drop the
+    cancelled run below as superseded; a withheld component exempts the row."""
+    older = _check("Backend Tests", "CANCELLED", 100)
+    newer = _check("Backend Tests", "SUCCESS", 200)
+    older["workflowRunEvent"] = newer["workflowRunEvent"] = None
+    assert _exit_for([older, newer]) == 20
 
 
 def test_unordered_duplicates_are_all_kept_fail_closed() -> None:
-    """Without startedAt on both entries there is no ordering evidence, so
-    neither may silently supersede the other -- the failure must survive."""
-    module = _load_script()
-    payload = _pr_payload(
-        [
-            {
-                "name": "Backend Tests",
-                "workflowName": "ci.yml",
-                "status": "COMPLETED",
-                "conclusion": "FAILURE",
-            },
-            {
-                "name": "Backend Tests",
-                "workflowName": "ci.yml",
-                "status": "COMPLETED",
-                "conclusion": "SUCCESS",
-                "startedAt": "2026-08-06T02:00:00Z",
-            },
-        ]
+    """Without a run id there is no ordering evidence, so neither may silently
+    supersede the other -- even a cancelled row of a cancelled run, the one
+    shape the collapse may drop, must survive."""
+    unidentified = _check("Backend Tests", "CANCELLED", None, startedAt="2026-08-06T01:00:00Z")
+    assert _exit_for([unidentified, _check("Backend Tests", "SUCCESS", 200)]) == 20
+
+
+def test_a_replaced_rounds_failure_rows_stay_live() -> None:
+    """The rollup carries no lineage edge: a later run of one identity may be an
+    independent dispatch (`synchronize` and `edited` are both `pull_request`), so
+    recency alone never licenses dropping a row. Only a run the concurrency group
+    CANCELLED is proven displaced; a replaced round that concluded FAILURE keeps
+    its rows live. Over-report rather than hide a live failure."""
+    assert (
+        _exit_for(
+            [_check("Backend Tests", "FAILURE", 100), _check("Backend Tests", "SUCCESS", 200)]
+        )
+        == 20
     )
-    _install_fake_gh(module, payload)
+
+
+def test_a_cancelled_row_inside_a_live_run_is_not_dropped() -> None:
+    """fail-fast, a failed `needs`, or an operator cancelling one job leave a
+    CANCELLED row inside a run that concluded FAILURE. That run is live; the
+    row's own cancellation is not displacement."""
+    sibling_cancelled = _check("shard 2", "CANCELLED", 100, run_conclusion="FAILURE")
+    newer_success = _check("shard 2", "SUCCESS", 200)
+    assert _exit_for([sibling_cancelled, newer_success]) == 20
+
+
+def test_a_cancelled_rows_verdict_must_also_be_cancelled_to_drop_it() -> None:
+    """A cancelled run can still hold a row that reached a real FAILURE before
+    the cancel landed. Removing it would take a verdict with it, so it stays."""
+    decided_in_cancelled_run = _check("Backend Tests", "FAILURE", 100, run_conclusion="CANCELLED")
+    assert _exit_for([decided_in_cancelled_run, _check("Backend Tests", "SUCCESS", 200)]) == 20
+
+
+def test_a_cancelled_newest_run_is_never_dropped() -> None:
+    """Dropping the newest run would revive the verdict it superseded: the
+    older SUCCESS would read as the live result of a lane whose latest attempt
+    did not finish."""
+    assert (
+        _exit_for(
+            [_check("Backend Tests", "SUCCESS", 100), _check("Backend Tests", "CANCELLED", 200)]
+        )
+        == 20
+    )
+
+
+def test_newest_is_the_greatest_run_id_not_the_latest_started_row() -> None:
+    """startedAt is when a JOB got a runner, and a busy queue starts an older
+    run's job after a newer run's. Ordered by startedAt the displaced CANCELLED
+    row below would be the 'newest' and survive as a failure; ordered by run id
+    it is the older run and is dropped."""
+    displaced_late_start = _check(
+        "Backend Tests", "CANCELLED", 100, startedAt="2026-08-06T02:00:00Z"
+    )
+    newest_early_start = _check("Backend Tests", "SUCCESS", 200, startedAt="2026-08-06T01:00:00Z")
+    assert _exit_for([displaced_late_start, newest_early_start]) == 0
+    assert _exit_for([newest_early_start, displaced_late_start]) == 0
+
+
+def test_a_displaced_round_is_dropped_whole_not_row_by_row() -> None:
+    """Measured shape: the concurrency group cancelled run 100 whole,
+    so every one of its rows is COMPLETED/CANCELLED under a CANCELLED run while
+    run 200 carries the live verdicts. The board reads as run 200 alone."""
+    displaced = [
+        _check(name, "CANCELLED", 100, definition=314753039, workflow="Code Review")
+        for name in ("Automated Rule Check", "Inclusive Language", "SAST (Semgrep)", "PR Hygiene")
+    ]
+    live = [
+        _check(name, "SUCCESS", 200, definition=314753039, workflow="Code Review")
+        for name in ("Automated Rule Check", "Inclusive Language", "SAST (Semgrep)", "PR Hygiene")
+    ]
+    module = _load_script()
+    assert module.collapse_superseded(displaced + live) == live
+    assert module.collapse_superseded(live + displaced) == live
+
+
+def test_status_contexts_are_never_collapsed() -> None:
+    """The host reports one status per context (the latest), so two rows of one
+    context is not a shape a collapse has to order, and the provider keeps every
+    status row. Keeping them all is the fail-closed direction: whatever the dates
+    say, an older FAILURE beside a newer SUCCESS of one context still counts."""
+    older_failure = {
+        "context": "PR Readiness",
+        "state": "FAILURE",
+        "createdAt": "2026-08-06T01:00:00Z",
+    }
+    newer_success = {
+        "context": "PR Readiness",
+        "state": "SUCCESS",
+        "createdAt": "2026-08-06T02:00:00Z",
+    }
+    assert _exit_for([older_failure, newer_success]) == 20
+    assert _exit_for([newer_success, older_failure]) == 20
+    module = _load_script()
+    assert module.collapse_superseded([older_failure, newer_success]) == [
+        older_failure,
+        newer_success,
+    ]
+
+
+# --- the rollup read ----------------------------------------------------------
+#
+# `gh pr view --json statusCheckRollup` rows carry only `workflowName` for the
+# workflow: no run id, no definition id, no event (measured on a live board). The
+# collapse keys on those, so the rollup is read through GraphQL. The read keeps
+# the contract the comment above ROLLUP_UNAVAILABLE_NOTICE states: its own call,
+# soft degradation, the head re-checked beside the rollup.
+
+
+def _rollup_read_calls(
+    module: ModuleType, responses: list[tuple[int, str, str]]
+) -> list[list[str]]:
+    """Drive main() with the rollup read answered page by page from ``responses``;
+    return the argv of every rollup read issued."""
+    core = json.loads(_pr_payload([]))
+    del core["statusCheckRollup"]
+    pages = list(responses)
+    seen: list[list[str]] = []
+
+    def fake_run(args: list[str]) -> tuple[int, str, str]:
+        if args[:3] == ["gh", "auth", "status"]:
+            return 0, "", ""
+        if args[:3] == ["gh", "pr", "view"]:
+            return 0, json.dumps(core), ""
+        if is_rollup_graphql_read(args):
+            seen.append(args)
+            return pages.pop(0) if pages else (1, "", "no more pages")
+        if args[:3] == ["gh", "repo", "view"]:
+            return 0, "example/repo", ""
+        if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
+            return 0, "[]", ""
+        if args[:2] == ["gh", "api"] and "/actions/runs" in args[2]:
+            return (
+                0,
+                json.dumps({"total_count": 1, "workflow_runs": [{"event": "pull_request"}]}),
+                "",
+            )
+        if args[:1] == ["git"]:
+            return _fake_git(args)
+        raise AssertionError("unexpected command: {}".format(args))
+
+    module.run = fake_run
+    module.unresolved_thread_count = lambda _number: 0
+    return seen
+
+
+def test_the_rollup_query_selects_every_field_the_collapse_keys_on() -> None:
+    """The fake answers whatever the fixture carries, so a field the query never
+    asked for would pass every test above while the live read lacked it. Pin the
+    selection bytes: the run id, event and definition id through the check
+    suite, the suite's conclusion (the run's own verdict), and the row fields
+    the rest of the report reads."""
+    module = _load_script()
+    seen = _rollup_read_calls(module, [(0, rollup_graphql_response([], "f" * 40), "")])
+    assert module.main(["pr_status.py", "42"]) == 20  # no checks reported -> fail-closed
+    assert len(seen) == 1
+    query = next(a for a in seen[0] if a.startswith("query="))
+    for selection in (
+        "headRefOid",
+        "commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100,after:$c)",
+        "pageInfo{hasNextPage endCursor}",
+        "... on CheckRun{name status conclusion startedAt detailsUrl "
+        "checkSuite{conclusion workflowRun{databaseId event workflow{databaseId name}}}}",
+        "... on StatusContext{context state targetUrl}",
+    ):
+        assert selection in query, selection
+    # Owner, repository and number travel as variables, never in the text. The
+    # strings go through `-f`: gh's typed `-F` turns an all-digit owner or
+    # repository (`someorg/2048`) into a JSON integer the host rejects against
+    # `String!`, and that repository would read as UNAVAILABLE forever.
+    assert ["-f", "o=example", "-f", "r=repo", "-F", "n=42"] == seen[0][-6:]
+
+
+def test_the_rollup_read_pages_and_re_checks_the_head_on_every_page() -> None:
+    module = _load_script()
+    head = "f" * 40
+    first = rollup_graphql_response(
+        [_check("a", "SUCCESS", 1)], head, has_next=True, end_cursor="c1"
+    )
+    second = rollup_graphql_response([_check("b", "FAILURE", 2)], head)
+    seen = _rollup_read_calls(module, [(0, first, ""), (0, second, "")])
+
+    assert module.main(["pr_status.py", "42"]) == 20  # the failure on page two counts
+    assert len(seen) == 2
+    assert not any(a.startswith("c=") for a in seen[0])
+    # The cursor is an opaque string and travels as one: `-f`, not typed `-F`.
+    assert seen[1][seen[1].index("c=c1") - 1] == "-f"
+
+
+def test_a_head_that_moves_mid_pagination_discards_the_rollup(capsys) -> None:
+    module = _load_script()
+    first = rollup_graphql_response(
+        [_check("a", "SUCCESS", 1)], "f" * 40, has_next=True, end_cursor="c1"
+    )
+    moved = rollup_graphql_response([_check("b", "SUCCESS", 2)], "b" * 40)
+    _rollup_read_calls(module, [(0, first, ""), (0, moved, "")])
 
     assert module.main(["pr_status.py", "42"]) == 20
+    out = capsys.readouterr().out
+    assert "NOTICE: " + module.ROLLUP_HEAD_MOVED_NOTICE in out
+    assert "- a:" not in out, "rows from the page before the move must not leak"
 
 
-def test_status_contexts_collapse_by_context_name() -> None:
-    """StatusContexts share the identity axis via their context string."""
+def test_a_rollup_whose_commit_is_not_the_reported_head_is_discarded(capsys) -> None:
+    """Both comparisons are the same guard: the pull request's head and the
+    commit the rollup hangs off must each be the head the core read reported."""
     module = _load_script()
-    payload = _pr_payload(
-        [
-            {"context": "PR Readiness", "state": "FAILURE", "startedAt": "2026-08-06T01:00:00Z"},
-            {"context": "PR Readiness", "state": "SUCCESS", "startedAt": "2026-08-06T02:00:00Z"},
-        ]
+    stale_commit = rollup_graphql_response(
+        [{"context": "PR Readiness", "state": "SUCCESS"}], "f" * 40, commit_oid="a" * 40
     )
-    _install_fake_gh(module, payload)
+    _rollup_read_calls(module, [(0, stale_commit, "")])
 
-    assert module.main(["pr_status.py", "42"]) == 0
+    assert module.main(["pr_status.py", "42"]) == 20
+    assert "NOTICE: " + module.ROLLUP_HEAD_MOVED_NOTICE in capsys.readouterr().out
+
+
+def test_a_board_past_the_page_cap_reads_unknown_not_partial(capsys) -> None:
+    """A partial read could keep a displaced row whose successor sits on the
+    page never fetched, so a board that outruns the cap is UNKNOWN, fail-closed."""
+    module = _load_script()
+    endless = rollup_graphql_response(
+        [_check("a", "SUCCESS", 1)], "f" * 40, has_next=True, end_cursor="again"
+    )
+    seen = _rollup_read_calls(module, [(0, endless, "")] * (module._MAX_ROLLUP_PAGES + 5))
+
+    assert module.main(["pr_status.py", "42"]) == 20
+    assert len(seen) == module._MAX_ROLLUP_PAGES
+    out = capsys.readouterr().out
+    assert "NOTICE: " + module.ROLLUP_UNAVAILABLE_NOTICE in out
+    assert "- a:" not in out
+
+
+def test_a_malformed_rollup_page_reads_unavailable(capsys) -> None:
+    module = _load_script()
+    for broken in (
+        json.dumps({"data": {"repository": None}}),
+        json.dumps(
+            {"data": {"repository": {"pullRequest": {"headRefOid": "f" * 40, "commits": "nope"}}}}
+        ),
+    ):
+        _rollup_read_calls(module, [(0, broken, "")])
+        assert module.main(["pr_status.py", "42"]) == 20
+        assert "NOTICE: " + module.ROLLUP_UNAVAILABLE_NOTICE in capsys.readouterr().out
 
 
 # --- issue-link advisory (closing keyword) ------------------------------------
@@ -779,22 +1045,6 @@ def test_visible_trailer_with_trailing_html_comment_still_confirms() -> None:
     module = _load_script()
     body = "Fixes #7 <!-- this explanation is not part of the trailer -->"
     assert module.closing_link_reason(body, [{"number": 7}]) is None
-
-
-def test_fenced_opt_out_example_does_not_silence_notice() -> None:
-    module = _load_script()
-    body = "```markdown\nno linked issue: example only\n```"
-    reason = module.closing_link_reason(body, [])
-    assert reason is not None
-    assert "no issue link" in reason
-
-
-def test_html_commented_opt_out_example_does_not_silence_notice() -> None:
-    module = _load_script()
-    body = "<!--\nno linked issue: example only\n-->"
-    reason = module.closing_link_reason(body, [])
-    assert reason is not None
-    assert "no issue link" in reason
 
 
 def test_fence_markers_inside_html_comment_do_not_hide_visible_trailer() -> None:
@@ -1043,26 +1293,20 @@ def test_malformed_targets_are_not_trailers() -> None:
         assert module._CLOSING_KW_RE.search(body) is None, body
 
 
-def test_no_reference_at_all_is_reported_with_the_opt_out_named() -> None:
+def test_no_reference_at_all_is_reported_and_names_the_gate() -> None:
     module = _load_script()
     reason = module.closing_link_reason("A pure refactor with no tracked issue.", [])
     assert reason is not None
-    assert "no linked issue" in reason
+    assert "Issue Gate" in reason
 
 
-def test_safe_explicit_opt_out_silences_notice_when_reason_names_an_issue() -> None:
-    module = _load_script()
-    body = (
-        "A follow-up that deliberately closes nothing.\n\n"
-        "no linked issue: #3257 is resolved by the release, not this change."
-    )
-    assert module.closing_link_reason(body, []) is None
-
-
-def test_explicit_opt_out_silences_the_notice() -> None:
+def test_there_is_no_opt_out_line_that_silences_the_notice() -> None:
+    """The Issue Gate lane rejects an issue-less PR, so this module must not
+    accept a body line that the gate rejects."""
     module = _load_script()
     body = "A pure refactor.\n\nno linked issue: no ticket exists for this cleanup."
-    assert module.closing_link_reason(body, []) is None
+    assert module.closing_link_reason(body, []) is not None
+    assert not hasattr(module, "_NO_ISSUE_RE")
 
 
 def test_host_closure_without_an_explicit_trailer_is_reported() -> None:
@@ -1452,45 +1696,6 @@ def test_an_unterminated_nested_fence_does_not_swallow_a_real_trailer() -> None:
     assert module.closing_link_reason(body, [{"number": 7}]) is None
 
 
-def test_opt_out_must_be_a_trailer_not_a_mention() -> None:
-    """Prose that merely discusses the check must NOT read as a declaration.
-
-    An unanchored substring match lets any body containing the phrase pass —
-    including a body that only explains what the phrase is for.
-    """
-    module = _load_script()
-    prose = "The gate accepts a `no linked issue: <why>` line as an opt-out."
-    assert module.closing_link_reason(prose, []) is not None
-    indented = "  no linked issue: buried in an instruction block"
-    assert module.closing_link_reason(indented, []) is not None
-    assert module.closing_link_reason("no linked issue but I forgot the colon", []) is not None
-
-
-def test_opt_out_phrasing_carries_no_closing_keyword() -> None:
-    """The opt-out line itself must never read as a close-on-merge trigger.
-
-    GitHub closes an issue on merge when the body matches
-    ``(close[sd]?|fix(e[sd])?|resolve[sd]?)\\s*:?\\s+#<n>``. A phrasing like
-    ``no issue closed: <why>`` puts the keyword ``closed`` directly
-    before the colon, so a ``<why>`` opening with an issue number
-    (``no issue closed: #<n> tracks the follow-up``) yields
-    ``closed: #<n>`` — auto-closing the very issue the line disclaims.
-    Lock in both properties: the canonical phrasing matches the opt-out
-    regex, and no closing keyword survives anywhere in it.
-    """
-    module = _load_script()
-    canonical = "no linked issue: kept open deliberately"
-    assert module._NO_ISSUE_RE.search(canonical) is not None
-    # Extract the literal prefix the regex anchors on and scan it (plus the
-    # full canonical line) for every GitHub closing-keyword inflection.
-    closing_kw = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b", re.IGNORECASE)
-    assert closing_kw.search(canonical) is None
-    assert closing_kw.search(module._NO_ISSUE_RE.pattern) is None
-    # The concrete failure mode: an issue number at the start of the <why>
-    # must not form a closing trailer with the phrasing's final word.
-    assert module._CLOSING_KW_RE.search("no linked issue: #1234 tracks the follow-up") is None
-
-
 def test_shipped_body_template_does_not_read_as_a_declaration() -> None:
     """An author who copies the template and skips the Issue link section must
     still see the notice -- the leftover instruction text must not read as a
@@ -1694,7 +1899,7 @@ class TestShaMatches:
 
 def test_elided_design_stamp_no_longer_reads_as_stale() -> None:
     """The reported harm: the Design lane mangled its own stamp and every
-    prepare-pr/babysit loop read exit 20 BLOCKED while PR Readiness was green."""
+    kirocrew-prepare-pr/babysit loop read exit 20 BLOCKED while PR Readiness was green."""
     module = _load_script()
     comments = json.dumps(
         [
@@ -2157,12 +2362,12 @@ def test_a_bound_slot_with_no_stamp_of_its_own_is_reported_stampless() -> None:
 
 
 def test_checks_blind_token_degrades_softly_instead_of_aborting(capsys) -> None:
-    """A token that cannot read Checks (any fine-grained PAT) fails EVERY gh
-    request naming statusCheckRollup -- gh resolves a --json field set
-    atomically. The core read must survive by not naming the field; the
-    rollup-only read fails and degrades: the script completes with a visible
-    notice and fails closed, never aborting with 'could not read PR'. Both
-    failure shapes are exercised: a non-zero exit and unparseable stdout.
+    """A token that cannot read Checks (any fine-grained PAT) fails EVERY read
+    naming statusCheckRollup. The core read must survive by not naming the
+    field; the rollup-only GraphQL read fails and degrades: the script completes
+    with a visible notice and fails closed, never aborting with 'could not read
+    PR'. Both failure shapes are exercised: a non-zero exit and unparseable
+    stdout.
     """
     raw = json.loads(_pr_payload([]))
     del raw["statusCheckRollup"]  # a Checks-blind token never returns the field
@@ -2182,9 +2387,10 @@ def test_checks_blind_token_degrades_softly_instead_of_aborting(capsys) -> None:
                 return 0, "", ""
             if args[:3] == ["gh", "pr", "view"]:
                 fields = args[args.index("--json") + 1] if "--json" in args else ""
-                if "statusCheckRollup" in fields:
-                    return _rollup
+                assert "statusCheckRollup" not in fields, "the core read must not name the rollup"
                 return 0, payload, ""
+            if is_rollup_graphql_read(args):
+                return _rollup
             if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
                 return 0, "[]", ""
             raise AssertionError("unexpected command: {}".format(args))
@@ -2218,21 +2424,17 @@ def test_head_moved_between_reads_discards_the_rollup_not_reports_clean(capsys) 
     core = json.loads(_pr_payload([]))
     del core["statusCheckRollup"]
     core["headRefOid"] = old_head
-    green_rollup = json.dumps(
-        {
-            "headRefOid": new_head,
-            "statusCheckRollup": [{"context": "PR Readiness", "state": "SUCCESS"}],
-        }
+    green_rollup = rollup_graphql_response(
+        [{"context": "PR Readiness", "state": "SUCCESS"}], new_head
     )
 
     def fake_run(args: list[str]) -> tuple[int, str, str]:
         if args[:3] == ["gh", "auth", "status"]:
             return 0, "", ""
         if args[:3] == ["gh", "pr", "view"]:
-            fields = args[args.index("--json") + 1] if "--json" in args else ""
-            if "statusCheckRollup" in fields:
-                return 0, green_rollup, ""
             return 0, json.dumps(core), ""
+        if is_rollup_graphql_read(args):
+            return 0, green_rollup, ""
         if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
             return 0, "[]", ""
         raise AssertionError("unexpected command: {}".format(args))
@@ -2272,10 +2474,9 @@ def test_degraded_rollup_reason_is_distinct_from_a_genuine_no_checks_pr(capsys) 
         if args[:3] == ["gh", "auth", "status"]:
             return 0, "", ""
         if args[:3] == ["gh", "pr", "view"]:
-            fields = args[args.index("--json") + 1] if "--json" in args else ""
-            if "statusCheckRollup" in fields:
-                return 1, "", "Resource not accessible by personal access token"
             return 0, core_payload, ""
+        if is_rollup_graphql_read(args):
+            return 1, "", "Resource not accessible by personal access token"
         if args[:2] == ["gh", "api"] and "/issues/" in args[2] and "/comments" in args[2]:
             return 0, "[]", ""
         raise AssertionError("unexpected command: {}".format(args))
@@ -2574,7 +2775,7 @@ def _gate_argv() -> list[str]:
 
 
 def test_disposition_gate_reports_a_blanket_record_as_a_violation(capsys) -> None:
-    """The gap this closes: a writer skipping the prepare-pr loop posts a
+    """The gap this closes: a writer skipping the kirocrew-prepare-pr loop posts a
     single-rationale record naming a lane but claiming no span, and the
     adjudication ledger admits it with full downgrade power. The gate must name
     it so the required status can fail."""
@@ -3451,8 +3652,8 @@ def _override_comment(
 def _override_lane_comment(head: str = _HEAD, actor: str = "maintainer") -> dict[str, object]:
     """The stampless body the GPT lane rewrites its keyed comment to."""
     return _bot_comment(
-        "## GPT 5.6 Review \u2014 human override accepted\n\n"
-        "Human judgment by @{} overrides the GPT 5.6 finding for `{}`.\n\n"
+        "## GPT 6.1 Review \u2014 human override accepted\n\n"
+        "Human judgment by @{} overrides the GPT 6.1 finding for `{}`.\n\n"
         "_The model was not re-run because an authorized human decision "
         "supersedes it._".format(actor, head),
         key="codex-ai-review",
@@ -3549,7 +3750,7 @@ def test_adjudication_clear_still_clears_through_its_intact_stamp(capsys) -> Non
     comments = json.dumps(
         [
             _bot_comment(
-                "## GPT 5.6 Review \u2014 adjudicated clear\n\n"
+                "## GPT 6.1 Review \u2014 adjudicated clear\n\n"
                 "The `[BLOCK-MERGE]` marker is defused. The "
                 f"`[GPT-REVIEWED] {_HEAD}` freshness stamp is deliberately left "
                 f"intact.\n[GPT-REVIEWED] {_HEAD}"
@@ -3779,3 +3980,44 @@ def test_the_evaluator_itself_refuses_an_untrusted_override_record() -> None:
         [forged], _HEAD, bindings, only=["GPT"], authors=("coverage-app[bot]",)
     )
     assert widened["overridden"] == {"GPT": "maintainer"}, widened
+
+
+# --- declared_issue_numbers: the one public declaration grammar -----------------
+#
+# `.github/scripts/issue_gate_refs.py` (the Issue Gate) reads bodies through
+# this function, so the gate never re-derives masking or targets. It answers a
+# different question from closing_link_reason (which issue is this work FOR,
+# not why the host resolved no closure), hence its own line-start shape and
+# the non-closing `Refs` / `Part of` verbs.
+
+
+def test_declared_issue_numbers_line_start_reading_frees_the_rest_of_the_line() -> None:
+    module = _load_script()
+    body = (
+        "Fixes #7 (the Windows half), closes #8\n- Scope:\n    - Closes #9\n"
+        "> Closes #10\nDiscloses #11 prefixes #12\nThis PR Fixes #13 partially.\n"
+    )
+    assert module.declared_issue_numbers(body, "example/repo") == (["7", "8"], True)
+
+
+def test_declared_issue_numbers_tail_references_need_a_word_start() -> None:
+    module = _load_script()
+    body = "Fixes #1; the crash is unresolved: #2 and prefixes #3\n"
+    assert module.declared_issue_numbers(body, "example/repo") == (["1"], True)
+
+
+def test_declared_issue_numbers_accepts_non_closing_declarations() -> None:
+    module = _load_script()
+    body = "Part of #3\n- Refs #4 and ref #5\nRelated to #6\n"
+    assert module.declared_issue_numbers(body, "example/repo") == (["3", "4", "5"], True)
+
+
+def test_declared_issue_numbers_masks_and_filters_like_the_notice_path() -> None:
+    module = _load_script()
+    body = (
+        "<!-- Fixes #1 -->\n```\nCloses #2\n```\nsee `Closes #3`\n"
+        "Closes other/repo#4\nFixes Example/Repo#5\nResolves #99999999999\n"
+    )
+    numbers, well_formed = module.declared_issue_numbers(body, "example/repo")
+    assert numbers == ["5"]
+    assert well_formed is False

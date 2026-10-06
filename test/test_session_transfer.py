@@ -177,7 +177,6 @@ def _slot(
         memory_mode="persistent",
         # Idle by default: Layer B only travels when no turn is in flight.
         running=False,
-        _in_stage_execution=False,
     )
 
 
@@ -2156,23 +2155,6 @@ async def test_layer_b_is_skipped_while_a_turn_is_in_flight(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_layer_b_is_skipped_between_stages_of_a_staged_plan(monkeypatch):
-    """``running`` reads False between stages, so the staged-plan flag is checked
-    too (chat_handlers documents that gap)."""
-    from kiro_crew.dashboard import session_transfer as st
-
-    msgs = [{"role": "user", "content": "hi", "ts": ""}]
-    slot = _slot(msgs)
-    slot.running = False
-    slot._in_stage_execution = True
-    monkeypatch.setattr(st, "_resolve_layer_b_sid", lambda *a: "sid")
-
-    bundle = await st.build_transfer_bundle_async(_state(msgs), slot, origin="mac")
-
-    assert "layer_b" not in bundle
-
-
-@pytest.mark.asyncio
 async def test_layer_b_travels_when_the_slot_is_idle(monkeypatch, tmp_path):
     """The positive case: an idle slot still carries its context."""
     from kiro_crew.dashboard import session_transfer as st
@@ -4053,7 +4035,14 @@ async def test_concurrent_expansions_are_bounded_and_the_excess_is_refused(monke
         asyncio.create_task(_run_import(st, monkeypatch, None, gz=gz))
         for _ in range(st._MAX_CONCURRENT_EXPANSIONS + st._MAX_QUEUED_EXPANSIONS + 2)
     ]
-    await asyncio.sleep(0.05)
+    # Wait for the gate rather than a fixed sleep: every request streams its body
+    # to disk before it reaches admission, which takes longer than any fixed tick
+    # on a slow runner. The gunzip is held shut, so an admitted or queued import
+    # cannot finish yet; any task done before the release is one the gate refused.
+    deadline = asyncio.get_running_loop().time() + 10
+    while not any(t.done() for t in running):
+        assert asyncio.get_running_loop().time() < deadline, "no import ever reached the gate"
+        await asyncio.sleep(0.01)
     refused = [t for t in running if t.done()]
     release.set()
     results = await asyncio.gather(*running)

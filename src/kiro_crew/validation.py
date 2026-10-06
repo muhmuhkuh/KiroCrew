@@ -25,6 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from typing import Any
 
+# The artifact tag rule lives with the store's other field grammar and is read
+# here so the tool gate and the store cannot disagree about a tag. Import-safe:
+# ``artifact_store.rules`` loads the record dataclasses and the slug hash
+# fallback, never ``kiro_crew.artifacts`` (the service module whose import from
+# here would close the ``artifacts -> hooks -> webhooks -> validation`` cycle).
+from kiro_crew.artifact_store.rules import MAX_TAG_LEN as ARTIFACT_TAG_MAX
+from kiro_crew.artifact_store.rules import normalize_tag as _normalize_artifact_tag
+
 # Computer-use tool names and their argument bounds. Safe to import at module
 # scope: ``computer_use.types`` is deliberately dependency-free (it imports
 # nothing from ``kiro_crew`` and never touches ctypes), so there is no cycle and
@@ -32,11 +40,17 @@ from typing import Any
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
 from kiro_crew.config.sections import SUBAGENT_MAX_TURNS_CEILING
+
+# ``MAX_SHORT_STRING`` is re-exported, not just used: it is part of this
+# module's surface and 15 other modules read it from here. It is DEFINED in
+# ``constants`` so ``execution_context`` can have it without this module's
+# import graph -- see the comment at its definition.
 from kiro_crew.constants import (
     ARTIFACT_MAX_CONTENT_BYTES,
     AWS_PROFILE_NAME_RE,
     CHANNEL_OWNER_DM_NAMESPACES,
     MAX_BANNER_CHARS,
+    MAX_SHORT_STRING,
     SLACK_NAMESPACE,
     WAIT_TOOL_MAX_SECS,
     WINDOWS_DEVICE_STEMS,
@@ -69,7 +83,6 @@ from kiro_crew.work_vocab import WORK_ITEM_STATES, WORK_VERDICTS, WORK_WORKER_ST
 
 # Max lengths for string inputs
 MAX_TOOL_NAME_LEN = 256
-MAX_SHORT_STRING = 500  # names, IDs, categories
 MAX_SKILL_KEY_CHARS = 32768  # nested catalog keys, transported in JSON for exact reads
 MAX_MEDIUM_STRING = 5_000  # messages, rules
 MAX_LONG_STRING = 50_000  # task specs, inline content
@@ -461,6 +474,32 @@ class ValidationError(Exception):
 #: here would silently attribute the sanitizer's removals to the truncation. Kept
 #: short so it costs almost none of the field's budget.
 _CLAMP_NOTE = " [... truncated, dropped {n} chars]"
+
+#: Reads :data:`_CLAMP_NOTE` back off a clamped value. Derived FROM that constant
+#: rather than spelled a second time, so the stamp and its reader cannot drift
+#: apart when the wording changes.
+_CLAMP_NOTE_RE = re.compile(re.escape(_CLAMP_NOTE).replace(r"\{n\}", r"(\d+)") + r"\Z")
+
+
+def clamp_report(value: str) -> tuple[int, int] | None:
+    """For a value stamped by :func:`clamp_to_max_len`, return ``(before, kept)``.
+
+    ``None`` when the value carries no stamp, which is the common case. ``before``
+    is the length the clamp saw and ``kept`` the length of the caller's own text
+    that survived, excluding the stamp itself — the two numbers a caller needs to
+    be told what happened to its field in the same round-trip that accepted it.
+
+    Reading the stamp back is what lets a tool whose reply does NOT echo the
+    applied value still report the cut (see ``mcp_work.work_report``). A caller
+    whose own text happens to end in the stamp's exact shape would be described
+    as clamped when it was not; the cost is one inaccurate advisory line, which
+    is why no decision is keyed off this.
+    """
+    match = _CLAMP_NOTE_RE.search(value)
+    if not match:
+        return None
+    kept = len(value) - (match.end() - match.start())
+    return kept + int(match.group(1)), kept
 
 
 @dataclass
@@ -1143,24 +1182,68 @@ def sanitize_response(text: str, max_len: int = MAX_RESPONSE_LEN) -> str:
 # ── JSON-RPC Envelope Validation ──
 
 
+#: JSON-RPC 2.0 reserved error codes for a request that cannot be served: a
+#: frame that does not parse, a malformed envelope, params a method cannot
+#: take, and a server-side fault. Here, beside the envelope validator, so a
+#: stdio MCP server can answer with them without importing the ACP layer.
+JSONRPC_PARSE_ERROR = -32700
+JSONRPC_INVALID_REQUEST = -32600
+JSONRPC_INVALID_PARAMS = -32602
+JSONRPC_INTERNAL_ERROR = -32603
+
+
+class JsonRpcEnvelopeError(ValidationError):
+    """A JSON-RPC request envelope that cannot be served, with what answers it.
+
+    ``req_id`` is the request's own id (``None`` for a notification, which is
+    never answered); ``invalid_params`` tells a ``params`` that is not an
+    object (JSON-RPC ``-32602``) from a malformed envelope (``-32600``).
+    """
+
+    def __init__(
+        self, field: str, message: str, *, req_id: Any, method: Any, invalid_params: bool
+    ) -> None:
+        super().__init__(field, message)
+        self.req_id = req_id
+        self.method = method
+        self.invalid_params = invalid_params
+
+
 def validate_jsonrpc_request(req: dict[str, Any]) -> tuple[str, Any, dict[str, Any]]:
     """Validate a JSON-RPC 2.0 request envelope.
 
-    Returns (method, id, params). Raises ValidationError on invalid structure.
+    Returns (method, id, params). Raises ValidationError on invalid structure:
+    :class:`JsonRpcEnvelopeError` for an object envelope, carrying the id the
+    refusal is owed to. Absent or ``null`` params read as ``{}``; params of any
+    other non-object type are refused rather than read as ``{}``, so a request
+    that names no usable arguments is answered as such instead of served as
+    one that sent none.
     """
     if not isinstance(req, dict):
         raise ValidationError("request", "must be a JSON object")
-    if req.get("jsonrpc") not in ("2.0", None):
-        raise ValidationError("jsonrpc", "must be '2.0'")
-
-    method = req.get("method")
-    if method is not None and not isinstance(method, str):
-        raise ValidationError("method", "must be a string")
-
     req_id = req.get("id")
-    params = req.get("params", {})
-    if not isinstance(params, dict):
+    method = req.get("method")
+    if req.get("jsonrpc") not in ("2.0", None):
+        raise JsonRpcEnvelopeError(
+            "jsonrpc", "must be '2.0'", req_id=req_id, method=method, invalid_params=False
+        )
+
+    if method is not None and not isinstance(method, str):
+        raise JsonRpcEnvelopeError(
+            "method", "must be a string", req_id=req_id, method=method, invalid_params=False
+        )
+
+    params = req.get("params")
+    if params is None:
         params = {}
+    elif not isinstance(params, dict):
+        raise JsonRpcEnvelopeError(
+            "params",
+            f"must be an object, not {type(params).__name__}",
+            req_id=req_id,
+            method=method,
+            invalid_params=True,
+        )
 
     return method or "", req_id, params
 
@@ -1422,6 +1505,25 @@ def _validate_monitor_runtime(args: dict[str, Any]) -> None:
             raise ValidationError("max_runtime_secs", str(exc)) from exc
 
 
+#: The one value ``watch`` accepts, as a LITERAL. Spelled here rather than imported from
+#: :mod:`kiro_crew.probes` for the reason that package spells its own kinds as literals:
+#: this module is imported by every MCP surface and ``probes`` pulls in a probe
+#: implementation, so the schema must not drag the observation layer along to validate a
+#: string. ``test_both_monitor_schemas_accept_the_work_ledger_watch`` pins it equal to
+#: ``probes.WORK_LEDGER``.
+#:
+#: CLOSED to one value on purpose. ``watch`` exists for the one subject an instruction
+#: cannot name -- a session's own key is not in its own prose -- and ``gh-pr`` is already
+#: inferred from the message, so accepting it here would offer a second spelling of the
+#: default. A caller naming anything else is refused rather than given an ordinary timer.
+_WATCH_WORK_LEDGER = "work-ledger"
+
+#: Shared by both monitor schemas, so the arm and the revision cannot drift on what the
+#: field accepts. Optional: absent means "infer the subject from the message", which is
+#: every caller written before this field existed.
+_MONITOR_WATCH_FIELD = FieldSpec("watch", str, allowed=frozenset({_WATCH_WORK_LEDGER}))
+
+
 MONITOR_WATCH_SCHEMA = ToolSchema(
     tool_name="monitor_watch",
     custom_validator=_validate_monitor_runtime,
@@ -1436,7 +1538,8 @@ MONITOR_WATCH_SCHEMA = ToolSchema(
             max_val=MAX_MONITOR_CADENCE_SECS,
         ),
         FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
@@ -1484,6 +1587,10 @@ MONITOR_START_SCHEMA = ToolSchema(
         # that names no brief is screened under the default, so refusing the judge
         # needs a spelling of its own. Only ``false`` survives validate_judge_spec.
         FieldSpec("judge", (dict, bool)),
+        # The SUBJECT, for the one subject a message cannot name. Accepted because
+        # the whole chain carries it: the payload, the applier and the authz forward
+        # all pass it through, so a request naming it is never silently discarded.
+        _MONITOR_WATCH_FIELD,
     ],
 )
 
@@ -1592,7 +1699,8 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         FieldSpec("max_runtime_secs", (int, float), min_val=1, max_val=MAX_RUNTIME_CEILING_SECS),
         FieldSpec("target", str, max_len=MAX_SHORT_STRING),
         FieldSpec("objective", str, allowed=publicly_armable_objectives()),
-        FieldSpec("max_agent_turns", int, min_val=1, max_val=MAX_MONITOR_AGENT_TURNS),
+        # Floor 0, not 1: zero is the unlimited sentinel for this one budget.
+        FieldSpec("max_agent_turns", int, min_val=0, max_val=MAX_MONITOR_AGENT_TURNS),
         FieldSpec("max_tokens", int, min_val=1, max_val=MAX_MONITOR_TOKENS),
         FieldSpec("max_provider_errors", int, min_val=1, max_val=MAX_MONITOR_PROVIDER_ERRORS),
         FieldSpec("wake_instructions", str, max_len=MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS),
@@ -1604,6 +1712,12 @@ MONITOR_UPDATE_SCHEMA = ToolSchema(
         # false`` is what takes the judge off a live loop; an empty object only drops
         # the owner's own criteria, and a gated loop then runs under the default.
         FieldSpec("judge", (dict, bool)),
+        # Same field as the arm side, for the reason the comment at the top of this
+        # schema gives: a loop must not be updatable into a state monitor_start would
+        # have refused. On this side it also ARMS a watch on a loop that has none, which
+        # is the only way a conductor that armed a plain timer reaches the gate without
+        # tearing its loop down and losing its cycle count.
+        _MONITOR_WATCH_FIELD,
     ],
 )
 
@@ -1963,9 +2077,12 @@ WORKFLOW_RERUN_SCHEMA = ToolSchema(
     ],
 )
 
-# Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE.
+# Artifact tools — slug pattern matches kiro_crew.artifacts._SLUG_RE. The tag
+# rule is NOT a pattern: a tag is Unicode letters, marks and digits, which are
+# general categories ``re`` cannot spell, so the artifact schemas below carry
+# only the tag count and length caps as fields and check each tag's characters
+# in ``_validate_artifact_tags`` through the store's own ``normalize_tag``.
 _ARTIFACT_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,78}[a-z0-9])?$")
-_ARTIFACT_TAG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_:.-]{0,63}\Z")
 _ARTIFACT_KIND_RE = re.compile(r"^(widget|html|markdown|svg|json|text|image|webapp)$")
 
 # Model identifiers passed to kiro-cli ``--model`` (AcpRuntime). First char
@@ -1983,8 +2100,33 @@ ARTIFACT_CONTENT_MAX = ARTIFACT_MAX_CONTENT_BYTES
 ARTIFACT_WEBAPP_METADATA_MAX_BYTES = 16_384
 
 
+def _validate_artifact_tags(cleaned: dict) -> None:
+    """Hold every tag argument to the store's tag rule and answer with its reason.
+
+    Runs after the field pass, so each item is already NFC-normalized, stripped
+    of hidden characters and bounded by the schema's caps; what is left to check
+    is the character rule, which is a category test no ``FieldSpec`` pattern can
+    express. The store applies the same rule on write; checking here means the
+    tool reports the offending tag and why, instead of a store error.
+    """
+    tags = cleaned.get("tags")
+    if isinstance(tags, list):
+        for i, item in enumerate(tags):
+            try:
+                _normalize_artifact_tag(item)
+            except ValueError as exc:
+                raise ValidationError("tags", f"item[{i}]: {exc}") from None
+    tag = cleaned.get("tag")
+    if isinstance(tag, str) and tag:
+        try:
+            _normalize_artifact_tag(tag)
+        except ValueError as exc:
+            raise ValidationError("tag", str(exc)) from None
+
+
 def _validate_artifact_save(cleaned: dict) -> None:
-    """Reject an oversized or structurally invalid webapp_metadata blob before disk write."""
+    """Reject a malformed tag, then an oversized or structurally invalid webapp_metadata blob."""
+    _validate_artifact_tags(cleaned)
     am = cleaned.get("webapp_metadata")
     if am is None:
         return
@@ -2168,8 +2310,7 @@ ARTIFACT_SAVE_SCHEMA = ToolSchema(
             "tags",
             list,
             item_type=str,
-            item_max_len=64,
-            item_pattern=_ARTIFACT_TAG_RE,
+            item_max_len=ARTIFACT_TAG_MAX,
             max_items=16,
         ),
         FieldSpec("folder", str, max_len=4096),
@@ -2197,8 +2338,7 @@ ARTIFACT_UPDATE_SCHEMA = ToolSchema(
             "tags",
             list,
             item_type=str,
-            item_max_len=64,
-            item_pattern=_ARTIFACT_TAG_RE,
+            item_max_len=ARTIFACT_TAG_MAX,
             max_items=16,
         ),
         FieldSpec("webapp_metadata", dict),
@@ -2213,9 +2353,10 @@ ARTIFACT_DELETE_SCHEMA = ToolSchema(
 )
 
 ARTIFACT_LIST_SCHEMA = ToolSchema(
+    custom_validator=_validate_artifact_tags,
     tool_name="artifact_list",
     fields=[
-        FieldSpec("tag", str, max_len=64, pattern=_ARTIFACT_TAG_RE),
+        FieldSpec("tag", str, max_len=ARTIFACT_TAG_MAX),
         FieldSpec("kind", str, max_len=20, pattern=_ARTIFACT_KIND_RE),
         FieldSpec("q", str, max_len=200),
     ],
@@ -2385,6 +2526,13 @@ CHAT_FOLDER_MOVE_SESSION_SCHEMA = ToolSchema(
     ],
 )
 
+CHAT_FOLDER_DELETE_SCHEMA = ToolSchema(
+    tool_name="chat_folder_delete",
+    fields=[
+        FieldSpec("folder", str, required=True, max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
 CHAT_FOLDER_FILE_SELF_SCHEMA = ToolSchema(
     tool_name="chat_folder_file_self",
     fields=[
@@ -2459,6 +2607,29 @@ CHAT_SESSION_PIN_SCHEMA = ToolSchema(
         # A real JSON boolean: the string "false" is truthy, so a coerced value
         # would pin a session the caller asked to unpin.
         FieldSpec("pinned", bool, required=True),
+    ],
+)
+
+# Board columns (``/api/chat/tag-columns``). A column name is stored as
+# ``name[:60]`` (``chat_tags._NAME_MAX``), the same cap as a tag name, and a
+# column reference is a 12-hex id or the column's exact name.
+CHAT_TAG_COLUMN_LIST_SCHEMA = ToolSchema(tool_name="chat_tag_column_list", fields=[])
+
+CHAT_TAG_COLUMN_CREATE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_create",
+    fields=[
+        FieldSpec("name", str, required=True, max_len=_CHAT_TAG_NAME_MAX),
+        FieldSpec("tag", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+    ],
+)
+
+CHAT_TAG_COLUMN_MOVE_SCHEMA = ToolSchema(
+    tool_name="chat_tag_column_move",
+    fields=[
+        # The handler requires exactly one of ``before`` / ``after``.
+        FieldSpec("column", str, required=True, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("before", str, max_len=_CHAT_TAG_REF_MAX),
+        FieldSpec("after", str, max_len=_CHAT_TAG_REF_MAX),
     ],
 )
 
@@ -3242,6 +3413,11 @@ SEND_MESSAGE_SCHEMA = ToolSchema(
         FieldSpec("unfurl_media", bool),
         FieldSpec("thread_ts", str, max_len=30, pattern=re.compile(r"^\d+\.\d+$")),
         FieldSpec("reply_broadcast", bool),
+        # Opt-in "Open session" deep-link button on the Slack leg. Declared here
+        # because ``validate_tool_args`` rejects any field the descriptor
+        # advertises but the schema does not declare; the gateway builds the URL
+        # server-side, so nothing but this flag crosses the wire.
+        FieldSpec("include_session_link", bool),
         # Must accept every value ``mcp_tools.messaging._SESSION_TARGETS``
         # advertises: this pattern runs BEFORE the handler, so a value missing
         # here is rejected as malformed even though the tool's own enum offers
@@ -3464,11 +3640,25 @@ SESSION_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_END_WAIT_SCHEMA = ToolSchema(
+    tool_name="session_end_wait",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
 SESSION_SET_MODEL_SCHEMA = ToolSchema(
     tool_name="session_set_model",
     fields=[
         FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
         FieldSpec("model", str, required=True, max_len=MAX_SHORT_STRING),
+    ],
+)
+
+SESSION_RELOAD_SCHEMA = ToolSchema(
+    tool_name="session_reload",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
     ],
 )
 
@@ -3809,7 +3999,9 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_create": SESSION_CREATE_SCHEMA,
     "session_fork": SESSION_FORK_SCHEMA,
     "session_stop": SESSION_STOP_SCHEMA,
+    "session_end_wait": SESSION_END_WAIT_SCHEMA,
     "session_set_model": SESSION_SET_MODEL_SCHEMA,
+    "session_reload": SESSION_RELOAD_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_revive": SESSION_REVIVE_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
@@ -3823,12 +4015,16 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,
     "chat_folder_move": CHAT_FOLDER_MOVE_SCHEMA,
     "chat_folder_move_session": CHAT_FOLDER_MOVE_SESSION_SCHEMA,
+    "chat_folder_delete": CHAT_FOLDER_DELETE_SCHEMA,
     "chat_folder_file_self": CHAT_FOLDER_FILE_SELF_SCHEMA,
     "chat_tag_list": CHAT_TAG_LIST_SCHEMA,
     "chat_tag_create": CHAT_TAG_CREATE_SCHEMA,
     "chat_tag_update": CHAT_TAG_UPDATE_SCHEMA,
     "chat_tag_assign": CHAT_TAG_ASSIGN_SCHEMA,
     "chat_session_pin": CHAT_SESSION_PIN_SCHEMA,
+    "chat_tag_column_list": CHAT_TAG_COLUMN_LIST_SCHEMA,
+    "chat_tag_column_create": CHAT_TAG_COLUMN_CREATE_SCHEMA,
+    "chat_tag_column_move": CHAT_TAG_COLUMN_MOVE_SCHEMA,
 }
 
 # ── Tool Schemas (MCP crew log — server ``kirocrew-crew-log``) ──
@@ -3878,7 +4074,12 @@ CREW_LOG_PROJECTION_SCHEMA = ToolSchema(
             "name",
             str,
             required=True,
-            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals"}),
+            # Must hold every name the tool ADVERTISES in its ``inputSchema`` enum, which is
+            # ``mcp_crew_log.PROJECTION_NAMES``. Spelled literally rather than imported
+            # because that module imports this one, and the two are pinned together by
+            # ``test_the_projection_schema_accepts_every_advertised_fold`` so a fold added to
+            # one and not the other fails CI instead of advertising a name this refuses.
+            allowed=frozenset({"status", "usage", "timeline", "tools", "approvals", "subagents"}),
         ),
     ],
 )
@@ -4017,18 +4218,39 @@ WORK_REPORT_SCHEMA = ToolSchema(
     tool_name="work_report",
     fields=[
         FieldSpec("status", str, required=True, allowed=_WORK_STATUSES),
-        # NOT ``clamp_to_max``: a truncated summary the worker believes landed
-        # whole is a silent data loss the worker cannot detect, and the conductor
-        # reads this field to decide. Refusing names the cap so the worker retries
-        # with a shorter one.
-        FieldSpec("summary", str, required=True, max_len=500),
+        # ``clamp_to_max``: the only caller is a model composing prose, which
+        # cannot measure the field before it calls, so a refusal here is
+        # discovered only by violating it and costs a whole round-trip to resend.
+        # Clamping is safe for the same reason it is on ``monitor_stop``'s
+        # ``reason``: the cut is not silent. ``clamp_to_max_len`` stamps the
+        # stored value, so the conductor reads a summary that announces its own
+        # truncation, and ``mcp_work.work_report`` reads the stamp back with
+        # ``clamp_report`` to tell the worker in the reply. Both halves are
+        # required: the stamp alone leaves the worker told only "Recorded.",
+        # which is a silent loss it cannot detect.
+        FieldSpec("summary", str, required=True, max_len=500, clamp_to_max=True),
         FieldSpec("artifacts", dict),
         FieldSpec("pr", int, min_val=1, max_val=1_000_000_000),
     ],
     custom_validator=lambda cleaned: _validate_work_artifacts(cleaned.get("artifacts")),
 )
 
-WORK_LEDGER_READ_SCHEMA = ToolSchema(tool_name="work_ledger_read")
+#: Every parameter of ``work_ledger_read`` narrows or shapes the read; none is
+#: required, and with none the whole board comes back as it always has. The
+#: ``events`` ceiling restates the route's own tail cap (``_MAX_EVENT_TAIL`` in
+#: ``dashboard/handlers/work_ledger.py``), pinned together by its tests.
+WORK_LEDGER_READ_SCHEMA = ToolSchema(
+    tool_name="work_ledger_read",
+    fields=[
+        FieldSpec("events", int, min_val=0, max_val=20),
+        FieldSpec("item_id", str, max_len=16, pattern=re.compile(r"^it_[0-9a-f]{8}$")),
+        FieldSpec("state", str, allowed=_WORK_ITEM_STATES),
+        # Long enough for an offset-carrying ISO-8601 stamp with microseconds;
+        # whether it PARSES is the route's check, with the store's own reader.
+        FieldSpec("since", str, max_len=40),
+        FieldSpec("compact", bool),
+    ],
+)
 WORK_LEDGER_REBUILD_SCHEMA = ToolSchema(tool_name="work_ledger_rebuild")
 
 WORK_LEDGER_RECORD_SCHEMA = ToolSchema(

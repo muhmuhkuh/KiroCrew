@@ -50,6 +50,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_POD_HOME_REMAP,
     ACP_BACKENDS_RESUME_WITHOUT_LOAD,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SERIAL_SESSION_STARTS,
     ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
     ACP_BACKENDS_SESSION_SHARING,
@@ -251,6 +252,17 @@ ACP_CLIENT_CAPABILITIES: dict = {
     "fs": {"readTextFile": False, "writeTextFile": False},
     "terminal": False,
 }
+
+# The variable kiro-cli reads to name the application driving it, and the name
+# Crew gives. kiro-cli puts it on the user-agent of EVERY request it sends to its
+# own model backend (``clientApp/<value>``), which is the only place a
+# backend-side record can tell a Crew-driven request apart. ``clientInfo.name``
+# in ``initialize`` does not reach there: kiro-cli keeps that in its telemetry and
+# on the ``AWS_EXECUTION_ENV`` of the tools it spawns, never on its own requests.
+# ``acp.client.CLIENT_NAME`` (``clientInfo.name``) is this same constant, so one
+# filter string (``clientApp/kirocrew``, ``acp-client/kirocrew``) finds Crew on both.
+KIRO_CLI_CLIENT_APPLICATION_ENV = "KIRO_CLI_CLIENT_APPLICATION"
+KIRO_CLI_CLIENT_APPLICATION = "kirocrew"
 
 # ── ACP Backend Identifiers ──
 # DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block

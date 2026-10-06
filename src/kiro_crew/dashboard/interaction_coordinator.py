@@ -15,6 +15,8 @@ _Redactor = Callable[[str], tuple[str, object]]
 #: rides in the ``approval_resolved`` payload: without it an expired card
 #: renders as a rejection.
 _EXPIRED_DECISION = "expired"
+#: The audit outcome of a wait whose id a later same-id request took over.
+_SUPERSEDED_DECISION = "superseded"
 
 
 def _redact(text: object, redact_url: _Redactor, redact_secret: _Redactor) -> str:
@@ -29,6 +31,21 @@ def _push_slots(state: Any) -> None:
         state.push_slots_update()
     except Exception:
         state._log.debug("push_slots_update failed after approval status change", exc_info=True)
+
+
+def _bounded_purpose(text: str) -> str:
+    """Cap a redacted approval purpose to the display bound native purposes use."""
+    # Circular import: chat_utils imports state, which imports this module.
+    from kiro_crew.dashboard.chat_utils import _MAX_TOOL_PURPOSE, _redact_tool_field
+
+    return _redact_tool_field(text, limit=_MAX_TOOL_PURPOSE)
+
+
+def _slot_decision(approved: bool, rejected_once: bool) -> str:
+    """The decision string a slot's approval future carries."""
+    if approved:
+        return "approved"
+    return "rejected_once" if rejected_once else "rejected"
 
 
 class ApprovalCoordinator:
@@ -60,7 +77,9 @@ class ApprovalCoordinator:
             "source": source,
             "tool": _redact(tool, redact_url, redact_secret),
             "tool_input": _redact(tool_input, redact_url, redact_secret),
-            "tool_purpose": _redact(tool_purpose, redact_url, redact_secret),
+            # Retained and broadcast, so bounded here like the native path's
+            # purpose: a caller's multi-megabyte purpose never reaches the record.
+            "tool_purpose": _bounded_purpose(_redact(tool_purpose, redact_url, redact_secret)),
             "slot": slot,
             "ts": time.time(),
         }
@@ -99,6 +118,12 @@ class ApprovalCoordinator:
                 # Every exit -- decided, expired, cancelled -- leaves the record
                 # gone, so one push here takes the slot back out of the lane.
                 _push_slots(state)
+            elif future.cancelled() or not future.done():
+                # Superseded by a same-id request: its frame, record and slot
+                # lane now belong to the replacement and are left alone, but
+                # this wait still ended undecided and the audit trail says so,
+                # under its own outcome so the replacement's rows stay distinct.
+                state._audit_approval(slot or "state", approval_id, False, _SUPERSEDED_DECISION)
 
     @staticmethod
     def _retire_unresolved(state: Any, approval_id: str, slot_key: str) -> None:
@@ -121,7 +146,7 @@ class ApprovalCoordinator:
             )
 
     @staticmethod
-    def audit_and_broadcast(
+    def audit(
         state: Any,
         session_key: str,
         approval_id: str,
@@ -130,6 +155,7 @@ class ApprovalCoordinator:
         *,
         audit_provider: Callable[[], Any],
     ) -> None:
+        """Record one approval outcome in the SEL, without telling any client."""
         try:
             audit_provider().log_tool_invocation(
                 session_key=session_key,
@@ -140,6 +166,20 @@ class ApprovalCoordinator:
             )
         except Exception:
             state._log.warning("SEL audit failed for approval resolution", exc_info=True)
+
+    @staticmethod
+    def audit_and_broadcast(
+        state: Any,
+        session_key: str,
+        approval_id: str,
+        approved: bool,
+        decision: str,
+        *,
+        audit_provider: Callable[[], Any],
+    ) -> None:
+        ApprovalCoordinator.audit(
+            state, session_key, approval_id, approved, decision, audit_provider=audit_provider
+        )
         try:
             payload: dict = {"id": approval_id, "approved": approved}
             if session_key and session_key != "state":
@@ -170,32 +210,57 @@ class ApprovalCoordinator:
         rejected_once: bool,
         permission_marker: Callable[[list[dict], str, str], bool],
     ) -> bool:
-        if approved:
-            decision = "approved"
-        elif rejected_once:
-            decision = "rejected_once"
-        else:
-            decision = "rejected"
         if state.resolve_state_approval(approval_id, approved):
             if rejected_once:
                 state._log.warning(
                     "approval %s resolved at state level; decision %r downgraded to rejected",
                     approval_id,
-                    decision,
+                    _slot_decision(approved, rejected_once),
                 )
             return True
         for slot in state._slots.values():
-            future = slot._approval_futures.get(approval_id)
-            if future and not future.done():
-                future.set_result(decision)
-                if permission_marker(slot.messages, approval_id, decision):
-                    # The periodic flush skips clean slots; the resolved marker
-                    # must become durable before its future disappears.
-                    slot._dirty = True
-                state._audit_and_broadcast_approval(slot.key, approval_id, approved, decision)
-                state.push_slots_update()
+            if ApprovalCoordinator.resolve_on_slot(
+                state,
+                slot,
+                approval_id,
+                approved,
+                rejected_once=rejected_once,
+                permission_marker=permission_marker,
+            ):
                 return True
         return False
+
+    @staticmethod
+    def resolve_on_slot(
+        state: Any,
+        slot: Any,
+        approval_id: str,
+        approved: bool,
+        *,
+        rejected_once: bool,
+        permission_marker: Callable[[list[dict], str, str], bool],
+        expected_future: asyncio.Future[str] | None = None,
+    ) -> bool:
+        """Resolve *approval_id* on *slot*'s own future only; never a state-level one.
+
+        With *expected_future*, resolve only while the slot still holds THAT
+        future under the id: request ids recur within one slot, so a caller that
+        judged one request across an await must not settle a newer same-id one.
+        """
+        future = slot._approval_futures.get(approval_id)
+        if not future or future.done():
+            return False
+        if expected_future is not None and future is not expected_future:
+            return False
+        decision = _slot_decision(approved, rejected_once)
+        future.set_result(decision)
+        if permission_marker(slot.messages, approval_id, decision):
+            # The periodic flush skips clean slots; the resolved marker
+            # must become durable before its future disappears.
+            slot._dirty = True
+        state._audit_and_broadcast_approval(slot.key, approval_id, approved, decision)
+        state.push_slots_update()
+        return True
 
 
 class QuestionCoordinator:

@@ -64,6 +64,7 @@ from kiro_crew.artifacts import (
     slug_is_well_formed,
     webapp_metadata_from_dict,
 )
+from kiro_crew.constants import md_link_destination
 from kiro_crew.dashboard.chat_folders import generate_emoji_for_name
 from kiro_crew.dashboard.handlers._shared import _is_restricted_session
 from kiro_crew.dashboard.state import _normalize_slot_key
@@ -81,6 +82,7 @@ from kiro_crew.publish_provider import (
     PublishError,
     PublishUnavailableError,
     get_provider,
+    is_registered,
     list_providers,
 )
 from kiro_crew.security import (
@@ -576,7 +578,9 @@ _SNIPPET_MAX_LEN = 160
 _SEARCH_QUERY_MAX_CHARS = 256
 _STRIP_TAGS_RE = re.compile(r"<[^>]+>")
 # Lightweight markdown → prose cleanup for previews (not a full parser).
-_MD_LINK_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")  # [text](url) / ![alt](url) -> text
+# [text](url) / ![alt](url) -> text; a balanced ``(...)`` pair stays inside the url,
+# and a label stops at the next ``[`` so a run of ``[`` cannot rescan the text.
+_MD_LINK_RE = re.compile(rf"!?\[([^\[\]]*)\]\({md_link_destination('[^()]')}*\)")
 _MD_HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*")  # # headings
 _MD_BLOCKQUOTE_RE = re.compile(r"(?m)^\s*>\s?")  # > quotes
 _MD_LIST_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+\.)\s+")  # -, *, 1. list markers
@@ -4865,10 +4869,11 @@ async def api_remote_artifacts_browse(request: web.Request) -> web.Response:
     A non-empty ``q`` runs full-text ``search_remote`` (providers whose
     ``discovery_model().full_text_search`` is True); otherwise
     ``list_remote(scope)``. ``None`` from the provider means that discovery
-    primitive isn't supported (400). Gated like other reads-with-state. In the
-    public edition the registry is empty, so ``get_provider`` raises
-    ``PublishUnavailableError`` and every browse returns 404 — the surface is
-    inert until a companion registers a provider.
+    primitive isn't supported (400). Gated like other reads-with-state. A
+    provider name with nothing registered under it answers 404; in the public
+    edition the registry is empty, so every browse returns 404 — the surface is
+    inert until a companion registers a provider. A registered provider that
+    raises ``PublishUnavailableError`` answers 503.
     """
     state = request.app.get("state")
     if state is None or _is_restricted_session(state, request):
@@ -4883,12 +4888,12 @@ async def api_remote_artifacts_browse(request: web.Request) -> web.Response:
     scope = request.rel_url.query.get("scope", "mine")
     query = request.rel_url.query.get("q") or ""
     page_token = request.rel_url.query.get("pageToken")
+    if not is_registered(provider_name):
+        return _err(_redact_text(f"unknown publish provider: {provider_name!r}"), status=404)
     try:
         provider = get_provider(provider_name)
     except PublishUnavailableError as exc:
-        # No provider registered under this name — inert public edition or a
-        # companion misconfiguration. 503 (not 404), matching the clone/fork
-        # handlers: the surface exists, the provider tooling doesn't.
+        # A registered provider whose tooling is unavailable.
         return _err(_redact_text(str(exc)), status=503)
     except Exception as exc:
         return _err(_redact_text(str(exc)), status=502)
@@ -5104,9 +5109,10 @@ async def api_remote_artifact_get(request: web.Request) -> web.Response:
     copy of — the content source for the remote-detail view. Routes through the
     registered provider's ``fetch_content`` (``Capability.CONTENT_PULL``); the
     returned ``{content, content_type, title, owner, visibility, ...}`` is
-    redacted before it leaves the process. When no provider is registered (the
-    public default) ``get_provider`` raises and this returns a clear error, not a
-    500. Read-only, so no publish-governance gate.
+    redacted before it leaves the process. A provider name with nothing
+    registered under it (every name in the public default) answers 404; a
+    registered provider that fails answers 502. Read-only, so no
+    publish-governance gate.
     """
     provider_name = request.match_info["provider"]
     external_id = request.match_info["external_id"]
@@ -5120,6 +5126,16 @@ async def api_remote_artifact_get(request: web.Request) -> web.Response:
         )
         return _err("restricted session", status=403)
 
+    if not is_registered(provider_name):
+        error = _redact_text(f"unknown publish provider: {provider_name!r}")
+        _audit(
+            tool="remote_artifact_fetch",
+            request=request,
+            outcome="error",
+            error=error,
+            extra={"provider": provider_name, "external_id": external_id},
+        )
+        return _err(error, status=404)
     try:
         provider = get_provider(provider_name)
         if Capability.CONTENT_PULL not in provider.capabilities():

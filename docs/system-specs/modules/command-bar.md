@@ -134,7 +134,14 @@ eviction.
 1. **Claim the slot** — declare `ui.overlays` in the manifest and take over the `quick-search`
    host slot while enabled, without the shell ever naming an app
 2. **Root index** — build the attention / command / app / settings rows from local data only,
-   rank them, and cap each group
+   rank them, and cap each group. Settings rows match through `scoreSettingEntry`, the scorer
+   the palette and the Settings search share (label, synonyms, then a description or tab that
+   contains the query), through the row's own `match`. Its tier picks the field the hit is
+   drawn on (title marks, the matched synonym, or the subtitle span), and a hit off the label
+   pays the same alias/subtitle discount as every other row. A settings row is withheld once a
+   cached `useSettingsSearchGovernance` answer (`{ fetch: false }`) says its tab does not draw
+   it; an unread answer offers it, as on the other searches, and opening the bar still issues
+   no request
 3. **Ranking** — fuzzy match against the live query plus a frecency boost, so habit surfaces
    without out-ranking a clearly better string match
 4. **Scopes** — enter a sub-surface (today: session search, artifact name search, folder search,
@@ -219,8 +226,18 @@ that.
   empty. `view` is named separately from its group because it opens a surface instead of acting
   and closing.
 - `PER_GROUP_LIMIT = 6` caps each group so one group cannot push the others off the page;
-  settings use the tighter `SETTINGS_IDLE_LIMIT = 2` while the query is empty, and `recent` is
-  capped ahead of ranking by the overlay at `RECENT_SESSION_ROWS = 3` rather than by this limit.
+  settings carry a second, tighter `SETTINGS_WEAK_LIMIT = 2` on WEAK matches whether or not a
+  query is present, and `recent` is capped ahead of ranking by the overlay at
+  `RECENT_SESSION_ROWS = 3` rather than by this limit. A weak settings match is one that does not
+  name the setting — an empty query (every row is weak), or a typed query that is not a substring
+  of the title and only survived as a scattered subsequence. The cap on weak matches holds under
+  a query for the same reason it holds on the idle page: a word that merely scatters across six
+  long setting titles would otherwise spend six rows and push the overlay's recovery rows (Ask
+  the agent, Search sessions / artifacts / folders / crewmates) below the fold — and those rows
+  are the whole answer to "the root does not search content" for a reader who typed a name. A
+  DIRECT settings hit (the query is a substring of the title) is the user naming the setting, so
+  it ranks up to `PER_GROUP_LIMIT` like any row and searching settings on their own name surfaces
+  every one of them. The full settings corpus stays one `view` row away regardless.
   **Known gap:** rows past a root cap are dropped silently. The artifacts view does not share
   that gap — it renders a `+N more` line under its list, outside the listbox so it cannot become
   an option that Enter does nothing with — and that line is the shape to copy when this one is
@@ -243,29 +260,56 @@ that.
 with a 14-day half-life, read through a guarded accessor (a disabled or full store degrades to
 no boost rather than throwing). `FRECENCY_WEIGHT` is sized so habit beats a marginally better
 string match but not a clearly better one: an exact prefix hit on a never-used row still wins
-over a scattered subsequence on a daily one.
+over a scattered subsequence on a daily one. A settings row's id follows its label, so
+`loadUsage` reads a relabelled row's history under the id it has now, through the legacy-id
+table its deep links use (`resolveLegacyHighlightId`): two stored ids that land on one row
+merge (counts add, the later use wins), and the next save writes the merged map.
 
 The root ranks from the LIVE query, not a debounced copy, so a fast typist never sees rows
 that answer an older prefix.
 
-### Stale rows must not act
+### A stale Enter is latched, not acted on and not dropped
 
 Every SCOPED view ranks from the debounced query, because each one reaches the network, so for
 one debounce interval its rows answer the previous query. A keyboard Enter in that window names
 an INDEX, and that index means a different row once the rows move under it — which is how typing
-`onc` and pressing Enter opened `accountant`. So the activation path all four views share does
-nothing until the rows answer what has been typed: a dropped keystroke rather than the wrong
-session, artifact, folder or crewmate.
+`onc` and pressing Enter opened `accountant`. So the activation path all four views share never
+acts on the rows in that window. It does not drop the keystroke either: type-a-name-then-confirm
+is the launcher's primary gesture, and eating it left a fast typist pressing Enter at a bar that
+said nothing. The Enter is LATCHED — held, then fired once, on the rows that answer the query it
+was pressed against — so the gesture lands on the right session, artifact, folder or crewmate
+instead of the wrong one or none.
 
-Three details carry the rule. The comparison is between what the view WOULD ask for the live
-query and what it DID ask, not between the two query strings: sessions and artifacts only search
-above a floor, so below it every query asks for the same listing, and comparing strings would
-freeze Enter on rows that were the correct answer. It binds the KEYBOARD only — a pointer names
-its own target, so the row a reader pressed opens what it says. And it sits above the row-tag
-switch, not inside the results case: a view's SYNTHESIZED rows are built from the same debounced
-query its results are, and two of them do something worse than opening the wrong thing — the
-no-match row wipes the query, and the empty-crewmates row navigates and closes the bar. Both
-live at a zero-result dead end, which is exactly where a reader types another character.
+The latch remembers the query the reader confirmed and the row they had selected, and it fires
+only while both still hold. A further keystroke confirms a DIFFERENT query, which this Enter never
+stood for, so it drops rather than committing whatever the reader typed next; an arrow or a hover
+that moves the selection aims at another row, so the latch drops rather than opening the row that
+happened to be first. Row 0 is the primary gesture — open the best match for the typed query — so
+it fires the live top row even though its content swaps to answer the new query; an arrowed
+non-top row instead carries the identity it was picked at, and if the new query is already cached
+its rows swap under the old indices with no empty frame, so a changed row at that index drops the
+latch rather than opening a row the reader never highlighted. The latch fires only at a settled RESULT row. If the live query settles on a
+view's synthesized dead end — a no-match row, an empty-roster row, or the retry row a read that
+failed WITH NO CACHED ROWS leaves at the top — the latch
+DROPS instead: those rows wipe the query or navigate away, which is not what a reader who typed a
+name and pressed Enter asked for, and firing one would act on the live query's dead end. A refetch
+that fails while the confirmed query's rows are still cached is NOT a dead end — slot 0 stays a
+result that answers the confirmed query, and the latch fires it exactly as a fresh Enter would. The list
+must be visible-stable first: while it is still fetching, the latch keeps waiting rather than
+firing on a settling frame. Every other way out of the window drops the latch too — Escape,
+leaving the scope, closing the bar, and a pointer activation all cancel the pending Enter rather
+than firing it late.
+
+Three details carry the window test the latch rides on. The comparison is between what the view
+WOULD ask for the live query and what it DID ask, not between the two query strings: sessions and
+artifacts only search above a floor, so below it every query asks for the same listing, and
+comparing strings would freeze Enter on rows that were the correct answer. It binds the KEYBOARD
+only — a pointer names its own target, so the row a reader pressed opens what it says, with no
+latch, and a pointer activation also drops any latch a prior keyboard Enter left armed. And it
+sits above the row-tag switch, not inside the results case: a view's SYNTHESIZED rows are built
+from the same debounced query its results are, so a check that covered results alone would let a
+latched Enter act on a stale no-match or empty-crewmates row at the dead end where a reader types
+another character.
 
 The query matching is not on its own enough for the crewmates view, which holds its previous rows
 across a key change (see the running-set key above). That hold is scoped to the running set: rows
@@ -285,6 +329,31 @@ debounced query already matches the new ones.
   it would never turn off, so the cue lives on the active OPTION. The one state with no option
   to highlight is an empty scope (`rowCount === 0`), and there the field carries the ring
   instead — a keyboard user is never left with no cue.
+- Opening a session — an attention or recent row on the root, or a row of the sessions view —
+  leaves the caret in that session's composer once the bar has closed, the outcome a sidebar
+  click has. The bar says so itself (`focusComposerForOpenedSession` /
+  `focusComposerForResumedSession` in `composerFocus.ts`) rather than leaning on the composer's
+  own autofocus: that effect fires only on a slot-key TRANSITION, so it never runs for the session
+  that is already active, and it declines while an editable element holds focus, which the bar's
+  input still does when a root row's `switchSlot` commits (the bar closes only once the row's
+  promise settles). The caret moves only once the switch has LANDED — the unwrapped
+  `switchSlot` has fulfilled and the opened slot is still the active one — never while the
+  gateway round trip is in flight: `switchSlot.pending` enters the slot synchronously, so a caret
+  placed before the answer would route the keystrokes typed meanwhile to a slot a 404 then
+  unwinds and evicts, and the page would file that text under the evicted key. A rejected switch
+  gets no focus from the bar: the selection unwinds to the origin, the pane notice explains the
+  gesture, and the composer's own autofocus treats that key transition as it treats any other.
+  A fulfilment the user has already moved past focuses nothing, as the `switchSlot.fulfilled`
+  reducer ignores it. Two switches to the same key can overlap (a second gesture, or the chat
+  page's mount-time `switchSlot(activeSlot)` when the bar was used from another page); when the
+  older read lands first, the caret waits for the newer claim to settle — placed once it clears
+  with the slot still active, dropped when its 404 unwinds the selection. In split view (a
+  session-grid pane is mounted) the bar places no caret at all: every pane's composer is bound to
+  that pane's own slot and the grid's focus model never follows the active slot, so the only
+  composer on offer belongs to a session the gesture did not open — the pre-existing behaviour,
+  until a lookup can resolve the pane bound to the opened key.
+  Touch devices are skipped and a collapsed composer stays collapsed, exactly as the sidebar's
+  autofocus leaves them; a resume the chat page cannot display focuses nothing.
 
 ## Invariants pinned by tests
 
@@ -305,8 +374,9 @@ debounced query already matches the new ones.
 | the running set is part of the crewmates query key | a resolved query keeps a finished mate's busy dot for the rest of the stale window |
 | that query holds its previous rows across the key change | a slot finishing elsewhere blanks the list and resets the reader's keyboard selection to row 0 |
 | it holds them across the RUNNING SET only, never across the query | rows answering the previous words stay actionable for as long as the new read takes |
-| Enter does nothing in any scoped view until the rows answer the live query | the row selected against an older debounced query opens under the reader's hands |
-| that guard covers a view's SYNTHESIZED rows, not only its results | a stale no-match row discards the query just typed, and a stale empty-roster row navigates away |
+| a scoped-view Enter is latched and fired on the rows that answer the query it was pressed against | a dropped keystroke makes a fast typist confirm into silence, and acting now opens the row selected against an older query |
+| the latch drops on a further keystroke, a selection move, or a pointer activation | a latch outliving its confirmation commits a query the reader never confirmed, opens the row they moved off of, or re-fires after a click |
+| the latch fires only at a settled result row, and drops at a synthesized dead end | a latch firing a no-match row discards the query just typed, and one firing an empty-roster row navigates away |
 | that guard binds the keyboard, not the pointer | a row the reader can read and press stops responding |
 | the guard compares what the view WOULD ask against what it DID ask | a sub-floor query freezes Enter on a listing that is the correct answer to it |
 | a crewmate row says BUSY in the same word as a session row | two vocabularies for one state, one keystroke apart, that a reader cannot tell apart |
@@ -320,6 +390,9 @@ debounced query already matches the new ones.
 | that cap still bounds one app's contributions | an app with twenty commands turns the first page into its index |
 | the product's own command list is uncapped | a builtin silently dropped from a page this repository reviews |
 | `aria-modal` and the focus trap travel together | a dialog that traps nothing while claiming modality |
+| a session opened from the bar ends with the caret in its composer, same-key or not | a keyboard-first switch that ends in a mouse click on the composer (#15732) |
+| the caret moves only once the opened session's `switchSlot` has fulfilled; a refused switch gets none from the bar | keystrokes typed during the gateway round trip filed under a slot the 404 unwind then evicts |
+| an older same-key read landing first defers the caret to the newer claim | a stale fulfilment focusing while the live read is still out, then its 404 stranding the typed text |
 | the `apps` query is a pure cache consumer (`enabled: false`) | a second identical fetch per open |
 | every `['apps']` reader goes through the one api call | a divergent shape silently poisons the shared cache |
 | no builtin declares both `ui.overlays` and `ui.entry` | origin downgrade on restart refuses its own slot |

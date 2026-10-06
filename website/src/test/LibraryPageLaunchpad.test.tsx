@@ -191,7 +191,8 @@ describe('LibraryPage — pin badge and persistence', () => {
 
       // Persistence: the sidebar nav id (`app-<name>` for an AppHost-routed
       // app) lands in the HIDDEN set, and same-tab listeners are notified —
-      // the only path by which the App.tsx sidebar filter learns of it.
+      // the only path by which the sidebar filter (shell/nav/appRail.tsx)
+      // learns of it.
       expect(JSON.parse(localStorage.getItem(APP_NAV_HIDDEN_KEY)!)).toEqual(['app-secretary'])
       expect(synced).toHaveBeenCalled()
 
@@ -355,6 +356,20 @@ describe('LibraryPage — action dispatch', () => {
     renderLibrary()
     const scope = await openTileMenu('secretary', 'Secretary')
     fireEvent.click(scope.getByRole('menuitem', { name: 'Details' }))
+    expect(await screen.findByTestId('route-probe')).toHaveAttribute('data-path', '/apps/detail/secretary')
+  })
+
+  it('the action row is visible at rest, so Details never needs hover or focus', async () => {
+    renderLibrary()
+    const el = await tile('secretary')
+    const toolbar = within(el).getByRole('toolbar', { name: 'Actions for Secretary' })
+    for (const cls of ['opacity-0', 'pointer-events-none']) {
+      expect(toolbar.className.split(/\s+/)).not.toContain(cls)
+    }
+    // No hover, no focus: Open and the Details route are both one click away.
+    expect(within(toolbar).getByRole('button', { name: 'Open' })).toBeInTheDocument()
+    fireEvent.click(within(toolbar).getByRole('button', { name: 'More actions for Secretary' }))
+    fireEvent.click(within(el).getByRole('menuitem', { name: 'Details' }))
     expect(await screen.findByTestId('route-probe')).toHaveAttribute('data-path', '/apps/detail/secretary')
   })
 

@@ -1,10 +1,10 @@
 """Keyword-only lesson ranking: rare words decide, long rows do not win on length.
 
-Startup renders lessons with no query vector, so the keyword score is the whole
+A startup render with no query vector makes the keyword score the whole
 ranking there. A capped overlap count would tie every rule sharing ten tokens with
 a long first message, and the stable sort would then return newest-first. These
 cases pin the scorer used instead: rarity-weighted overlap divided by the square
-root of the row's token count.
+root of the row's number of distinct words.
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[VectorMem
     # Distinct write instants, so newest-first is a defined order to beat.
     ticks = iter(f"2026-01-01T00:00:00.{tick:06d}+00:00" for tick in range(1, 1000))
     monkeypatch.setattr(vector_memory, "_now_iso", lambda: next(ticks))
-    # Startup has no query vector; pin that no embedder is consulted either way.
+    # These renders carry no query vector; pin that no embedder is consulted either way.
     memory.embed_fn = None
     yield memory
     memory.close()
@@ -131,6 +131,22 @@ class TestLengthDoesNotBuyRank:
         assert order.index(short) < order.index(long)
         # Both carry the rare term, so both still lead every row without it.
         assert set(order[:2]) == {short, long}
+
+    def test_inflected_newer_row_keeps_recency_when_distinct_word_counts_match(
+        self, store: VectorMemoryStore
+    ) -> None:
+        older = "Run the test before push near amber glacier quartz"
+        newer = "Run the tests before pushing beside cobalt orchard nebula tests"
+        assert len(set(re.findall(r"\w+", older.lower()))) == len(
+            set(re.findall(r"\w+", newer.lower()))
+        )
+        store.write_lesson(older)
+        store.write_lesson(newer)
+        assert len(store.get_lessons()) == 2, "dedup merged fixture rows"
+
+        order = shown(render_startup(store, "run tests", budget=7_000))
+
+        assert order == [newer, older]
 
 
 class TestStartupCost:

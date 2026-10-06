@@ -6,6 +6,7 @@
   "author": "kirocrew",
   "license": "MIT",
   "defaultEnabled": false,
+  "iconUrl": "/app-assets/goal-owner/icon.svg",
   "platform": {
     "os": [
       "macos",

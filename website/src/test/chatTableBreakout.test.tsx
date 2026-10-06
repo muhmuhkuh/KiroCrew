@@ -12,7 +12,7 @@ import TranscriptScrollShell, { PANE_WIDTH_PROPERTY } from '../pages/chat/Transc
 const TABLE = '| Signal | Value |\n| --- | --- |\n| `sample.daily.messages` | 42 |'
 // The CSS matches the renderer's stable root wrapper, not all descendant
 // tables: nested list/quote tables and formatted code cards must stay local.
-const TABLE_SELECTOR = '[data-role="assistant"] > .message-bubble > [data-image-scope] > div > .markdown-table'
+const TABLE_SELECTOR = '[data-role="assistant"] > .message-bubble:not([data-bordered]) > [data-image-scope] > div > .markdown-table'
 const here = dirname(fileURLToPath(import.meta.url))
 const css = readFileSync(resolve(here, '../index.css'), 'utf8')
 
@@ -22,12 +22,15 @@ describe('transcript table breakout contract', () => {
     const table = container.querySelector(TABLE_SELECTOR)
     expect(table).not.toBeNull()
     expect(table?.closest('.chat-message-body')).not.toBeNull()
-    expect(css).toContain(`${TABLE_SELECTOR} {`)
+    expect(css).toContain(`${TABLE_SELECTOR}[data-expanded] {`)
     expect(css).toContain(`.chat-message-body:has(${TABLE_SELECTOR}),`)
   })
 
   it('contains offscreen copy announcements in the table scroll wrapper', () => {
     const { container } = render(<ChatMessageList messages={[{ role: 'assistant', content: TABLE }]} running={false} />)
+    // The scroller is the table root's direct child and owns `overflow-x-auto`;
+    // the overflow fade is a `mask-image` on the scroller itself, so no wrapper
+    // node sits between the root and the scroller.
     const scroll = container.querySelector(`${TABLE_SELECTOR} > .overflow-x-auto`)
     // Absolute sr-only status spans must have a containing block inside the
     // local scroller, or unclipping the bubble lets them widen the transcript.
@@ -53,7 +56,7 @@ describe('transcript table breakout contract', () => {
     // every pixel the rail does not need). In px, like the constant: a rem
     // clearance shrinks under a browser's smaller root font while the rail's
     // band does not.
-    const clearance = css.match(/\.markdown-table \{[^}]*width: max\(100%, calc\(var\(--chat-pane-width, 100%\) - (\d+)px\)\)/)
+    const clearance = css.match(/\.markdown-table\[data-expanded\] \{[^}]*width: max\(100%, calc\(var\(--chat-pane-width, 100%\) - (\d+)px\)\)/)
     expect(clearance).not.toBeNull()
     expect(Number(clearance![1]) / 2).toBe(40)
   })
@@ -75,6 +78,42 @@ describe('transcript table breakout contract', () => {
     expect(main).toContain('chat-message-body flex flex-col gap-0.5 min-w-0 overflow-hidden max-w-full')
   })
 
+  it('keeps a table at the reading column\'s width until its Expand toggle is pressed, and back', () => {
+    // The breakout width rule is gated on `data-expanded`: no ungated rule
+    // may widen a top-level table by default.
+    expect(css).not.toContain(`${TABLE_SELECTOR} {`)
+    const { container } = render(<ChatMessageList messages={[{ role: 'assistant', content: TABLE }]} running={false} />)
+    const table = container.querySelector(TABLE_SELECTOR)!
+    const toggle = table.querySelector<HTMLButtonElement>('[data-testid="table-expand"]')!
+    expect(table).not.toHaveAttribute('data-expanded')
+    expect(container.querySelector(`${TABLE_SELECTOR}[data-expanded]`)).toBeNull()
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toggle).toHaveAccessibleName('Widen table')
+    expect(toggle).toHaveAttribute('title', 'Widen table')
+    expect(toggle).toHaveTextContent('Widen')
+
+    act(() => toggle.click())
+    expect(container.querySelector(`${TABLE_SELECTOR}[data-expanded]`)).toBe(table)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    // The accessible name and title flip with the visible word, so a
+    // voice-control user can say what they see.
+    expect(toggle).toHaveAccessibleName('Narrow table')
+    expect(toggle).toHaveAttribute('title', 'Narrow table')
+    expect(toggle).toHaveTextContent('Narrow')
+
+    act(() => toggle.click())
+    expect(table).not.toHaveAttribute('data-expanded')
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toggle).toHaveAccessibleName('Widen table')
+  })
+
+  it('shows the Expand toggle only on a top-level table in an unbordered bubble', () => {
+    // Hidden everywhere by default; revealed by the same top-level selector
+    // the width rule uses, and only on a viewport where expanding can widen.
+    expect(css).toMatch(/\.markdown-table-expand \{\s*display: none;\s*\}/)
+    expect(css).toContain(`@media (min-width: 880px) {\n  .chat-container ${TABLE_SELECTOR} .markdown-table-expand {\n    display: flex;`)
+  })
+
   it('does not widen nested quotation/list tables or user messages', () => {
     const quoted = TABLE.split('\n').map(line => `> ${line}`).join('\n')
     const listed = `- Nested table\n\n${TABLE.split('\n').map(line => `  ${line}`).join('\n')}`
@@ -83,6 +122,15 @@ describe('transcript table breakout contract', () => {
       { role: 'user', content: TABLE },
     ]} running={false} />)
     expect(container.querySelectorAll('table')).toHaveLength(3)
+    expect(container.querySelector(TABLE_SELECTOR)).toBeNull()
+  })
+
+  it('keeps a bordered (crewmate) bubble\'s table inside its card', () => {
+    // A crewmate's chat draws the reply as a bordered card via bubbleClassName;
+    // a table breaking out of it paints past the card's edges.
+    const { container } = render(<div className="chat-message-body"><AssistantMessage content={TABLE} isStreaming={false} bubbleClassName="bg-card border" /></div>)
+    expect(container.querySelector('.message-bubble')).toHaveAttribute('data-bordered')
+    expect(container.querySelector('.markdown-table')).not.toBeNull()
     expect(container.querySelector(TABLE_SELECTOR)).toBeNull()
   })
 
@@ -101,7 +149,7 @@ describe('transcript table breakout contract', () => {
     // reaches the tables as an inherited property, not via a query container.
     expect(css).not.toMatch(/\.chat-container\s*\{[^}]*container(?:-type|-name)?\s*:/)
     expect(css).not.toContain('@container chat-transcript')
-    expect(css).toContain(`.chat-container ${TABLE_SELECTOR} {`)
+    expect(css).toContain(`.chat-container ${TABLE_SELECTOR}[data-expanded] {`)
     expect(css).toContain(`width: max(100%, calc(var(${PANE_WIDTH_PROPERTY}, 100%) - 80px))`)
     expect(css).toContain(`margin-inline: min(0px, calc((100% - (var(${PANE_WIDTH_PROPERTY}, 100%) - 80px)) / 2))`)
   })

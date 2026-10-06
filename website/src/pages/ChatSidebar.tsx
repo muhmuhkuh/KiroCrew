@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, memo, useMemo, useCallback, useId, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 import { LayoutGroup, AnimatePresence, motion } from 'framer-motion'
-import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Zap, Check, Copy, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server } from 'lucide-react'
+import { Plus, X, Pin, Monitor, ArrowUpDown, Eye, EyeOff, VenetianMask, Ghost, FolderPlus, FolderX, MessageSquare, MessageSquarePlus, Folder, ChevronRight, ChevronDown, ChevronUp, Clock, Pencil, BrushCleaning, Link2, Circle, MoreVertical, Tag as TagIcon, Columns3, CornerDownRight, GripVertical, Check, GitFork, List, ListTree, Loader, Loader2, Settings, RotateCcw, Bot, ExternalLink, Cpu, GitMerge, Workflow, CircleDot, Users, TriangleAlert, Goal, MessageCircleQuestionMark, ShieldCheck, Server, Pause, Play, Hourglass } from 'lucide-react'
 import GithubLogo from '../components/icons/GithubLogo'
 import GitlabLogo from '../components/icons/GitlabLogo'
 import { FolderBody } from '../components/FolderBody'
+import { FolderRail } from '../components/FolderRail'
 import ErrorNotice, { ErrorNoticeMenuItem } from '../components/ErrorNotice'
 import JiraLogo from '../components/icons/JiraLogo'
 import { sourceProviderMeta } from '../utils/sourceProviderMeta'
@@ -13,6 +14,8 @@ import { DndContext, DragOverlay, MeasuringStrategy } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
+import { usePreviewFlag } from '../hooks/usePreviewFlag'
+import { PREVIEW_DASHBOARD } from '../utils/previewFlags'
 import { shallowEqual, useStore } from 'react-redux'
 import { useAppDispatch, useAppSelector } from '../store'
 import type { RootState } from '../store'
@@ -20,12 +23,11 @@ import { useConnected } from '../hooks/useConnected'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent } from '../components/ui/dropdown-menu'
 import { ContextMenu, ContextMenuTrigger, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent } from '../components/ui/context-menu'
 import { offlineProps } from '../utils/offline'
-import { switchSlot, createSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
+import { switchSlot, deleteSlot, fetchHistory, resumeFromHistory, deleteHistorySession, selectSidebarWorkflowActive, selectAutomationForSlot } from '../store/chatSlice'
 import { slotIsRemoteBound } from '../store/dashboardSlice'
 import { IS_MAC } from '../hooks/useKeyboardShortcuts'
 import { api, SEARCH_MIN_CHARS } from '../api/client'
 import { errMessage } from '../utils/thunkError'
-import { findReport } from '../utils/errorReport'
 import { computeRecentRank, recencyTintShadow, clampTintCount } from '../utils/recencyTint'
 import { folderOffersHide } from '../utils/folderVisibility'
 import { groupHistoryByFolder } from '../utils/groupHistoryByFolder'
@@ -50,6 +52,7 @@ import { useChatPopouts } from '../hooks/useChatPopouts'
 import { platformShortcut } from '../utils/platform'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { useIsMobile } from '../hooks/useIsMobile'
+import { useIsTouchDevice } from '../hooks/useIsTouchDevice'
 import ResizeHandle from '../components/ResizeHandle'
 import { SearchFilterBar, FilterMenuButton, FilterChip, FILTER_CHIP_ROW_CLS, FilterMenuLabel, FilterMenuContent } from '../components/SearchFilterBar'
 import { ListDock } from '../components/ListDock'
@@ -70,6 +73,7 @@ import { sanitizeLlmOutput } from '../utils/sanitize'
 import type { PaletteBoost } from '../utils/sessionColors'
 import type { ChatFolder, ChatTag, SessionLink } from '../types'
 import { SESSION_LANES, hasLiveSessionWork } from './chat/sessionLane'
+import { isMemoryWait, queuedWaitText } from './chat/subagentQueuedReason'
 import {
   type RecentUnit,
   RECENT_WINDOW_PRESETS,
@@ -93,11 +97,12 @@ import { compareText, fmtDateFields, fmtList } from '../i18n/format'
 import { sidebarCollision } from './chat-sidebar/dnd/collision'
 export { sidebarCollision, isFolderNestBand } from './chat-sidebar/dnd/collision'
 export { boardSidebarWidth } from './chat-sidebar/board'
-import { ChatPaneDropZone, RootDropHint, SortableFolderBlock, SortableSubfolderBlock, SortableColumnFolder, FolderDragGhost, SessionDragGhost } from './chat-sidebar/dnd/targets'
+import { ChatPaneDropZone, RootDropHint, BoardUnfileDropStrip, SortableFolderBlock, SortableSubfolderBlock, SortableColumnFolder, FolderDragGhost, SessionDragGhost } from './chat-sidebar/dnd/targets'
 import type { Slot, SourceLinkState, SidebarSourceLink, HistoryItem, AgentInfo, SessionFilterKey, RevealBlockingFilter, FilterDimension } from './chat-sidebar/types'
 import { HIDDEN_FOLDERS_LS_KEY, FOLDERS_SHELVED_LS_KEY, FLAT_VIEW_LS_KEY } from './chat-sidebar/persistence'
 import { SESSION_FILTERS, useSessionFilterState, useSessionStatusFilters } from './chat-sidebar/filters'
 import { useDebouncedSessionSearch, useSearchMatches } from './chat-sidebar/search'
+import { openCrewWindow, useCrewWindow } from './chat/crew-window/crewWindowStore'
 import { isPeerRow, sessionRowIdentity, historyRowIdentity, localSlotFolder, isLocallyPinned, compareLocalPinnedThenSort } from './chat-sidebar/rowIdentity'
 import { useSessionSources } from './chat-sidebar/sessionSources'
 import { useSessionRename, useFolderRename } from './chat-sidebar/rename'
@@ -106,13 +111,14 @@ import { useHistoryPane } from './chat-sidebar/history'
 import { usePinnedSessionOrder, usePinnedOrderAuthority, usePinnedKeyboardReorder } from './chat-sidebar/pinnedOrder'
 import { useStaleCollapse, useStaleMoveWatcher, useStaleNarrowBridge } from './chat-sidebar/stale'
 import { useFolderSort, useFolderVisibility, useFolderFilterReveal, useFolderFilterRows, useFolderMutations, useFolderTree, useRootFolderLanes } from './chat-sidebar/folders'
+import FolderCleanupPanel from './chat-sidebar/FolderCleanupPanel'
 import { useSidebarResize } from './chat-sidebar/resize'
 import { useSidebarTags } from './chat-sidebar/tags'
 import { useBoardColumns, useColumnPopover, useBoardColumnMutations, useColumnMatches, useBoardFolderCollapse } from './chat-sidebar/board'
 import { useHoverHold, useHoverPinLiveness } from './chat-sidebar/hoverHold'
-import { useLineageSeed, useConductorLane } from './chat-sidebar/conductor'
+import { useLineageAvailable, useConductorLane, citedCreatorOf } from './chat-sidebar/conductor'
 import { useShortcutOrder } from './chat-sidebar/shortcuts'
-import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers } from './chat-sidebar/dnd/useSidebarDrag'
+import { useFolderDropOps, useSidebarMoveUndo, useSidebarDragHandlers, useNativeSessionDrag } from './chat-sidebar/dnd/useSidebarDrag'
 import { useSidebarReveal } from './chat-sidebar/reveal'
 import { useFolderChatCreate, useSessionCreate } from './chat-sidebar/create'
 
@@ -766,7 +772,7 @@ const FOLDER_ROW_STICKY_Z = 20
  *  divider: 2px left of) its content column. Shared by the list-view and
  *  board-view folder bodies. */
 export const FOLDER_ROW_PAD_CLS = '[&_.session-row]:pl-[9px] [&_[data-row-divider]]:ml-[9px] [&_[data-stale-toggle]]:pl-[9px] [&_[data-folder-new-chat]]:pl-[9px] [&_[data-pinned-divider]]:ml-[7px] [&_[data-folder-hidden-reveal]]:pl-[9px]'
-export const FOLDER_BODY_CLS = `border-l border-border mb-1 ml-1 pl-[3px] rounded-bl-md ${FOLDER_ROW_PAD_CLS}`
+export const FOLDER_BODY_CLS = `relative border-l border-border mb-1 ml-1 pl-[3px] rounded-bl-md ${FOLDER_ROW_PAD_CLS}`
 
 /** The board-view folder body. Its header is not the list header: `paddingLeft`
  *  6, an 11px glyph and `gap-2` 8 put the folder name at 6 + 11 + 8 = 25 from the
@@ -775,7 +781,7 @@ export const FOLDER_BODY_CLS = `border-l border-border mb-1 ml-1 pl-[3px] rounde
  *  D 2 + `ml-2` 8 + border 1 + `pl-[5px]` 5 + R_in 9 = 25, rows on the name. The
  *  connector lands at D + 8 = 10, inside the glyph's 6..17 span. Each board
  *  nesting level costs 2 + 8 + 1 + 5 = 16px. */
-export const BOARD_FOLDER_BODY_CLS = `border-l border-border ml-2 pl-[5px] ${FOLDER_ROW_PAD_CLS}`
+export const BOARD_FOLDER_BODY_CLS = `relative border-l border-border ml-2 pl-[5px] ${FOLDER_ROW_PAD_CLS}`
 
 /** Test seam: reports every SessionRow body execution. The memo boundary
  *  below is a behavioral contract — one slot's background event re-renders one
@@ -837,11 +843,22 @@ interface SessionRowProps {
   dragInFlight: boolean
   activeDraggedKey: string | null
   activeDraggedPinnedIndex: number
+  /** A board card drags with native HTML5 DnD, outside every DndContext, so the
+   *  shell learns of that drag only from the row: called with the slot key at
+   *  `dragstart`. The end is read at the window (see `useNativeSessionDrag`). */
+  onNativeDragStart?: (key: string) => void
+  /** The one end the window cannot hear: the row unmounting while its own
+   *  native drag is still in flight (its lane changed under it), after which
+   *  the browser's `dragend` lands on a detached node. */
+  onNativeDragEnd?: () => void
   pinnedOrderIndex: number
   pinnedReorderEnabled: boolean
   onPinnedKeyboardReorder: (key: string, container: string, delta: -1 | 1, row: HTMLElement) => void
   defaultAgent: string
   mode?: string
+  /** Show the single ⋯ menu instead of the hover-revealed action cluster: a
+   *  phone-width viewport, or any touch screen, where the cluster would sit
+   *  permanently over the row's timestamp and pin. */
   isMobile: boolean
   colorMode: string
   installedAgents: AgentInfo[]
@@ -867,55 +884,12 @@ interface SessionRowProps {
    *  creator it admits only as an ANCHOR, so the workers that creator opened
    *  have something to hang from. */
   onOpenElsewhere?: () => void
-  /** ADOPT a row whose session lives on a remote instance: create a local slot
-   *  bound to that peer session and switch to it. Distinct from `onSelectSlot`
-   *  because there is no local slot to switch to YET — this is what makes one. */
-  onAdoptPeerSession?: (instanceId: string, remoteSlot: string, rowIdentity: string) => void
-  /** An adopt for THIS row is in flight. The peer's transcript is backfilled
-   *  server-side before the response, so the round-trip is long enough that a row
-   *  with no feedback reads as a dead click. */
-  adoptPending?: boolean
-  /** Why the last adopt of THIS row failed, already resolved to display text.
-   *  Empty renders nothing. */
-  adoptError?: string
+  /** Open a row whose session lives on a remote instance as a window onto the
+   *  peer's own slot. Distinct from `onSelectSlot` because the session has no
+   *  local slot: the peer owns it. */
+  onOpenPeerSession?: (instanceId: string, remoteSlot: string) => void
   onOpenSlotInNewTab?: (key: string, opts?: { background?: boolean }) => void
   onOpenSource?: (slotKey: string, link: { url: string; kind: 'change' | 'issue' }) => boolean
-}
-
-/** Display text for a FAILED peer-session adopt, preferring the backend's own
- * machine-readable `code` over its prose.
- *
- * Why the code has to be recovered from the error journal rather than read off
- * the error: the adopt goes through `dispatch(createSlot(...)).unwrap()`, and RTK
- * serializes a thrown error down to its string fields — so `ApiError.status` and
- * `ApiError.body` are GONE by the time this runs, and `parseErrorCode(err.body)`
- * (the pattern every non-thunk call site uses) reads `undefined`. `apiFailure`
- * journals the status and the code keyed by the message that DOES survive, which
- * is what `findReport` looks back up. See `utils/thunkError`'s module doc.
- *
- * `adopt_target_unknown` gets copy that names the crew, because its backend
- * sentence does not; anything else shows the backend's own sentence (`apiFailure`
- * already unwrapped it out of the `{error, code}` envelope), and a fixed sentence
- * is the floor — a failed click must never render nothing, which is the defect
- * this exists to fix.
- *
- * `remote_bind_failed` deliberately has NO case of its own. The backend collapses
- * every refusal on the bind leg to that one code — a dead tunnel, but also a
- * version-parity refusal ("This crew runs Kiro Crew 0.6.0 but this machine runs
- * 0.7.0 …") — and only its sentence tells them apart. A fixed "could not reach"
- * string here would render a healthy, reachable crew as unreachable and hide the
- * one line that tells the user which end to update. The sentence is always present
- * for a journaled code: `findReport` matches on a non-empty message, so a code
- * with no message is unreachable and a fallback for it would be dead code. */
-function adoptFailureText(err: unknown, crewName: string): string {
-  const message = errMessage(err)
-  switch (findReport(message)?.code) {
-    // The peer no longer lists that session (closed there, or never adoptable).
-    case 'adopt_target_unknown':
-      return i18nT('pages.chatSidebar.adopt_target_unknown', { name: crewName })
-    default:
-      return message || i18nT('pages.chatSidebar.adopt_failed')
-  }
 }
 
 /** One sidebar session row behind a memo boundary, so the 200+ row bodies do
@@ -929,10 +903,10 @@ function adoptFailureText(err: unknown, crewName: string): string {
 const SessionRow = memo(function SessionRow({
   slot: s, showDivider, scope, navScope, holdContainer, conductor, isActive, connected, isOut, isPinned, isUnread, isRunning,
   recent, recentTintCount, subagentCount, subagentApprovalCount, digitBadge,
-  isRenaming, renamingHere, renameValue, revealFlash, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex, pinnedOrderIndex, pinnedReorderEnabled, onPinnedKeyboardReorder, rowAnimEnabled,
+  isRenaming, renamingHere, renameValue, revealFlash, dragInFlight, activeDraggedKey, activeDraggedPinnedIndex, onNativeDragStart, onNativeDragEnd, pinnedOrderIndex, pinnedReorderEnabled, onPinnedKeyboardReorder, rowAnimEnabled,
   defaultAgent, mode, isMobile, colorMode, installedAgents, tagById, paletteColors, boost, boostFor,
   renameInputRef, onRenameStart, onRenameChange, onRenameCommit, onRenameCancel,
-  onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onAdoptPeerSession, adoptPending, adoptError,
+  onDuplicate, onCloseSession, onMenuCloseAutoFocus, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession,
   onOpenElsewhere,
 }: SessionRowProps) {
   sessionRowRenderProbe.current?.(s.key)
@@ -949,7 +923,7 @@ const SessionRow = memo(function SessionRow({
   // The affordance gate proper. A peer row and a row that opens elsewhere are
   // withheld the SAME set -- rename, close, fork, drag, the row menu -- for the
   // same reason: this sidebar does not own the slot's lifecycle. They differ only
-  // in what a click does (adopt vs. navigate), which the handlers below decide.
+  // in what a click does (open a window vs. navigate), which the handlers below decide.
   const foreignRow = !!peerId || onOpenElsewhere != null
   const peerName = s.peer_name || s.peer_id
   const rowIdentity = sessionRowIdentity(s)
@@ -993,6 +967,7 @@ const SessionRow = memo(function SessionRow({
   const goalLoop = automation?.kind === 'legacy_goal_loop' ? automation : undefined
   const monitor = automation?.kind === 'structured_monitor' ? automation : null
   const queuedForSlot = useAppSelector(st => st.chat.subagentQueued?.[localSlotKey] || 0)
+  const queuedReason = useAppSelector(st => st.chat.subagentQueuedReason?.[localSlotKey])
   // {count, name, phase} of this slot's running workflow fan-out, or undefined.
   // shallowEqual because the map is rebuilt per run event; the primitives only
   // change when THIS slot's runs do.
@@ -1094,6 +1069,11 @@ const SessionRow = memo(function SessionRow({
     // than handled per drop target. A remote-EXECUTED local slot is not excluded:
     // its slot is right here, and reordering it is as meaningful as any other.
     const dndRow = (scope === 'list' || scope === 'flat') && !foreignRow
+    // Whether THIS row's native drag is in flight, so the unmount cleanup below
+    // reports the drag's end only for the row that started it: every other row
+    // unmounts freely under the windowing, and must not end a drag it never began.
+    const nativeDragInFlight = useRef(false)
+    useEffect(() => () => { if (nativeDragInFlight.current) onNativeDragEnd?.() }, [onNativeDragEnd])
     const reorderContainer = scope === 'flat' ? 'flat' : (s.folder_id || 'root')
     const agentName = s.agent || defaultAgent || ''
     // What the row SHOWS, kept separate from `agentName` on purpose. That value
@@ -1157,6 +1137,14 @@ const SessionRow = memo(function SessionRow({
         ? i18nT('pages.chatSidebar.running_queued', { started: subagentStarted, queued: subagentQueuedCount })
         : i18nT('pages.chat.subagentRunCard.agent_running', { count: subagentStarted })
     const subagentApprovalLabel = i18nT('pages.chatSidebar.sub_agent_needs_approval', { count: subagentAwaiting })
+    // Children accepted but not started, with none started: the session is
+    // WAITING on them, not working, so the row says so without the running
+    // pulse. A memory wait names memory; a cap wait keeps the queued count.
+    const subagentsOnlyQueued = subagentQueuedCount > 0 && subagentStarted === 0 && subagentAwaiting === 0
+    const subagentWaitingLabel = isMemoryWait(queuedReason)
+      ? i18nT('pages.chatSidebar.waiting_for_memory')
+      : subagentLabel
+    const subagentWaitingTitle = queuedWaitText(queuedReason) ?? subagentLabel
     // Live dynamic-workflow activity for THIS slot (slot-scoped subscription
     // above). The label mirrors what the sidebar-wide map used to precompute:
     // one run shows its sanitized name · phase, a fan-out shows a count.
@@ -1203,7 +1191,8 @@ const SessionRow = memo(function SessionRow({
     const snapshotLiveWorkLabel = i18nT('pages.chatSidebar.filter_running')
     const liveWorkSupersedesInterruption = hasLiveSessionWork(s, {
       workflowActive: !!wfActive,
-      detailedSubagentsRunning: subagentCount > 0,
+      // Started children only: a queued child has not superseded anything.
+      detailedSubagentsRunning: subagentCount - subagentQueuedCount > 0,
     })
     const goalLoopStalled = !!goalLoop && !!s.interrupted && !liveWorkSupersedesInterruption
     // An armed loop whose NEWEST reply is an explicit `[OPTIONS:]` ask. The
@@ -1219,7 +1208,7 @@ const SessionRow = memo(function SessionRow({
     // Ordinary sessions need the same reboot/error visibility as goal loops,
     // without claiming that an older interrupted parent turn has stopped live
     // child work. A goal loop keeps its richer cycle-specific treatment below;
-    // active workflows, subagents, turns, orchestration, and queued work keep
+    // active workflows, subagents, turns, and queued work keep
     // their progress indicators.
     const turnNeedsAttention = !goalLoop && !!s.interrupted && !liveWorkSupersedesInterruption
     // Whatever this row would have said if no loop were running, reused as the
@@ -1266,60 +1255,6 @@ const SessionRow = memo(function SessionRow({
     //
     // The tail is `last_message`, and the `unread` dot rides on it (below).
     const rowState = ([
-      {
-        // ADOPT feedback, on the row the user just clicked. It sits at the TOP
-        // because it describes THEIR in-flight action, not the session's own
-        // state, and it lives INSIDE this resolver rather than beside it: the
-        // resolver renders exactly one secondary line (`session-row-fixed-height`
-        // in website/AUTOSDE.yaml — "ONE status line, and only one"), so a running
-        // peer row that is also adopting would otherwise render two lines and grow
-        // the row.
-        //
-        // Through `ErrorNotice`, not a hand-rolled tinted div: the shared surface
-        // carries `role="alert"` and recovers the endpoint/status/code from the
-        // error journal. `askAgent` is OFF — the hand-off navigates away, and this
-        // row sits beside a composer that may hold a draft.
-        // `messageClassName="truncate"` is what keeps this to ONE line. The
-        // resolver already guarantees one status ENTRY, but `ErrorNotice` wraps a
-        // long message by default (`overflowWrap: anywhere`), so a localized
-        // failure string was still able to grow the row past its fixed height --
-        // the same `session-row-fixed-height` rule, reached from the other side.
-        // Truncating rather than dropping the component: `errors-use-error-notice`
-        // requires an error to BE an `ErrorNotice`, so the two rules together
-        // leave exactly this shape. `messageTooltip` carries the whole sentence:
-        // the row is one line wide, and the server's reason ("This crew runs Kiro
-        // Crew 0.6.0 but this machine runs 0.7.0 …") puts the actionable half past
-        // the clip. `truncate` + `title` is the shape `session-row-fixed-height`
-        // itself prescribes for a field that does not fit.
-        key: 'peer_adopt_error',
-        when: !!peerId && !adoptPending && !!adoptError,
-        build: () => (
-          <>
-            {/* No hand-off: the adjacent composer may contain an unsaved draft. */}
-            <ErrorNotice
-              message={adoptError || ''}
-              messageTooltip={adoptError || undefined}
-              variant="inline"
-              messageClassName="truncate"
-              testId="session-peer-adopt-error"
-            />
-          </>
-        ),
-      },
-      {
-        // A peer-row click is a network round-trip that includes a server-side
-        // transcript backfill, so it is slow enough that silence reads as a dead
-        // click. Several peer rows can be adopting independently, which is why
-        // this is per-row and not a page-level banner.
-        key: 'peer_adopt_pending',
-        when: !!peerId && !!adoptPending,
-        build: () => (
-          <div className={ROW_STATUS_LINE_MUTED_CLS} data-testid="session-peer-adopt-pending">
-            <Loader2 size={10} className="animate-spin shrink-0 text-accent" aria-hidden="true" />
-            <span className="truncate min-w-0">{i18nT('pages.chatSidebar.opening_session_locally')}</span>
-          </div>
-        ),
-      },
       {
         // Pending approval outranks running (mirrors the Board's inferLane,
         // which returns its approval lane before the running check), so an owed
@@ -1490,10 +1425,23 @@ const SessionRow = memo(function SessionRow({
         ),
       },
       {
-        // A spawned subagent is still running (or queued behind the concurrency
-        // cap) — surface it even if the parent turn has ended (`s.running` is
-        // false while it waits for completion events), so the sidebar shows
-        // live activity instead of a stale last message.
+        // Every child is still queued: a static badge, never the running pulse,
+        // because nothing has started. The tooltip carries the wait's own
+        // sentence (how much memory is short, or the concurrency limit).
+        key: 'subagents_waiting',
+        when: subagentsOnlyQueued,
+        build: () => (
+          <div className={ROW_STATUS_LINE_MUTED_CLS} title={subagentWaitingTitle} data-testid="session-subagents-waiting">
+            <Hourglass size={ROW_ICON_PX} className="shrink-0" aria-hidden />
+            <span className="truncate">{subagentWaitingLabel}</span>
+          </div>
+        ),
+      },
+      {
+        // A spawned subagent is still running (with or without more queued
+        // behind it) — surface it even if the parent turn has ended
+        // (`s.running` is false while it waits for completion events), so the
+        // sidebar shows live activity instead of a stale last message.
         key: 'subagents',
         when: subagentCount > 0,
         build: () => (
@@ -1504,7 +1452,7 @@ const SessionRow = memo(function SessionRow({
         ),
       },
       {
-        // Reconnect snapshots can report orchestration, queued work, or running
+        // Reconnect snapshots can report queued work or running
         // children before their detailed activity records arrive. The shared
         // predicate suppresses stale Resume; this branch replaces the equally
         // stale last-message fallback with an honest localized working state.
@@ -1573,7 +1521,7 @@ const SessionRow = memo(function SessionRow({
         // opened locally the local slot wins the identity dedupe, `peerId` is
         // gone, and the line goes with it.
         key: 'peer_not_open_here',
-        when: !!peerId && !adoptPending,
+        when: !!peerId,
         build: () => (
           <div className={ROW_STATUS_LINE_MUTED_CLS} data-testid="session-peer-not-open-here">
             <span className="truncate min-w-0">{i18nT('pages.chatSidebar.not_open_here_yet', { name: peerName || '' })}</span>
@@ -1669,7 +1617,7 @@ const SessionRow = memo(function SessionRow({
             <button type="button" className="mc-touch-hit text-muted/50 active:text-text p-1 cursor-pointer bg-transparent border-none" aria-label={i18nT('pages.chatSidebar.more_options')} onMouseDown={e => e.stopPropagation()} onClick={e => e.stopPropagation()}><MoreVertical size={14} /></button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[160px]" onClick={e => e.stopPropagation()} onCloseAutoFocus={onMenuCloseAutoFocus}>
-            <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
+            <SessionActionsMenu variant="dropdown" {...rowMenuProps} onDuplicate={() => onDuplicate(rowKey)} />
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
@@ -1683,7 +1631,7 @@ const SessionRow = memo(function SessionRow({
             <SessionActionsMenu variant="dropdown" {...rowMenuProps} />
           </DropdownMenuContent>
         </DropdownMenu>
-        <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><Copy size={12} /></IconButton>
+        <IconButton variant="accent" title={i18nT('pages.chatSidebar.duplicate')} aria-label={i18nT('pages.chatSidebar.duplicate')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onDuplicate(rowKey) }}><GitFork size={12} /></IconButton>
         <IconButton variant="danger" title={i18nT('pages.chatSidebar.close')} aria-label={i18nT('pages.chatSidebar.close_session')} onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); onCloseSession(rowKey) }}><X size={12} /></IconButton>
       </IconButtonGroup>
     )) : null
@@ -1768,9 +1716,6 @@ const SessionRow = memo(function SessionRow({
           data-session-container={holdContainer}
           aria-current={isActive ? 'true' : undefined}
           aria-disabled={!connected}
-          // An adopt in flight is a pending state ON THIS ROW, so a screen reader
-          // hears "busy" rather than nothing while the peer transcript backfills.
-          aria-busy={peerId && adoptPending ? 'true' : undefined}
           aria-keyshortcuts={dndRow && pinnedReorderEnabled && isPinned ? 'Alt+ArrowUp Alt+ArrowDown' : undefined}
           onKeyDown={e => {
             if (dndRow && pinnedReorderEnabled && isPinned && e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey
@@ -1816,12 +1761,15 @@ const SessionRow = memo(function SessionRow({
             if ((e.target as HTMLElement) !== e.currentTarget) return // don't hijack inner buttons
             e.preventDefault()
             if (!connected) return
-            if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            if (peerId) { onOpenPeerSession?.(peerId, s.key); return }
             if (onOpenElsewhere) { onOpenElsewhere(); return }
             dispatch(switchSlot({ key: s.key, announceOnMissing: true }))
             onSelectSlot?.(s.key)
           }}
-          onDragStart={!dndRow ? (e => { e.dataTransfer.setData('text/plain', s.key); e.dataTransfer.effectAllowed = 'move' }) : undefined}
+          onDragStart={!dndRow ? (e => { e.dataTransfer.setData('text/plain', s.key); e.dataTransfer.effectAllowed = 'move'; nativeDragInFlight.current = true; onNativeDragStart?.(s.key) }) : undefined}
+          // Reaches the row only while it is still attached; the detached case is
+          // the unmount cleanup above.
+          onDragEnd={!dndRow ? (() => { nativeDragInFlight.current = false }) : undefined}
           // Chrome and Edge on Windows enter autoscroll on middle-button
           // MOUSEDOWN, before `auxclick` fires — so cancelling it in the
           // auxclick handler alone opens the tab AND leaves the pointer in
@@ -1859,15 +1807,13 @@ const SessionRow = memo(function SessionRow({
             // /forking still works — those are local ops (or short-circuit) that
             // don't depend on gateway state.
             if (!connected) return
-            // A peer-owned row has no local slot yet, so `switchSlot` would
-            // resolve nothing and clear the transcript. ADOPT it instead: create a
-            // local slot bound to that peer session, backfill its transcript, and
-            // switch to THAT — the click opens the session the row names, in the
-            // local pane, which is what every other row's click means. (The
-            // federated Older-Sessions rows still switch panes; a history row has
-            // no live peer slot to bind.) A remote-EXECUTED local slot falls
-            // through to `switchSlot` below, because its transcript IS here.
-            if (peerId) { onAdoptPeerSession?.(peerId, s.key, rowIdentity); return }
+            // A peer-owned row has no local slot, so `switchSlot` would resolve
+            // nothing and clear the transcript. It opens as a window onto the
+            // peer's own slot instead (CrewChatWindow). (The federated
+            // Older-Sessions rows still switch panes; a history row has no live
+            // peer slot.) A remote-EXECUTED local slot falls through to
+            // `switchSlot` below, because its transcript IS here.
+            if (peerId) { onOpenPeerSession?.(peerId, s.key); return }
             // A row whose session belongs to another page: the pane cannot show
             // it, so `switchSlot` would land on a transcript the surface filter
             // hides and leave the user on the previous one. Go where it lives.
@@ -2128,7 +2074,6 @@ const SessionRow = memo(function SessionRow({
               )}
               {s.memory_mode === 'incognito' && <span className="text-muted" title={i18nT('pages.chatSidebar.incognito_no_memory_writes')}><EyeOff size={10} /></span>}
               {s.memory_mode === 'temporary' && <span className="text-aim" title={i18nT('pages.chatSidebar.temporary_no_memory_reads_or_writes')}><VenetianMask size={10} /></span>}
-              {s.mode === 'orchestrator' && <span className="px-1 py-0 rounded bg-accent/15 text-accent font-medium" title={i18nT('pages.chatSidebar.autopilot_mode')}>{i18nT('pages.chatSidebar.autopilot')}</span>}
               {/* Trailing meta grouped under ONE ml-auto: two sibling auto
                *  margins would split the free space and strand the timestamp
                *  mid-row.
@@ -2312,6 +2257,9 @@ interface ChatSidebarProps {
    *  not a live slot, because the composer stages it until send. Never fired for
    *  incognito/temporary sessions or for the already-active session. */
   onDropSessionRef?: (ref: { key: string; title: string; messages?: number }) => void
+  /** Where a crew row's window opens, for a host with no chat pane of its
+   *  own (embed/sessions). Omit to open it over this page's pane. */
+  onOpenPeerSession?: (instanceId: string, key: string) => void
 }
 
 /** Sort options, in menu order. The label lives in `SORT_LABEL_KEY`. */
@@ -2392,7 +2340,7 @@ export { SIDEBAR_MIN, SIDEBAR_MAX } from './chat/sidebarWidth'
  * Owner hooks are called where their block used to sit, so React runs their effects in
  * the order the sidebar has always run them; ChatSidebar.ownerComposition.test.ts pins
  * that call order. SessionRow, the row and folder render closures, the filter-dimension
- * registry, the peer-session adopt, the idle-session cleanup, the bulk model switch and
+ * registry, the idle-session cleanup, the bulk model switch and
  * the JSX stay in this file: source pins read them here (the switchSlot call-site
  * count, list-shell parity, the bulk switcher, the filter registry, the restyle
  * ratchet), and the render closures stamp rows in paint order. The owner table and
@@ -2408,7 +2356,7 @@ function ChatSidebar({
   // only the binding is scoped, which forces every call site inside this file
   // to say which collection it means.
   slots: localSlots, activeSlot, unreadSlots, history, historyHasMore,
-  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSlotInNewTab, onOpenSource, collapsible,
+  defaultAgent, installedAgents, mode, onWidthChange, onDragChange, onSelectSlot, onOpenSlotInNewTab, onOpenSource, onOpenPeerSession, collapsible,
   chatDropTarget, onDropSessionRef, staticRows,
 }: ChatSidebarProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
@@ -2420,9 +2368,15 @@ function ChatSidebar({
   const store = useStore<RootState>()
   const ime = useImeGuard()
   const isMobile = useIsMobile()
+  const isTouchDevice = useIsTouchDevice()
 
   // Sidebar-only state
   const [seedError, setSeedError] = useState('')
+  // The board/list toggle also persists a chat-config field (`tagColumnsEnabled`)
+  // via `saveChatConfig`, which returns false and rolls back when storage cannot
+  // hold the write (GPT 6.1, errors-use-error-notice). That reuses the seedError
+  // notice slot below, but with a save-specific title — this flag picks it.
+  const [toggleSaveFailed, setToggleSaveFailed] = useState(false)
   // Shared failure line for the board's column mutations (delete / reorder /
   // add-after / card drop) — one state, because they all edit the same strip and
   // a second banner per verb would stack. Server-side inputs only, so a failed
@@ -2463,99 +2417,16 @@ function ChatSidebar({
     historySearchResults, instancesList, instanceSessions, remoteSessionsError, allRows, allLiveSlots,
     selectInstance,
   } = useSessionSources({ historyFilter, slotTitleDigest, localSlots })
-  // Adopt state, keyed by ROW IDENTITY (`<peerId>:<key>`) rather than raw slot
-  // key: a peer key can be byte-identical to a local one, and to another peer's,
-  // so a raw-key map would show one row's failure on another row. Two separate
-  // maps because they are two different facts and both can be true of different
-  // rows at once.
-  const [adoptPending, setAdoptPending] = useState<Record<string, boolean>>({})
-  const [adoptErrors, setAdoptErrors] = useState<Record<string, string>>({})
-  // Read inside the click handler to refuse a SECOND adopt of a row already in
-  // flight. The backend is idempotent (a repeat pair returns the same local
-  // slot), so this is not a correctness guard — it is what stops an impatient
-  // double-click spending two round-trips and two transcript backfills.
-  const adoptPendingRef = useRef(adoptPending)
-  adoptPendingRef.current = adoptPending
-  // The active slot AT COMPLETION time. `activeSlot` closed over by the mutation
-  // body is the value from the render that started the adopt, which is precisely
-  // the stale one — the question this answers is whether the user has moved since.
-  const activeSlotRef = useRef(activeSlot)
-  activeSlotRef.current = activeSlot
-  const adoptPeerSessionMutation = useMutation({
-    mutationFn: async ({ instanceId, remoteSlot }: { instanceId: string; remoteSlot: string; identity: string }) => {
-      // ADOPT, not mint: `adoptRemoteSlot` names the peer session that already
-      // exists, so the local slot this creates binds to it instead of to a fresh
-      // one. Modelled on `createRemoteChatMutation` — same `createSlot` thunk,
-      // same stay-local stance, and deliberately NO `selectInstance`: staying put
-      // is the whole point, because the session now opens HERE.
-      //
-      // `activate: false` so ONE piece of code decides whether the view moves.
-      // `createSlot.fulfilled` already refuses to activate when the user
-      // navigated elsewhere during the round-trip, but this path needs its own
-      // `switchSlot` (that is what loads the transcript, not just what sets
-      // `activeSlot`) — and an unconditional one overrode exactly the decision
-      // that guard had just made. Duplicating the comparison here instead would
-      // race it: on the guard's success path the reducer moves `activeSlot` to
-      // the new key, so a check against the pre-adopt origin cannot tell "the
-      // user moved" from "the reducer moved". Opting out of reducer activation
-      // removes that ambiguity: `activeSlot` can now only differ because the
-      // USER moved.
-      const origin = activeSlotRef.current
-      const created = await dispatch(
-        createSlot({ instanceId, adoptRemoteSlot: remoteSlot, activate: false }),
-      ).unwrap()
-      // The adopt round-trip is a real network call to the peer and can span
-      // seconds over a tunnel, so switching sessions while it spins is an
-      // ordinary thing to do — not a race worth ignoring.
-      if (activeSlotRef.current === origin) {
-        // Plain dispatch rather than `.unwrap()`: the adopt SUCCEEDED, so a slow
-        // or failing transcript fetch is `switchSlot`'s own error to report on
-        // the pane, not a reason to tell the row its adopt failed.
-        dispatch(switchSlot({ key: created.key, announceOnMissing: true }))
-        onSelectSlot?.(created.key)
-      }
-      return created
-    },
-    onSuccess: (_data, variables) => {
-      // Drop the cached peer listing for THIS crew. The backend stops listing an
-      // adopted session, but that only takes effect on the next fetch — until
-      // then the cached peer row co-exists with the freshly created local slot in
-      // `allRows` ([...localSlots, ...instanceSessions.rows], which does not
-      // dedupe), so the user sees the session they just opened twice. Scoped to
-      // the one crew rather than the whole query family: the other crews' rows did
-      // not change, and refetching them would spend a tunnel round-trip each.
-      void queryClient.invalidateQueries({ queryKey: ['instance-slots', variables.instanceId] })
-    },
-    onSettled: (_data, _err, variables) => {
-      setAdoptPending(prev => {
-        if (!prev[variables.identity]) return prev
-        const next = { ...prev }
-        delete next[variables.identity]
-        return next
-      })
-    },
-    onError: (err: unknown, variables) => {
-      // The crew's DISPLAY name, resolved here rather than threaded up from the
-      // row: `useMutation` reads its callbacks fresh each render, so closing over
-      // `instancesList` is safe where closing over it in the stable
-      // `adoptPeerSession` callback below would not be.
-      const crewName = instancesList.find(i => i.id === variables.instanceId)?.name || variables.instanceId
-      setAdoptErrors(prev => ({ ...prev, [variables.identity]: adoptFailureText(err, crewName) }))
-    },
-  })
-  const adoptMutateRef = useRef(adoptPeerSessionMutation.mutate)
-  adoptMutateRef.current = adoptPeerSessionMutation.mutate
-  // Stable for the life of the component, because it is a prop of every memoized
-  // SessionRow — the same reasoning as the `selectInstanceRef` indirection this
-  // replaced: react-query's mutation object takes a fresh identity every render,
-  // so closing over it directly would re-render EVERY row on every shell commit
-  // (the regression `ChatSidebar.rowMemo.test.tsx` exists to catch). The ref is
-  // rewritten each render and read inside a never-changing callback.
-  const adoptPeerSession = useCallback((instanceId: string, remoteSlot: string, identity: string) => {
-    if (adoptPendingRef.current[identity]) return
-    setAdoptPending(prev => ({ ...prev, [identity]: true }))
-    setAdoptErrors(prev => (prev[identity] ? { ...prev, [identity]: '' } : prev))
-    adoptMutateRef.current({ instanceId, remoteSlot, identity })
+  // Opening a crew row is local and instant: the window reads the peer's slot
+  // itself, so nothing is created here and there is nothing to wait on.
+  const crewWindow = useCrewWindow()
+  const onOpenPeerSessionRef = useRef(onOpenPeerSession)
+  onOpenPeerSessionRef.current = onOpenPeerSession
+  const openPeerSession = useCallback((instanceId: string, remoteSlot: string) => {
+    // A host with no chat pane of its own (the embedded Sessions list) says
+    // where the window opens; otherwise it opens over this page's pane.
+    if (onOpenPeerSessionRef.current) onOpenPeerSessionRef.current(instanceId, remoteSlot)
+    else openCrewWindow({ instanceId, key: remoteSlot })
   }, [])
   // Connected crews, for the "New chat on crew" entry. `warm` is the authority
   // on which peers hold a live tunnel (it holds the loopback port + minted
@@ -2617,21 +2488,23 @@ function ChatSidebar({
   const flatView = lane === 'flat'
   const conductorView = lane === 'conductor'
   const {
-    activeFilters, setActiveFilters, filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter,
+    activeFilters, filtersPaused, setAllFiltersPaused, clearAllFilters,
+    filterHiddenFolders, setFilterHiddenFolders, toggleFolderFilter,
     showAllFolders, filterTagIds, toggleTagFilter, clearTagFilter, foldersShelved, setFoldersShelved,
     toggleFoldersShelved, toggleFilter, disableFilter, enableFilter,
   } = useSessionFilterState()
   const {
-    slotsLoaded, workflowActiveSet, automationRunningSet, subagentCounts, subagentApprovalCounts, unreadSet,
+    slotsLoaded, workflowActiveSet, automationRunningSet, subagentCounts, subagentStartedCounts, subagentApprovalCounts, unreadSet,
     recentWindowMs, recentAmountDraft, setRecentAmountDraft, recentUnitDraft, selectRecentPreset,
     commitRecentAmount, changeRecentUnit, runningSet, _derivedLookup, filterCounts,
-  } = useSessionStatusFilters({ unreadSlots, activeFilters, enableFilter, localSlots, allRows, disableFilter })
+  } = useSessionStatusFilters({ unreadSlots, activeFilters, filtersPaused, enableFilter, localSlots, allRows, disableFilter })
   const creatingSlot = useAppSelector(s => s.chat.creatingSlot)
   const connected = useConnected()
   const {
     historyOpen, setHistoryOpen, openHistoryPane, historyHeight, historyDragging, historyResize,
   } = useHistoryPane({ setHistoryFilter, slotFilter, dispatch })
   const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [folderCleanupOpen, setFolderCleanupOpen] = useState(false)  // header ⋮ → "Clean up empty folders" panel
   const [manageTagsOpen, setManageTagsOpen] = useState(false)  // header ⋮ → "Manage tags…" panel (list-view tag CRUD)
   const [filterSortOpen, setFilterSortOpen] = useState(false)
   const [cleanupDays, setCleanupDays] = useState(3)
@@ -2757,8 +2630,10 @@ function ChatSidebar({
   // NEXT row to decide dividers; a lane that forgot the mask would be a bug
   // nobody notices until two rows glow at once.
   const isActiveRow = useCallback(
-    (s: Slot | null | undefined): boolean => !!s && !isPeerRow(s) && activeSlot === s.key,
-    [activeSlot],
+    (s: Slot | null | undefined): boolean => !!s && (isPeerRow(s)
+      ? !!crewWindow && crewWindow.instanceId === s.peer_id && crewWindow.key === s.key
+      : !crewWindow && activeSlot === s.key),
+    [activeSlot, crewWindow],
   )
   // The two halves render either side of the expander, so a held row crossing it
   // leaves the sub-list the anchor was measured against. Freeze the side instead.
@@ -2929,7 +2804,7 @@ function ChatSidebar({
   } = useBoardColumnMutations({ queryClient, setBoardError, orderedColumns, rawColumns, sidebarWidthRef, widenForBoard, setSeedError })
   const {
     columnMatches,
-  } = useColumnMatches({ subagentCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet })
+  } = useColumnMatches({ subagentStartedCounts, subagentApprovalCounts, workflowActiveSet, automationRunningSet })
 
   const {
     slotFolders, foldersWithActiveSubtree, setRevealForcedVisible, isFolderHidden, filterHiddenSubtree,
@@ -2970,7 +2845,9 @@ function ChatSidebar({
    * memos already depend on that state themselves.
    */
   const filterDimensions = useMemo<FilterDimension[]>(() => {
-    const activeFilterDefs = SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
+    // A paused filter keeps its chip but narrows nothing, so the whole status
+    // dimension goes inert while the pause is on.
+    const activeFilterDefs = filtersPaused ? [] : SESSION_FILTERS.filter(filterDef => activeFilters.has(filterDef.key))
     return [
       {
         // Tags. Unlike the folder filter this does NOT go inert while
@@ -3018,18 +2895,15 @@ function ChatSidebar({
       },
       {
         // Status chips (SESSION_FILTERS). Active chips OR together: a row
-        // passes when any active chip's predicate matches it.
+        // passes when any active chip's predicate matches it. `activeFilterDefs`
+        // is empty while the filters are paused, so every row passes and the
+        // dimension neither narrows nor hides.
         filtersRow: slot => activeFilterDefs.length === 0 || activeFilterDefs.some(filterDef => _derivedLookup[filterDef.key](slot)),
-        narrows: () => activeFilters.size > 0,
-        hides: (slot, excluded) => activeFilters.size > 0 && excluded(slot),
-        clear: () => {
-          // Persisted like toggleFilter: remount re-reads the stored '1' and
-          // would silently restore the filter that hides this row.
-          for (const filterDef of SESSION_FILTERS) {
-            if (activeFilters.has(filterDef.key)) safeSetItem(filterDef.storageKey, '0')
-          }
-          setActiveFilters(new Set())
-        },
+        narrows: () => activeFilterDefs.length > 0,
+        hides: (slot, excluded) => activeFilterDefs.length > 0 && excluded(slot),
+        // Persisted inside the hook: a remount re-reads the stored '1' (or '2')
+        // and would silently restore the filter that hides this row.
+        clear: () => clearAllFilters(),
       },
       {
         // Folder filter. It filters no rows and never narrows (see the memo
@@ -3061,7 +2935,7 @@ function ChatSidebar({
         },
       },
     ]
-  }, [activeFilters, activeTagIds, filterTagIds, clearTagFilter, slotFilter, folderNameMatchIds, searchRanked, _derivedLookup, filterHiddenSubtree, folders, slotFolders, setActiveFilters, setFilterHiddenFolders])
+  }, [activeFilters, filtersPaused, activeTagIds, filterTagIds, clearTagFilter, slotFilter, folderNameMatchIds, searchRanked, _derivedLookup, filterHiddenSubtree, folders, slotFolders, clearAllFilters, setFilterHiddenFolders])
 
   // State and in the memo deps on purpose, not a ref: a frozen run caches its
   // stale list against new deps, so clearing a ref would invalidate nothing.
@@ -3137,7 +3011,7 @@ function ChatSidebar({
   )
   const flatLaneActive = !boardLaneActive && flatView && folders.length > 0
 
-  const { lineageAvailable } = useLineageSeed({ localSlots, dispatch, allRows })
+  const { lineageAvailable } = useLineageAvailable({ allRows })
   // Gated on `lineageAvailable` as well as the board, and the reason is the toggle:
   // it renders only when more than one lane is available, so with a persisted
   // conductor preference, no edges and no folders the cycle holds `tree` alone, the
@@ -3256,6 +3130,8 @@ function ChatSidebar({
   const dndSensors = useDndSensors({ distance: 5, keyboard: true })
   // Tracks the item currently being dragged, for the DragOverlay preview.
   const [activeDrag, setActiveDrag] = useState<{ type: string; id: string } | null>(null)
+  // Its native counterpart: the board card in flight, which no DndContext sees.
+  const { nativeSessionDrag, startNativeSessionDrag, endNativeSessionDrag } = useNativeSessionDrag()
   const {
     reorderFolders, moveFolderTo,
   } = useFolderDropOps({ folderReorderable, queryClient, setFolderActionError, updateFolderMutation })
@@ -3287,11 +3163,15 @@ function ChatSidebar({
   } = useFolderChatCreate({ folders, defaultAgent, mode, dispatch, dropSlotMutation, onOpenSlotInNewTab, updateFolderMutation, clearBoardCollapse })
 
   const {
-    createAutopilotMutation, crewPreview, openCrewMembers, remoteCrewChatPreview,
-    createChatMutation, createRemoteChatMutation, createPlainChatMutation, createEphemeralChatMutation,
-  } = useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen })
+    crewPreview, openCrewMembers, remoteCrewChatPreview,
+    createChatMutation, createRemoteChatMutation, createEphemeralChatMutation,
+  } = useSessionCreate({ setNewChatError, dispatch, defaultAgent, mode, onOpenSlotInNewTab, setRemoteCrewError, setNewChatMenuOpen, onOpenPeerSession })
   // A conductor-lane member anchor opens on the Members page (see renderSessionRow).
   const navigate = useNavigate()
+  // The Dynamic Dashboard is a Feature Preview (Settings > Developer): the
+  // kebab's "All dashboards" door is offered only once it is on. The page it
+  // opens stays routable either way, like every preview's route.
+  const dashboardPreview = usePreviewFlag(PREVIEW_DASHBOARD)
 
   // Session colors
   const { paletteColors, boost, boostFor, colorMode } = useSessionPalette()
@@ -3459,7 +3339,7 @@ function ChatSidebar({
           {/* List-view parity: an empty folder's row keeps its action cluster
             *  visible (see the note in renderFolderHeader). */}
           {!(editingId === folder.id && editScope === columnId) && (
-          <span className={`${emptyBody ? '' : 'opacity-0 '}group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5`}>
+          <span className={`${emptyBody ? '' : 'opacity-0 '}group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity flex items-center gap-0.5`}>
             {/* ⋯ menu + a primary "new chat in folder" action, mirroring the
              *  list-view folder header (renderFolderHeader) so board view has
              *  the same one-click way to start a session inside a folder. */}
@@ -3538,6 +3418,9 @@ function ChatSidebar({
            *  (`FOLDER_ROW_PAD_CLS`), with a body pad sized to this header, so in
            *  both views a folder's rows land on that folder's name column. */}
           <div className={BOARD_FOLDER_BODY_CLS}>
+            {(deepChildren.length > 0 || childSlots.length > 0) && (
+              <FolderRail name={folder.name} id={`${columnId}-${folder.id}`} onToggle={() => toggleColumnCollapse(columnId, folder)} />
+            )}
             {/* Default: the empty-folder affordance stays exactly as it was, in
              *  list-view parity (see renderFolderBlock). Reached only when the
              *  setting is OFF - with it on there is no body to put this in. */}
@@ -3624,11 +3507,9 @@ function ChatSidebar({
     return (
       <WindowedSessionRow key={rowIdentity} rowId={rowIdentity} slotKey={s.key} navScope={navScope} holdContainer={holdContainer}
         title={s.title && s.title !== s.key ? s.title : s.key}
-        keepMounted={isActive || revealing || (!isPeer && renamingSlot === s.key) || (activeDrag?.type === 'session' && activeDrag.id === s.key)}>
+        keepMounted={isActive || revealing || (!isPeer && renamingSlot === s.key) || (activeDrag?.type === 'session' && activeDrag.id === s.key) || (!isPeer && nativeSessionDrag === s.key)}>
       <SessionRow slot={s} orderStamp={orderStamp}
-        onAdoptPeerSession={adoptPeerSession}
-        adoptPending={isPeer && !!adoptPending[rowIdentity]}
-        adoptError={isPeer ? (adoptErrors[rowIdentity] || '') : ''}
+        onOpenPeerSession={openPeerSession}
         showDivider={showDivider} scope={scope} navScope={navScope} holdContainer={holdContainer} conductor={conductor}
         isActive={isActive} connected={connected} isOut={!isPeer && poppedOut.has(s.key)}
         isPinned={!isPeer && pinned.has(s.key)} isUnread={!isPeer && unreadSet.has(s.key)}
@@ -3642,6 +3523,8 @@ function ChatSidebar({
         dragInFlight={!!activeDrag}
         activeDraggedKey={activeDrag?.type === 'session' ? activeDrag.id : null}
         activeDraggedPinnedIndex={activeDrag?.type === 'session' ? (pinnedRank.get(activeDrag.id) ?? -1) : -1}
+        onNativeDragStart={startNativeSessionDrag}
+        onNativeDragEnd={endNativeSessionDrag}
         // `pinnedRank` is a local-pin ordering, so a peer row reports -1 (outside
         // the pinned band) and refuses keyboard reorder — the same stance as its
         // `isPinned={false}`. Without the mask a key collision would hand a peer
@@ -3657,7 +3540,7 @@ function ChatSidebar({
         // window: every later row shares the clamped stamp and snaps, keeping
         // Framer's projection registry bounded at every total list size.
         rowAnimEnabled={rowAnimEnabled && orderStamp < SIDEBAR_DISPLACEMENT_WINDOW && !staticRows}
-        defaultAgent={defaultAgent} mode={mode} isMobile={isMobile} colorMode={colorMode}
+        defaultAgent={defaultAgent} mode={mode} isMobile={isMobile || isTouchDevice} colorMode={colorMode}
         installedAgents={installedAgents} tagById={tagById}
         paletteColors={paletteColors} boost={boost} boostFor={boostFor}
         renameInputRef={renameInputRef}
@@ -4119,7 +4002,7 @@ function ChatSidebar({
           *  is what an empty folder usually wants), so nothing is ADDED to the
           *  row and the two-buttons-per-row cap is untouched. */}
         {!(editingId === folder.id && editScope === 'list') && (
-        <div className={`transition-all flex items-center gap-0.5 rounded-md group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100${emptyRow ? ' shrink-0 -my-1' : ' absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100'}`}>
+        <div className={`transition-all flex items-center gap-0.5 rounded-md group-focus-within:opacity-100 focus-within:opacity-100 has-[[data-state=open]]:opacity-100${emptyRow ? ' shrink-0 -my-1' : ' absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 [@media(hover:none)]:static [@media(hover:none)]:translate-y-0 [@media(hover:none)]:shrink-0 [@media(hover:none)]:-my-1 [@media(hover:none)]:p-0 [@media(hover:none)]:bg-transparent [@media(hover:none)]:border-transparent [@media(hover:none)]:shadow-none'}`}>
           {/* ⋯ menu first, then the primary "new chat" action.  Sibling
            *  <button>s of the collapse toggle (valid ARIA — no nesting). */}
           <DropdownMenu>
@@ -4280,6 +4163,7 @@ function ChatSidebar({
     const emptyBody = hideEmptyFolderBody && childNodes.length === 0
     const wrapped = childNodes.length > 0 ? (
       <div key={`folder-children-${folder.id}`} className={FOLDER_BODY_CLS}>
+        <FolderRail name={folder.name} id={folder.id} onToggle={() => toggleCollapse(folder.id)} />
         {childNodes}
       </div>
     ) : emptyBody || listNarrowed ? null : (
@@ -4333,6 +4217,10 @@ function ChatSidebar({
   // Used to reveal the empty-state drop placeholder inside the "No folder"
   // group so there's always a reachable ungroup target.
   const draggingFolderedSession = activeDrag?.type === 'session' && !!slotFolders[activeDrag.id]
+  // The board's reading of the same question, from the native mirror: a card
+  // drags with HTML5 DnD there, so `activeDrag` never carries it. Reveals the
+  // unfile strip at the foot of every column.
+  const boardDraggingFiledSession = nativeSessionDrag !== null && !!slotFolders[nativeSessionDrag]
   // WHY the session being dragged may not be referenced into the open chat, or
   // null when it may be. Carries the reason rather than a boolean because the two
   // refusals read differently to the user (a privacy guard vs a self-drop no-op).
@@ -4429,16 +4317,27 @@ function ChatSidebar({
               <button className="mc-touch-hit w-7 h-7 rounded-md border border-border bg-transparent text-muted cursor-pointer flex items-center justify-center hover:border-border-strong hover:text-text transition-all" title={i18nT('pages.chatSidebar.more_options')} aria-label={i18nT('pages.chatSidebar.more_options')}><MoreVertical size={14} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[180px]">
-              <DropdownMenuItem onSelect={() => navigate('/session-dashboards')}>
+              {dashboardPreview && <DropdownMenuItem onSelect={() => navigate('/session-dashboards')}>
                 <Monitor size={14} className="text-muted" />
                 {i18nT('commandCenter.all_title')}
-              </DropdownMenuItem>
+              </DropdownMenuItem>}
               <DropdownMenuItem disabled={seedStateLanesMutation.isPending} onClick={() => {
                 if (seedStateLanesMutation.isPending) return
                 const isActive = tagColumnsEnabled && rawColumns.length > 0
                 const next = !isActive
                 const cfg = loadChatConfig()
-                saveChatConfig({ ...cfg, tagColumnsEnabled: next })
+                // The toggle persists `tagColumnsEnabled` through saveChatConfig,
+                // which returns false and rolls back when the write (or its dirty
+                // marker) cannot be stored. Surface that failure and STOP before
+                // clearing the error, seeding lanes or restoring widths — none of
+                // which should happen for a preference that was not saved (GPT 6.1
+                // F1, errors-use-error-notice).
+                if (!saveChatConfig({ ...cfg, tagColumnsEnabled: next })) {
+                  setToggleSaveFailed(true)
+                  setSeedError(i18nT('pages.chatSidebar.failed_to_save_board_toggle'))
+                  return
+                }
+                setToggleSaveFailed(false)
                 setSeedError('')
                 if (!next) {
                   // Leaving board view: give back the width the user chose before
@@ -4470,6 +4369,10 @@ function ChatSidebar({
               <DropdownMenuItem onClick={() => { setCleanupOpen(!cleanupOpen); setCleanupExpanded(false); setCleanupError('') }}>
                 <BrushCleaning size={14} className="text-muted" />
                 {i18nT('pages.chatSidebar.clean_up_sessions')}
+              </DropdownMenuItem>
+              <DropdownMenuItem data-testid="clean-up-empty-folders" onClick={() => setFolderCleanupOpen(!folderCleanupOpen)}>
+                <FolderX size={14} className="text-muted" />
+                {i18nT('pages.chatSidebar.clean_up_empty_folders_menu')}
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => { setBulkModelOpen(true); setBulkModel(''); setBulkSkipRunning(true); setBulkModelError('') }}>
                 <Cpu size={14} className="text-muted" />
@@ -4522,26 +4425,11 @@ function ChatSidebar({
               <DropdownMenuContent align="end" className="min-w-[200px] max-w-[264px]" onCloseAutoFocus={onMenuCloseAutoFocus}>
                 {/* The plain chat is what the button's main segment does, but a
                  *  menu that lists every OTHER way to create and omits the
-                 *  ordinary one reads as if autopilot were the only kind of
-                 *  chat the caret can make. Listed first so the default stays
-                 *  the default. */}
-                <DropdownMenuItem disabled={creatingSlot} onClick={() => { createPlainChatMutation.mutate() }}>
+                 *  ordinary one reads as if the other kinds were the only ones
+                 *  the caret can make. Listed first so the default stays the
+                 *  default. */}
+                <DropdownMenuItem disabled={creatingSlot} onClick={() => { createChatMutation.mutate({ inNewTab: false }) }}>
                   <MessageSquarePlus size={14} className="text-muted" /> {i18nT('pages.chatSidebar.new_chat')}
-                </DropdownMenuItem>
-                {/* The two engineered modes carry a one-line description, because the
-                 *  moment a user cannot tell them apart is the moment this menu opens
-                 *  — and until now the only explanation lived in a native title= on
-                 *  the sidebar badge, i.e. after the session already existed. The
-                 *  plain entries stay single-line: "New chat" and "New folder" need
-                 *  no gloss, and describing them would bury the contrast that
-                 *  actually needs drawing. `items-start` so the icon aligns to the
-                 *  label, not to the middle of the two-line block. */}
-                <DropdownMenuItem className="items-start" disabled={creatingSlot} onClick={() => { createAutopilotMutation.mutate() }}>
-                  <Zap size={14} className="text-muted mt-[3px] shrink-0" />
-                  <span className="flex min-w-0 flex-col gap-px">
-                    <span>{i18nT('pages.chatSidebar.new_autopilot_chat')}</span>
-                    <span className="whitespace-normal text-[11px] leading-snug text-muted">{i18nT('pages.chatSidebar.autopilot_desc')}</span>
-                  </span>
                 </DropdownMenuItem>
                 {/* Ephemeral session types are grouped one level down: they are two
                  *  spellings of one choice (a session that leaves no lasting memory),
@@ -4691,13 +4579,32 @@ function ChatSidebar({
                  *  does not yet show live remote sessions. Toggle lives in
                  *  Settings > Remote Crew. */}
                 {remoteCrewChatPreview && warmCrews.length > 0 && (() => {
-                  const crewRows = warmCrews.map(c => (
-                    <DropdownMenuItem key={c.id} data-testid={`new-chat-on-crew-${c.id}`}
-                      disabled={createRemoteChatMutation.isPending}
-                      onSelect={e => { e.preventDefault(); createRemoteChatMutation.mutate(c.id) }}>
-                      <Server size={14} className="text-info" /> {c.name}
-                    </DropdownMenuItem>
-                  ))
+                  // The picked row swaps its icon for a spinner and its label for
+                  // "Starting chat on <crew>…": the create opens a session on the peer
+                  // before the local one exists, so it takes seconds, and the menu
+                  // stays open (onSelect preventDefault) the whole time, so the row
+                  // is where the eye already is.
+                  const crewRows = warmCrews.map(c => {
+                    const pendingHere = createRemoteChatMutation.isPending && createRemoteChatMutation.variables === c.id
+                    return (
+                      <DropdownMenuItem key={c.id} data-testid={`new-chat-on-crew-${c.id}`}
+                        // The picked row is the progress cue, so it is not disabled
+                        // (a disabled row is drawn faded); the guard in onSelect is
+                        // what refuses a second pick while the create runs.
+                        disabled={createRemoteChatMutation.isPending && !pendingHere}
+                        aria-busy={pendingHere || undefined}
+                        onSelect={e => {
+                          e.preventDefault()
+                          if (createRemoteChatMutation.isPending) return
+                          createRemoteChatMutation.mutate(c.id)
+                        }}>
+                        {pendingHere
+                          ? <Loader2 size={14} className="text-info animate-spin" aria-hidden="true" data-testid={`new-chat-on-crew-spinner-${c.id}`} />
+                          : <Server size={14} className="text-info" />}{' '}
+                        {pendingHere ? i18nT('pages.chatSidebar.creating_on_crew', { name: c.name }) : c.name}
+                      </DropdownMenuItem>
+                    )
+                  })
                   // Inline failure reason (version mismatch, tunnel down), shown
                   // through the shared ErrorNotice (website AGENTS.md forbids a
                   // hand-written text-danger div for a rejected mutation). Kept in
@@ -4765,6 +4672,7 @@ function ChatSidebar({
        *  and the header's "in split" badge is the way back into a live split. */}
 
       {/* Clean Up dialog */}
+      {folderCleanupOpen && <FolderCleanupPanel folders={folders} onClose={() => setFolderCleanupOpen(false)} />}
       {cleanupOpen && (() => {
         const archivable = cleanupPreview ? cleanupPreview.map(k => localSlots.find(s => s.key === k)).filter(Boolean) as Slot[] : []
         const noStale = cleanupPreview != null && cleanupPreview.length === 0 && !activeIsStale
@@ -5136,6 +5044,23 @@ function ChatSidebar({
                     </DropdownMenuItem>
                   )
                 })}
+                {/* Lift every active status filter at once, for a look at the
+                    whole list without losing the filter setup, then put them
+                    back. A menu row, not a third control in the chip row:
+                    AUTOSDE max-two-buttons-per-row grandfathers that row but
+                    forbids growing it, and the chip click keeps its one meaning
+                    (clear this filter). Hidden with no active filter, when
+                    there is nothing to pause. */}
+                {activeFilters.size > 0 && (
+                  <DropdownMenuItem
+                    data-testid="filter-pause-all"
+                    aria-pressed={filtersPaused}
+                    onSelect={e => { e.preventDefault(); setAllFiltersPaused(!filtersPaused) }}
+                  >
+                    {filtersPaused ? <Play size={12} className="text-muted" aria-hidden="true" /> : <Pause size={12} className="text-muted" aria-hidden="true" />}
+                    <span className="flex-1 truncate">{filtersPaused ? i18nT('pages.chatSidebar.resume_all_filters') : i18nT('pages.chatSidebar.pause_all_filters')}</span>
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuSeparator />
                 {/* Names its object: this menu also carries "Folder order" two
                     sections down, and a bare "Sort by" over one list beside an
@@ -5477,8 +5402,10 @@ function ChatSidebar({
             return (
               <FilterChip
                 key={filterDef.key}
+                testId={`filter-chip-${filterDef.key}`}
                 label={`${filterLabel}${filterDef.key === 'recent' ? ` · ${formatRecentWindow(recentWindowMs)}` : ''}${slotCount > 0 ? ` (${slotCount})` : ''}`}
                 color={filterDef.color}
+                paused={filtersPaused}
                 clearLabel={clearLabel}
                 onClear={() => toggleFilter(filterDef.key)}
               />
@@ -5495,21 +5422,28 @@ function ChatSidebar({
          * Retry is a separate button, not the notice itself. */
         <div className="mx-2 mt-2 flex flex-col gap-1 shrink-0">
           <ErrorNotice
-            title={i18nT('pages.chatSidebar.lane_seed_failed')}
+            title={toggleSaveFailed ? undefined : i18nT('pages.chatSidebar.lane_seed_failed')}
             message={seedError}
             askAgent
-            onDismiss={() => setSeedError('')}
+            onDismiss={() => { setSeedError(''); setToggleSaveFailed(false) }}
             testId="lane-seed-error"
           />
-          <div>
-            <Btn
-              type="button"
-              className="text-[12px] px-2 py-0.5"
-              onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
-            >
-              {i18nT('pages.chatSidebar.lane_seed_retry')}
-            </Btn>
-          </div>
+          {/* The Retry button seeds state lanes — the recovery for a SEED
+           * failure. It must not show under a toggle-SAVE failure: there its
+           * "Try again" label would promise to retry the save but instead seed
+           * lanes into a board the user never switched to (UX Review). The
+           * save-failure copy already carries its own next step. */}
+          {!toggleSaveFailed && (
+            <div>
+              <Btn
+                type="button"
+                className="text-[12px] px-2 py-0.5"
+                onClick={() => { setSeedError(''); seedStateLanesMutation.mutate() }}
+              >
+                {i18nT('pages.chatSidebar.lane_seed_retry')}
+              </Btn>
+            </div>
+          )}
         </div>
       )}
       {/* Read failures for the two lists this pane is built from. Same placement
@@ -5755,9 +5689,9 @@ function ChatSidebar({
                 // against the unfiltered population. A creator that is still there is
                 // open and running, so saying it closed would be false.
                 const cited = orphanCitation(slot, tree.parentOf.get(key) ?? null)
-                const citedKey = slot.parent?.key
-                const creatorStillOpen = cited != null && citedKey != null
-                  && (citedCreatorExists.get(slot.peer_id)?.has(citedKey) ?? false)
+                const creator = citedCreatorOf(slot)
+                const creatorStillOpen = cited != null && creator !== null
+                  && (citedCreatorExists.get(creator.origin)?.has(creator.key) ?? false)
                 rows.push({
                   id: key,
                   slot,
@@ -6328,7 +6262,8 @@ function ChatSidebar({
                     document.body
                   )}
                   <SessionRowWindowScroller className="flex-1 overflow-y-auto scrollbar-none p-1.5 flex flex-col" style={{ scrollbarWidth: 'none' }}>
-                    {/* No onDrop here: folder assignment only changes via folder-header drop.
+                    {/* No onDrop here: folder assignment only changes via folder-header drop
+                        (into a folder) and the unfile strip below this scroller (out of one).
                         Cross-column drops are handled by the OUTER column onDrop
                         (which only mutates status tags, keeping folder_id intact). */}
                     {(() => {
@@ -6417,6 +6352,14 @@ function ChatSidebar({
                       )
                     })()}
                   </SessionRowWindowScroller>
+                  {/* The way back out of a folder, at the foot of the column and
+                    * outside the scroller so it stays in reach however far the
+                    * lane is scrolled. Only while a FILED card is in flight: an
+                    * unfiled card has nothing to leave, and a column reorder is
+                    * not a card. The strip's handlers stop propagation, so the
+                    * column onDrop above never sees this release -- the retag
+                    * and the unfile stay two gestures. */}
+                  {boardDraggingFiledSession && <BoardUnfileDropStrip columnId={col.id} onUnfile={k => moveByDrag(k, null)} />}
                 </div>
               )
             })}
@@ -6648,7 +6591,7 @@ function ChatSidebar({
                     dispatch(resumeFromHistory({ key: s.key, title: s.title || s.key }))
                   }
                   return (
-                    <div className={`group relative flex items-start gap-2.5 pr-4 py-2 rounded-md text-sm transition-all select-none ${!connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'}`} style={{ paddingLeft: '10px' }} title={s.title || s.key} {...offlineProps(connected, 'resume sessions')} role="button" tabIndex={0} aria-disabled={!connected} onKeyDown={e => {
+                    <div className={`group relative flex items-start gap-2.5 pr-4 py-2 rounded-md text-sm transition-all select-none ${remoteInstanceId ? '' : '[@media(hover:none)]:pr-10 '}${!connected ? 'text-muted opacity-50 cursor-not-allowed' : 'text-muted hover:text-text hover:bg-bg-hover cursor-pointer'}`} style={{ paddingLeft: '10px' }} title={s.title || s.key} {...offlineProps(connected, 'resume sessions')} role="button" tabIndex={0} aria-disabled={!connected} onKeyDown={e => {
                       // WCAG 2.1.1: history rows must be resumable via keyboard.
                       if (e.key !== 'Enter' && e.key !== ' ') return
                       if ((e.target as HTMLElement) !== e.currentTarget) return
@@ -6713,7 +6656,7 @@ function ChatSidebar({
                           Hidden for remote rows: deleteHistorySession targets the
                           LOCAL session file, which for a remote row is at best a
                           same-keyed unrelated conversation. */}
-                      {!remoteInstanceId && <div className="absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-all flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm">
+                      {!remoteInstanceId && <div className="absolute top-1/2 -translate-y-1/2 right-1.5 opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-all flex items-center gap-0.5 rounded-md p-1 bg-card border border-border shadow-sm">
                         <button type="button" title={i18nT('pages.chatSidebar.delete_history_session')} aria-label={i18nT('pages.chatSidebar.delete_history_session')} className="text-[12px] text-muted cursor-pointer p-[4px] rounded hover:text-danger hover:bg-danger-subtle transition-all bg-transparent border-none" onMouseDown={e => e.stopPropagation()} onClick={e => { e.stopPropagation(); if (confirm(i18nT('pages.chatSidebar.are_you_sure_you_want_to_delete_this_history_ses'))) dispatch(deleteHistorySession(s.key)) }}><X size={12} /></button>
                       </div>}
                     </div>

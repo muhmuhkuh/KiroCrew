@@ -200,12 +200,22 @@ def test_tail_and_updated_soul_survive_small_ordinary_context_budget(env):
     env.forbidden.assert_not_called()
 
 
-def test_oversized_essential_refuses_with_source_name_instead_of_partial_prompt(env):
+def test_oversized_guide_is_left_out_by_name_instead_of_refusing_the_turn(env):
+    """An over-budget guide drops out whole and is named; the turn still runs.
+
+    This replaced ``test_oversized_essential_refuses_with_source_name_instead_of_
+    partial_prompt``: the source is still named and never cut mid-body, but the
+    member's core keeps working instead of every turn refusing.
+    """
     (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
-    with pytest.raises(MemberEssentialContextError, match="AGENTS.md"):
-        env.builder.build_message(
-            "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
-        )
+    message, _ = env.builder.build_message(
+        "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
+    )
+    assert "x" * 1_000 not in message
+    assert "[Essential source: essential-context#omitted]" in message
+    assert f"{env.project / 'AGENTS.md'} (64,001 characters)" in message
+    assert "Bound Soul: preserve the user's voice." in message
+    assert "Preference anchor: 请保留中文原文。" in message
 
 
 @pytest.mark.asyncio
@@ -413,8 +423,12 @@ def test_execution_namespace_controls_member_prompt_identity(env, entrypoint, se
     env.forbidden.assert_not_called()
 
 
-def _delegate_expectations(prompt: str, store: str) -> None:
-    """The subset a template-selected delegate on a member's store receives.
+def _delegate_expectations(prompt: str, store: str, *, template_instructions: bool = True) -> None:
+    """The subset a member turn with the desk WITHHELD receives.
+
+    Shared by the template-selected delegate and the member selection off its
+    desk (a plain chat on the alias, a cron or channel turn): the two arms of
+    ``_desk_withheld``, one section shape.
 
     Identity, `[PERMANENT RULES]`, the store's anchors and the selected template's
     own instructions stay; the desk protocol and the briefing do not, in any of
@@ -427,7 +441,8 @@ def _delegate_expectations(prompt: str, store: str) -> None:
     assert "[PERMANENT RULES" in prompt
     assert "Do not publish drafts." in prompt
     assert "Preference anchor" in prompt
-    assert "Execution task instructions." in prompt
+    if template_instructions:
+        assert "Execution task instructions." in prompt
     assert "[HOW YOU WORK]" not in prompt
     assert "Front desk vs workshop" not in prompt
     assert "[CURRENT ASSIGNMENT" not in prompt
@@ -501,17 +516,20 @@ def test_template_selected_delegate_session_start_withholds_the_desk_protocol(en
 
 
 @pytest.mark.parametrize("entrypoint", ["message", "session"])
-def test_member_selected_by_name_still_gets_its_whole_desk(env, entrypoint):
-    """The counterpart: a MEMBER selection keeps all four layers, protocol included."""
+def test_member_at_its_desk_gets_its_whole_desk(env, entrypoint):
+    """The counterpart: a member turn the caller names as the DESK keeps all four
+    layers, protocol included. ``member=`` is what the dashboard passes for a
+    ``mode == "member"`` slot -- the pinned DM thread."""
     from kiro_crew.execution_context import resolve_member_execution
 
     execution = resolve_member_execution(KiroCrewConfig.load(), "writer")
-    options = dict(execution_context=execution, project=str(env.project))
+    options = dict(execution_context=execution, project=str(env.project), member="writer")
     if entrypoint == "message":
         prompt, _ = env.builder.build_message("Continue", True, **options)
     else:
         prompt = env.builder.build_session_context(**options)
     assert "You are writer." in prompt
+    assert "This DM thread is your durable working relationship" in prompt
     assert "[HOW YOU WORK]" in prompt
     assert "Front desk vs workshop" in prompt
     assert "[PERMANENT RULES" in prompt
@@ -520,10 +538,52 @@ def test_member_selected_by_name_still_gets_its_whole_desk(env, entrypoint):
     env.forbidden.assert_not_called()
 
 
+@pytest.mark.parametrize("entrypoint", ["message", "session"])
+@pytest.mark.parametrize(
+    "fresh, options",
+    [
+        (True, {}),
+        (False, {}),
+        (False, {"needs_reinjection": True}),
+        (True, {"resumed": True}),
+        (True, {"minimal_context": True}),
+    ],
+)
+def test_member_selected_off_its_desk_keeps_identity_and_rules_but_not_the_desk(
+    env, entrypoint, fresh, options
+):
+    """A member SELECTION with no desk argument is not the member's desk.
+
+    An ordinary dashboard chat that resolved to a crew alias -- every plain chat
+    lands on the stock ``default`` alias this way -- a cron turn or a channel turn
+    carries the member's record and therefore its identity, rules and memory, but
+    no caller named it as the member's DM thread. It gets exactly what a delegate
+    gets: identity and `[PERMANENT RULES]`, no `[HOW YOU WORK]`, no briefing (so
+    nothing tells it to rewrite the briefing file), and no sentence describing a
+    DM thread it is not in. Pinned on every lifecycle the section is rebuilt for
+    and on both entry points.
+    """
+    from kiro_crew.execution_context import resolve_member_execution
+
+    execution = resolve_member_execution(KiroCrewConfig.load(), "writer")
+    base = dict(execution_context=execution, project=str(env.project))
+    if entrypoint == "message":
+        prompt, _ = env.builder.build_message(
+            "Continue", fresh, "dashboard:chat-1-123", **base, **options
+        )
+    else:
+        if not fresh:
+            pytest.skip("build_session_context is the session-start entry point")
+        prompt = env.builder.build_session_context(**base, **options)
+    _delegate_expectations(prompt, env.store, template_instructions=False)
+    assert "This DM thread is your durable working relationship" not in prompt
+    env.forbidden.assert_not_called()
+
+
 def test_a_delegate_with_memory_withheld_gets_no_layer_four_placeholder_either(env):
     """The scope notice explains a member's missing layer 4; a delegate has none.
 
-    With the memory group withheld, the member selected by name is told why its
+    With the memory group withheld, the member AT ITS DESK is told why its
     briefing is missing and not to fill the gap; the delegate on the same store
     keeps identity and rules and gets no `[CURRENT ASSIGNMENT` line of any kind.
     """
@@ -533,7 +593,11 @@ def test_a_delegate_with_memory_withheld_gets_no_layer_four_placeholder_either(e
     config = KiroCrewConfig.load()
     options = dict(project=str(env.project), context_groups=frozenset({CONTEXT_GROUP_PROJECT}))
     member_prompt, _ = env.builder.build_message(
-        "Continue", True, execution_context=resolve_member_execution(config, "writer"), **options
+        "Continue",
+        True,
+        execution_context=resolve_member_execution(config, "writer"),
+        member="writer",
+        **options,
     )
     assert "withheld by this turn's memory/privacy scope]" in member_prompt
     delegate_prompt, _ = env.builder.build_message(
@@ -591,8 +655,11 @@ def test_a_member_with_no_persisted_id_keeps_its_rules_when_session_create_names
     identity and, the part that matters, no `[PERMANENT RULES]`. The arm keeps the
     selection and changes only the template (the record
     `test_explicit_template_child_of_a_member_with_no_persisted_id_keeps_its_selection`
-    pins through the arm itself), so the child stays that member with its rules
-    and, the limit this states, its whole desk.
+    pins through the arm itself), so the child stays that member with its rules.
+    It does NOT keep the desk: no caller names a delegate as the member's
+    DM thread, so the surface half of ``_desk_withheld`` withholds the protocol
+    and the briefing without the record having to say "this member, under that
+    template".
     """
     from dataclasses import replace
 
@@ -621,7 +688,9 @@ def test_a_member_with_no_persisted_id_keeps_its_rules_when_session_create_names
     assert "[PERMANENT RULES" in prompt
     assert "Scribe: keep every draft." in prompt
     assert "Execution task instructions." in prompt
-    assert "[HOW YOU WORK]" in prompt
+    assert "[HOW YOU WORK]" not in prompt
+    assert "[CURRENT ASSIGNMENT" not in prompt
+    assert "This DM thread" not in prompt
     env.forbidden.assert_not_called()
 
 
@@ -2176,3 +2245,118 @@ def test_another_harness_never_reads_the_setting(operator_steering, monkeypatch,
     reads = _count_setting_reads(monkeypatch)
     _envelope_with_folder_steering_trees(env, provider_type=provider_type)
     assert reads == []
+
+
+def _declare_resources(env, names: list[str]) -> None:
+    spec = env.project / ".kiro" / "agents" / "writer-template.json"
+    data = json.loads(spec.read_text(encoding="utf-8"))
+    data["resources"] = [f"file://{name}" for name in names]
+    spec.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _member_message(env) -> str:
+    message, _ = env.builder.build_message(
+        "Continue", False, memory_store=env.store, member=env.member, project=str(env.project)
+    )
+    return message
+
+
+def _envelope(message: str) -> str:
+    start = message.index("[V2 ESSENTIAL CONTEXT")
+    end = message.index("[END V2 ESSENTIAL CONTEXT]\n\n", start)
+    return message[start : end + len("[END V2 ESSENTIAL CONTEXT]\n\n")]
+
+
+def test_over_budget_declared_resources_leave_out_the_tail_and_the_turn_runs(env, caplog):
+    """The reported shape: an agent spec whose ``resources`` grew past the envelope.
+
+    Guides leave from the tail of declaration order, whole, only as many as needed;
+    every one left out is named with its size in one in-band notice; the member's
+    core (persona prompt, SOUL.md, profile anchors, recall note) is all still there;
+    the result fits the envelope; and the drop is logged at warning.
+    """
+    names = [f"context/g{i}.md" for i in range(4)]
+    (env.project / "context").mkdir()
+    for i, name in enumerate(names):
+        (env.project / name).write_text(f"GUIDE_{i}_HEAD\n" + "y" * 25_000, encoding="utf-8")
+    _declare_resources(env, names)
+    with caplog.at_level("WARNING"):
+        message = _member_message(env)
+    assert "GUIDE_0_HEAD" in message and "GUIDE_1_HEAD" in message
+    assert "GUIDE_2_HEAD" not in message and "GUIDE_3_HEAD" not in message
+    assert "[Essential source: essential-context#omitted]" in message
+    for name in names[2:]:
+        assert f"{env.project / name} (25,013 characters)" in message
+    for name in names[:2]:
+        assert f"{env.project / name} (25,013 characters)" not in message
+    for core in (
+        "Bound Soul: preserve the user's voice.",
+        "Project Soul: write with empathy.",
+        "Preference anchor: 请保留中文原文。",
+        "Project anchor: the launch guide is authoritative.",
+        "memory_recall",
+    ):
+        assert core in message
+    assert len(_envelope(message)) <= 64_000
+    warned = [r for r in caplog.records if r.levelname == "WARNING" and "g2.md" in r.getMessage()]
+    assert len(warned) == 1 and "g3.md" in warned[0].getMessage()
+
+
+def test_a_fitting_envelope_carries_no_omission_notice(env):
+    assert "essential-context#omitted" not in _member_message(env)
+
+
+@pytest.mark.parametrize("core", ["prompt", "SOUL.md"])
+def test_an_over_budget_core_still_refuses_with_the_source_named(env, core):
+    if core == "prompt":
+        spec = env.project / ".kiro" / "agents" / "writer-template.json"
+        data = json.loads(spec.read_text(encoding="utf-8"))
+        data["prompt"] = "p" * 64_001
+        spec.write_text(json.dumps(data), encoding="utf-8")
+        named = "writer-template.json#prompt"
+    else:
+        (env.project / "SOUL.md").write_text("s" * 64_001, encoding="utf-8")
+        named = "SOUL.md"
+    with pytest.raises(MemberEssentialContextError, match="exceeds 64000") as raised:
+        _member_message(env)
+    assert named in str(raised.value)
+
+
+def test_a_refused_declared_source_still_refuses_when_the_envelope_is_over_budget(env):
+    """Budget fitting never turns a source the reader refuses into an omission."""
+    (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
+    (env.project / "declared-guide.md").unlink()
+    with pytest.raises(MemberEssentialContextError, match="declared-guide"):
+        _member_message(env)
+
+
+def test_guides_whose_names_do_not_fit_are_counted_by_the_short_notice():
+    """When the core leaves no room to list every left-out guide, they are counted."""
+    from kiro_crew.context_assembly.member import _fit_member_guides_into_envelope
+
+    guides = [(f"/project/context/{'n' * 200}-{i}.md", "g") for i in range(40)]
+    core = ("template#prompt", "c" * 63_200)
+    fitted, left_out = _fit_member_guides_into_envelope(
+        [core, *guides], frozenset(source for source, _ in guides), identity="I", owner="w"
+    )
+    assert left_out == 40
+    assert fitted[0] == core and len(fitted) == 2
+    source, notice = fitted[1]
+    assert source == "essential-context#omitted"
+    assert "40 guide document(s)" in notice and "nnnn" not in notice
+    big_core = ("template#prompt", "c" * 64_000)
+    documents = [big_core, *guides]
+    assert _fit_member_guides_into_envelope(
+        documents, frozenset(source for source, _ in guides), identity="I", owner="w"
+    ) == (documents, 0)
+
+
+def test_a_guide_too_large_to_fit_does_not_take_the_smaller_guides_after_it_out(env):
+    """Only the guides that cannot fit are left out; later small ones are given back."""
+    (env.project / "AGENTS.md").write_text("x" * 64_001, encoding="utf-8")
+    message = _member_message(env)
+    assert f"{env.project / 'AGENTS.md'} (64,001 characters)" in message
+    assert "1 guide document(s)" in message
+    assert "Declared guide: examples must be reproducible." in message
+    assert "Always guide: explain assumptions." in message
+    assert len(_envelope(message)) <= 64_000

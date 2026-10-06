@@ -109,7 +109,6 @@ from kiro_crew.config.service_sections import (
     CronHistoryConfig,
     MessagingConfig,
     MonitoringConfig,
-    OrchestratorConfig,
     TaskRunnerConfig,
     WatchdogConfig,
 )
@@ -153,24 +152,6 @@ def _build_taskrunner_config(taskrunner_data: dict) -> TaskRunnerConfig:
     return TaskRunnerConfig(
         max_parallel_steps=taskrunner_data.get("max_parallel_steps", DEFAULT_MAX_PARALLEL_STEPS),
         workspace_dir=str(taskrunner_data.get("workspace_dir", "")),
-    )
-
-
-def _build_orchestrator_config(orchestrator_data: dict) -> OrchestratorConfig:
-    return OrchestratorConfig(
-        stage_timeout_seconds=_safe_int(orchestrator_data.get("stage_timeout_seconds", 1800), 1800),
-        # Default read off the dataclass rather than imported: the loader's
-        # re-export list from config.sections is a frozen boundary snapshot
-        # (test_config_module_boundaries), and this keeps
-        # DEFAULT_MAX_PLAN_DURATION as the single source of truth without
-        # adding an alias to it.
-        max_plan_duration_seconds=_safe_int(
-            orchestrator_data.get(
-                "max_plan_duration_seconds",
-                OrchestratorConfig.max_plan_duration_seconds,
-            ),
-            OrchestratorConfig.max_plan_duration_seconds,
-        ),
     )
 
 
@@ -271,6 +252,9 @@ def _build_memory_config(memory_data: dict) -> MemoryConfig:
         persistence_enabled=_safe_bool(memory_data.get("persistence_enabled", True), True),
         inject_memory=_safe_bool(memory_data.get("inject_memory", True), True),
         inject_lessons=_safe_bool(memory_data.get("inject_lessons", True), True),
+        inject_lessons_per_turn=_safe_bool(
+            memory_data.get("inject_lessons_per_turn", False), False
+        ),
         inject_activity=_safe_bool(memory_data.get("inject_activity", True), True),
         migrated=memory_data.get("migrated", False),
     )
@@ -704,6 +688,9 @@ def _build_slack_config(slack_data: dict) -> SlackConfig:
         dm_single_session=bool(slack_data.get("dm_single_session", False)),
         home_tab_sessions_per_kind=_safe_int(slack_data.get("home_tab_sessions_per_kind", 5), 5),
         sessions_limit=_safe_int(slack_data.get("sessions_limit", 10), 10),
+        # Default False: a missing or unparseable value must mean "open no
+        # thread", never the reverse.
+        auto_link_sessions=_safe_bool(slack_data.get("auto_link_sessions", False), False),
     )
 
 
@@ -919,4 +906,7 @@ def _build_stt_config(stt_data: dict) -> SttConfig:
         ),
         transcribe_region=stt_data.get("transcribe_region", "us-east-1"),
         transcribe_profile=stt_data.get("transcribe_profile", ""),
+        transcribe_vocabulary=_sections._validated_transcribe_vocabulary(
+            stt_data.get("transcribe_vocabulary")
+        ),
     )

@@ -23,6 +23,7 @@ import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from overload_fakes import settle_depth_emits, settle_store_writes
 
 from kiro_crew import subagent as subagent_module
 from kiro_crew.subagent import (
@@ -39,6 +40,11 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py``.
+
+
+@pytest.fixture(autouse=True)
+def _close_subagent_managers(close_subagent_managers):
+    """Every manager built here is closed at teardown; the body is in ``conftest``."""
 
 
 # ── 1. Coalescer ─────────────────────────────────────────────────────
@@ -490,125 +496,6 @@ class TestBatchIdentity:
         assert events[0][2]["outcome"] == "stopped"
 
     @pytest.mark.asyncio
-    async def test_stage_owned_queued_stop_holds_its_parent_report_barrier(self):
-        """The next stage waits until its queued predecessor reports stopped."""
-        from kiro_crew.subagent import stage_boundary_owner_for_run
-
-        report_started = asyncio.Event()
-        release_report = asyncio.Event()
-        announced: list[SubagentInfo] = []
-
-        async def on_done(info):  # type: ignore[no-untyped-def]
-            announced.append(info)
-            report_started.set()
-            await release_report.wait()
-
-        parent = "dashboard:one"
-        owner = "stage-owner"
-        mgr = SubagentManager(
-            sessions=_mock_sessions(),
-            ctx_builder=_mock_ctx(),
-            on_done=on_done,
-        )
-        mgr._queue = [
-            {
-                "task": "stage-owned queued task",
-                "_preassigned_id": "q-stage-stop",
-                "parent_session_key": parent,
-                "_stage_boundary_owner": owner,
-            }
-        ]
-        mgr._emit_queue_depth = MagicMock()
-
-        assert await mgr.cancel("q-stage-stop") is True
-        await report_started.wait()
-        barrier = asyncio.create_task(mgr.wait_for_parent_reports(parent, owner))
-        await asyncio.sleep(0)
-
-        assert stage_boundary_owner_for_run(announced[0]) == owner
-        assert not barrier.done(), "the next stage captured a late queued-stop report"
-
-        release_report.set()
-        assert await barrier is True
-
-    def test_stage_boundary_owner_survives_every_run_reconstruction_site(self):
-        """Every run copy keeps the boundary token that admitted its source."""
-        import inspect
-        from types import SimpleNamespace
-
-        from kiro_crew.dashboard.handlers.messaging import (
-            _stage_boundary_owner_for_parent,
-            _stage_boundary_slot_for_parent,
-            api_spawn_retry,
-        )
-        from kiro_crew.dashboard.state import StageBoundary
-        from kiro_crew.subagent_manager.admission.gate import _GateMixin
-        from kiro_crew.subagent_manager.cancellation import CancellationCoordinator
-        from kiro_crew.subagent_manager.continuation import ContinuationCoordinator
-
-        requirements = {
-            "spawn": (SubagentManager.spawn, "_stage_boundary_owner=_stage_boundary_owner"),
-            "spawn result": (
-                SubagentManager.spawn,
-                "result._stage_boundary_owner = _stage_boundary_owner",
-            ),
-            "queued spawn": (
-                _GateMixin.spawn_impl,
-                '"_stage_boundary_owner": _stage_boundary_owner',
-            ),
-            "retry": (
-                api_spawn_retry,
-                "_stage_boundary_owner_for_parent(state, old.parent_session_key)",
-            ),
-            "respawn": (
-                CancellationCoordinator._schedule_cancel_recovery_impl,
-                "self._manager._run(info)",
-            ),
-            "queued stop": (
-                CancellationCoordinator._report_queued_stop_impl,
-                '_stage_boundary_owner=str(params.get("_stage_boundary_owner") or "")',
-            ),
-            "automatic follow-up": (
-                ContinuationCoordinator._deliver_followups_impl,
-                "_stage_boundary_owner=stage_boundary_owner_for_run(info)",
-            ),
-            "synthetic failure": (
-                ContinuationCoordinator._announce_followup_failure_impl,
-                "synthetic._stage_boundary_owner = stage_boundary_owner_for_run(info)",
-            ),
-            "channel parent": (
-                _stage_boundary_slot_for_parent,
-                "effective_session_key(candidate) == parent",
-            ),
-        }
-        missing = [
-            site
-            for site, (function, needle) in requirements.items()
-            if needle not in inspect.getsource(function)
-        ]
-        continuation_source = inspect.getsource(ContinuationCoordinator._continue_prelude_impl)
-        if (
-            continuation_source.count("_stage_boundary_owner=_stage_boundary_owner")
-            != continuation_source.count("SubagentInfo(") + 1
-        ):
-            missing.append("continuation result")
-        assert missing == [], f"stage boundary owner dropped at: {missing}"
-
-        parent = "slack:123.456"
-        boundary = StageBoundary(stage=1, generation="stage-owner")
-        slot = SimpleNamespace(
-            key="slack_123.456",
-            linked_session_key=parent,
-            stage_boundary=boundary,
-        )
-        state = SimpleNamespace(_slots={slot.key: slot})
-        with patch(
-            "kiro_crew.dashboard.handlers.messaging.dashboard_slot_key",
-            return_value="",
-        ):
-            assert _stage_boundary_owner_for_parent(state, parent) == "stage-owner"
-
-    @pytest.mark.asyncio
     async def test_stop_parent_removes_its_queued_agents_before_start(self):
         mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
         mgr._queue = [
@@ -693,52 +580,6 @@ class TestBatchIdentity:
 
         assert (stopped, queued) == (1, 0)
         mgr.cancel.assert_awaited_once_with("run")
-
-    @pytest.mark.asyncio
-    async def test_stop_boundary_includes_approval_waiters_and_preserves_sibling(self):
-        parent = "dashboard:shared"
-        owner_a, owner_b = "owner-a", "owner-b"
-        mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx())
-        running_a = SubagentInfo(
-            id="run-a",
-            task="run-a",
-            parent_session_key=parent,
-            _stage_boundary_owner=owner_a,
-        )
-        approval_a = SubagentInfo(
-            id="approval-a",
-            task="approval-a",
-            parent_session_key=parent,
-            _stage_boundary_owner=owner_a,
-        )
-        approval_a._awaiting_approval = True
-        approval_a._exec_started = None
-        running_b = SubagentInfo(
-            id="run-b",
-            task="run-b",
-            parent_session_key=parent,
-            _stage_boundary_owner=owner_b,
-        )
-        mgr._agents = {info.id: info for info in (running_a, approval_a, running_b)}
-        waits = {
-            info.id: asyncio.create_task(asyncio.Event().wait()) for info in mgr._agents.values()
-        }
-        mgr._tasks = dict(waits)
-        mgr._fire_event = AsyncMock()
-        mgr._write_tombstone = MagicMock()
-        mgr._record_cost = MagicMock()
-
-        try:
-            stopped, queued = await mgr.cancel_for_boundary(parent, owner_a)
-            await asyncio.gather(waits[running_a.id], waits[approval_a.id], return_exceptions=True)
-
-            assert (stopped, queued) == (2, 0)
-            assert waits[running_a.id].cancelled()
-            assert waits[approval_a.id].cancelled(), "spawn-approval waiter stayed parked"
-            assert not waits[running_b.id].done(), "sibling owner was cancelled"
-        finally:
-            waits[running_b.id].cancel()
-            await asyncio.gather(waits[running_b.id], return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_spawn_counts_submissions_once_per_member(self):
@@ -1155,7 +996,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1218,7 +1058,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1256,6 +1095,45 @@ class TestWaveDigest:
         assert "requested" not in body
 
     @pytest.mark.asyncio
+    async def test_wave_digest_flags_a_completed_partial_member(self):
+        """A member kept after a generate failure is completed but partial; its ok line says so."""
+        orch = _make_orchestrator()
+        orch.sessions = _mock_sessions()
+        orch.ctx_builder = MagicMock()
+        orch.ctx_builder.hooks = MagicMock()
+        orch.dashboard_state = _mock_dashboard_state()
+        slot = MagicMock()
+        slot.mode = "chat"
+        slot.running = False
+        slot.task = None
+        slot._subagent_deliveries_inflight = 0
+        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
+        mgr, on_done = self._capture_on_done(orch)
+        injected: list[str] = []
+
+        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
+            injected.append(text)
+
+        with (
+            patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat),
+            patch("kiro_crew.subagent_persistence.mark_delivered"),
+        ):
+            m0, m1 = self._member(0, 2), self._member(1, 2)
+            m0.partial = True
+            mgr.batch_members_pending = MagicMock(return_value=True)
+            await on_done(m0)
+            await asyncio.sleep(0)
+            mgr.batch_members_pending = MagicMock(return_value=False)
+            await on_done(m1)
+            await asyncio.sleep(0)
+            await _settle(lambda: len(injected) >= 1, what="the wave digest injected")
+
+        lines = "\n".join(injected).splitlines()
+        tag = "✅ (partial: backend failed to generate the final response)"
+        assert any(f"`{m0.id}` {tag}" in line for line in lines)
+        assert not any(f"`{m1.id}`" in line and "partial" in line for line in lines)
+
+    @pytest.mark.asyncio
     async def test_wave_digest_no_model_tag_when_served_model_absent(self):
         """Maintainer kyleseaman: when resolved_model is empty the card shows
         nothing, so the digest line must not label the pin as `model
@@ -1269,7 +1147,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1309,7 +1186,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1356,7 +1232,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1408,7 +1283,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1456,7 +1330,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1513,7 +1386,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1559,7 +1431,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1694,7 +1565,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1798,7 +1668,6 @@ class TestWaveDigest:
         # than dispatched. `task = None` keeps the shield-await a no-op.
         slot.running = True
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         slot._subagents_inline_collected = set()
         queued: list[dict] = []
@@ -1876,7 +1745,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         # Real attribute, not a MagicMock truthy stub: the stub below flips it
         # exactly as _run_chat does on a signed-out CLI.
@@ -1945,7 +1813,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -1981,58 +1848,6 @@ class TestWaveDigest:
         ], "the debt stays parked for a recovery replay to claim"
 
     @pytest.mark.asyncio
-    async def test_guard_msgs_from_all_members_fold_into_digest(self):
-        """Orchestration escalations from HELD mid-wave members must survive
-        into the digest (Arbiter item 3) — not just the last member's."""
-        orch = _make_orchestrator()
-        orch.sessions = _mock_sessions()
-        orch.ctx_builder = MagicMock()
-        orch.ctx_builder.hooks = MagicMock()
-        orch.dashboard_state = _mock_dashboard_state()
-        slot = MagicMock()
-        slot.mode = "orchestrator"
-        # Pre-seeded tracker: every failure trips the escalation ceiling.
-        tracker = MagicMock()
-        tracker.stopped = False
-        tracker.record_failure = MagicMock(return_value=True)
-        tracker.failure_count = MagicMock(return_value=2)
-        tracker.record_success = MagicMock()
-        tracker.record_round = MagicMock(return_value=False)
-        slot._orch_tracker = tracker
-        slot.running = False
-        slot.task = None
-        slot._subagent_deliveries_inflight = 0
-        orch.dashboard_state.get_slot = MagicMock(return_value=slot)
-        mgr, on_done = self._capture_on_done(orch)
-        mgr.running_agents_for = MagicMock(return_value=["still-running"])
-        total = 12
-        injected: list[str] = []
-
-        async def _fake_run_chat(_state, _slot, text, *, _directive_user_origin, **_kw):
-            assert _directive_user_origin is False
-            injected.append(text)
-
-        with (
-            patch("kiro_crew.slack.gateway._run_chat", side_effect=_fake_run_chat),
-            patch("kiro_crew.subagent_persistence.mark_delivered"),
-        ):
-            for i in range(total):
-                mgr.batch_members_pending = MagicMock(return_value=i != total - 1)
-                # Mid-wave failure (held member) trips the ceiling; the LAST
-                # member succeeds, so its own guard_msg is empty.
-                await on_done(self._member(i, total, error="boom" if i == 2 else ""))
-                await asyncio.sleep(0)
-            await _settle(lambda: len(injected) >= 2, what="both digest chunks injected")
-        assert len(injected) == 2  # chunked: 10 + 2
-        combined = "\n".join(injected)
-        # The held member's escalation instruction reached the parent, in the
-        # chunk that contains that member…
-        assert "You MUST ask the user for guidance" in injected[0]
-        # …exactly once across the whole wave (deduped within the chunk, and
-        # chunk buffers reset between flushes — no bleed into later chunks).
-        assert combined.count("You MUST ask the user for guidance") == 1
-
-    @pytest.mark.asyncio
     async def test_small_wave_delivers_single_chunk_digest(self):
         """Small multi-task waves (2-10 agents) get ONE consolidated chunk
         digest on wave close — chunking is uniform for every multi-task
@@ -2049,7 +1864,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -2089,7 +1903,6 @@ class TestWaveDigest:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
         mgr, on_done = self._capture_on_done(orch)
@@ -2296,7 +2109,6 @@ class TestDigestHoldDeadline:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         slot._subagents_inline_collected = set()
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
@@ -2373,7 +2185,6 @@ class TestDigestHoldDeadline:
         slot.mode = "chat"
         slot.running = False
         slot.task = None
-        slot._orch_tracker = None
         slot._subagent_deliveries_inflight = 0
         slot._subagents_inline_collected = set()
         orch.dashboard_state.get_slot = MagicMock(return_value=slot)
@@ -2546,39 +2357,6 @@ class TestRetryGating:
         assert resp.status == 200
         assert mgr.spawn.call_args.args[0] == "original raw task"
         assert mgr.spawn.call_args.kwargs["parent_session_key"] == "dashboard:m"
-
-    @pytest.mark.asyncio
-    async def test_retry_inherits_original_active_stage_boundary_owner(self):
-        """Retry ownership stays with the failed work while its boundary is active."""
-        from kiro_crew.dashboard.handlers.messaging import api_spawn_retry
-        from kiro_crew.dashboard.state import StageBoundary
-        from kiro_crew.execution_context import ExecutionContext, MemoryStoreRef
-
-        parent = "dashboard:m"
-        failed = SubagentInfo(id="f1", task="failed", parent_session_key=parent)
-        failed.done = True
-        failed.error = "boom"
-        failed._stage_boundary_owner = "stage-owner"
-        failed.execution_context = ExecutionContext(
-            None, MemoryStoreRef("default"), "template", "kirocrew"
-        )
-        mgr = self._mgr_with(failed)
-        mgr.spawn = MagicMock(return_value=SubagentInfo(id="n1", task="failed"))
-        request = self._request(mgr, "f1")
-        request.app["state"]._slots = {
-            "m": MagicMock(
-                stage_boundary=StageBoundary(
-                    stage=1,
-                    generation="stage-owner",
-                    parent_session_keys={parent},
-                )
-            )
-        }
-
-        resp = await api_spawn_retry(request)
-
-        assert resp.status == 200
-        assert mgr.spawn.call_args.kwargs["_stage_boundary_owner"] == "stage-owner"
 
 
 # ── 6. Durable task queue at scale ───────────────────────────────────
@@ -2869,10 +2647,11 @@ class TestQueuedDepthReachesZero:
         assert all(d == 0 for d in depths[first_zero:]), depths
 
     def test_dispatching_rows_are_excluded_from_dispatch_reads_only(self):
-        """Two exclusion sets, on purpose. The pump's refill and the depth the
-        chip shows leave a popped row out (it is being started); a parent's
-        Stop and every other pending-work read keep seeing it, because a row in
-        exactly that popped-unclaimed state is the one a Stop must still reach."""
+        """Two exclusion sets, on purpose. The pump's refill (and, through its
+        own set, the depth the chip shows) leaves a popped row out (it is being
+        started); a parent's Stop and every other pending-work read keep seeing
+        it, because a row in exactly that popped-unclaimed state is the one a
+        Stop must still reach."""
         mgr = SubagentManager(sessions=_mock_sessions(), ctx_builder=_mock_ctx(), max_concurrent=4)
         mgr._dispatching_ids.add("popped-row")
         assert "popped-row" in mgr._admission.taskq_dispatch_excluded_ids()
@@ -2922,6 +2701,9 @@ class TestQueuedDepthReachesZero:
             mgr._claim_finalize(first)
             assert mgr._release_slot(first)
             mgr._running_count -= 1
+            await settle_store_writes(mgr._taskq, rounds=4)
+            await settle_depth_emits(mgr)
+            popped_at = len(depths)
             mgr._drain_queue()
             await asyncio.wait_for(hold.wait(), 5)
             assert second.id in mgr._dispatching_ids and not mgr._queue
@@ -2929,13 +2711,17 @@ class TestQueuedDepthReachesZero:
             assert await mgr.has_pending_work_for_async("dashboard:s1") is True
             assert mgr.queued_count_for("dashboard:s1") == 1
             assert await mgr.queued_count_for_async("dashboard:s1") == 1
-            # The chip's reading: the row is being started, not waiting.
-            assert mgr._queued_depth("dashboard:s1", for_dispatch=True) == 0
+            # The chip's reading, as published: the row is being started.
+            await settle_store_writes(mgr._taskq, rounds=4)
+            await settle_depth_emits(mgr)
+            assert depths[popped_at:] == [0], depths
             released.set()
-            for _ in range(25):
-                await asyncio.sleep(0.02)
+            await settle_store_writes(mgr._taskq, rounds=4)
+            await settle_depth_emits(mgr)
+        assert second.id in mgr._agents
         assert mgr._dispatching_ids == set()
-        assert depths and depths[-1] == 0, depths
+        # Nothing published after the pop shows the started row as waiting.
+        assert depths[popped_at:] and all(d == 0 for d in depths[popped_at:]), depths
 
     @pytest.mark.asyncio
     async def test_stop_all_reaches_a_popped_but_unclaimed_row(self):
@@ -3097,11 +2883,11 @@ class TestQueuedDepthReachesZero:
         await mgr.wait_taskq_ready()
         assert mgr._taskq is not None
 
-        async def boom():
+        async def boom(*_args):
             raise RuntimeError("probe: store read failed before the pick")
 
         with (
-            patch.object(mgr, "retry_pending_boundary_cancellations", new=boom),
+            patch.object(type(mgr._admission), "ensure_coordinator_async", new=boom),
             caplog.at_level("ERROR"),
         ):
             await mgr._drain_queue_pass()  # must not raise

@@ -4,8 +4,9 @@ import { ArrowRight } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { FeaturePreviewIntroButton, type FeaturePreviewIntro } from '../../components/FeaturePreviewIntroDialog'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_ARTIFACT_DEPLOY, PREVIEW_CREW, PREVIEW_INSTANCE_SESSIONS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
+import { PREVIEW_ARTIFACT_DEPLOY, PREVIEW_CREW, PREVIEW_DASHBOARD, PREVIEW_INSTANCE_SESSIONS, PREVIEW_LAYOUT_HARNESS, PREVIEW_REMOTE_CREW_CHAT, PREVIEW_WEBHOOKS, setPreviewFlag } from '../../utils/previewFlags'
 import { DecisionsCard } from './DecisionsCard'
+import AutomaticCardSetting from '../chat/command-center/AutomaticCardSetting'
 import { i18nT } from '../../i18n/t'
 
 
@@ -133,6 +134,8 @@ export function FeaturePreviewsSection() {
   const crew = usePreviewFlag(PREVIEW_CREW)
   const remoteCrewChat = usePreviewFlag(PREVIEW_REMOTE_CREW_CHAT)
   const instanceSessions = usePreviewFlag(PREVIEW_INSTANCE_SESSIONS)
+  const layoutHarness = usePreviewFlag(PREVIEW_LAYOUT_HARNESS)
+  const dashboard = usePreviewFlag(PREVIEW_DASHBOARD)
 
   return (
     // The wrapper exists for the legacy redirect: `?highlight=key:<anchor>`
@@ -179,7 +182,7 @@ export function FeaturePreviewsSection() {
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.webhooks')}
-          description={i18nT('pages.developer.featurePreviewsTab.inbound_webhook_tokens_registered_contexts_and_r')}
+          hint={i18nT('pages.developer.featurePreviewsTab.inbound_webhook_tokens_registered_contexts_and_r')}
           checked={webhooks}
           onChange={v => setPreviewFlag(PREVIEW_WEBHOOKS, v)}
         />
@@ -225,7 +228,7 @@ export function FeaturePreviewsSection() {
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.crew_members')}
-          description={i18nT('pages.developer.featurePreviewsTab.crew_members_desc')}
+          hint={i18nT('pages.developer.featurePreviewsTab.crew_members_desc')}
           checked={crew}
           onChange={v => setPreviewFlag(PREVIEW_CREW, v)}
         />
@@ -260,7 +263,7 @@ export function FeaturePreviewsSection() {
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew')}
-          description={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc')}
+          hint={i18nT('pages.developer.featurePreviewsTab.chat_on_a_crew_desc')}
           checked={remoteCrewChat}
           onChange={v => setPreviewFlag(PREVIEW_REMOTE_CREW_CHAT, v)}
         />
@@ -277,10 +280,59 @@ export function FeaturePreviewsSection() {
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.developer.featurePreviewsTab.remote_instance_sessions')}
-          description={i18nT('pages.developer.featurePreviewsTab.merge_a_connected_remote_instances_live_sessions')}
+          hint={i18nT('pages.developer.featurePreviewsTab.merge_a_connected_remote_instances_live_sessions')}
           checked={instanceSessions}
           onChange={v => setPreviewFlag(PREVIEW_INSTANCE_SESSIONS, v)}
         />
+      </SettingsCard>
+      {/* Dev-only MECHANISM preview, not a shippable surface: the composable-layout
+          mechanism (placement-driven renderer + scope + editor) being built beside
+          the Members page. This card is the FLAG PLUMBING only — the switch exists so
+          the mechanism can be built and tested behind a per-device gate.
+
+          NO ingress button, on purpose: unlike the webhooks card, this preview has no
+          routable door in the bundle yet, so a link here would point at a route that
+          does not exist. It follows the toggle-only shape of "Chat on a crew" above —
+          an honest switch with no door to promise. Add a "See what it looks like" intro
+          and/or an ingress the day the feature lands a real capture and route. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.layout_harness')}
+          description={i18nT('pages.developer.featurePreviewsTab.layout_harness_desc')}
+          checked={layoutHarness}
+          onChange={v => setPreviewFlag(PREVIEW_LAYOUT_HARNESS, v)}
+        />
+      </SettingsCard>
+      {/* The Dynamic Dashboard: the dock above the composer, the side panel's
+          Dashboard view, the Crewmates Dashboard tab and the All dashboards
+          page. Still being designed, so held here until it is.
+
+          NO ingress button: turning it on puts the dock, the + menu entry and
+          the sidebar's "All dashboards" item back in the same tick, so a link
+          here would be a second door beside ones already on screen. NO "See
+          what it looks like" either, for the capture rule: the surface is
+          changing shape and a capture would be stale by the next change.
+
+          The ONE setting the dashboard owns gateway-wide — automatic cards for
+          every session, a cost opt-in — rides INSIDE this card and only while
+          the flag is on. Not in the panel's Overview or on the All dashboards
+          page: those are places meant for reading, and a setting belongs in
+          Settings. This card is the whole story of the preview, so the switch
+          that spends on its behalf lives here with the switch that reveals it.
+          It stays visible with the preview OFF: it is a gateway-wide server
+          setting, the preview is a per-device flag, and hiding the only
+          control for a spend opt-in would leave cards running with no way to
+          turn them off from this machine. */}
+      <SettingsCard>
+        <SettingsToggle
+          label={i18nT('pages.developer.featurePreviewsTab.dashboard')}
+          description={i18nT('pages.developer.featurePreviewsTab.dashboard_desc')}
+          checked={dashboard}
+          onChange={v => setPreviewFlag(PREVIEW_DASHBOARD, v)}
+        />
+        <div className="pt-1" data-testid="feature-preview-dashboard-settings">
+          <AutomaticCardSetting active />
+        </div>
       </SettingsCard>
       {/* LAST, and the only card here whose switch is not a per-device flag: it
           writes the KEYSTONE `decisions_consent.json`, not a config path. It lives in

@@ -664,7 +664,22 @@ def test_message_is_owned_by_both_kinds_because_both_have_messages():
     )
 
 
-@pytest.mark.parametrize("bad", ["noslash", "/leading", "trailing/", "a/b/c", "-bad/x", "x/-bad"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "noslash",
+        "/leading",
+        "trailing/",
+        "a/b/c",
+        "-bad/x",
+        "x/-bad",
+        # The name pattern ends at ``\Z``: a trailing newline is not part of a
+        # plain name, and an accepted one would be persisted into every reader of
+        # the entry.
+        "activity/tick\n",
+        "activity\n/tick",
+    ],
+)
 def test_a_type_that_is_not_domain_slash_action_is_refused(bad):
     crew = _crew()
     with _raises(lg.CODE_BAD_TYPE) as exc:
@@ -678,7 +693,10 @@ def test_a_crew_log_accepts_its_own_emitters(src):
     assert _crew().append(entry_type, {}, src=src).src == src
 
 
-@pytest.mark.parametrize("bad", ["", "Gate way", "session:s-1", "crew:", "app:bad/name", "unknown"])
+@pytest.mark.parametrize(
+    "bad",
+    ["", "Gate way", "session:s-1", "crew:", "app:bad/name", "unknown", "crew:qa\n", "app:radar\n"],
+)
 def test_an_unrecognized_src_is_refused(bad):
     crew = _crew()
     with _raises(lg.CODE_BAD_SRC) as exc:
@@ -1317,6 +1335,114 @@ def test_a_torn_last_line_is_truncated_on_open():
     assert path.read_bytes() == intact  # the crash artifact is gone, history is not
     assert reopened.last_seq == 1
     assert reopened.append("item/opened", {}, src="gateway").seq == 2
+
+
+def _append_stuck_in_fsync(monkeypatch, crew):
+    """Start an append that has written and flushed its line and is inside a failing fsync.
+
+    Returns the event that lets the fsync fail and the appender thread. Until the event
+    is set the line is in the file and the append lock is held, which is the window a
+    reader without the lock would see a line the rollback then removes.
+    """
+    in_fsync, fail = threading.Event(), threading.Event()
+    real_fsync = store.os.fsync
+
+    def _fsync(fd: int) -> None:
+        # Only the append's own fsync fails; the rollback's fsync is real, so the
+        # failure is the definite "the line is gone" outcome a rollback promises.
+        if threading.current_thread().name != "stuck-appender" or in_fsync.is_set():
+            return real_fsync(fd)
+        in_fsync.set()
+        fail.wait(5)
+        raise OSError(5, "simulated fsync failure")
+
+    monkeypatch.setattr(store.os, "fsync", _fsync)
+
+    def _append() -> None:
+        with pytest.raises(OSError):
+            crew.append("item/opened", {"kept": False}, src="gateway")
+
+    appender = threading.Thread(target=_append, name="stuck-appender", daemon=True)
+    appender.start()
+    assert in_fsync.wait(5)
+    return fail, appender
+
+
+def _read_in_thread(read):
+    """Run *read* on a thread; return (finished event, result box)."""
+    done, box = threading.Event(), {}
+
+    def _run() -> None:
+        try:
+            box["value"] = read()
+        finally:
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done, box
+
+
+def test_an_open_does_not_see_an_append_whose_fsync_has_not_returned(monkeypatch):
+    # No reader folds bytes the writer has not yet fsynced under its lock: the open's
+    # tail read waits for the append, and the failed fsync's rollback is what it sees.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    fail, appender = _append_stuck_in_fsync(monkeypatch, crew)
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    assert path.read_bytes().count(b'"seq":2') == 1  # the in-flight line is on disk
+
+    done, box = _read_in_thread(lambda: CrewLog.open(lg.KIND_CREW, CREW).last_seq)
+    assert not done.wait(0.3), "the open read the tail while the append held the lock"
+    fail.set()
+    appender.join(5)
+    assert done.wait(5)
+
+    assert box["value"] == 1
+
+
+def test_a_held_handle_does_not_read_an_append_whose_fsync_has_not_returned(monkeypatch):
+    # The same rule for a handle opened earlier: each read measures the newest
+    # segment's end under the lock, so an in-flight line is never yielded.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    held = CrewLog.open(lg.KIND_CREW, CREW)
+    fail, appender = _append_stuck_in_fsync(monkeypatch, crew)
+
+    done, box = _read_in_thread(lambda: [entry.seq for entry in held.iter_from(1)])
+    assert not done.wait(0.3), "the read walked the file while the append held the lock"
+    fail.set()
+    appender.join(5)
+    assert done.wait(5)
+
+    assert box["value"] == [1]
+
+
+def test_a_torn_tail_still_waits_for_the_lock_before_truncating():
+    # A torn tail may be an append in flight, so its open takes the lock and
+    # reads again: the holder finishing the line means nothing is dropped.
+    crew = _crew()
+    crew.append("item/opened", {"kept": True}, src="gateway")
+    path = lg.crew_log_path(lg.KIND_CREW, CREW)
+    intact = path.read_bytes()
+    finished = b'{"type":"item/opened","seq":2}\n'
+    path.write_bytes(intact + finished[:12])
+    taken, release = threading.Event(), threading.Event()
+
+    def _finish_under_lock() -> None:
+        with store._open_lock(store._lock_path(lg.KIND_CREW, CREW)):
+            taken.set()
+            release.wait(5)
+            path.write_bytes(intact + finished)
+
+    holder = threading.Thread(target=_finish_under_lock, daemon=True)
+    holder.start()
+    assert taken.wait(5)
+    threading.Timer(0.2, release.set).start()
+
+    CrewLog.open(lg.KIND_CREW, CREW)
+    holder.join(5)
+
+    assert path.read_bytes() == intact + finished
 
 
 def test_a_complete_last_line_missing_only_its_newline_is_kept():
@@ -2211,6 +2337,52 @@ def test_a_neighbour_file_sharing_the_prefix_is_ignored_not_refused(tmp_path):
     assert [p.name for p in lg.segment_paths(lg.KIND_SESSION, "seg-neighbour")] == ["log.jsonl"]
     reader = lg.CrewLog.open(lg.KIND_SESSION, "seg-neighbour")
     assert [e.seq for e in reader.iter_from(1)] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        # isdigit() but not decimal: int() raises on it.
+        "log.\u00b2.jsonl",
+        # Decimal but not ASCII: int() parses it as 12, so it would pass for a
+        # real segment starting at seq 12.
+        "log.\u0661\u0662.jsonl",
+        # A leading zero: int() parses it as 5, a second "segment" at seq 5.
+        "log.05.jsonl",
+    ],
+)
+def test_a_non_ascii_digit_neighbour_is_ignored_not_raised(tmp_path, stray):
+    # The segment name's number is ASCII decimal only. Any other digit
+    # character makes the file a stray like log.backup.jsonl, never a segment.
+    led = _session("seg-unicode")
+    for n in range(1, 5):
+        led.append("turn/started", {"turn": n, "actor": "user", "depth": 0}, src="gateway")
+    directory = lg.crew_log_dir(lg.KIND_SESSION, "seg-unicode")
+    (directory / stray).write_text("not a segment\n")
+
+    assert [p.name for p in lg.segment_paths(lg.KIND_SESSION, "seg-unicode")] == ["log.jsonl"]
+    reader = lg.CrewLog.open(lg.KIND_SESSION, "seg-unicode")
+    assert [e.seq for e in reader.iter_from(1)] == [1, 2, 3, 4]
+
+
+@pytest.mark.parametrize(
+    ("name", "is_history"),
+    [
+        ("log.jsonl", True),
+        # Removal is broader than a reader on purpose: no real segment starts
+        # below seq 2, yet a numbered file is still history by shape.
+        ("log.0.jsonl", True),
+        ("log.1.jsonl", True),
+        ("log.12.jsonl", True),
+        # A name a reader ignores as a stray is not history either.
+        ("log.\u00b2.jsonl", False),
+        ("log.\u0661\u0662.jsonl", False),
+        ("log.05.jsonl", False),
+        ("log.backup.jsonl", False),
+    ],
+)
+def test_removal_orders_history_by_the_readers_number_spelling(name, is_history):
+    assert store._is_segment_name(name) is is_history
 
 
 def test_a_chmod_refusing_filesystem_warns_once_not_once_per_append(monkeypatch, caplog):

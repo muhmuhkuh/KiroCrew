@@ -27,7 +27,11 @@ function getUpdateApi(): UpdateAPI | undefined {
   return window.updateAPI
 }
 
-export default function UpdateModal() {
+/**
+ * `held`: another update dialog (What's new) is on screen, whose app switch
+ * can itself start a download. The prompt waits for it to close.
+ */
+export default function UpdateModal({ held = false }: { held?: boolean } = {}) {
   const { data: update } = useQuery<UpdateState | null>({
     queryKey: ['update-state'],
     queryFn: () => null,
@@ -75,7 +79,7 @@ export default function UpdateModal() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- reset identity is stable; keying on state transition
   }, [state, stateVersion, installFor, installMutation.isSuccess])
 
-  const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed
+  const open = !!update && update.state === 'downloaded' && !update.replayed && !dismissed && !held
 
   // Escape dismisses the modal (unless an install is in flight), matching the
   // backdrop-click affordance and keeping the overlay keyboard-accessible.
@@ -149,8 +153,19 @@ export default function UpdateModal() {
   const dismiss = () => { if (!installing) setDismissed(true) }
 
   return (
+    // The dismissible "update ready" dialog is ordinary chrome, not the
+    // full-screen takeover above: it renders inside the App shell's
+    // `relative z-[1]` root (NOT portaled to document.body like Modal), so it
+    // sits at z-[65] — above every chat-page layer it must cover (sessions
+    // flyout z-[59], its drawer morph z-[60], the focus-peek rail toggle
+    // z-[61], the focus-mode rail inline z 62 and its drag strips z 63) and
+    // below the shell's z-[70] toast/menu band and its own z-[100] installing
+    // takeover. Modal.tsx's z-[100] is NOT the reference here: Modal portals to
+    // document.body, a separate stacking context, while a z-[100] in THIS
+    // context would tie the DOM-earlier takeover and win on document order,
+    // painting a dismissible dialog over the surface meant to hide everything.
     <div
-      className="fixed inset-0 z-50 bg-bg/80 backdrop-blur-xs flex items-center justify-center animate-rise"
+      className="fixed inset-0 z-[65] bg-bg/80 backdrop-blur-xs flex items-center justify-center animate-rise"
       role="button"
       tabIndex={-1}
       aria-label={i18nT('components.updateModal.dismiss_update_dialog')}

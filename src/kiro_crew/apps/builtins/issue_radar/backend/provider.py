@@ -505,6 +505,8 @@ _TERMS = {
         "change_request_short": "issue",
         # Jira addresses issues by key (PROJ-123); there is no PR sigil.
         "change_request_sigil": "",
+        "tracked_item": "issue",
+        "tracked_item_plural": "issues",
         "provider_name": "Jira",
         "cli": "",
     },

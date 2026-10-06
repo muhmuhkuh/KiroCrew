@@ -1,8 +1,6 @@
-/** The conductor lane: the lineage seed poll, the lineage tree over every row (plus
+/** The conductor lane: whether there is lineage, the lineage tree over every row (plus
  *  the member creators this page does not list), and which conductors are open. */
 import { useMemo, useEffect, useState, useCallback, useRef } from 'react'
-import { fetchSlots } from '../../store/dashboardSlice'
-import type { AppDispatch } from '../../store'
 import type { Slot } from './types'
 import { buildLineage, ancestorsOf } from '../../lib/sessionLineage'
 import { safeSetItem } from '../../utils/safeStorage'
@@ -10,55 +8,33 @@ import { isPeerRow, sessionRowIdentity } from './rowIdentity'
 import { readConductorExpanded, CONDUCTOR_EXPANDED_LS_KEY } from './persistence'
 import type { ChatSlot } from '../../types'
 
-/** Re-reads the slots while the lineage projection seeds; whether any row has a creator. */
-export function useLineageSeed({ localSlots, dispatch, allRows }: {
-  localSlots: Slot[]
-  dispatch: AppDispatch
-  allRows: Slot[]
-}) {
-  /**
-   * Does any visible row actually have a creator that is also on screen?
-   *
-   * The conductor lane is only OFFERED when the answer is yes. A lane that renders
-   * exactly the flat list, with a chevron nowhere, is a dead position in the toggle
-   * cycle -- and the crew log can legitimately be off, in which case no row will ever
-   * carry a parent. Read off `filteredSlots`, the same list the lane renders, so the
-   * toggle never offers a lane the current filters have emptied of edges.
-   */
-  // While the gateway reports its lineage projection as still seeding, this frame's
-  // `parent` values are provisional. The seed deliberately does not broadcast when it
-  // lands (it would either write the slots coalescer's clock or add a frame, and both
-  // are load-bearing there), so the recovery is a READ repeated from here. It matters
-  // most on an IDLE gateway: with nothing running, no further frame is coming, and an
-  // unnested cold start would otherwise persist until the user happened to act.
-  //
-  // Backed off 2s/4s/8s and abandoned after ~30s, because this is a cosmetic catch-up,
-  // not a correctness loop: a seed that has not landed by then is not going to be fixed
-  // by asking again, and a sidebar polling forever is worse than one that nests late.
-  const lineagePending = useMemo(
-    () => localSlots.some(s => s.lineage_pending === true),
-    [localSlots],
-  )
-  useEffect(() => {
-    if (!lineagePending) return
-    let cancelled = false
-    let attempt = 0
-    const started = Date.now()
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const tick = () => {
-      if (cancelled || Date.now() - started > 30_000) return
-      dispatch(fetchSlots())
-      attempt += 1
-      // 2s, 4s, 8s, then hold at 8s until the 30s budget runs out.
-      timer = setTimeout(tick, Math.min(2000 * 2 ** attempt, 8000))
-    }
-    timer = setTimeout(tick, 2000)
-    return () => {
-      cancelled = true
-      if (timer) clearTimeout(timer)
-    }
-  }, [lineagePending, dispatch])
+/**
+ * The creator a row cites, as the (origin, slot key) pair the lane resolves it in, or
+ * null when the row cites nobody it could nest under.
+ *
+ * `parent.key` is a bare slot key in the key space of the row's OWN gateway, so it is
+ * resolved among rows of the same `peer_id`. `parent.hub_key` is the one half the hub
+ * stamps in ITS key space: a peer row whose creator is a peer slot this hub drives
+ * cites the LOCAL row driving it (the peer's own key for that creator never crosses
+ * the wire), so it is resolved among local rows -- origin `undefined`. Every reader
+ * that asks "does this creator exist" or "which row is it" goes through this, so the
+ * two halves cannot be resolved in different spaces by different readers.
+ */
+export function citedCreatorOf(row: Pick<Slot, 'parent' | 'peer_id'>): { origin: string | undefined; key: string } | null {
+  const hubKey = row.parent?.hub_key
+  if (typeof hubKey === 'string' && hubKey !== '') return { origin: undefined, key: hubKey }
+  const cited = row.parent?.key
+  if (cited == null || cited === '') return null
+  return { origin: row.peer_id, key: cited }
+}
 
+/** Whether any row has a creator.
+ *
+ *  Nothing here reads the slots again. While the gateway's projection seeds, a frame
+ *  ships `parent: null` with `lineage_pending`; the gateway PUSHES the settled rows as a
+ *  `slot_patch` the moment the seed lands or the tree moves (`push_lineage_patch`), so
+ *  the sidebar nests without asking. */
+export function useLineageAvailable({ allRows }: { allRows: Slot[] }) {
   // Read from the FULL row set, never from `filteredSlots`. The lane's own tree is
   // built from every row, so whether there is anything to nest is not a question a
   // filter gets to answer: computed from the narrowed list, turning on Unread could
@@ -150,7 +126,8 @@ export function useConductorLane({ conductorLaneActive, allRows, allLiveSlots, i
    * merely concealed has a creator that is open and running, so the same glyph would
    * state something false about a live session. Read against the population before any
    * concealment, a present creator means the lane is simply not nesting -- which is what
-   * `citesParent` says.
+   * `citesParent` says. Looked up with the pair `citedCreatorOf` gives, so a hub-stamped
+   * `hub_key` is checked among local rows and a peer `key` among its own origin's.
    */
   const citedCreatorExists = useMemo(() => {
     const byOrigin = new Map<string | undefined, Set<string>>()
@@ -229,7 +206,10 @@ export function useConductorLane({ conductorLaneActive, allRows, allLiveSlots, i
     // slot key in the key space of the CHILD's own gateway, so the creator is the row
     // carrying that key with the SAME origin. Resolving through this index rather than
     // composing the qualified form keeps that format the server's alone, and makes a
-    // peer row unable to nest under a local row whose key merely matches.
+    // peer row unable to nest under a local row whose key merely matches. The one
+    // citation that DOES cross origins is `parent.hub_key`, which the hub stamps in its
+    // own key space (see `citedCreatorOf`): it resolves among local rows, so a worker
+    // a remote-executed lead opened on the peer hangs from the lead's local row.
     //
     // Nested by origin rather than keyed on one joined string: there is then no
     // separator, so no peer id or slot key containing it can be read as the wrong pair.
@@ -245,9 +225,9 @@ export function useConductorLane({ conductorLaneActive, allRows, allLiveSlots, i
     return buildLineage(conductorRows, {
       identityOf: sessionRowIdentity,
       parentIdentityOf: s => {
-        const cited = s.parent?.key
-        if (cited == null) return null
-        return byOrigin.get(s.peer_id)?.get(cited) ?? null
+        const cited = citedCreatorOf(s)
+        if (cited === null) return null
+        return byOrigin.get(cited.origin)?.get(cited.key) ?? null
       },
     })
   }, [conductorLaneActive, conductorRows])

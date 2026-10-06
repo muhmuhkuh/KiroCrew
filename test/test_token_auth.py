@@ -2426,6 +2426,26 @@ async def test_non_api_path_gets_html_403() -> None:
     assert b"kirocrew token" in resp.body
 
 
+@pytest.mark.asyncio
+async def test_signin_recovery_preserves_destination_path() -> None:
+    # The recovery script runs in the browser on the SAME URL the stale button
+    # was tapped (a session deep link, /chat?sid=...&token=<stale>, served 403
+    # inline). It must round-trip that destination -- keep the path + query and
+    # swap ONLY the pasted token -- instead of redirecting to the dashboard root
+    # and discarding /chat?sid=..., which is the "tap and get nowhere" dead end
+    # this PR exists to remove (UX stale-tap finding).
+    mw = token_auth_middleware()
+    req = _make_request(path="/dashboard", method="POST", remote="10.0.0.1")  # No token
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 403
+    body = resp.body.decode()
+    # Rebuilds from the current URL and swaps only the token param.
+    assert "new URL(window.location.href)" in body
+    assert "searchParams.set('token'" in body
+    # The old path-discarding redirect (protocol//host?token=) is gone.
+    assert "window.location.host+'?token='" not in body
+
+
 # -- Property 12b: SPA shell is public so the app can cold-start refresh --
 
 
@@ -2536,13 +2556,21 @@ def test_no_get_route_outside_shell_exclusions() -> None:
     _is_spa_shell_request gained its own /apps/ early-return branch).
     (Reads source rather than importing server.py to avoid heavy import side effects.)
     """
+    import glob
     import os
     import re as _re
 
     import kiro_crew.dashboard.token_auth as ta
 
-    server_path = os.path.join(os.path.dirname(ta.__file__), "server.py")
-    source = open(server_path, encoding="utf-8").read()
+    # server.py and the server_runtime owners it composes, which hold the MCP and
+    # build route tables.
+    dashboard_dir = os.path.dirname(ta.__file__)
+    server_paths = [
+        os.path.join(dashboard_dir, "server.py"),
+        *sorted(glob.glob(os.path.join(dashboard_dir, "server_runtime", "[!_]*.py"))),
+    ]
+    assert len(server_paths) > 1, "expected the server_runtime owners beside server.py"
+    source = "".join(open(path, encoding="utf-8").read() for path in server_paths)
     get_paths = _re.findall(r'add_get\(\s*["\']([^"\']+)["\']', source)
     assert get_paths, "expected add_get route literals in server.py"
 
@@ -3900,7 +3928,9 @@ def test_app_window_entries_register_route_and_exclusion(tmp_path) -> None:
     for route_path, entry in discover_app_window_entries(tmp_path / "src" / "apps"):
         # Same handler factory the gateway uses — see server._window_entry_handler
         # for why the path is a closure cell and not a handler parameter.
-        app.router.add_get(route_path, _window_entry_handler(entry))
+        app.router.add_get(
+            route_path, _window_entry_handler(tmp_path, f"{entry.parent.name}/{entry.name}")
+        )
         window_paths.append(route_path)
 
     prior = ta._APP_WINDOW_EXCLUDED_PATHS

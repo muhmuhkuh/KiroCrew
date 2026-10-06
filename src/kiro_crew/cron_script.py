@@ -34,9 +34,10 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -48,22 +49,17 @@ from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.env import sanitize_spec_env
 from kiro_crew.github_runner import prevalidated_gh_env
 from kiro_crew.hooks import FileTooLargeError, safe_read_file_bytes_nolink
+from kiro_crew.json_line import parse_json_object_line
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.port_resolution import resolve_serving_port
 from kiro_crew.sandbox import (
     _AGENT_DENIED_ENV_KEYS,
     CANONICAL_TEMP_KEYS,
     CRON_SCRIPT_CHILD_ENV,
-    SandboxCeilingUnsealable,
     SandboxUnavailableError,
-    aliased_app_secret_ids,
-    app_data_window_targets,
     cgroup_scope_argv,
-    credential_mask_applies,
-    masked_dir_identity,
-    materialize_caller_masked_dir,
     popen_limited,
-    refuse_if_an_app_secret_is_linked,
     run_limited,
     wrap_argv,
 )
@@ -76,6 +72,7 @@ from kiro_crew.security import (
     sensitive_path_refusal,
 )
 from kiro_crew.sel import sel
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # Env vars stripped from EVERY cron subprocess (command and script), regardless
 # of OS sandbox mode. The OS sandbox can fall back to backend "none" (e.g.
@@ -1094,13 +1091,25 @@ Report = ReportError
 
 @dataclass
 class ScriptContext:
-    """Passed to script functions. Provides delivery and tool access."""
+    """Passed to script functions. Provides delivery, tool access and session control.
+
+    Every gateway call presents the cron's OWN credential: the internal secret,
+    the ``cron:<job id>`` session key and the run's signed session token. No
+    method here mints or holds a dashboard token. ``POST /api/token/local``
+    refuses a sandboxed cron child on purpose, because a cron body is
+    agent-writable and an owner token reaches the keystone writes under
+    ``/api/security``; the methods below reach only routes the internal secret
+    already serves, and that secret is not admitted to those writes.
+    """
 
     job: CronJob
     _port: int = 5476
     _secret: str = ""
+    _session_token: str = ""
+    _kept_servers: KeptMcpServers = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        self._kept_servers = KeptMcpServers(session_key=f"cron:{self.job.id}")
         # The parent injects the port it minted the credential for. Preferring it
         # keeps credential and dial target from one resolution; KIROCREW_PORT is the
         # fallback for a directly-constructed context and is 5476 on a --port auto
@@ -1119,6 +1128,10 @@ class ScriptContext:
                 pass
         else:
             self._secret = os.environ.pop("KIROCREW_INTERNAL_SECRET", "")
+        # The key states an identity; the token PROVES it (see
+        # _publish_script_session_token). Read, not popped: the MCP servers
+        # ``call_tool`` spawns inherit the same env and need the same token.
+        self._session_token = os.environ.get(STUB_SESSION_TOKEN_ENV, "")
 
     @property
     def message(self) -> str:
@@ -1144,8 +1157,106 @@ class ScriptContext:
             raise RuntimeError(f"notify() failed: {result['error']}")
         return result
 
+    # ── Dashboard sessions ──
+    #
+    # A dispatcher cron lists the folder it files sessions in, opens a session
+    # there and seeds it with its first message. Each call goes to a ``/api/chat``
+    # route the internal secret already serves, with the same credential
+    # ``notify()`` presents; see the class docstring for why no dashboard token
+    # is involved. A cron bound to a crew member is admitted to the folder calls
+    # and refused on ``open_session`` and ``send_to_session`` by the member
+    # chat-control gate, the same answer that gate gives any member caller.
+
+    def list_session_folders(self) -> list[dict]:
+        """Return the dashboard's session folders (``GET /api/chat/folders``).
+
+        Raises RuntimeError if the gateway refuses or cannot be reached.
+        """
+        result = self._exchange(
+            urllib.request.Request(
+                f"http://127.0.0.1:{self._port}/api/chat/folders",
+                headers=self._headers(),
+                method="GET",
+            )
+        )
+        if not isinstance(result, list):
+            raise RuntimeError(f"list_session_folders() failed: {self._reason(result)}")
+        return result
+
+    def create_session_folder(self, name: str) -> dict:
+        """Create a session folder and return it (``POST /api/chat/folders``).
+
+        The name is redacted the way ``notify()`` redacts its text, because it
+        is rendered in the dashboard sidebar. Raises RuntimeError if the gateway
+        refuses or cannot be reached.
+        """
+        result = self._post("/api/chat/folders", {"name": redact(name)})
+        if not isinstance(result, dict) or "error" in result:
+            raise RuntimeError(f"create_session_folder() failed: {self._reason(result)}")
+        return result
+
+    def open_session(
+        self, name: str = "", *, folder_id: str = "", agent: str = "", model: str = ""
+    ) -> str:
+        """Open a dashboard session and return its slot key (``POST /api/chat/slots``).
+
+        An omitted argument is left out of the request, so the gateway applies
+        its own default for it. The name is redacted the way ``notify()``
+        redacts its text, because it is rendered in the dashboard sidebar.
+        When ``agent.session_control`` is false the gateway refuses with
+        ``session_control_disabled``, and this method raises RuntimeError
+        carrying that code. Raises RuntimeError if the gateway refuses or
+        cannot be reached.
+        """
+        body = {
+            key: value
+            for key, value in (
+                ("name", redact(name)),
+                ("folder_id", folder_id),
+                ("agent", agent),
+                ("model", model),
+            )
+            if value
+        }
+        result = self._post("/api/chat/slots", body)
+        key = result.get("key") if isinstance(result, dict) else None
+        if not isinstance(key, str) or not key or "error" in result:
+            raise RuntimeError(f"open_session() failed: {self._reason(result)}")
+        return key
+
+    def send_to_session(self, slot: str, message: str) -> dict:
+        """Queue *message* as the next user turn on *slot* (``POST /api/chat?ws=1``).
+
+        The turn runs on the gateway; this returns the receipt as soon as the
+        message is accepted instead of streaming the reply. An idle slot answers
+        ``{"ok": True, "slot": <key>}`` and starts the turn. A slot that is busy
+        answers ``{"ok": True, "queued": True, "queue_id": <id>}`` and runs the
+        turn when its current one ends, so read ``slot`` with ``.get()``. The
+        message is redacted the way ``notify()`` redacts its text. When
+        ``agent.session_control`` is false the gateway refuses with
+        ``session_control_disabled``, and this method raises RuntimeError
+        carrying that code. Raises RuntimeError if the gateway refuses or
+        cannot be reached.
+        """
+        result = self._post("/api/chat?ws=1", {"slot": slot, "message": redact(message)})
+        if not isinstance(result, dict) or "error" in result:
+            raise RuntimeError(f"send_to_session() failed: {self._reason(result)}")
+        return result
+
+    @staticmethod
+    def _reason(result: object) -> str:
+        if isinstance(result, dict) and result.get("error"):
+            return str(result["error"])
+        return f"unexpected response {json.dumps(result)[:200]}"
+
     def call_tool(self, server: str, tool: str, args: dict) -> str:
-        """Call an MCP tool by spawning the server subprocess directly.
+        """Call an MCP tool, starting the server subprocess on the first call to it.
+
+        The server lives for the run, not for one call: :class:`KeptMcpServers`
+        keeps a server that answered the call (with a result or a tool error)
+        for this run's next call to it, so a server that signs in to a service
+        when it starts signs in once per run rather than once per call.
+        :meth:`close` stops the kept servers.
 
         Args are scanned for credential/URL leakage before passing to the
         sandboxed MCP server subprocess.
@@ -1154,18 +1265,21 @@ class ScriptContext:
         args_str = json.dumps(args)
         args_str = redact(args_str)
         safe_args = json.loads(args_str)
-        client = None
         try:
-            client = McpToolClient(server, session_key=f"cron:{self.job.id}")
-            result = client.call_tool(tool, safe_args)
-            self._audit_tool_call(server, tool, "ok")
-            return result
+            result = self._kept_servers.call_tool(server, tool, safe_args)
         except Exception as exc:
             self._audit_tool_call(server, tool, "error", str(exc))
             raise
-        finally:
-            if client is not None:
-                client.close()
+        self._audit_tool_call(server, tool, "ok")
+        return result
+
+    def close(self) -> None:
+        """Stop every MCP server kept for reuse; later calls keep none.
+
+        The launcher calls this once the script function returns. It never
+        raises, because by then the run's result is already decided.
+        """
+        self._kept_servers.close()
 
     def _audit_tool_call(self, server: str, tool: str, outcome: str, error: str = "") -> None:
         """Log tool invocation for audit trail."""
@@ -1189,27 +1303,60 @@ class ScriptContext:
             logger.debug("SEL audit logging failed in cron_script tool call", exc_info=True)
 
     def _post(self, path: str, body: dict) -> dict:
-        data = json.dumps(body).encode()
+        """POST *body* to *path* as this cron, decoded; ``{"error": ...}`` on failure."""
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self._port}{path}",
+            data=json.dumps(body).encode(),
+            headers=self._headers(),
+            method="POST",
+        )
+        return self._exchange(req)
+
+    def _headers(self) -> dict[str, str]:
+        """The cron's whole credential, on every call.
+
+        The internal secret proves the loopback process, the ``cron:<job id>``
+        key names the job, and the signed token attests the key.
+        """
         headers = {
             "Content-Type": "application/json",
             "X-Internal-Secret": self._secret,
             "X-Session-Key": f"cron:{self.job.id}",
         }
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{self._port}{path}",
-            data=data,
-            headers=headers,
-            method="POST",
-        )
+        if self._session_token:
+            headers["X-Session-Token"] = self._session_token
+        return headers
+
+    @staticmethod
+    def _exchange(req: urllib.request.Request) -> Any:
+        """Send one built loopback request; decoded JSON, or ``{"error": ...}``.
+
+        An HTTP refusal keeps the gateway's own reason, redacted, because
+        ``HTTP Error 403: Forbidden`` alone hides the remedy the gateway names
+        in its body.
+        """
+        where = f"{req.get_method()} {req.selector}"
         try:
             with loopback_urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = redact(exc.read().decode("utf-8", "replace"))[:500]
+            except Exception:
+                pass
+            logger.warning("ScriptContext %s refused: HTTP %s", where, exc.code)
+            return {"error": f"HTTP {exc.code}: {detail or exc.reason}"}
         except Exception as exc:
-            logger.warning("ScriptContext._post(%s) failed: %s", path, exc)
+            logger.warning("ScriptContext %s failed: %s", where, exc)
             return {"error": str(exc)}
 
 
 # ── MCP Tool Bridge ──
+
+
+class McpToolError(RuntimeError):
+    """A tool call the MCP server answered with an error; the server is still usable."""
 
 
 class McpToolClient:
@@ -1298,7 +1445,9 @@ class McpToolClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr_file,
-                text=True,
+                # errors="replace": a byte that is not UTF-8 costs its line
+                # (it does not parse) rather than raising out of readline.
+                **UTF8_TEXT,
                 env=proc_env,
             )
         except Exception:
@@ -1330,13 +1479,20 @@ class McpToolClient:
         self._proc.stdin.flush()
 
     def _recv(self) -> dict | None:
+        """The next line the server wrote as a JSON object, or ``None`` at EOF.
+
+        A line that is not one (a blank, banner or log line on stdout, a
+        scalar, a value nested past the decoder's ceiling) comes back as an
+        empty object, so it costs that line rather than the call, and every
+        line read counts toward ``_rpc``'s cap: a server that writes only
+        noise fails the call instead of holding it.
+        """
         assert self._proc.stdout is not None
-        while True:
-            line = self._proc.stdout.readline()
-            if not line:  # EOF
-                return None
-            if line.strip():
-                return json.loads(line)
+        line = self._proc.stdout.readline()
+        if not line:  # EOF
+            return None
+        msg = parse_json_object_line(line)
+        return {} if msg is None else msg
 
     def _stderr_tail(self, limit: int = 1024) -> str:
         """Return the last `limit` bytes of the subprocess's captured stderr.
@@ -1379,21 +1535,23 @@ class McpToolClient:
                 )
             if msg.get("id") == req_id:
                 return msg
-        raise RuntimeError(
-            f"MCP server '{name}' did not respond to '{method}' within 1000 messages"
-        )
+        raise RuntimeError(f"MCP server '{name}' did not respond to '{method}' within 1000 lines")
 
     def call_tool(self, name: str, arguments: dict) -> str:
         r = self._rpc("tools/call", {"name": name, "arguments": arguments})
         if "error" in r:
-            raise RuntimeError(f"MCP tool error: {r['error']}")
+            raise McpToolError(f"MCP tool error: {r['error']}")
         result = r.get("result", {})
         if result.get("isError"):
             content = result.get("content", [])
             err_text = content[0].get("text", "unknown error") if content else "unknown error"
-            raise RuntimeError(f"MCP tool error: {err_text}")
+            raise McpToolError(f"MCP tool error: {err_text}")
         content = result.get("content", [])
         return content[0].get("text", "") if content else ""
+
+    def is_running(self) -> bool:
+        """Whether the server process is still up and so can take another call."""
+        return self._proc.poll() is None
 
     def close(self) -> None:
         try:
@@ -1414,6 +1572,73 @@ class McpToolClient:
                 Path(stderr_file.name).unlink(missing_ok=True)
             if self._sandbox_cleanup:
                 Path(self._sandbox_cleanup).unlink(missing_ok=True)
+
+
+class KeptMcpServers:
+    """One MCP server per name, kept across the calls of a run.
+
+    A server is kept after a call it answered, with a result or with a tool
+    error, for the run's next call to the same server name. So a server that
+    signs in to a service when it starts signs in once per run rather than once
+    per call. A call that fails any other way (the server exited, stopped
+    answering, or wrote no answer) stops its server, and the next call starts a
+    fresh one. A kept server whose process has exited is replaced. A call made
+    while another call to the same server still holds the kept server starts a
+    server of its own, and once both finish only one is kept. :meth:`close`
+    stops every kept server and keeps none afterwards.
+    """
+
+    def __init__(self, session_key: str = ""):
+        self._session_key = session_key
+        self._kept_clients: dict[str, McpToolClient] = {}
+        self._kept_clients_lock = threading.Lock()
+        self._closed = False
+
+    def call_tool(self, server: str, tool: str, args: dict) -> str:
+        client = self._take_kept_client(server)
+        kept = False
+        try:
+            if client is None:
+                client = McpToolClient(server, session_key=self._session_key)
+            try:
+                result = client.call_tool(tool, args)
+            except McpToolError:
+                kept = self._keep_client(server, client)
+                raise
+            kept = self._keep_client(server, client)
+            return result
+        finally:
+            if client is not None and not kept:
+                client.close()
+
+    def close(self) -> None:
+        """Stop every kept server; never raises, and later calls keep none."""
+        with self._kept_clients_lock:
+            self._closed = True
+            clients = list(self._kept_clients.values())
+            self._kept_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("stopping a kept MCP server failed", exc_info=True)
+
+    def _take_kept_client(self, server: str) -> McpToolClient | None:
+        """The server kept from an earlier call, if its process is still running."""
+        with self._kept_clients_lock:
+            client = self._kept_clients.pop(server, None)
+        if client is not None and not client.is_running():
+            client.close()
+            return None
+        return client
+
+    def _keep_client(self, server: str, client: McpToolClient) -> bool:
+        """Keep ``client`` for the next call to ``server``; False when one is already kept."""
+        with self._kept_clients_lock:
+            if self._closed or server in self._kept_clients:
+                return False
+            self._kept_clients[server] = client
+            return True
 
 
 @lru_cache(maxsize=16)
@@ -2135,6 +2360,8 @@ def run_script_sandboxed(
         "    print(json.dumps({'status': 'report', 'message': r.message}))\n"
         "except Exception as e:\n"
         "    print(json.dumps({'status': 'error', 'error': str(e)}))\n"
+        "finally:\n"
+        "    ctx.close()\n"
     )
 
     # A granted launcher is born inside the private pinned dir: on Python
@@ -2195,20 +2422,6 @@ def run_script_sandboxed(
             if stdin_payload is not None
             else [sys.executable, launcher_path]
         )
-        # Every installed app's ``.app_secret`` lives under ``<config_dir>/apps``, and
-        # that file is a bearer credential rather than a marker:
-        # ``dashboard.token_auth.validate_app_secret`` compares it and issues that app's
-        # scoped token, so a child that can read one can act as the app. A script body
-        # is model-supplied, so it must not reach any of them.
-        #
-        # The containing DIRECTORY is masked, not a list of per-app leaves read out of
-        # it: a mask is applied to the paths named at spawn and is never recomputed for a
-        # live child, so an enumeration cannot name an app installed while this run is
-        # still executing, and that app's secret would stay readable for the rest of the
-        # child's life. Masking the directory covers whatever appears under it
-        # afterwards. Both branches get it -- a granted run's approved isolation is the
-        # stricter of the two, so it may not be the one that keeps the credentials.
-        apps_tree = str(config_dir() / "apps")
         # A granted child must never see the LIVE crons dir OR the script's
         # own parent directory: the launcher's empty-sys.path isolation stops
         # accidental sibling imports, but the verified script itself could
@@ -2227,12 +2440,11 @@ def run_script_sandboxed(
                     (
                         str(config_dir() / "crons"),
                         str(Path(file_path_str).resolve().parent),
-                        apps_tree,
                     )
                 )
             )
         else:
-            hidden = (apps_tree,)
+            hidden = ()
         # Same tier as ``run_command_sandboxed`` below: a script body is
         # agent-written, so it is the HIGHER-capability cron surface, and it
         # ran the WIDER profile — ``standard`` leaves ~/.aws/credentials, the
@@ -2250,56 +2462,8 @@ def run_script_sandboxed(
         # secret_env grant, which runs ``strict`` and injects the one approved
         # secret instead of exposing a store.
         sandbox_mode = "strict" if stdin_payload is not None else "cc"
-        # Create the mask target only when this spawn will actually CARRY the mask.
-        # The apps tree is created on first install, so on a home where no app has ever
-        # been installed the Linux mask loop finds the name absent, skips it, and the
-        # first-ever install appears inside this running child's view -- hence the
-        # create. But ``credential_mask_applies`` is false exactly where the child comes
-        # back unwrapped and every mask is dropped anyway, so creating a directory there
-        # buys no confinement while adding a way for this run to fail. It also keeps
-        # ``wrap_argv``'s own fail-closed refusal the FIRST thing a backend-less host
-        # hears: that refusal names the remedy an operator acts on, and a create error
-        # standing in front of it would replace an actionable message with an incidental
-        # one.
-        if credential_mask_applies(sandbox_mode):
-            try:
-                materialize_caller_masked_dir(apps_tree)
-                # The apps root is the one entry in ``hidden`` under a directory an agent
-                # can rename, so it is the one whose mask needs an identity and not just a
-                # name. Taken here, while this spawn settles which directory it means.
-                apps_mask_ids: tuple[tuple[str, int, int], ...] = (masked_dir_identity(apps_tree),)
-                # Before anything downstream: a LINKED credential puts its bytes outside
-                # this tree, where no mask, window or pre-exec scan reaches them.
-                refuse_if_an_app_secret_is_linked(apps_tree)
-            except SandboxCeilingUnsealable as exc:
-                return {"status": "error", "error": f"❌ {exc}"}
-            # The mask covers ``apps/<app>/data`` as well, which is an app's documented
-            # persistence root, and on Linux it is a WRITABLE empty bind -- so without a
-            # window an app script cron's writes there report success and are discarded.
-            # A window keeps the mask and every ``.app_secret`` denied and re-exposes
-            # only the data directories on their real inodes.
-            apps_windows = app_data_window_targets(apps_tree)
-        else:
-            apps_windows = ()
-            apps_mask_ids = ()
         sandboxed_argv, sandbox_cleanup = wrap_argv(
-            argv,
-            mode=sandbox_mode,
-            extra_hidden_dirs=hidden,
-            extra_hidden_dir_ids=apps_mask_ids,
-            # An alias to a secret at a path NO mask covers is read through that path, not
-            # through the mask, so withholding windows cannot answer it. The launcher's
-            # pre-exec hardlink scan is what answers it, and it builds its match set one
-            # level deep, which is one level short of ``apps/<app>/.app_secret``. Naming the
-            # root lets those secrets into that set, and the refusal then fires only when an
-            # alias is actually FOUND where the child could read it -- not merely because a
-            # link count is above one, which would let one app's on-disk layout stop every
-            # cron on the host. Read HERE rather than in the child, which masks this tree in
-            # its own process and would stat an empty directory. Non-empty exactly when this
-            # spawn masks the tree.
-            extra_alias_credential_ids=(aliased_app_secret_ids(apps_tree) if apps_mask_ids else ()),
-            extra_private_dirs=tuple(window.path for window in apps_windows),
-            extra_private_dir_ids=tuple(apps_windows),
+            argv, mode=sandbox_mode, extra_hidden_dirs=hidden
         )
         if stdin_payload is not None and sandboxed_argv == argv:
             # On a host with no OS sandbox backend, the unsandboxed-exec
@@ -2819,52 +2983,7 @@ def run_command_sandboxed(
         if shell is None:
             return {"status": "error", "output": _no_command_shell_message(), "exit_code": -1}
         argv = _command_argv(shell, command)
-        # The same app-secret mask the script path applies, for the same reason and on
-        # the same trust reading: the comment above says this command string is fully
-        # model-supplied, so the two cron exec paths have one trust level between them
-        # and a control on only one of them is bypassable by choosing the other. The
-        # storage-time vet cannot substitute here -- it denies ``.ssh`` references in the
-        # command TEXT, and a shell can build a path this credential's name never
-        # appears in.
-        apps_tree = str(config_dir() / "apps")
-        # Gated and handled exactly as the script path does it, and for the same two
-        # reasons: a spawn that comes back unwrapped drops the mask, so materializing
-        # the target there adds a failure mode and buys no confinement; and letting a
-        # create error through ahead of ``wrap_argv`` would put an incidental message
-        # where this host needs the fail-closed remedy. The refusal is reported here
-        # rather than left to the generic handler below, which would label it "Command
-        # failed" -- no command runs, the spawn is refused before it happens.
-        if credential_mask_applies("cc"):
-            try:
-                materialize_caller_masked_dir(apps_tree)
-                # Same identity as the script path, for the same reason: this mask root
-                # sits under a directory an agent can rename, so the child gets the
-                # directory it was approved for and not whatever holds the name later.
-                apps_mask_ids: tuple[tuple[str, int, int], ...] = (masked_dir_identity(apps_tree),)
-                # Same as the script path.
-                refuse_if_an_app_secret_is_linked(apps_tree)
-            except SandboxCeilingUnsealable as exc:
-                return {"status": "error", "output": f"❌ {exc}", "exit_code": -1}
-            # Same window as the script path, for the same reason: the mask covers each
-            # app's documented ``data`` root with a writable empty bind, so a command
-            # writing there would be told it succeeded and lose the bytes.
-            apps_windows = app_data_window_targets(apps_tree)
-        else:
-            apps_windows = ()
-            apps_mask_ids = ()
-        sandboxed_argv, sandbox_cleanup = wrap_argv(
-            argv,
-            mode="cc",
-            extra_hidden_dirs=(apps_tree,),
-            extra_hidden_dir_ids=apps_mask_ids,
-            # Same as the script path: the scan, not the windows, is what answers an alias
-            # at a path no mask covers, its match set stops one level above this tree's
-            # per-app secrets, and the inodes are read here because the child cannot see
-            # them through its own mask.
-            extra_alias_credential_ids=(aliased_app_secret_ids(apps_tree) if apps_mask_ids else ()),
-            extra_private_dirs=tuple(window.path for window in apps_windows),
-            extra_private_dir_ids=tuple(apps_windows),
-        )
+        sandboxed_argv, sandbox_cleanup = wrap_argv(argv, mode="cc")
         sandboxed_argv = cgroup_scope_argv(sandboxed_argv)  # cgroup DoS ceiling
         clean_env = _clean_cron_env()
         if _spawn_cancelled(job_id):

@@ -654,11 +654,19 @@ def _tcp_pair(host: str):
     import socket
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind((host, 0))
-    server.listen(1)
-    client = socket.create_connection(server.getsockname(), timeout=5)
-    accepted, _ = server.accept()
-    return server, client, accepted
+    client = None
+    try:
+        server.settimeout(5)
+        server.bind((host, 0))
+        server.listen(1)
+        client = socket.create_connection(server.getsockname(), timeout=5)
+        accepted, _ = server.accept()
+        return server, client, accepted
+    except OSError:
+        server.close()
+        if client is not None:
+            client.close()
+        raise
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="libproc is macOS only")
@@ -679,7 +687,10 @@ def test_real_libproc_counts_a_non_loopback_connection_and_not_a_loopback_one():
         for s in loop:
             s.close()
 
-    remote = _tcp_pair(host)
+    try:
+        remote = _tcp_pair(host)
+    except OSError as exc:
+        pytest.skip(f"host cannot accept a non-loopback TCP connection: {exc}")
     try:
         # Both ends live in this process and each names the other as a
         # non-loopback peer.

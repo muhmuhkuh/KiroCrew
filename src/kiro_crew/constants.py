@@ -26,6 +26,31 @@ KIROCREW_SPAWNED_VALUE = "1"
 # this one says WHICH spawn, so a teardown that has lost its root can still tell
 # the root's own tree from a fresh spawn that took the root's recycled pid.
 KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
+# The data home of the gateway that spawned an agent runtime, set beside the
+# instance and inherited the same way. KIROCREW_SPAWNED is install-agnostic, so
+# this is what tells this install's runtime from a sibling install's on the same
+# uid. Read only to WITHHOLD a kill: absent or different means not ours.
+KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
+# Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
+# ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
+# whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:
+# this tree was spawned as TOOL work rather than as a session leader Kiro Crew owns
+# and tears down. ``session_pid._env_is_sandbox_tool`` reads it back out of the
+# kernel's exec-time copy, which lets the runtime reconciler leave such a tree out of
+# its kill-candidate population on evidence a same-uid process cannot forge on
+# another process, where an argv0 basename is merely a name.
+#
+# It is a claim about the TREE, not about each process in it. The chokepoint has
+# callers whose argv0 is itself a managed harness -- a pod child probe, an unattended
+# fix-authoring agent -- and the marker is inherited, so a harness can carry it
+# without being tool work. The reconciler therefore pairs this marker with the
+# managed-argv test and excludes only a pid that is marked AND is not a harness.
+#
+# Kept DISTINCT from KIROCREW_SPAWNED because that marker is the reconciler's
+# kill-ENABLING condition: an exclusion overloaded onto the same flag would have to
+# weaken the ownership test to express itself.
+KIROCREW_SANDBOX_TOOL_ENV = "KIROCREW_SANDBOX_TOOL"
+KIROCREW_SANDBOX_TOOL_VALUE = "1"
 
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
 # KIROCREW_DEV_MODE, …).  Use ``env_flag_enabled`` rather than ``bool(os.environ
@@ -38,13 +63,55 @@ ENV_TRUTHY = frozenset({"1", "true", "yes", "on"})
 ENV_FALSY = frozenset({"0", "false", "no", "off"})
 
 
-# Minimum supported Node.js MAJOR version for every Python-side check
-# (``kirocrew doctor``, the frontend-build probe in ``cli.py``, the TUI
-# launcher in ``cli_chat.py``). Single source of truth so doctor and chat can
-# never disagree about the floor. 22 is the oldest non-EOL line the frontend
-# bundler supports (``ensure-node.sh`` enforces the finer-grained 22.12 floor;
-# ``.nvmrc`` pins the recommended 24 LTS).
-MIN_NODE_MAJOR = 22
+# Minimum supported Node.js version (major, minor, patch), shared by the startup
+# probe in ``cli.py`` and ``kirocrew doctor``. Below it, doctor fails and the
+# startup probe logs a warning; the probe's yes/no answer (which gates the
+# ensure-node repair at gateway boot) stays on ``MIN_NODE_VERSION[0]`` only. A
+# FULL version because a major-only compare admits an early 22.x that cannot
+# run the code:
+#
+# - ``worker_threads.markAsUncloneable`` first shipped in Node 22.10.0
+#   (nodejs/node#55234, CHANGELOG_V22.md). A recent undici fetch client calls
+#   it and fails with "webidl.util.markAsUncloneable is not a function" below.
+# - The frontend bundler (vite 8 / rolldown) declares engines.node
+#   "^20.19.0 || >=22.12.0"; 20.x is end-of-life, leaving 22.12.0.
+#
+# The floor is the stricter of the two. ``ensure-node.sh`` and ``make.ps1``
+# enforce the same 22.12 cutoff; ``.nvmrc`` pins the recommended 24 LTS.
+MIN_NODE_VERSION: tuple[int, int, int] = (22, 12, 0)
+
+_NODE_VERSION_RE = re.compile(r"^\s*v?(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_node_version(text: str | None) -> tuple[int, int, int] | None:
+    """Parse ``node -v`` output (``v22.12.0``) into a tuple; None if unreadable."""
+    m = _NODE_VERSION_RE.match(text or "")
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+
+def format_node_version(version: tuple[int, int, int]) -> str:
+    """Render a version tuple as ``22.12.0``."""
+    return ".".join(str(part) for part in version)
+
+
+def node_version_meets_floor(
+    version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
+) -> bool:
+    """True iff *version* is at or above *floor*, comparing major.minor.patch."""
+    return tuple(version) >= tuple(floor)
+
+
+def node_too_old_message(
+    version: tuple[int, int, int], floor: tuple[int, int, int] = MIN_NODE_VERSION
+) -> str:
+    """User-facing line naming the found version, the exact floor, and the fix."""
+    return (
+        f"Node.js v{format_node_version(version)} is too old: Kiro Crew needs "
+        f"v{format_node_version(floor)} or newer. Update Node.js: install 24 LTS "
+        "from https://nodejs.org, or run `nvm install 24` / `mise use -g node@24`."
+    )
 
 
 def env_flag_enabled(name: str) -> bool:
@@ -124,12 +191,15 @@ CHAT_TURN_TIMEOUT = 14400.0
 # overrides it and is clamped below the turn ceiling at load time.
 TOOL_APPROVAL_TIMEOUT = 600.0
 
-# How long any caller waits for a compaction to report completed/failed —
-# the default of ``LLMProvider.wait_for_compaction`` and the cap on the
-# automatic context-threshold compaction in ``session.py``. Manual (/compact,
-# !compact) and automatic compaction deliberately share this single budget:
-# the operation is identical, so a shorter manual budget only reports
-# "timed out" on work that is still running and subsequently succeeds.
+# How long any caller waits for a compaction to report completed/failed when
+# ``session.compact_wait_secs`` is unset (0) -- the default of
+# ``LLMProvider.wait_for_compaction``. Manual (/compact, !compact, channel
+# commands) and automatic compaction deliberately share one budget: the
+# operation is identical, so a shorter manual budget only reports "timed out"
+# on work that is still running and subsequently succeeds. A configured key
+# raises both: every caller -- the automatic coordinator, the task runner,
+# the dashboard and each chat channel -- resolves it through the one
+# ``SessionManager.compact_wait_budget_secs()``.
 COMPACT_WAIT_TIMEOUT_SECS = 300.0
 
 # Wall-clock ceiling on one subagent execution: the default of
@@ -144,10 +214,36 @@ COMPACT_WAIT_TIMEOUT_SECS = 300.0
 # investigation); the reaper still force-kills at the deadline.
 SUBAGENT_TIMEOUT_SECS = 10800
 
+# Budget for an agent backend's ``initialize`` handshake, in seconds. Spent by
+# ``acp.runtime`` (which re-exports it as ``_INITIALIZE_TIMEOUT`` and documents why
+# the value is what it is), and read by the subagent startup watchdog, whose window
+# has to cover a handshake that spends all of it
+# (``SubagentManager._startup_deadline``). Owned here because that second reader is
+# outside the ACP layer, and may not import it.
+INITIALIZE_TIMEOUT_SECS = 90.0
+
 # Tool-call budget for long subagent work. Shared by the config default, loader,
 # manager fallback and tool description; the wall-clock deadline still bounds a
 # run that makes little progress or spends a long time inside one tool.
 DEFAULT_SUBAGENT_MAX_TURNS = 1000
+
+# Memory (GiB) that must remain available AFTER a subagent start is admitted:
+# the default of ``agent.spawn_min_memory_gb``. One number for the config
+# default, the loader fallback, the admission gate's fallback and
+# ``check_memory_available``'s default, so a later change cannot move some of
+# them and leave the others behind.
+DEFAULT_SPAWN_MIN_MEMORY_GB = 2.0
+
+# Default of ``agent.subagent_queue_max_wait_secs``: how long a spawn the memory
+# floor keeps deferring (durable or in memory) may wait before it ends with the
+# delivered terminal ``never started: waiting for memory``. Finite by owner
+# decision (a memory wait is never unbounded); one number for the config default,
+# the loader fallback and the manager's boot value.
+DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS = 1800
+
+# Default of ``agent.subagent_cost_gb``: the least a dedicated subagent start is
+# priced at, and the auto cap's per-agent fallback. Same one-source reason.
+DEFAULT_SUBAGENT_COST_GB = 0.5
 
 # Load-time clamp for ``agent.subagent_timeout_secs``. Same reason as the other
 # resource knobs in ``_SECURITY_BOUNDED_FIELDS``: the value governs how long one
@@ -1496,6 +1592,13 @@ DENY_CAUSE_APPROVAL_UNDELIVERABLE = "approval_undeliverable"
 #: ``DENY_CAUSE_APPROVAL_UNDELIVERABLE`` (the card could not be posted at all):
 #: here the fix is in the model's hands, and the notice must say so.
 DENY_CAUSE_APPROVAL_OVERSIZE = "approval_oversize"
+#: An UNATTENDED surface refused a call it would otherwise have auto-approved
+#: because its audit record could not be written (audit-or-deny: an approval
+#: that leaves no trace is what the Security Event Log exists to prevent).
+#: Nothing judged the action; the host could not record it. Distinct from
+#: ``DENY_CAUSE_HOOK_ERROR`` (a PreToolUse hook raised while deciding the call):
+#: naming a hook here would send the model looking at a gate that never ran.
+DENY_CAUSE_AUDIT_UNAVAILABLE = "audit_unavailable"
 
 #: Upper bound on the best-effort in-band deny notice steered into a running
 #: turn before a permission rejection goes back on the wire. Every deny site
@@ -1511,3 +1614,13 @@ STEER_NOTICE_BOUND_SECS = 5.0
 # wait (``acp.liveness.ToolCallState.declared_wait_verdict``), so raising it in one
 # place cannot leave a long wait badged as stalled.
 WAIT_TOOL_MAX_SECS = 1800
+
+# Longest retained STRING for a name, id or category. It lives here rather than
+# beside the other length caps in ``validation`` because ``execution_context``
+# needs exactly this one: ``validation`` reaches ``artifact_store``,
+# ``computer_use``, ``config.sections``, ``monitoring`` and ``project_scope``
+# (and ``security`` behind it), which is about 8 MB and 86 modules to learn one
+# integer -- and ``execution_context`` is on the identity path every MCP stub
+# takes at startup, so that graph lands once per session per server.
+# ``validation`` re-exports it, so every other reader is unaffected.
+MAX_SHORT_STRING = 500  # names, IDs, categories

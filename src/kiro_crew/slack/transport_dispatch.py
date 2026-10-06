@@ -42,6 +42,7 @@ from kiro_crew.messaging.dispatch import (
     consume_reinjection,
     driver_turn_landed,
     rearm_reinjection,
+    rollback_skill_bodies,
 )
 from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
@@ -81,6 +82,13 @@ from kiro_crew.slack.thread_parent import (
     parent_prompt_text,
     record_thread_parent,
 )
+from kiro_crew.slack.thread_replies import (
+    ThreadReplies,
+    has_noted_turn,
+    note_turn,
+    replies_since_last_turn,
+)
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.stats import Stats
 
 if TYPE_CHECKING:
@@ -195,8 +203,12 @@ async def handle_message_transport(
     gateway: Any | None = None,
     from_trusted_bot: bool = False,
     dm_single_session: bool = False,
+    start_priority: StartPriority = StartPriority.BACKGROUND,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
+
+    ``start_priority``: as for ``handler.handle_message`` (rule:
+    ``kiro_crew.start_priority``).
 
     This replaces handle_message when the feature flag is on. It uses
     TurnDriver + SlackRenderer instead of the inline stream loop.
@@ -496,6 +508,8 @@ async def handle_message_transport(
     # turn consumed the one-shot flag, and whether it landed (recorded success).
     _needs_reinjection = False
     _turn_landed = False
+    # This turn's thread-replies read; its watermark moves in the finally.
+    _thread_replies: ThreadReplies | None = None
 
     try:
         # ── Fire the ack reaction + working status IMMEDIATELY, before the
@@ -578,7 +592,7 @@ async def handle_message_transport(
             or _DEFAULT_KIROCREW_AGENT
         )
         client, is_new, resumed = await sessions.get_or_create(
-            session_key, agent=_agent, channel_id=channel
+            session_key, agent=_agent, channel_id=channel, start_priority=start_priority
         )
         _acquired = True
         # Authorize the outbound-image root, which only exists once the provider
@@ -642,13 +656,15 @@ async def handle_message_transport(
         # prior turns; recorded BEFORE the receipt row below so the transcript
         # shows it above the reply. See ``slack/thread_parent.py``.
         _thread_parent: ThreadParent | None = None
+        # One transcript read serves the parent and the thread-replies checks.
+        _prior: bool | None = None
         if (
             is_new
             and not resumed
             and thread_ts
             and thread_ts != msg_ts
             and is_slack_born(session_key)
-            and not await has_prior_turns(conversation_log, session_key)
+            and not (_prior := await has_prior_turns(conversation_log, session_key))
         ):
             _record_parent = bool(conversation_log and not _is_slack_restricted(session_key))
             _thread_parent = await fetch_thread_parent(
@@ -659,6 +675,22 @@ async def handle_message_transport(
                 await record_thread_parent(
                     conversation_log, session_key, _thread_parent, agent=_agent
                 )
+
+        # ── Thread replies since this conversation's last turn in the thread ──
+        # Read BEFORE the receipt row below, which would otherwise count as a
+        # prior turn. Context only: who gets answered was decided above.
+        if context_builder and thread_ts and thread_ts != msg_ts:
+            if _prior is None and not has_noted_turn(session_key, thread_ts):
+                _prior = await has_prior_turns(conversation_log, session_key)
+            _first_turn = not has_noted_turn(session_key, thread_ts) and not _prior
+            _thread_replies = await replies_since_last_turn(
+                slack,
+                channel,
+                thread_ts,
+                msg_ts,
+                session_key=session_key,
+                first_turn=_first_turn,
+            )
 
         # ── Conversation log: the user's turn, at RECEIPT ──
         # Recorded BEFORE the turn runs rather than alongside the reply
@@ -753,6 +785,7 @@ async def handle_message_transport(
                 thread_parent_text=(
                     parent_prompt_text(_thread_parent) if _thread_parent is not None else None
                 ),
+                thread_replies_text=_thread_replies.text if _thread_replies else None,
                 # The user's row already landed at receipt above. Without this the
                 # history fallback replays it as the thread's history, ahead of
                 # the same text as the current request.
@@ -1284,6 +1317,11 @@ async def handle_message_transport(
         # discarded the prompt carrying the re-injected context; put the flag
         # back so the next turn re-injects it.
         rearm_reinjection(sessions, session_key, consumed=_needs_reinjection, landed=_turn_landed)
+        # The replies watermark moves only past a turn that landed after a good
+        # read; a cancelled or failed turn discarded the prompt that carried them.
+        if _turn_landed and _thread_replies is not None and _thread_replies.read_ok:
+            note_turn(session_key, thread_ts or msg_ts, msg_ts)
+        rollback_skill_bodies(context_builder, session_key, landed=_turn_landed)
         # Guarantee renderer teardown even if TurnDriver.run() raised before
         # on_done: cancels the 30s tool-elapsed timer so it can't survive the
         # turn and keep hitting append_task against a dead stream.

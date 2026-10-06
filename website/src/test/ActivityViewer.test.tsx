@@ -784,6 +784,19 @@ describe('ActivityViewer — queued subagents', () => {
     expect(text).not.toContain('concurrency limit')
   })
 
+  it('names macOS memory pressure without GB figures, even if an event carries them', () => {
+    // The kernel's pressure verdict holds a start whose free-memory figure
+    // cleared the floor, so a "needs M GB, N GB free" pair would contradict it.
+    render(<ActivityViewer {...baseProps} view="subagents" />, {
+      wrapper: queuedWrapper(1, { reason: 'memory_pressure', available_gb: 8, required_gb: 4.5 }),
+    })
+    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
+    expect(text).toBe(
+      '1 waiting to start — macOS reports memory pressure; the starts resume on their own once it eases or the running agents finish; starts give up once the pressure outlasts the wait limit',
+    )
+    expect(text).not.toMatch(/GB/)
+  })
+
   it('tells the user what to do about a memory wait', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, {
       wrapper: queuedWrapper(1, { reason: 'low_memory', available_gb: 3.2, required_gb: 4.5 }),
@@ -800,13 +813,12 @@ describe('ActivityViewer — queued subagents', () => {
     expect(text).not.toMatch(/needs .* of free memory/)
   })
 
-  it('drops to the figure-less critical sentence when the posture event carries no number', () => {
+  it('keeps the default text for the posture label an older gateway sent', () => {
     render(<ActivityViewer {...baseProps} view="subagents" />, {
       wrapper: queuedWrapper(1, { reason: 'posture_critical' }),
     })
-    const text = screen.getByTestId('subagent-queued-banner').textContent ?? ''
-    expect(text).toContain('critically low; free up memory')
-    expect(text).not.toContain('(')
+    expect(screen.getByTestId('subagent-queued-banner').textContent)
+      .toBe('1 waiting to start — queued behind the concurrency limit')
   })
 
   it('keeps the concurrency text for the concurrency kind itself', () => {

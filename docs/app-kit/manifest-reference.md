@@ -116,8 +116,8 @@ installed against:
 | `message` | string | Prompt sent to the agent on each run |
 | `agent` | string | Agent to run (optional, uses default if omitted) |
 | `agent_sequence` | string[] | Ordered agents to run |
-| `command` | string | Shell command executed without a model call; mutually exclusive with `script` |
-| `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command` |
+| `command` | string | Shell command executed without a model call; mutually exclusive with `script`. A present non-string value is rejected rather than treated as absent |
+| `script` | string | Synchronous Python callable (`file.py:function`) executed without a model call; mutually exclusive with `command`. A present non-string value is rejected rather than treated as absent |
 | `env` | object | String environment variables passed to the job |
 | `persistent_session` | boolean | Default `true`; retain one agent session across runs |
 | `silent` | boolean | Default `false`; suppress automatic result delivery |
@@ -393,11 +393,18 @@ own route base, with `session_key` always and `folder_id` / `folder_name`
 when the chat is in a folder, and reads:
 
 ```json
-{ "state": "ok", "tooltip": "Bound to production" }
+{ "state": "ok", "tooltip": "Bound to production", "detail": "production" }
 ```
 
 `state` is `ok`, `warn` or `none`; the chip tints for the first two and the
-tooltip is length-bounded. The path is charset-bounded at install and re-checked
+tooltip is length-bounded. The optional `detail` is shown on the chip after the
+manifest label, as `<label> — <detail>`, so the per-session value is visible
+without hovering while the label still identifies the control. Make `detail`
+the bare name the control is bound to (`production`, not `Bound to production`)
+and let `tooltip` state the relationship. It is cut to 40 characters after
+control, format, bidi, zero-width and line-separator characters are removed; a
+missing or non-string `detail` shows the label alone. A `detail` is shown even
+when `state` is `none`. The path is charset-bounded at install and re-checked
 in the dashboard, and one that would leave the app's own route prefix is refused
 before any request rather than sanitized -- so a control with an invalid
 `statusPath` is simply never polled. Polling fails closed: an app that is down is
@@ -814,7 +821,7 @@ packages at all.
 | `permissions.cron` | boolean | Can create cron jobs |
 | `permissions.memory` | string | Memory access: `""` (none), `"app-scoped"`, or `"shared"` |
 | `permissions.network` | boolean | Can make external network requests |
-| `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices), approve or deny pending tool requests, and change approval modes within the limits below |
+| `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices, but not a change to the session's agent binding, persona settings, or a harness slash command), approve or deny pending tool requests, and change approval modes within the limits below |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
 | `permissions.jobs` | boolean | May run durable background work through `ctx.jobs` and the app-owned `_jobs/*` routes |
 | `permissions.exposeToApps` | string[] | App names (or `"*"`) allowed to request cross-app visibility into this app's slots/subagents |
@@ -845,7 +852,10 @@ API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 > user-session calls, in addition to `permissions.api`. The app must be enabled.
 > The grant reaches existing local user-owned sessions only; cron, system, remote,
 > member-mode, and other apps' sessions are denied. Apps retain their pre-existing
-> access to their own slots. Mode changes must name a live allowed slot and are
+> access to their own slots. On the per-slot routes (`/api/chat/slots/{slot}/*`)
+> the grant reaches approving or denying a pending tool request only; every other
+> per-slot route answers an app `404 slot_not_found` unless the app owns the slot,
+> whatever `permissions.api` prefix it holds. Mode changes must name a live allowed slot and are
 > limited to Normal, Reads and Trust; YOLO is a process-global override and stays
 > dashboard-only. An update that newly adds the flag disables the app until the user
 > enables it again from the detail page, which shows why (this re-gate is specific
@@ -901,7 +911,6 @@ the endpoint; it does not import provider code.
   "setup": {
     "onInstall": "cd ui && npm install && npm run build",
     "onUninstall": "echo cleanup done",
-    "onUpdate": "cd ui && npm install && npm run build",
     "onEnable": "echo enabled",
     "onDisable": "echo disabled",
     "configSchema": {}
@@ -911,9 +920,9 @@ the endpoint; it does not import provider code.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `setup.onInstall` | string | `""` | Shell command run only during a registry install, after clone/build and before the installed copy is created |
+| `setup.onInstall` | string | `""` | Shell command run during a registry install **and again on every registry update** (an update re-enters the install transaction), after clone/build and before the installed copy is created. Not run for a local-path install. Make it idempotent |
 | `setup.onUninstall` | string | `""` | Shell command run before uninstall |
-| `setup.onUpdate` | string | `""` | Preserved in the manifest but currently not executed; do not rely on it |
+| `setup.onUpdate` | string | `""` | Declared and preserved in the manifest but **not executed** — no code path dispatches it. Put update-time work in an idempotent `onInstall`, which a registry update re-runs |
 | `setup.onEnable` | string | `""` | Shell command run when app is enabled |
 | `setup.onDisable` | string | `""` | Shell command run when app is disabled |
 | `setup.onEnableTimeout` | number | `30` | Timeout in seconds for `onEnable` script |

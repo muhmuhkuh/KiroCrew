@@ -329,6 +329,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     # the key at module level would close an import cycle.
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
     from kiro_crew.dashboard.session_control import (
+        CHANNEL_RECIPIENT_META_KEY,
         QUEUED_CONTAINMENT_META_KEY,
         SEND_ORIGIN_META_KEY,
     )
@@ -397,7 +398,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # actor at all -- the same fail-closed baseline the flags above get.
             #
             # The SENDING SLOT goes with them, and it is the sharpest of the
-            # three because the value is not merely read, it names a WRITE
+            # first three because the value is not merely read, it names a WRITE
             # TARGET: the drain resolves the recipient of its drop notice from
             # this key alone and appends the entry's own text there
             # (`session_control.notify_send_origin_dropped`). Carried back off
@@ -410,6 +411,11 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # itself still survives -- which is what putting the stamp in
             # ``meta`` rather than a consumption callback buys, since a
             # callback-carrying entry is not persisted at all.
+            #
+            # The CHANNEL RECIPIENT stamp goes for the same reason with a wider
+            # blast radius: it names a conversation on a network surface and the
+            # drop notice would carry the entry's text there, so an edited stamp
+            # would turn a file write into an outbound channel message.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
@@ -418,6 +424,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
                     QUEUED_CONTAINMENT_META_KEY,
                     TURN_ACTOR_META_KEY,
                     SEND_ORIGIN_META_KEY,
+                    CHANNEL_RECIPIENT_META_KEY,
                 )
             }
         try:
@@ -490,6 +497,47 @@ def _renumber_marker(content: str, marker: str, old: int, new: int, path: str) -
     for at, end in reversed(_marker_spans(content, marker, old, path)):
         content = content[:at] + replacement + content[end:]
     return content
+
+
+_QUOTE_ATTRIBUTION = {
+    "user": "— quoting an earlier message from the user",
+    "assistant": "— quoting an earlier message from the assistant",
+}
+
+
+def quote_block(quote: Any) -> str | None:
+    """The blockquote a ``meta.quote`` record serializes to, or ``None``.
+
+    Mirrors the dashboard's ``quoteBlock`` (``chat-core/composer/messageQuote.ts``)
+    byte for byte: the card the client draws strips exactly this block from
+    the head of the row, so a record whose block is absent from the text has
+    nothing to point at.
+    """
+    if not isinstance(quote, dict):
+        return None
+    text, role = quote.get("text"), quote.get("role")
+    # ``role`` is type-gated before the dict lookup: a restored queue file is an
+    # untrusted boundary, and an unhashable role must refuse the record, not
+    # raise out of the edit that reads it.
+    if not isinstance(text, str) or not isinstance(role, str) or role not in _QUOTE_ATTRIBUTION:
+        return None
+    return "\n".join("> " + line for line in [*text.split("\n"), _QUOTE_ATTRIBUTION[role]])
+
+
+def prune_quote_meta(meta: Any, content: str) -> None:
+    """Drop an entry's ``meta.quote`` when an edit took its block out of *content*.
+
+    The drained row's card is drawn from the record and the record's block is
+    stripped from the text; a record whose block the edit removed or changed
+    would draw a card over text that does not open with it -- a stale card
+    beside raw ``>`` lines. The edit keeps whatever the user wrote; only the
+    card's claim is withdrawn.
+    """
+    if not isinstance(meta, dict) or "quote" not in meta:
+        return
+    block = quote_block(meta.get("quote"))
+    if block is None or not content.startswith(block):
+        meta.pop("quote", None)
 
 
 def prune_attachment_meta(meta: Any, content: str, previous: str) -> str:
@@ -725,9 +773,21 @@ class SlotQueueRepository:
             # (prune_attachment_meta). An entry the old text never named is
             # not the edit's to drop.
             previous = item.get("content")
-            item["content"] = prune_attachment_meta(
-                item.get("meta"), content, previous if isinstance(previous, str) else ""
-            )
+            previous = previous if isinstance(previous, str) else ""
+            # The quoted block is another message's words: a marker inside it
+            # is not one of this entry's attachments, so it is neither counted
+            # as removed nor renumbered. The block comes off both texts for the
+            # pruning and goes back unchanged -- an edit that kept it keeps the
+            # card; one that changed it falls through to `prune_quote_meta`.
+            block = quote_block((item.get("meta") or {}).get("quote"))
+            if block and content.startswith(block) and previous.startswith(block):
+                body = prune_attachment_meta(
+                    item.get("meta"), content[len(block) :], previous[len(block) :]
+                )
+                item["content"] = block + body
+            else:
+                item["content"] = prune_attachment_meta(item.get("meta"), content, previous)
+            prune_quote_meta(item.get("meta"), item["content"])
             if directive_user_origin:
                 item["_directive_user_origin"] = True
             else:

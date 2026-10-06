@@ -18,9 +18,12 @@ compatibility or egress claims rather than "the feature works":
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
+import functools
 import gzip
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -100,7 +103,7 @@ def _slot(messages, *, title="My session", memory_mode="persistent", app="", **o
         agent="",
         model="claude-opus-5",
         reasoning_effort="high",
-        mode="orchestrator",
+        mode="design-critique",
         autocompact_pct=75.0,
         workspace="default",
         project="/home/me/checkout",
@@ -113,7 +116,6 @@ def _slot(messages, *, title="My session", memory_mode="persistent", app="", **o
         _dirty_gen=0,
         memory_mode=memory_mode,
         running=False,
-        _in_stage_execution=False,
         _app=app,
     )
     for k, v in over.items():
@@ -455,6 +457,15 @@ async def test_export_revalidates_the_line_at_response_commit():
     assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
 
 
+class _BusyAtCommit(_FakeLog):
+    """A log whose publication hold is busy, so the response commit is refused."""
+
+    @contextlib.contextmanager
+    def publication_hold(self, _key, *, expected_keys=None):
+        raise TranscriptBusy("fake: held at response commit")
+        yield
+
+
 def _capture_audit(monkeypatch) -> list[dict]:
     events: list[dict] = []
 
@@ -525,12 +536,6 @@ async def test_a_busy_commit_leaves_only_the_failure_audit(monkeypatch, tmp_path
     out.mkdir()
     monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
     events = _capture_audit(monkeypatch)
-
-    class _BusyAtCommit(_FakeLog):
-        @contextlib.contextmanager
-        def publication_hold(self, _key, *, expected_keys=None):
-            raise TranscriptBusy("fake: held at response commit")
-            yield
 
     slot = _slot(MSGS)
     state = _state(MSGS, slots={"slot-1": slot})
@@ -710,7 +715,8 @@ async def test_an_app_cannot_export_a_slot_it_does_not_own():
     resp = await se.api_chat_slot_export(_request(state, app="my-app"))
 
     assert resp.status == 404
-    assert json.loads(resp.body)["code"] == "export_slot_not_found"
+    # The per-slot checkpoint's body, so the handler and the checkpoint agree.
+    assert json.loads(resp.body) == {"error": "not found", "code": "slot_not_found"}
 
 
 @pytest.mark.asyncio
@@ -1076,9 +1082,9 @@ async def test_an_app_cannot_export_a_channel_linked_slot_it_owns():
     resp = await se.api_chat_slot_export(_request(state, app="my-app"))
 
     assert resp.status == 404
-    # Indistinguishable from an unknown slot: a separate code would let an app
+    # Indistinguishable from an unknown slot: a separate body would let an app
     # learn which of its slots carry a channel link.
-    assert json.loads(resp.body)["code"] == "export_slot_not_found"
+    assert json.loads(resp.body) == {"error": "not found", "code": "slot_not_found"}
 
 
 @pytest.mark.asyncio
@@ -1187,7 +1193,8 @@ async def test_an_export_streams_layer_b_from_its_snapshot_and_removes_it(monkey
 @pytest.mark.asyncio
 async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, monkeypatch):
     """The body goes out of the staged file, a chunk at a time, and the file is
-    removed once the send ends. Nothing reads it whole into memory."""
+    removed once the send ends. Nothing reads it whole into memory. The wait is on
+    the cleanup handshake, not a sleep."""
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
@@ -1198,6 +1205,16 @@ async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, mo
     monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
     document = {"bundle_version": 2, "messages": [{"role": "user", "content": "hi", "ts": ""}]}
     staged = se._stage_export(document)
+    real_rm = se._rm_import_temps
+    removed = threading.Event()
+
+    def wrapper(*paths):
+        try:
+            return real_rm(*paths)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(se, "_rm_import_temps", wrapper)
 
     def _no_whole_read(self, *a, **k):
         raise AssertionError("the staged export was read whole")
@@ -1213,6 +1230,141 @@ async def test_a_sent_export_streams_its_staged_file_and_removes_it(tmp_path, mo
         resp = await client.get("/x")
         assert resp.status == 200
         assert json.loads(gzip.decompress(await resp.read())) == document
+    assert await asyncio.to_thread(removed.wait, 10), "staged export cleanup never ran"
+    assert not staged.exists()
+
+
+class _HeldExecutor(concurrent.futures.ThreadPoolExecutor):
+    """A default executor that queues the jobs *held* picks out without starting
+    them, until :meth:`release`. A held job is a submitted job no worker has
+    picked up yet, the state a loaded runner leaves a cleanup in."""
+
+    def __init__(self, held) -> None:
+        super().__init__(max_workers=4)
+        self._is_held = held
+        self.queued: list[tuple[concurrent.futures.Future, object, tuple]] = []
+        self.submitted = threading.Event()
+
+    def submit(self, fn, /, *args, **kwargs):
+        target = fn.args[0] if isinstance(fn, functools.partial) and fn.args else fn
+        if not self._is_held(target):
+            return super().submit(fn, *args, **kwargs)
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self.queued.append((future, fn, args))
+        self.submitted.set()
+        return future
+
+    def release(self) -> None:
+        for future, fn, args in self.queued:
+            if future.set_running_or_notify_cancel():
+                future.set_result(fn(*args))
+
+
+@pytest.mark.asyncio
+async def test_a_send_cancelled_while_its_cleanup_waits_for_a_worker_still_removes_it(
+    tmp_path, monkeypatch
+):
+    """A client that goes away cancels the send. When that lands while the
+    removal is queued but not yet started, the removal still runs."""
+    from aiohttp import web
+
+    async def _sent(self, *_a, **_k):
+        return None
+
+    for name in ("prepare", "write", "write_eof"):
+        monkeypatch.setattr(web.StreamResponse, name, _sent)
+    staged = tmp_path / "staged.kcsession.json.gz"
+    staged.write_bytes(gzip.compress(b"{}"))
+    removals = {"_close_and_remove", "_rm_import_temps"}
+    pool = _HeldExecutor(lambda target: getattr(target, "__name__", "") in removals)
+    asyncio.get_running_loop().set_default_executor(pool)
+    try:
+        response = se._StagedExport(staged, headers={})
+        send = asyncio.ensure_future(response.prepare(SimpleNamespace(method="GET")))
+        assert await asyncio.to_thread(pool.submitted.wait, 10), "the removal was never queued"
+        send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await send
+        pool.release()
+        await asyncio.gather(*getattr(se, "_PENDING_RELEASES", ()))
+        assert not staged.exists(), "a cancelled send withdrew its queued removal"
+    finally:
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_commit_cancelled_while_its_cleanup_waits_still_removes_it(
+    tmp_path, monkeypatch
+):
+    """A commit that never hands the staged file to a response removes it
+    itself. When the handler is cancelled while that removal is queued but not
+    yet started, the removal still runs."""
+    import kiro_crew.dashboard.session_transfer as st
+
+    out = tmp_path / "egress"
+    out.mkdir()
+    monkeypatch.setattr(st, "_egress_tmp_dir", lambda: out)
+    _capture_audit(monkeypatch)
+
+    state = _state(MSGS, slots={"slot-1": _slot(MSGS)})
+    state.conversation_log = _BusyAtCommit(MSGS)
+    pool = _HeldExecutor(lambda target: getattr(target, "__name__", "") == "_rm_import_temps")
+    asyncio.get_running_loop().set_default_executor(pool)
+    try:
+        handler = asyncio.ensure_future(se.api_chat_slot_export(_request(state)))
+        assert await asyncio.to_thread(pool.submitted.wait, 10), "the removal was never queued"
+        assert list(out.iterdir()), "the staged body was removed before the cancel"
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        pool.release()
+        await asyncio.gather(*se._PENDING_RELEASES)
+        assert list(out.iterdir()) == [], "a cancelled commit withdrew its queued removal"
+    finally:
+        pool.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_a_sent_export_closes_its_handle_before_removing_the_file(tmp_path, monkeypatch):
+    """The removal starts only once the send's own handle is closed: Windows
+    refuses to delete a file any handle still holds open."""
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    staged = tmp_path / "staged.kcsession.json.gz"
+    staged.write_bytes(gzip.compress(b'{"k": 1}'))
+    handles = []
+    real_open = se._open_staged
+
+    def _tracked_open(path):
+        fobj, size = real_open(path)
+        handles.append(fobj)
+        return fobj, size
+
+    monkeypatch.setattr(se, "_open_staged", _tracked_open)
+    seen_open: list[bool] = []
+    removed = threading.Event()
+    real_rm = se._rm_import_temps
+
+    def _rm(*paths):
+        try:
+            seen_open.extend(not fobj.closed for fobj in handles)
+            return real_rm(*paths)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(se, "_rm_import_temps", _rm)
+
+    async def _handler(_request):
+        return se._StagedExport(staged, headers={"Content-Type": "application/gzip"})
+
+    app = web.Application()
+    app.router.add_get("/x", _handler)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/x")
+        assert json.loads(gzip.decompress(await resp.read())) == {"k": 1}
+    assert await asyncio.to_thread(removed.wait, 10), "staged export cleanup never ran"
+    assert seen_open == [False]
     assert not staged.exists()
 
 

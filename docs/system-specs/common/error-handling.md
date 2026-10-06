@@ -24,7 +24,10 @@ AcpError (base, acp/transport_errors.py) — carries `transient`, the retry verd
 │                            terminal generic death. Classified only while the
 │                            session has produced no text and run no tool, so
 │                            the verdict can never license a replay that
-│                            repeats side effects
+│                            repeats side effects. An ambiguous-delivery death
+│                            (a stdin stall with the child alive) is never
+│                            this subclass: it stays a non-transient
+│                            AcpProcessDied with ambiguous_delivery set
 ├── AcpAuthRequired        — kiro-cli not authenticated; non-retryable
 ├── AcpSandboxInitFailed   — an OS sandbox refused to initialize; non-retryable
 ├── AcpToolGateUnroutable  — tool calls would bypass the PreToolUse gate;
@@ -68,6 +71,7 @@ instead of the row simply disappearing.
 | ACP → CLI | Catch `AcpError`, print user-friendly message, `sys.exit(1)` |
 | JSON-RPC read | Non-JSON lines silently skipped (kiro-cli debug output) |
 | Config load | Invalid JSON → log warning, return defaults |
+| Skill index (`list_skills`) | One global SKILL.md that is not UTF-8 or cannot be opened → one warning naming the file, that row dropped, every other row listed. Never a failed listing: the index feeds every chat turn and `GET /api/skills`. Rationale: [memory-skills-hooks](../modules/memory-skills-hooks.md) |
 | Process spawn | Backend-specific executable resolver, including trusted-path checks where required; clear error if missing |
 | asyncio loop callback | A Windows Proactor reset repeated by its `connection_lost` close callback is warning-only; task-level connection resets and other exceptions remain ERRORs with crash breadcrumbs |
 
@@ -82,6 +86,28 @@ literal code values on computed-status responses and refuses dictionary spreads
 that could replace the code. A Pi catalog fetch failure from `GET /api/models`
 returns HTTP 503 with `code="pi_models_unavailable"`.
 
+## Dashboard Error Hand-off
+
+`ErrorNotice`'s optional **Ask the agent** action resolves the structured report,
+stages its prompt in the error hand-off FIFO, then navigates to `/chat` through
+the imperative navigator installed by `App`. The installed navigator carries the
+same `useMayLeaveForNavigation` answer used by shell links. `sendErrorToChat`
+asks that answer before it writes the FIFO or notifies a mounted chat subscriber;
+a veto therefore leaves the current page, its draft, and the hand-off queue
+unchanged. With no registered page guard the answer remains `true`, preserving
+the existing hand-off. The root error boundary's explicit hard-navigation mode
+continues to bypass the live React tree and stages before reloading.
+
+The ask happens exactly once per click. A surface that already has a leave gate
+in scope (the notification sheet's crash fallback, through `AskAgentButton`'s
+`gate` built on `useGuardedLeave`) asks the page through that gate; the hand-off
+it then runs passes `leaveGranted` to `sendErrorToChat`, which skips the
+installed navigator's own ask. Both reads are the same
+`useMayLeaveForNavigation` channel, and a page guard that confirms a draft away
+keeps the draft dirty until the page unmounts, so a second ask was a second live
+confirm — one whose "keep my draft" cancelled a hand-off the first ask had
+already accepted. An ungated caller still asks through the navigator.
+
 ## Backend Error Classification
 
 `acp/transport_errors.py` (re-exported by `acp/client.py`) rewrites raw JSON-RPC
@@ -90,6 +116,15 @@ retry-eligibility (`_is_transient_raw_error`).
 Both key off the SAME module-level `_RE_*` patterns so wording and retry verdict
 never drift. Notable terminal (non-retryable) classes:
 
+- **Context window overflow**: the provider's exact "The context window
+  overflowed" rejection becomes an ordinary `AcpError` with `transient=False`,
+  `structural_terminal=True`, and `context_overflow=True`. `_raise_acp_error`
+  constructs it through the common `AcpError` path and applies all three facts
+  in the existing data-field-only structural tag block; an echo in the JSON-RPC
+  `message` cannot classify an unrelated failure. It is terminal on the same
+  native session: replaying the same startup envelope cannot make it smaller. A
+  surface may replace the session or runtime only when no model text or tool side
+  effect was observed; subagents use one shared-to-dedicated retry.
 - **Malformed request**: a structural rejection (backend "Improperly formed
   request"). Classified TERMINAL: the identical payload cannot succeed on
   retry, so the message states the request was malformed and points at a repair
@@ -124,7 +159,14 @@ never drift. Notable terminal (non-retryable) classes:
   session-scoped stop generations at enqueue, and the queue drain drops the entry
   (refunding the shared one-shot) when either counter moved, when user input
   queued behind it, or when the slot was rebound to another session — the same
-  guard the model-access and refusal replays carry.
+  rule (`chat_runner._replay_revocation`) the model-access and refusal replays
+  carry, re-checked at the turn's consume seam. One requeue is exempt, decided
+  at the requeue: a verbatim requeue of a sub-agent completion the model never
+  consumed is a result the parent is still owed, so it is queued again as the
+  completion it is (`SUBAGENT_COMPLETION_KIND`), with no recovery record, and
+  runs ahead of a newer user message instead of being suppressed or cancelled
+  by a soft Stop. A hard kill discards it, and runner-written text queued for
+  the completion (a continuation, a retry prompt) is never exempt.
 - **Oversized request**: kiro-cli's own refusal, `This message is too large to
   send, and it contains no text that can be shortened. Remove or reduce the
   attached content and try again.` It is emitted when the context overflowed

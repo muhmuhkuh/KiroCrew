@@ -75,6 +75,7 @@ from kiro_crew.kiro_cli import SPEC_PERMISSIONS_MIN_VERSION
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS
 from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.metrics.events import CHILD_PERMISSION_DENIED
+from kiro_crew.start_priority import StartPriority
 
 # ── Harness ──
 
@@ -322,7 +323,10 @@ async def test_derived_worker_identity_keeps_freshness_and_readiness(
     agents_dir = tmp_path / "agents"
     agents_dir.mkdir()
     monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: agents_dir)
-    monkeypatch.setattr(paths_mod, "kiro_agents_dir", lambda: agents_dir)
+    # Redirect through the override: ``acp.skill_projection`` is first imported
+    # inside this test and binds ``kiro_agents_dir`` by name, so the redirect must
+    # live in a value that function reads on every call.
+    monkeypatch.setattr(paths_mod, "_agents_dir_override", lambda: agents_dir)
     monkeypatch.setattr(agent_state, "config_dir", lambda: tmp_path / "derived-state")
     default = agents_dir / "kirocrew.json"
     spec = {
@@ -382,6 +386,90 @@ async def test_derived_worker_identity_keeps_freshness_and_readiness(
             await asyncio.wait_for(start, 3.0)
             terminate.assert_not_awaited()
         assert wire.sent.empty(), "startup must not issue a prompt"
+    finally:
+        if start is not None:
+            if not start.done():
+                start.cancel()
+            await asyncio.gather(start, return_exceptions=True)
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["new", "load"])
+async def test_session_cwd_is_bound_through_real_create_and_load(
+    kas_readiness_wire, monkeypatch, tmp_path, resume
+):
+    """The directory a session opens against must survive to the PUBLIC provider cwd.
+
+    This drives the REAL ``create_session``/``load_session`` wire path (not a
+    hand-set ``handle._bound_cwd``), so it pins the wiring the unit tests cannot:
+    ``runtime.py`` records ``bound_cwd=str(session_work_dir)`` on create and
+    ``bound_cwd=str(load_params["cwd"])`` on load. Reverting either line makes
+    the handle's ``_bound_cwd`` fall back to ``""`` and both assertions below
+    fail. The runtime's ``_work_dir`` is repointed at a sibling directory while
+    the session opens against ``tmp_path`` (a different directory), which is the
+    shared-runtime case bolichen97's review is about: on a shared runtime,
+    answering reuse validation with the runtime's own directory would evict a
+    live session that bound elsewhere.
+
+    It also pins the SessionMap/resume-caller flow end to end: the inner
+    ``AcpSessionProvider.cwd`` must report the bound dir, AND the ``AcpProvider``
+    wrapper that every caller actually holds must forward it rather than
+    returning ``self._client._work_dir``.
+    """
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+    from kiro_crew.providers.acp import AcpProvider
+
+    wire = kas_readiness_wire
+    # The fixture starts the runtime in tmp_path and the session also opens
+    # against tmp_path. Repoint the runtime's _work_dir at a DIFFERENT directory
+    # so the two genuinely diverge -- the shared-runtime case: a runtime started
+    # in A hosting a session that bound to B. If cwd leaked the runtime's dir,
+    # the assertions below would read A, not the session's B (tmp_path).
+    runtime_work_dir = tmp_path / "runtime-elsewhere"
+    runtime_work_dir.mkdir()
+    wire.runtime._work_dir = runtime_work_dir
+    assert str(wire.runtime._work_dir) != str(tmp_path)
+
+    # ``_bound_cwd`` is recorded synchronously when ``create_session`` /
+    # ``load_session`` constructs the handle, well before the session reaches
+    # readiness. Capture the handle at construction rather than driving the full
+    # readiness dance -- the wiring under test is the construction argument.
+    captured: list[AcpSessionHandle] = []
+    constructed = AcpSessionHandle.__init__
+
+    def capture_init(self, *args, **kwargs):
+        constructed(self, *args, **kwargs)
+        captured.append(self)
+
+    monkeypatch.setattr(AcpSessionHandle, "__init__", capture_init)
+
+    reader_task = await _start_reader(wire.runtime)
+    start = None
+    try:
+        start = await wire.handshake(resume, pre_ready=True)
+        # Let the handshake get as far as constructing the handle (session/new or
+        # session/load has returned; the handle is built right after).
+        for _ in range(20):
+            if captured:
+                break
+            await asyncio.sleep(0)
+        assert captured, "the real create/load path never constructed a handle"
+        handle = captured[-1]
+
+        # The wiring recorded the session's own directory, not the runtime's.
+        assert handle._bound_cwd == str(tmp_path)
+
+        # The inner provider reads the bound dir off the handle.
+        inner = AcpSessionProvider(handle, wire.runtime)
+        assert inner.cwd == str(tmp_path)
+
+        # The wrapper every SessionMap/resume caller holds forwards the SAME
+        # bound dir, not the shared runtime's _work_dir.
+        wrapper = AcpProvider.__new__(AcpProvider)
+        wrapper._client = inner
+        assert wrapper.cwd == str(tmp_path)
     finally:
         if start is not None:
             if not start.done():
@@ -1223,7 +1311,7 @@ async def test_answer_cap_timeout_marks_runtime_dead_without_growth():
         else:
             second_started.set()
 
-    def mark_dead(reason: str) -> None:
+    def mark_dead(reason: str, **_kw: object) -> None:
         dead_reasons.append(reason)
         rt._dead = True
         marked_dead.set()
@@ -1981,13 +2069,13 @@ def test_cold_start_admission_registry_releases_contended_closed_loop(monkeypatc
     async def contend_and_drain():
         admission = runtime_mod._cold_start_admission()
         assert runtime_mod._cold_start_admission() is admission
-        await admission.acquire()
-        queued = asyncio.create_task(admission.acquire())
+        await admission.acquire(StartPriority.BACKGROUND)
+        queued = asyncio.create_task(admission.acquire(StartPriority.BACKGROUND))
         await _wait_for_queued(admission, 1)
         admission_ref = weakref.ref(admission)
         queued.cancel()
         await asyncio.gather(queued, return_exceptions=True)
-        admission.release()
+        admission.release(StartPriority.BACKGROUND)
         assert admission.active == 0
         assert admission.queued == 0
         return admission_ref
@@ -2071,7 +2159,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         await runtime.spawn()
 
     if project_skills:
-        native_agent = runtime._native_skill_projection.agent(runtime._agent)
+        native_agent = runtime._native_skill_projection.spawn_agent(runtime._agent)
     else:
         assert runtime._native_skill_projection is None
         native_agent = runtime._agent
@@ -2707,6 +2795,50 @@ async def test_the_windows_branch_amends_the_summary_too(caplog, monkeypatch):
     assert "returncode=None" not in summary
     reaped = _reap_records(caplog)
     assert [r.levelname for r in reaped] == ["INFO"]
+
+
+@pytest.mark.asyncio
+async def test_a_slow_windows_drain_is_one_warning_and_keeps_the_process(caplog, monkeypatch):
+    """A tree that outlives one bounded drain pass is pending cleanup, not lost.
+
+    The kill still raises -- its callers retain the runtime on a raise, and the
+    drain kept every pin for the cleanup sweep -- but the log says exactly that
+    in one line, without a traceback. A traceback here reads in the field as the
+    crash, and hides the failure that asked for the kill.
+    """
+    import logging
+
+    import kiro_crew.acp.runtime as rt_mod
+
+    rt, _, proc = _make_runtime()
+    _neuter_kill_side_effects(monkeypatch, proc)
+    monkeypatch.setattr(rt_mod.platform_compat, "IS_WINDOWS", True)
+    pending = rt_mod.platform_compat.WindowsTreeDrainPending(root_pid=4242, pending=3)
+
+    async def _drain_is_slow(process):
+        raise pending
+
+    monkeypatch.setattr(rt_mod.platform_compat, "terminate_windows_asyncio_tree", _drain_is_slow)
+
+    with caplog.at_level(logging.INFO, logger="kiro_crew.acp.runtime"):
+        with pytest.raises(rt_mod.platform_compat.WindowsTreeDrainPending):
+            await rt.kill(reason="failed session setup cleanup")
+
+    assert rt._process is proc, "a tree still draining dropped its process"
+    assert rt._process_tree_confirmed_dead is False
+    records = [
+        r
+        for r in caplog.records
+        if r.name == "kiro_crew.acp.runtime" and "cleanup sweep" in r.getMessage()
+    ]
+    assert len(records) == 1, [r.getMessage() for r in caplog.records]
+    assert records[0].levelname == "WARNING"
+    assert records[0].exc_info is None
+    assert "4242" in records[0].getMessage()
+    assert "3 member" in records[0].getMessage()
+    assert not [
+        r for r in caplog.records if r.name == "kiro_crew.acp.runtime" and r.exc_info
+    ], "a slow drain still logged a traceback"
 
 
 @pytest.mark.asyncio
@@ -4400,6 +4532,81 @@ async def test_wait_for_compaction_drain_path_resets_context_stats():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["", None])
+async def test_wait_for_compaction_drain_failed_with_empty_summary_carries_the_reason(summary):
+    """kiro-cli's ``summary`` is empty on failure, so the drain path carries the
+    reason the payload names -- read by the same extractor the dispatch loop
+    uses -- and a manual /compact names its cause the way auto-compaction does."""
+    from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+    rt, _reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(
+        JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params={
+                "sessionId": "sA",
+                "status": {"type": "failed", "error": "context window exceeded"},
+                "summary": summary,
+            },
+        )
+    )
+
+    result = await handle.wait_for_compaction(timeout=3.0)
+
+    assert result == {"type": "failed", "summary": "context window exceeded"}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_compaction_drain_failed_without_a_reason_reports_the_fallback():
+    """No summary and no reason-bearing key: the drain result carries the
+    extractor's own generic text, the same line the streaming notice shows."""
+    from kiro_crew.acp.transport_errors import compaction_failure_detail
+    from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+    rt, _reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    params = {"sessionId": "sA", "status": {"type": "failed"}, "summary": ""}
+    q["sA"].put_nowait(JsonRpcMessage(method=METHOD_COMPACTION_STATUS, params=params))
+
+    result = await handle.wait_for_compaction(timeout=3.0)
+
+    assert result["type"] == "failed"
+    assert result["summary"] == compaction_failure_detail(params)
+    assert result["summary"].startswith("no reason reported by the agent")
+
+
+@pytest.mark.asyncio
+async def test_wait_for_compaction_drain_failed_with_a_credential_shaped_summary_is_redacted():
+    """A backend-echoed failure summary is LLM-influenced text, so the drain
+    result carries it scrubbed -- the same ``redact_text`` the client wait path
+    applies -- before the dashboard or a channel mirror shows it."""
+    from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+    rt, _reader, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(
+        JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params={
+                "sessionId": "sA",
+                "status": {"type": "failed"},
+                "summary": "backend error: key AKIAIOSFODNN7EXAMPLE rejected",
+            },
+        )
+    )
+
+    result = await handle.wait_for_compaction(timeout=3.0)
+
+    assert result["type"] == "failed"
+    assert "AKIAIOSFODNN7EXAMPLE" not in result["summary"]
+    assert "[REDACTED: credential]" in result["summary"]
+
+
+@pytest.mark.asyncio
 async def test_wait_for_compaction_drain_applies_post_compaction_metadata():
     """kiro emits the real post-compaction pct ~1s after the completed status;
     the drain path must capture it and derive against the KEPT served window."""
@@ -5861,7 +6068,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [100]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -5887,7 +6094,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [200]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -5913,7 +6120,7 @@ class TestAcpSessionHandleCommands:
         sent_payloads = []
         req_counter = [300]
 
-        async def capture_send(method, params):
+        async def capture_send(method, params, **_kw):
             sent_payloads.append((method, params))
             req_id = req_counter[0]
             req_counter[0] += 1
@@ -8015,7 +8222,7 @@ async def test_send_command_redacts_output(monkeypatch):
     rt, _, _ = _make_runtime()
     q = _register(rt, "sA")
 
-    async def _fake_send_request(method, params):
+    async def _fake_send_request(method, params, **_kw):
         return 1
 
     rt.send_request = _fake_send_request  # type: ignore[method-assign]
@@ -9567,6 +9774,175 @@ async def test_create_session_admits_spawn_agent_named_as_current_mode():
 
 
 @pytest.mark.asyncio
+async def test_activate_mode_bracketed_allows_the_launched_agent_every_start():
+    """The session-start bracket activates the launched agent (``self._agent``)
+    even with no prepared view, keyed on ``self._agent`` -- NOT on a stored
+    ``spawn_agent_name`` (the shared runtime never sets one). A shared runtime
+    starts many sessions as the same agent over its life, so the allowance holds
+    on every start and nothing is consumed."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    # No spawn_agent_name on the shared runtime: the allowance is keyed on
+    # self._agent alone.
+    rt._native_skill_projection = NativeSkillProjection(aliases={})
+    refreshed = NativeSkillProjection(aliases={})
+    captured: dict = {}
+
+    async def _send(method, params, *, timeout=None, **kwargs):
+        captured["method"] = method
+        captured["params"] = params
+        captured["kwargs"] = kwargs
+        return {}
+
+    rt._send_and_await = AsyncMock(side_effect=_send)  # type: ignore[method-assign]
+
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        await rt._activate_mode_bracketed(
+            "s1", "kirocrew", budget=30.0, payload_snapshot=None, wire_registered=True
+        )
+
+    # The launched agent's authored name goes on the wire (translate=False), with
+    # no spawn_agent_name needed or set anywhere.
+    assert rt._native_skill_projection is refreshed
+    assert captured["method"] == METHOD_SET_MODE
+    assert captured["params"]["modeId"] == "kirocrew"
+    assert captured["kwargs"].get("translate") is False
+    assert refreshed.spawn_agent_name == ""
+
+
+@pytest.mark.asyncio
+async def test_activate_mode_bracketed_refresh_still_rejects_a_foreign_mode():
+    """The launched-agent allowance is narrow: only ``self._agent`` passes with no
+    view. A session start naming some OTHER unprepared mode still raises through the
+    strict resolver -- an agent cannot escape its launch scope."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    rt._native_skill_projection = NativeSkillProjection(aliases={}, spawn_agent_name="kirocrew")
+    refreshed = NativeSkillProjection(aliases={})
+    # The strict resolver rejects a foreign mode BEFORE any send, so this must not run.
+    rt._send_and_await = AsyncMock()  # type: ignore[method-assign]
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        with pytest.raises(ValueError, match="no prepared skill discovery view"):
+            await rt._activate_mode_bracketed(
+                "s1",
+                "intruder",
+                budget=30.0,
+                payload_snapshot=None,
+                wire_registered=True,
+            )
+    rt._send_and_await.assert_not_called()
+    # The shared runtime does NOT set spawn_agent_name, and recognise() does not
+    # carry it, so the refreshed projection carries NO launch name -- the bracket
+    # allows the launched agent purely via self._agent, not a carried exemption.
+    assert refreshed.spawn_agent_name == ""
+
+
+@pytest.mark.asyncio
+async def test_two_shared_sessions_both_start_as_the_launched_agent():
+    """A shared runtime starts MANY sessions as self._agent. Each start brackets its
+    own set_mode, so the launched-agent allowance must hold for the second session
+    exactly as for the first: the allowance is per-start, not consumed by the first
+    start. Both back-to-back starts send set_mode for the launched agent, with no
+    prepared view, and neither raises."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    # The shared runtime does NOT set spawn_agent_name: the bracket allows the
+    # launched agent purely via self._agent. Projections carry no launch name.
+    rt._native_skill_projection = NativeSkillProjection(aliases={})
+    rt._spawn_skill_projection = rt._native_skill_projection
+    refreshed = NativeSkillProjection(aliases={})
+    sent: list[dict] = []
+
+    async def _send(method, params, *, timeout=None, **kwargs):
+        if method == METHOD_SET_MODE:
+            sent.append(params)
+        return {}
+
+    rt._send_and_await = AsyncMock(side_effect=_send)  # type: ignore[method-assign]
+
+    with patch(
+        "kiro_crew.acp.skill_projection.prepare_native_skill_projection",
+        return_value=refreshed,
+    ):
+        for session_id in ("s1", "s2"):
+            await rt._activate_mode_bracketed(
+                session_id,
+                "kirocrew",
+                budget=30.0,
+                payload_snapshot=None,
+                wire_registered=True,
+            )
+
+    # Both sessions sent set_mode for the launched agent; the second did NOT fail,
+    # and no spawn_agent_name was ever needed on the shared runtime.
+    assert [p["modeId"] for p in sent] == ["kirocrew", "kirocrew"]
+    assert refreshed.spawn_agent_name == ""
+
+
+def test_resolve_start_alias_keeps_the_launch_agent_and_stays_strict_otherwise():
+    """``_resolve_start_alias`` is the single launch-agent-aware resolver used at
+    the initial resolution AND both supersession re-checks. It keeps the launched
+    agent's authored name with no prepared view, and takes the strict resolver for
+    every other mode (which raises for an unprepared one)."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    projection = NativeSkillProjection(aliases={})
+
+    # The launched agent passes with no view, keeping its authored name.
+    assert rt._resolve_start_alias(projection, "kirocrew") == "kirocrew"
+    # A foreign unprepared mode is rejected by the strict resolver.
+    with pytest.raises(ValueError, match="no prepared skill discovery view"):
+        rt._resolve_start_alias(projection, "intruder")
+
+
+def test_refuse_if_view_superseded_keeps_an_unchanged_launch_agent():
+    """A concurrent no-view start must not be treated as superseded.
+
+    When a concurrent no-view start adopts a newer EMPTY projection, a post-send
+    supersession check that recomputes the current alias with the STRICT resolver
+    finds no entry for the no-view launch agent, so ``newest != sent_alias`` and the
+    start would raise, terminating a session that was never superseded. The
+    launch-agent-aware resolver keeps the unchanged launch agent here: the launched
+    agent's authored name is still its name in the newer view, so nothing is
+    superseded and no raise occurs."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    # A newer (empty) projection is adopted at a higher generation than the start
+    # used -- the concurrent-start condition under test.
+    rt._native_skill_projection = NativeSkillProjection(aliases={})
+    rt._skill_projection_generation = 7
+    rt._skill_projection_unadopted = 0
+
+    # sent_alias is the launch agent's authored name; used_generation is older than
+    # the adopted one, forcing the supersession branch. With the launch-agent-aware
+    # resolver, newest == sent_alias == "kirocrew", so this does NOT raise.
+    rt._refuse_if_view_superseded("kirocrew", "kirocrew", used_generation=3)
+
+    # A genuinely superseded FOREIGN agent (strict, no view in the newer projection)
+    # still fails closed -- the fix is scoped to the launch agent.
+    with pytest.raises(AcpRuntimeError):
+        rt._refuse_if_view_superseded("intruder", "intruder-alias", used_generation=3)
+
+
+@pytest.mark.asyncio
 async def test_create_session_spawn_agent_guard_skipped_on_kas_backend():
     """Guard (A2) is restricted to the backend whose argv carries `--agent`. On KAS
     the agent travels over the wire and is activated by set_mode, which Guard (A)
@@ -9585,6 +9961,107 @@ async def test_create_session_spawn_agent_guard_skipped_on_kas_backend():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_verify_spawn_agent_active_accepts_a_projected_agent_via_the_framed_response():
+    """Guard (A2) accepts a projected agent because framing normalises its alias.
+
+    The spawn argv forwards the view ALIAS for a projected agent, but every inbound
+    frame passes through ``projection.frame`` before this guard reads it, and frame
+    maps ``currentModeId`` from the alias back to the declared name. So the response
+    this guard sees names the DECLARED name, and the plain ``current == spawn_agent``
+    comparison accepts it -- no alias-matching set in the guard is needed.
+    """
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    projection = NativeSkillProjection(aliases={"kirocrew": "native-alias-abc"})
+    rt._native_skill_projection = projection
+    # The backend reports the alias; framing maps it back to the declared name
+    # before the guard, which is exactly what the guard then compares against.
+    framed = projection.frame(
+        {"currentModeId": "native-alias-abc", "availableModes": [{"id": "native-alias-abc"}]}
+    )
+    assert await rt._verify_spawn_agent_active("s1", _new_resp(framed), override=None) is None
+
+
+@pytest.mark.asyncio
+async def test_verify_spawn_agent_active_accepts_a_no_view_launch_agent_under_its_own_name():
+    """Guard (A2) accepts a launch agent with NO prepared view spawned under its name.
+
+    This PR lets a launch identity with no projected view spawn and activate under
+    its own name (``spawn_agent`` returns it unchanged). The availability check
+    must mirror that exemption independently of the direct-client switch exemption
+    (``spawn_agent_name``, empty on the shared runtime): an unprojected launch
+    agent the backend advertises under its own name is a valid session, not a
+    substitution.
+    """
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kiro_default"
+    # Projection holds a view for a DIFFERENT agent; kiro_default has none.
+    rt._native_skill_projection = NativeSkillProjection(aliases={"other": "other-alias"})
+    assert (
+        await rt._verify_spawn_agent_active(
+            "s1",
+            _new_resp(
+                {"currentModeId": "kiro_default", "availableModes": [{"id": "kiro_default"}]}
+            ),
+            override=None,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_spawn_agent_active_still_fails_closed_on_substitution_with_a_projected_agent():
+    """A backend default still fails closed under the plain declared-name comparison.
+
+    When the backend ran its OWN default agent after refusing the spec, the
+    reported current mode matches neither the declared name nor anything framing
+    maps to it, so the guard still terminates and raises.
+    """
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "kirocrew"
+    rt._native_skill_projection = NativeSkillProjection(aliases={"kirocrew": "native-alias-abc"})
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+    with pytest.raises(AcpRuntimeError, match="spawned with --agent"):
+        await rt._verify_spawn_agent_active(
+            "s1",
+            _new_resp(
+                {"currentModeId": "kiro_default", "availableModes": [{"id": "kiro_default"}]}
+            ),
+            override=None,
+        )
+    rt.terminate_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_verify_spawn_agent_active_still_fails_closed_when_declared_name_is_absent():
+    """A genuine substitution still fails closed under the declared-name comparison.
+
+    When the backend reports a DIFFERENT current mode than the launch identity, the
+    guard still terminates and raises -- the plain comparison does not loosen the
+    substitution check.
+    """
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    rt, _, _ = _make_runtime()
+    rt._agent = "custom"
+    rt._native_skill_projection = NativeSkillProjection(aliases={"custom": "native-alias"})
+    rt.terminate_session = AsyncMock()  # type: ignore[method-assign]
+    with pytest.raises(AcpRuntimeError, match="spawned with --agent"):
+        await rt._verify_spawn_agent_active(
+            "s1",
+            _new_resp({"currentModeId": "default", "availableModes": [{"id": "default"}]}),
+            override=None,
+        )
+    rt.terminate_session.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -12805,7 +13282,7 @@ async def test_answer_task_cap_marks_dead_instead_of_growing_unbounded():
     )
     dead: list[str] = []
 
-    def _fake_mark_dead(reason):
+    def _fake_mark_dead(reason, **_kw):
         dead.append(reason)
         rt._dead = True  # mirror the real _mark_dead contract
 
@@ -12909,7 +13386,7 @@ async def test_sel_audit_tasks_do_not_count_toward_answer_cap():
         _t.add_done_callback(rt._audit_tasks.discard)
 
     dead: list[str] = []
-    rt._mark_dead = lambda reason: dead.append(reason)  # type: ignore[method-assign]
+    rt._mark_dead = lambda reason, **_kw: dead.append(reason)  # type: ignore[method-assign]
 
     answered: list[object] = []
 
@@ -12948,7 +13425,7 @@ async def test_buffered_burst_with_responsive_backend_does_not_trip_cap():
     _register(rt, "sA")
     rt._max_answer_tasks = 4
     dead: list[str] = []
-    rt._mark_dead = lambda reason: dead.append(reason)  # type: ignore[method-assign]
+    rt._mark_dead = lambda reason, **_kw: dead.append(reason)  # type: ignore[method-assign]
 
     # Buffer MORE frames than the cap before the reader runs at all.
     for i in range(10):

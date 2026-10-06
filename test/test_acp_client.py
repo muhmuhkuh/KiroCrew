@@ -16,7 +16,7 @@ import pytest
 from spawn_test_helpers import strip_spawn_shim
 
 import kiro_crew.acp.client as acp_client
-from conftest import requires_symlinks
+from conftest import cap_node_module_walk, requires_symlinks
 from kiro_crew.acp.client import (
     _CLAUDE_ACP_PKG_ENTRY,
     _DRAIN_DURATION,
@@ -162,13 +162,16 @@ class TestVendoredClaudeAcp:
         assert _resolve_vendored_claude_acp(pkg_dir=pkg_dir) is None
 
     def test_skips_incomplete_copy_missing_deps(self, tmp_path, monkeypatch):
-        # Regression: an entry script with no hoisted deps must be rejected
-        # (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
+        # Regression: an entry script whose dependency Node could not import must
+        # be rejected (it would crash with ERR_MODULE_NOT_FOUND @agentclientprotocol/sdk),
         # falling through to a complete copy under KIROCREW_PROJECT_DIR.
         pkg_dir = tmp_path / "site-packages" / "kiro_crew"
         pkg_dir.mkdir(parents=True)
-        # Incomplete copy in _vendor (entry only, no deps) — must be skipped.
+        # Incomplete copy in _vendor (entry only, no deps) — must be skipped. The
+        # dependency walk runs to the filesystem root like Node's; cap it at tmp_path
+        # so a node_modules the host keeps above the temp root cannot complete it.
         self._make_vendored(pkg_dir / "_vendor" / "node_modules", with_deps=False)
+        cap_node_module_walk(monkeypatch, tmp_path)
         # Complete copy in the project dir — must win.
         (tmp_path / "proj").mkdir()
         good = self._make_vendored(tmp_path / "proj" / "node_modules")
@@ -5652,6 +5655,66 @@ class TestWaitForCompaction:
         assert result == {"type": "failed", "summary": "error"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("summary", ["", None])
+    async def test_failed_with_empty_summary_carries_the_payload_reason(self, tmp_path, summary):
+        """kiro-cli's ``summary`` is empty on failure, so the wait result carries
+        the reason the payload names -- read by the same extractor the dispatch
+        loop uses -- and a manual /compact names its cause like auto-compaction."""
+        client = AcpClient(work_dir=tmp_path)
+        from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+        msg = JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params={
+                "status": {"type": "failed", "error": "context window exceeded"},
+                "summary": summary,
+            },
+        )
+        client._read_message = AsyncMock(return_value=msg)
+
+        result = await client.wait_for_compaction(timeout=5.0)
+        assert result == {"type": "failed", "summary": "context window exceeded"}
+
+    @pytest.mark.asyncio
+    async def test_failed_without_a_reason_reports_the_extractor_fallback(self, tmp_path):
+        """No summary and no reason-bearing key: the result carries the
+        extractor's own generic text, the same line the streaming notice shows."""
+        client = AcpClient(work_dir=tmp_path)
+        from kiro_crew.acp.client import compaction_failure_detail
+        from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+        params = {"status": {"type": "failed"}, "summary": ""}
+        msg = JsonRpcMessage(method=METHOD_COMPACTION_STATUS, params=params)
+        client._read_message = AsyncMock(return_value=msg)
+
+        result = await client.wait_for_compaction(timeout=5.0)
+        assert result["type"] == "failed"
+        assert result["summary"] == compaction_failure_detail(params)
+        assert result["summary"].startswith("no reason reported by the agent")
+
+    @pytest.mark.asyncio
+    async def test_failed_with_a_credential_shaped_summary_is_redacted(self, tmp_path):
+        """A backend-echoed failure summary is LLM-influenced text, so the wait
+        result carries it scrubbed -- the same ``redact_text`` the session
+        handle applies -- before the dashboard or a channel mirror shows it."""
+        client = AcpClient(work_dir=tmp_path)
+        from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+        msg = JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params={
+                "status": {"type": "failed"},
+                "summary": "backend error: key AKIAIOSFODNN7EXAMPLE rejected",
+            },
+        )
+        client._read_message = AsyncMock(return_value=msg)
+
+        result = await client.wait_for_compaction(timeout=5.0)
+        assert result["type"] == "failed"
+        assert "AKIAIOSFODNN7EXAMPLE" not in result["summary"]
+        assert "[REDACTED: credential]" in result["summary"]
+
+    @pytest.mark.asyncio
     async def test_timeout_returns_timeout_dict(self, tmp_path):
         client = AcpClient(work_dir=tmp_path)
         client._read_message = AsyncMock(return_value=None)
@@ -9572,6 +9635,83 @@ class TestIsTransientRawError:
         assert auth_exc.transient is False
         assert "authentication failed" in str(auth_exc).lower()
 
+    def test_context_window_overflow_is_structural_and_non_transient(self):
+        import pytest
+
+        import kiro_crew.acp as acp_package
+        from kiro_crew.acp import transport_errors
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                "The context window overflowed "
+                "(request_id: 3844b25f-d540-4972-9b0b-03ddb5d177c6)"
+            ),
+        }
+        with patch.object(
+            transport_errors,
+            "_is_transient_raw_error",
+            wraps=transport_errors._is_transient_raw_error,
+        ) as classify:
+            with pytest.raises(AcpError) as raised:
+                _raise_acp_error(error)
+
+        exc = raised.value
+        classify.assert_called_once_with(error, None)
+        assert type(exc) is AcpError
+        assert exc.transient is False
+        assert exc.structural_terminal is True
+        assert exc.context_overflow is True
+        assert "Retrying on the same model session will not help" in str(exc)
+        assert "3844b25f-d540-4972-9b0b-03ddb5d177c6" in str(exc)
+        assert not hasattr(acp_client, "AcpContextOverflow")
+        assert not hasattr(acp_package, "AcpContextOverflow")
+
+    def test_context_window_overflow_tag_is_data_field_only(self):
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "The context window overflowed",
+            "data": "opaque error detail",
+        }
+        with pytest.raises(AcpError) as raised:
+            _raise_acp_error(error)
+
+        exc = raised.value
+        assert type(exc) is AcpError
+        assert exc.transient is False
+        assert exc.structural_terminal is False
+        assert exc.context_overflow is False
+
+    def test_context_window_overflow_wording_is_surface_neutral(self):
+        # The formatter cannot tell a first turn from a later one, and
+        # ``subagent_manager/run.py`` appends this text after its own
+        # post-activity reason, so a startup-only claim would contradict the
+        # caller. Both causes and both remedies must be named.
+        from kiro_crew.acp.client import AcpError, _raise_acp_error
+
+        error = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "The context window overflowed (request_id: 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0)",
+        }
+        with pytest.raises(AcpError) as raised:
+            _raise_acp_error(error)
+
+        text = str(raised.value)
+        assert "before the turn could run" not in text
+        assert "established conversation" in text
+        assert "accumulated history" in text
+        assert "fresh session" in text
+        assert "always-loaded" in text
+        assert "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" in text
+        assert raised.value.transient is False
+        assert raised.value.structural_terminal is True
+        assert raised.value.context_overflow is True
+
     def test_acp_error_default_transient_is_none(self):
         from kiro_crew.acp.client import AcpError
 
@@ -10768,7 +10908,10 @@ class TestSubstitutionFollow:
         async def _send(method, params):
             sent.append(list(params.get("mcpServers") or []))
             if len(sent) == 1 and lose_surface:
-                settings.write_text("{}", encoding="utf-8")
+                # A link: the one shape that can be neither governed nor left out
+                # of the session's setting sources.
+                settings.unlink()
+                settings.symlink_to(tmp_path / "elsewhere.json")
             return len(sent)
 
         waits = 0
@@ -11971,6 +12114,15 @@ class TestModelEntitlementPreflight:
         # _is_claude is derived from the backend seam, not settable directly.
         client._acp_backend = ACP_BACKEND_CLAUDE if is_claude else ""
         client._available_models = [{"modelId": m, "name": m} for m in advertised]
+
+        # The refusal and the withhold first re-ask entitlement on a throwaway
+        # probe process. Held to a FAILED probe here (no evidence), so these pin
+        # the snapshot's own verdict and never launch a real kiro-cli -- a host
+        # with one installed would otherwise answer with its own account's list.
+        async def _no_probe_evidence():
+            return [], 0.0
+
+        client._probe_advertised_models = _no_probe_evidence
         return client
 
     def test_unadvertised_model_is_unusable(self):
@@ -13741,3 +13893,26 @@ class TestCreateRaceLoserPoll:
         assert loser._claude_settings_authored is False
         assert loser._permission_surface_governed is False
         assert path.read_text(encoding="utf-8") == winners_payload
+
+
+def test_resolve_spawn_agent_argv_converts_a_refusal_to_acperror(tmp_path):
+    """A projection ``errors`` entry (an unreadable/excluded spec) makes
+    ``spawn_agent`` raise a bare ``ValueError``. Raised raw out of ``_spawn`` it
+    would escape ``ensure_ready``'s transport ladder uncaught, skipping cleanup;
+    the helper must convert it to ``AcpError`` (which the ladder catches) while
+    keeping the actionable message, and pass a resolvable name straight through."""
+    from kiro_crew.acp.skill_projection import NativeSkillProjection
+
+    client = AcpClient(work_dir=tmp_path, agent="ghost")
+    client._native_skill_projection = NativeSkillProjection(
+        aliases={}, errors={"ghost": "its spec could not be read"}
+    )
+    with pytest.raises(AcpError) as excinfo:
+        client._resolve_spawn_agent_argv()
+    assert "its spec could not be read" in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+    # A resolvable launch name passes through unchanged (no raise).
+    client._agent = "fine"
+    client._native_skill_projection = NativeSkillProjection(aliases={})
+    assert client._resolve_spawn_agent_argv() == "fine"

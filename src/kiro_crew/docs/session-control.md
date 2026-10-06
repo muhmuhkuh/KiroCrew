@@ -1,20 +1,22 @@
 # Session Control — driving another session
 
 One chat session can open, fork, seed, watch, stop, close and revive another one,
-change its model, and take another one under itself in the sidebar. The tools come from the
+change its model, reload its agent process, and take another one under itself in
+the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 23 of its tools, written for the agent that is about to use them.
+for all 29 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
 - **Session control** — `session_create`, `session_fork`, `session_send`,
-  `session_read_message`, `session_summary`, `session_stop`, `session_set_model`,
-  `session_close`, `session_revive`, `session_broadcast`, `session_status`,
-  `session_adopt`, `session_release`. These reach another session.
+  `session_read_message`, `session_summary`, `session_stop`, `session_end_wait`,
+  `session_set_model`, `session_reload`, `session_close`, `session_revive`, `session_broadcast`,
+  `session_status`, `session_adopt`, `session_release`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
-  `chat_folder_move`, `chat_folder_move_session`, `chat_folder_file_self`,
-  `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`,
+  `chat_folder_move`, `chat_folder_move_session`, `chat_folder_delete`,
+  `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`,
+  `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`,
   `chat_session_pin`. These organize what the person sees in the sidebar.
 
 Everything a created session does is visible: it appears in the user's sidebar
@@ -392,6 +394,33 @@ cancel is still in flight.
 `session_revive` brings it back — but it does discard a running turn's work. Read the session first
 when you are not sure what it is doing.
 
+### `session_end_wait`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | Session key or exact title |
+
+Wakes a session that is sleeping in the `wait` tool, the same way the End wait
+button on its countdown does. The turn is not cancelled: the target's `wait`
+returns a normal result, and the turn carries on from there. Use it when a
+worker is waiting for something that has already happened, such as a build you
+watched finish. It reaches only sessions you created; any other target is
+refused with `not_creator`, even for a caller the other verbs do not fence.
+
+The target's `wait` result names your session (`Wait ended early by session
+<key> (session_end_wait) ...`), so the woken agent can tell that a peer ended its
+sleep rather than the person or a steer. The wake lands on the target's next
+keepalive ping, within about five seconds.
+
+A target that is not sleeping in `wait` gets an informational reply ending
+`Nothing to end.`, not an error, so there is nothing to retry. The same reply
+comes back when two sleeps share the target's session key: the dashboard cannot
+tell which one to wake, and hides the button for the same reason.
+
+Compared with the verbs next to it: `session_stop` discards the turn's work,
+and `session_send` to a sleeping target also ends its wait (as a steer) but
+delivers text the target then acts on. `session_end_wait` does neither.
+
 ### `session_set_model`
 
 | Argument | Required | Meaning |
@@ -417,6 +446,39 @@ To force the change, call `session_stop`, then retry once the target is idle.
 Also refused: `auto` and `Auto (Jev)` (`model_owner_only`), because with the Jev
 preview on a slot on `auto` hands each turn's model to Jev routing, which only the
 owner may arm; and a target bound to a remote crew (`remote_target_unsupported`).
+
+### `session_reload`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `target` | yes | Session key or exact title |
+
+Relaunches the target's agent process, the same as **Reload session** in that
+tab's menu. A running session builds its tool table once, when its process
+starts, so a newly granted or enabled MCP server, an MCP config edit or an
+agent-spec fix only reaches it after a reload. The new process re-reads its
+agent spec, environment and MCP servers and resumes the same conversation. The
+transcript is not rewritten; one reload notice is appended, and it names the
+calling session's key so the person reading that tab can see who reloaded it.
+The agent, model and workspace do not change.
+
+Only sessions you created can be reloaded, whatever kind of session you are.
+Only an idle one: a turn running or starting, queued messages, or attached
+sub-agents refuse the call with `target_busy` ("session busy, not reloaded")
+and nothing is torn down. The tool never stops anything itself. You cannot
+reload yourself (`self_target`): the calling session is mid-turn, and a reload
+under a running turn would orphan it. A target bound to a remote crew is refused
+with `remote_target_unsupported`.
+
+If the target gains a channel link or otherwise leaves your reach while its
+process is being reset, the call answers `target_changed_during_reload`: the
+old process is already gone and will start again on the target's next message,
+but no reload notice was written.
+
+If the old process fails while shutting down after it was removed, the reload
+still counts as done: the notice is written, the process starts again, and the
+reply carries a `warning`. A failure before anything was removed answers
+`reload_failed`, and nothing was torn down.
 
 ### `session_revive`
 
@@ -459,6 +521,7 @@ The sidebar tree the person organizes their sessions in.
 | `chat_folder_create` | `name` (required), `parent` | Create a folder. `parent` is an id or a `/`-separated path; missing segments are created (`mkdir -p`). Omit or pass `root` for top level. Creating never moves anything |
 | `chat_folder_move` | `folder` (required), `new_parent`, `before`, `after` | Reparent a folder and/or set its position among siblings. Moves everything inside it; cycle-guarded |
 | `chat_folder_move_session` | `session` (required), `folder` | File another live session into a folder, or omit `folder` to unfile it to the top level |
+| `chat_folder_delete` | `folder` (required) | Delete an **empty** folder **this session created**. Refused for the person's folders, and while it holds a subfolder, a live session or an archived session |
 | `chat_folder_file_self` | `folder` | File **this** session — the caller — into a folder. Writes only its own placement |
 
 Read `chat_folder_tree` before you move anything: it renders folders in the order
@@ -480,7 +543,23 @@ is safe to grant where `chat_folder_move_session` is withheld.
 
 Folder moves are metadata only: the session keeps its transcript, its model, and
 any running turn. Archived (history) sessions cannot be moved — bring one back
-with `session_revive` first. There is no delete verb here.
+with `session_revive` first.
+
+`chat_folder_delete` is how a conductor cleans up after its own work. It removes
+only a folder that the calling session created and that has nothing in it.
+
+A folder created through an agent's MCP call records the creating session's key
+in `created_by_session`. The person claims the folder, and the field is removed
+for good, when they rename, move, restyle or hide it, file a session into it,
+open a new chat in it, or nest a folder under it. Collapsing it or dragging its
+siblings into a new order does not claim it. A folder the person created, a
+same-name folder an agent reused instead of creating, and every folder from
+before this field existed carry no mark, so no agent can delete them.
+
+The dashboard checks the mark, subfolders and live sessions in the same locked
+step that removes the folder, and refuses rather than unfiling anything. Empty
+the folder first with `chat_folder_move` and `chat_folder_move_session`. The
+dashboard refuses an app agent or a crew member outright.
 
 ## Tags
 
@@ -500,10 +579,39 @@ tag at the same moment, the call fails with the current list instead of
 overwriting their click — re-read and retry. At least one of `add` / `remove`
 must be non-empty, and a tag must already exist.
 
+The agent tag-grants policy (the same one `chat_tag` `set_state` enforces)
+applies to `chat_tag_assign` for every non-person caller. A tag the person
+**reserved** — a protected grant row with policy `none`, or `add-only` when you
+try to remove it — is refused `tag_policy_denied`. A workflow-**status** tag
+whose protected identity is missing is refused `status_identity_unprotected` on
+add as well as strip, and adding a status tag that would leave the session with
+two mutually exclusive states is refused `status_tag_requires_set_state` (drive a
+workflow state through `chat_tag` `set_state`, which strips the peer). When the
+grants store is unavailable the refusal is `tag_grants_unavailable`. An ordinary
+label with no protected row is yours to apply; a freshly `chat_tag_create`d
+status tag stays rowless until the owner adopts it, so it may not be assignable
+until then.
+
 Tag names are capped at 60 characters, checked after redaction. **This server can
 never delete a tag**, so nothing here can lose a label the person put on a
 session. `chat_tag_update` is metadata only: every session carrying the tag keeps
 it, and a column filtering on it keeps filtering.
+
+## Board columns
+
+The sidebar board shows one column per tag filter (or live-state lane). The
+column list is part of the person's own layout, shared by every session.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `chat_tag_column_list` | none | Every column in board order: id, name, what it filters on. Read-only |
+| `chat_tag_column_create` | `name` (required), `tag` (required) | Append a column showing sessions that carry `tag`. A column with the same name and tag is returned instead of duplicated |
+| `chat_tag_column_move` | `column` (required), exactly one of `before` / `after` | Move one column next to another. The others keep their order |
+
+`tag`, `column`, `before` and `after` take an id or an exact name. There is
+no delete or retag verb: removing a column or changing its filter removes a view
+the person built. An app agent and a crew member can list columns but not
+write them; the `/api/chat/tag-columns` write endpoints refuse both.
 
 ## Pins
 
@@ -537,7 +645,9 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `linked_session_target` / `mirrored_target` | A channel-linked or channel-mirrored session is out of scope — reaching it would cross into a thread other people read |
 | `session_control_disabled` | `agent.session_control` is off in config |
 | `create_rate_limited` | Per-caller creation budget spent — a fork spends the same budget |
-| `target_busy` | Model change only: the target has a turn or sub-agents in flight, so its model was not changed |
+| `target_busy` | Model change and reload: the target has a turn, queued messages (reload) or sub-agents in flight, so nothing was changed |
+| `target_changed_during_reload` | Reload: the target left your reach while its process was being reset. The process was reset; no reload notice was written |
+| `reload_failed` | Reload: the teardown failed before the target's process was removed. Nothing was torn down |
 | `invalid_broadcast_mode` | `session_broadcast` needs `mode` to be `queue` or `steer`; there is no default |
 | `caller_changed_mid_broadcast` | The calling session moved workspace while a broadcast was in flight, so its per-target report is withheld. The deliveries already happened — do not re-send |
 | `too_many_targets` | A broadcast reaches at most 50 sessions. Refused, never truncated — name a subset |
@@ -565,6 +675,8 @@ other humans can see, and sending would run channel text as a turn inside it.
 sidebar the same way `session_adopt` and `session_release` do. The tool also
 refuses a `channel:` caller itself, before listing any session, so an
 auto-approved call that never reaches the permission prompt is still refused.
+`chat_tag_column_create` and `chat_tag_column_move` are blocked and refused at
+dispatch in the same way, because they rearrange the person's board.
 `session_broadcast` is blocked for that reason multiplied by the fleet, and
 `session_status` because its rows carry other sessions' titles — the names of the
 user's private work, in front of whoever is in the thread.
@@ -578,7 +690,7 @@ user's private work, in front of whoever is in the thread.
 | `agent.crew_panel` | `true` | A crew member publishes its own webview, shown in that member's drawer on the Crew page. Its own mount and its own switch, so withdrawing session control leaves the drawer alone and withdrawing the drawer leaves session control alone |
 
 Rate limits are per caller, per verb, over a 300-second window: **20** session
-creates (forks included), **10** folder creates, **10** tag creates. Capacity ceilings sit behind
+creates (forks included), **10** folder creates, **10** tag creates, **10** board-column creates. Capacity ceilings sit behind
 them: 500 live sessions, 50 per creator, 500 folders.
 
 ## This or `spawn_run`?

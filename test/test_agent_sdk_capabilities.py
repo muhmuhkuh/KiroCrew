@@ -74,6 +74,23 @@ def _tree(rel: str) -> ast.Module:
     return ast.parse((SRC / rel).read_text(encoding="utf-8"))
 
 
+#: A migrated consumer whose functions live in owner modules it composes: the
+#: dashboard agents handlers run the functions ``dashboard/agent_admin`` defines on
+#: ``handlers/agents.py``'s globals, so the identity ratchet reads those owners as
+#: part of that file.
+_COMPOSED_OWNERS = {"dashboard/handlers/agents.py": "dashboard/agent_admin"}
+
+
+def _composed_owner_rels(rel: str) -> list[str]:
+    """The owner modules *rel* composes, relative to ``SRC``; ``[]`` if none."""
+    owner_dir = _COMPOSED_OWNERS.get(rel)
+    if owner_dir is None:
+        return []
+    owners = sorted((SRC / owner_dir).glob("[!_]*.py"))
+    assert len(owners) >= 13, f"{owner_dir}: the composed owners were not found"
+    return [owner.relative_to(SRC).as_posix() for owner in owners]
+
+
 # ── 1. the identity checks are gone, and stay gone ──────────────────────────
 
 
@@ -140,6 +157,16 @@ def test_no_migrated_consumer_reads_a_backend_identity(rel: str) -> None:
             # ``getattr(client, "is_claude_backend", False)`` -- a string literal
             # naming the attribute is the same read with the check hidden.
             record(node, f"{node.value!r} as a literal")
+    # A composed owner's functions are this consumer's code, and no allowance
+    # reaches into them: every identity read there is an offender.
+    for owner_rel in _composed_owner_rels(rel):
+        for node in ast.walk(_tree(owner_rel)):
+            if isinstance(node, ast.Attribute) and node.attr in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: .{node.attr}")
+            elif isinstance(node, ast.Name) and node.id in banned_attrs | {"ACP_BACKEND_CLAUDE"}:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.id}")
+            elif isinstance(node, ast.Constant) and node.value in banned_attrs:
+                offenders.append(f"{owner_rel} line {node.lineno}: {node.value!r} as a literal")
     assert not offenders, (
         f"{rel} asks which backend it is: {offenders}. Ask a capability instead "
         f"(SessionCapabilities has one field per question these branches make); "

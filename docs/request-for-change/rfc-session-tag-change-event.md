@@ -7,8 +7,8 @@ last-audited: 2026-09-02
 audited-at: 6581a04ee
 doc-pr: 10930
 implementation-prs: [7669]
-implementation-scope: partial — 7669 ships the delta-only payload and defers re-entrancy
-tracking-issues: [7663]
+implementation-scope: partial — 7669 ships the delta-only payload and the dispatcher, and defers every emit site and re-entrancy
+tracking-issues: [13865]
 supersedes: []
 superseded-by: []
 ---
@@ -52,7 +52,7 @@ adding a subsystem. The positions this RFC takes, one line each:
 4. **Re-entrancy** is settled now, not deferred: the event carries **advisory
    provenance**, following the in-repo precedent that `Stop` self-limits by
    advisory `hook_continuation_count` / `stop_hook_active`
-   (`src/kiro_crew/hooks.py:4213-4221`) rather than an enforced cap.
+   (`src/kiro_crew/hooks.py:3089-3097`) rather than an enforced cap.
 5. **Placement** is a **sixth `HOOK_EVENTS` entry** (a `SessionTagsChanged`
    script-hook event), because the ask is to *run an automation now* on the
    transition, which is precisely what the script-hook engine does, not to
@@ -101,7 +101,7 @@ Three neighbouring issues sit around this one; none asks for it:
   reaction raised a trust question about executing hook definitions that arrive
   inside a project checkout. **That concern does not apply here**: hook
   definitions live in a single global, user-authored store
-  (`_HOOKS_FILE = "hooks.json"`, `src/kiro_crew/hooks.py:3939`), not per-agent and
+  (`_HOOKS_FILE = "hooks.json"`, `src/kiro_crew/hooks.py:2729`), not per-agent and
   not from a checkout.
 - **[#1861](https://github.com/kirodotdev/KiroCrew/issues/1861)** (closed,
   completed), an agent auto-tags its own session from context, shipped as
@@ -117,17 +117,18 @@ Three neighbouring issues sit around this one; none asks for it:
 
 - **Global, user-authored store, not per-agent.** A tag change has no agent and
   no turn, so a per-agent config would have been a blocker; the global
-  `hooks.json` store (`hooks.py:3939`) is not.
+  `hooks.json` store (`hooks.py:2729`) is not.
 - **No new capability surface.** Script hooks are already governance-gated by
   `capabilities.script_hooks`, default OFF, via
-  `_script_hooks_capability_denied` (`src/kiro_crew/hooks.py:3671-3690`, checked
-  inside `run_script_hook` at `:3743`). A tag-change hook rides that same gate;
+  `_script_hooks_capability_denied` (`src/kiro_crew/hook_runtime/governance_gate.py:163-198`, checked
+  inside `run_script_hook` (`src/kiro_crew/hooks.py:2488`, the `asyncio.to_thread` call
+  at line 2509)). A tag-change hook rides that same gate;
   the capability surface does not widen.
 - **Dispatch from an HTTP handler with no agent turn is already supported.**
   `api_hook_test` (`src/kiro_crew/dashboard/handlers/hooks.py:307`) calls
   `run_script_hook` (`:337`) with a synthesized payload, and `run_script_hook`
-  (`src/kiro_crew/hooks.py:3728`) builds a default `hook_event` itself when passed
-  `None` (`hooks.py:3761`), requiring no session and no agent config. A tag-write
+  (`src/kiro_crew/hooks.py:2488`) builds a default `hook_event` itself when passed
+  `None` (`hooks.py:2527-2528`), requiring no session and no agent config. A tag-write
   handler firing a hook is the same shape.
 
 ## Goals
@@ -215,7 +216,7 @@ This follows the settled in-repo precedent: `Stop` controls its own re-entrancy
 with **advisory** signals, not an enforced cap. `hook_continuation_count` (the
 depth of the current continuation run) and `stop_hook_active` (its boolean
 shorthand) are stamped on the `Stop` payload unconditionally
-(`src/kiro_crew/hooks.py:4213-4221`) precisely so a hook *may* self-limit while a
+(`src/kiro_crew/hooks.py:3089-3097`) precisely so a hook *may* self-limit while a
 real gate hook checks its own condition and ignores them. The comment there is
 explicit: *"Kiro's Stop contract defines no cap ... a hook may self-limit,
 diagnose, or surface the count."* We adopt the same stance: the runtime provides
@@ -322,15 +323,15 @@ docstring warns about for its consolidation. Per-site emits are rejected: they a
 the shape that let review miss call sites twice during #7366 (as the
 mcp-lifecycle RFC records) and would re-open that finding here.
 
-**Amendment — what actually shipped, and how it differs from the above.** The
+**Amendment — what the implementation PR carries, and how it differs from the above.** The
 recommendation stands as the target shape, but the implementation PR (#7669) does
-**not** implement it. Emits come per-writer rather than through a single choke point: the two
-`chat_tags.py` writers, plus closing-order step 1, the folder inheritance in
-`_read_folder_tags` reached from `api_chat_slot_create` (`chat_handlers.py`), which
-emits because the create handler already runs under a dashboard request. Two
-`slot.tags.append` sites therefore still write status tags without emitting, both in
-`surface_channel_session` (`channel_slots.py`) — verified by grep at the shipped
-head, against a positive control showing `chat_tags.py` carries the dispatch six times.
+**not** implement it. #7669 ships the dispatcher, `dispatch_session_lane_changed_bulk`, with
+no emit site: it touches neither `chat_tags.py` nor `chat_handlers.py`, so no writer calls
+the dispatcher and the event cannot fire. Per-writer emits — the two `chat_tags.py`
+writers, and closing-order step 1, the folder inheritance in `_read_folder_tags` reached
+from `api_chat_slot_create` (`chat_handlers.py`) — are deferred to a follow-up PR. The two
+`slot.tags.append` sites in `surface_channel_session` (`channel_slots.py`) stay silent
+after that follow-up too, until closing-order step 2.
 
 The blocker is authorization, not scheduling. The dispatch helper itself needs no
 request — `_lane_dispatch_queue()` takes its loop from `asyncio.get_running_loop()`
@@ -339,10 +340,10 @@ callers could reach it as they stand. What needs a request is the PERMIT GATE,
 `_lane_dispatch_is_permitted`, which is what confines dispatch to the dashboard
 user. Routing folder filing, channel-slot filing and app-token moves through the
 dispatch means deciding what authorizes a fire on a path with no dashboard caller
-to check, and that decision belongs with the choke point rather than ahead of it. Until then a session can still enter a lane without the event firing — by
-channel slot filing — which is the exact
-failure mode this section was written to prevent. It is a narrowed gap, not a solved
-one, and the choke point remains the shape to build.
+to check, and that decision belongs with the choke point rather than ahead of it. Until then a session can still enter a lane without the event firing — through
+every writer, since none emits yet — which is the exact
+failure mode this section was written to prevent. It is an open gap, and the choke
+point remains the shape to build.
 
 **Closing order.** Each writer gains emission when its own authorization question has an answer, so
 the order below is set by that dependency rather than by convenience:
@@ -350,8 +351,8 @@ the order below is set by that dependency rather than by convenience:
 1. **Folder inheritance** (`_read_folder_tags`, reached from `api_chat_slot_create`) goes first,
    because it already runs under a dashboard request: `_lane_dispatch_is_permitted` applies to it
    unchanged, so it needs no new authorization rule and closes the folder-inherit gap on its own.
-   It ships in #7669, the implementation PR — not in the docs-only PR that adds
-   this amendment.
+   It is deferred from #7669, the implementation PR, to a follow-up PR — and is not in
+   the docs-only PR that adds this amendment.
 2. **Channel first-filing** (both `slot.tags.append` sites in `surface_channel_session`) goes
    second, because it has no
    dashboard caller. It needs a stated rule for what authorizes a fire on a channel surface, and
@@ -416,10 +417,10 @@ and the emit helper.
 
 - **No new capability surface.** The event rides the existing
   `capabilities.script_hooks` gate (default OFF,
-  `hooks.py:3671-3690`); a deployment that has not enabled script hooks sees no
+  `hook_runtime/governance_gate.py:163-198`); a deployment that has not enabled script hooks sees no
   new behavior.
 - **No new trust decision.** Hook definitions remain in the global user-authored
-  `hooks.json` (`hooks.py:3939`); nothing executes definitions that arrive with a
+  `hooks.json` (`hooks.py:2729`); nothing executes definitions that arrive with a
   project checkout (the [#1487](https://github.com/kirodotdev/KiroCrew/issues/1487)
   concern does not apply).
 - **Minimal payload.** The event carries the session key and status tag ids
@@ -449,7 +450,7 @@ and the emit helper.
 - **Enforced re-entrancy suppression.** Rejected per Question 4: it would swallow
   legitimate rapid transitions and would be the only enforced re-entrancy control
   in the hook engine, contradicting the advisory `Stop` precedent
-  (`hooks.py:4213-4221`).
+  (`hooks.py:3089-3097`).
 
 ## Open questions
 

@@ -20,6 +20,7 @@ import tempfile
 import unittest
 from email.message import Message
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
@@ -363,6 +364,9 @@ class ConnectRouteTests(unittest.IsolatedAsyncioTestCase):
 
     def _req(self, payload: dict) -> web.Request:
         request = make_mocked_request("POST", "/api/apps/issue-radar/connect")
+        request.app["state"] = SimpleNamespace(owner_id="owner-1")
+        request["user"] = "owner-1"
+        request["app"] = ""
 
         async def _json(*_args: object, **_kwargs: object) -> object:
             return payload

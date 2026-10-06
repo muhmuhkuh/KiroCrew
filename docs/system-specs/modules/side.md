@@ -183,6 +183,7 @@ second time.
 | queue cancel | DELETE | `/api/chat/slots/{slot}/side/queue/{queue_id}` | Drop a queued entry; echoes its text back for the composer |
 | queue edit | PATCH | `/api/chat/slots/{slot}/side/queue/{queue_id}` | Rewrite a queued entry in place |
 | close | POST | `/api/chat/slots/{slot}/side/close` | Drop buffer + queue + destroy LLM session |
+| stop | POST | `/api/chat/slots/{slot}/side/stop` | Cancel the in-flight side turn (hung-turn escape hatch); idempotent when none is running |
 
 ## Wire Protocol
 
@@ -226,7 +227,8 @@ a parent-slot turn.
 ### `dashboard/side_state.py`
 
 `SideState` dataclass: `open`, `messages`, `last_run_id`, `created_at`,
-`is_complete`, `queue`, `steers`.
+`is_complete`, `queue`, `steers`, `task` (the running side turn's asyncio task
+handle, so `/side/stop` can cancel it; `None` when idle).
 Helpers: `append_user` (with a `steer` marker), `append_assistant`, `clear`,
 `queue_append` / `queue_insert_front` / `queue_pop` / `queue_remove` /
 `queue_edit`, and the ledger's `steer_register` / `steer_state` /
@@ -287,7 +289,8 @@ pre-authorizes `@kirocrew-cron/cron_remove_all` and `@kirocrew-core` wholesale.
 So every side session runs as `<agent>--readonly`: the resolved agent's spec
 with every backend-side grant emptied (`allowedTools: []`, no
 `mcpServers.*.autoApprove`, no `toolsSettings.*.allowed*`/`trusted*`/`auto*`
-— `shell.autoAllowReadonly` included — `includeMcpJson: false`,
+— `shell.autoAllowReadonly` included — `includeMcpJson: false` with its
+`useLegacyMcpJson` alias removed,
 `autoAllowReadonly: false`, an empty KAS `permissions`) and the lifecycle
 `hooks` removed (`agentSpawn`/`userPromptSubmit`/`preToolUse`/`postToolUse`/
 `stop` are shell commands the backend runs unprompted, some fed model-controlled
@@ -327,7 +330,9 @@ native read runs outside the gate, and the guarantee holds because it is a
 read. FAIL CLOSED: a turn whose spec cannot be derived or published is refused
 with a coded error (`ReadOnlySpecError.code`: `unsafe_name`,
 `base_spec_missing`, `base_spec_unreadable`, `derived_name_shadowed`,
-`derived_path_foreign`, `spec_write_failed`), logged and shown in the panel; it
+`derived_path_foreign`, `spec_write_failed`, `base_spec_malformed` — a
+`mcpServers`/`toolsSettings` value or entry that is neither an object nor
+`null`), logged and shown in the panel; it
 never runs under the base agent.
 
 **The allowance is a harness capability, granted by positive membership.**

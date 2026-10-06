@@ -483,10 +483,33 @@ class TestABootWriteDoesNotOverwriteALiveSuccessor:
         )
         # The successor is live: its recorded token still matches what the host
         # reports for its pid. That is the proof, not the pid number.
-        with mock.patch.object(run_marker, "pid_start_token", return_value="live-token"):
+        with (
+            mock.patch.object(run_marker.platform_compat, "pid_exists", return_value=True),
+            mock.patch.object(run_marker, "pid_start_token", return_value="live-token"),
+        ):
             run_marker.write_marker(5476)
 
         assert run_marker.read_pid(5476) == other, "the successor's record must stand"
+
+    def test_an_exited_predecessor_is_not_a_rival_even_while_its_token_still_reads(
+        self, home: Path
+    ) -> None:
+        # Windows: a process object outlives its process while any handle is open,
+        # and its creation time keeps reading back unchanged. The pod supervisor
+        # holds exactly such a handle to the gateway an in-app restart exec-ed
+        # away while it waits for the successor to publish. Identity without
+        # liveness is a corpse, not a rival, and the successor must write.
+        dashboard_server._write_secret_file(run_marker.pid_path(5476), "424242\n")
+        dashboard_server._write_secret_file(
+            run_marker._start_path_for(run_marker.pid_path(5476)), "live-token\n"
+        )
+        with (
+            mock.patch.object(run_marker.platform_compat, "pid_exists", return_value=False),
+            mock.patch.object(run_marker, "pid_start_token", return_value="live-token"),
+        ):
+            run_marker.write_marker(5476)
+
+        assert run_marker.read_pid(5476) == os.getpid()
 
     def test_writes_when_the_recorded_pid_is_not_provably_live(self, home: Path) -> None:
         # A crashed predecessor leaves its pid behind and its token cannot be
@@ -983,12 +1006,19 @@ class TestTheSharedHelperOwnsThePairing:
 
         src = pathlib.Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
         allowed = {pathlib.Path("config/loader.py")}
+        # dashboard/server.py composes its server_runtime owners into one namespace,
+        # so the two are read as one module.
+        runtime = pathlib.Path("dashboard/server_runtime")
+        owners = sorted((src / runtime).glob("[!_]*.py"))
+        assert owners, "expected the server_runtime owners beside server.py"
         offenders = []
         for path in src.rglob("*.py"):
             rel = path.relative_to(src)
-            if rel in allowed:
+            if rel in allowed or rel.parent == runtime:
                 continue
             text = path.read_text(encoding="utf-8")
+            if rel == pathlib.Path("dashboard/server.py"):
+                text += "".join(owner.read_text(encoding="utf-8") for owner in owners)
             reads_per_port = "run_marker.read_secret(" in text
             reads_shared = '".local_secret"' in text
             if reads_per_port and reads_shared:

@@ -21,7 +21,9 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace, optionally filed into a sidebar folder at creation |
 | `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
+| `session_end_wait` | `POST /api/session-control/end-wait` | Wake a session the caller CREATED from the `wait` tool early, keeping its turn; any other target is refused `not_creator`, for every caller class |
 | `session_set_model` | `POST /api/session-control/set-model` | Record a pending model pick on an idle session; `apply_pending_model_pick` commits it at the start of the target's next turn after re-running `authorize_target` in the same synchronous step. A busy target is refused with `target_busy` and keeps its model |
+| `session_reload` | `POST /api/session-control/reload` | Relaunch the agent process of an idle session the caller created, through `chat_handlers.reload_slot_session` (shared with the tab menu's Reload session). The transcript is kept and gets one notice naming the caller. Self, remote-crew and busy targets (turn running or starting, queued messages, sub-agents) are refused |
 | `session_close` | `POST /api/session-control/close` | Close (archive) another session, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
 | `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn, or cut it into the turn already running (`steer`) |
@@ -196,7 +198,13 @@ WRITE TARGET, so a stamp carried back off the metadata line would append the
 entry's own text to a session the editor does not own, with nothing that retracts
 it. A delivery that outlives a restart and is then dropped reports to nobody while
 the delivery itself still survives, which is the price of the stamp living in
-`meta`.
+`meta`. The channel counterpart, `CHANNEL_RECIPIENT_META_KEY`
+(`channel_recipient_meta` / `channel_recipient_of` / `notify_channel_recipient_dropped`,
+stamped by `dashboard/channel_handoff.py` for a message a channel conversation
+queued into a resumed dashboard session), is stripped for the same reason with a
+wider blast radius — it names a conversation on a network surface — and its notice
+re-runs the outbound recipient check with the principal the channel authorized on
+inbound before anything is sent (see [messaging](messaging.md#a-busy-resumed-dashboard-session-takes-the-slots-own-machinery-discord)).
 
 **`steer: true` asks for a third outcome on a busy target.** Instead of waiting
 for the running turn, the message cuts into it (`steer_into_running_turn`, the
@@ -251,7 +259,16 @@ window and replaces it with a narrower one: the steer RPC suspends on
   bound between then and the reply, and the reply is what reaches the channel. So the
   sender records and, on what it can see, stops the turn; whether the reply may be
   published is the publisher's question, answered in the same synchronous moment it
-  publishes.
+  publishes. A channel conversation resumed into the session records the same fence
+  for a mid-turn steer of its own (`dashboard/channel_handoff.py`), without the stop —
+  a human's own message clears no containment gate for a stop to narrow — so the
+  publisher's question has one answer whoever cut into the turn. Its records are
+  keyed by audience and capped at `MAX_PENDING_STEERS` (one per distinct
+  containment snapshot per turn, never one per message; at the cap no fence is
+  evicted and the message takes the slot's queue instead, refused only when that
+  queue is itself full), where a peer delivery's
+  are one random token each, popped by the sender on every outcome but a landed
+  steer and a cancellation.
 
   Two consequences worth stating. An ordinary steer costs the channel audience
   nothing: the comparison is exact rather than precautionary, so a turn nobody
@@ -282,17 +299,6 @@ send, unchanged, and a crew-bound (`executor == "remote"`) target stays refused
 before either arm is reached. `steer` is strictly typed at both entry points (the
 tool schema and the HTTP handler) and defaults false, so a caller that omits it
 keeps the queue-or-run behaviour.
-
-**A target mid-plan is busy even when `running` says otherwise.** Both arms read
-`slot.running or slot._in_stage_execution`, the predicate every producer that must
-not start a concurrent turn reads — the composer, the cron injection, the nudge arm
-and the transfer gate. Between a multi-stage plan's stages each stage's `_run_chat`
-closes its own turn, so `running` reads False while the plan is still live, and
-`enqueue_or_run_prompt` gates on `running` alone: handing it a prompt there starts a
-second turn racing the plan, with no recovery once two turns own the same slot. So
-an inter-stage send is queued with the same admission stamp that method applies and
-held until the plan ends. There is no steer client in that window either, so a steer
-falls through its own re-gate to the same queue branch.
 
 `session_create` earns its place on its own, not as the front half of a delivery
 design: an agent that has just worked out that a job needs its own session can
@@ -618,6 +624,9 @@ Two rules give a member caller its shape:
   unchanged.
 
 Ordinary (non-member) callers are untouched: they still require the switch.
+The exceptions are `session_end_wait`, whose own creator fence (below, "Ending
+a wait early") binds every caller class, owner sessions included, and
+`session_reload`, whose creator fence binds every caller class the same way.
 
 #### The strict-internal surface admits a member DM slot, not every scoped caller
 
@@ -657,13 +666,17 @@ member identity and takes the template's selection namespace — `selection_kind
 template as `template_id` — through `ExecutionContext.with_template`, the same
 rewrite the subagent admission gate makes for `spawn_run(agent=…)`. The record
 therefore says whose memory the child runs on and, separately, what was picked to
-run it: a member's child that selected a template is that member's delegate, and
-`ContextBuilder` reads the namespace to withhold the member operating protocol from
-it (see [memory-skills-hooks](memory-skills-hooks.md)). A caller whose member has
-no persisted `member_id` is the one exception: its member is named by the selection
-alone, so the arm keeps that selection and changes only the template with its own
-`replace` — `with_template` would leave the child attributed to no member, which is
-the shape the spawn gate mints for that caller. The child's
+run it: a member's child that selected a template is that member's delegate. The
+member operating protocol and briefing are withheld from every child regardless,
+because no created worker is the member's DM thread — `ContextBuilder` delivers
+that desk only where the caller's `member=` argument names it, and the template
+namespace is the second, independent reason
+(see [memory-skills-hooks](memory-skills-hooks.md)). A caller whose member has
+no persisted `member_id` keeps its identity and rules through a different record
+shape: its member is named by the selection alone, so the arm keeps that selection
+and changes only the template with its own `replace` — `with_template` would leave
+the child attributed to no member, which is the shape the spawn gate mints for that
+caller. The child's
 execution record is published before slot metadata, broadcast or provider startup.
 Publication failure retracts an idle empty child and reports the actual failure.
 
@@ -709,19 +722,16 @@ A private member store is reachable on two authorities and no others:
   This keeps the shipped capability: an owner reopening member conversations and
   dispatching member workers.
 
-The vouched half is held in this process only, so a restart drops it while the durable
-records survive, and the own-store admission is refused until the owner re-selects the
-agent — which binds afresh through the durable path and vouches again. That deferral is
-deliberate rather than an oversight: nothing reachable on the rehydrate path can
-re-establish the authority safely, because every candidate resolves through something the
-session itself can influence. The record is written by the session; `slot.memory_store` is
-rehydrated from that record; the execution the selection path carries is built from it on
-the provider-switch path; and a config lookup there is keyed by that record's own
-`member_id`, so re-reading config agrees with a forged record by construction instead of
-checking it. Refusing is the fail-closed direction, an owner's own dispatch is unaffected,
-and the refusal is pinned by a regression test alongside the re-bind that clears it. The
-authenticated identity that would let a rehydrated session self-heal without an owner
-action is tracked separately as #12528.
+The vouched half is held in this process, and the gateway also writes a copy of each
+vouch to `vouched-executions/` at the data-home root. Every sandbox masks that leaf and
+agent file tools refuse it, so only the gateway writes it; it is NOT under `trust/`,
+which sandboxes keep writable for the audit log. The copy is removed wherever a vouch is
+withdrawn on purpose (a privacy tightening, a selection rollback, an explicit clear) and
+when the transcript is deleted, but not on cap eviction or restart. After a restart, the
+next gate-verified admission re-vouches a member DM key whose slug the durable record
+agrees with, or any other key whose disk copy, durable record, privacy mode and the
+member's configured store all agree. A session that rewrites its record to name a peer's
+store matches neither source and stays refused.
 
 For an operator, the recovery is one owner action and nothing at restart time: a member
 session whose worker dispatch answers `memory_delegation_denied` after a gateway restart
@@ -836,12 +846,31 @@ other answer, including an unreadable config or a degraded `memory_stores`
 section, is `False`, which withdraws admission and the bypass and can never open
 the surface wider than it is.
 
-`_created_by` is the marker, and it needs no lineage walk: `create_session` is its
-ONLY writer, so a non-empty value means "an agent made this session" at any depth.
-A grandchild carries its parent's key there and is fenced by the same test, and a
-chain whose middle slot has been closed cannot fail open because no chain is
-walked. A person's own tab and a fork reach `get_or_create_slot` directly and stay
-unattributed, so ordinary human use is unaffected.
+`_created_by` is the attribution marker, and it needs no lineage walk:
+`create_session` is its ONLY writer, so a non-empty value means "an agent made
+this session" at any depth. `_caller_is_ownership_fenced` reads this marker alone
+for the ownership boundary `authorize_target` evaluates on every verb: ANY
+agent-created session is fenced there, so a created session reaches only slots it
+created itself and nothing an unfenced creator could reach. A person's own tab and
+a fork reach `get_or_create_slot` directly and stay unattributed, so ordinary human
+use is unaffected.
+
+The one place an owner-rooted agent chain must be LET THROUGH is the
+private-member delegation gate in `create_session`: a conductor the owner started
+in their own tab has to be able to mint private-member workers, while a conductor
+rooted in a cron, channel link or crew member must not. That decision is made at
+the gate alone by `_delegation_lineage_fenced`, read once per create and never by
+`authorize_target`, so permitting the owner-rooted dispatch never widens the
+per-verb ownership boundary. The gate walk climbs the `_created_by` chain LIVE at
+each hop: a creator that is now a crew member, carries a channel link, or is a cron
+tab fences the whole chain the moment it does -- there is no frozen verdict to go
+stale, so a mid-chain takeover cannot leave an "unfenced" answer behind. The walk
+ends unfenced only at an unattributed root (the owner's own tab or a fork); it
+fails CLOSED on any gap -- a hop whose creator slot is gone, or a chain past the
+depth bound -- so a chain whose middle slot has been closed loses dispatch rather
+than widening reach. No verdict is stored on the slot and none is persisted: the
+owner-rooted answer is recomputed live from the chain at each delegation, so a
+restart changes nothing about the boundary.
 
 The same attribution is the one lineage fact the child's append-only crew log
 records: its `session/opened` carries `parent {slot, sid?}` -- `_created_by` as the
@@ -1029,11 +1058,18 @@ item. Three refusals had to move for that, and one deliberately did not:
   (`_caller_is_ownership_fenced` is the single predicate both admissions and the
   fence read, so they cannot drift). A cron reaches the sessions it created and
   nothing else, fail-closed on an unowned slot. `unattended_target` still stands,
-  so a cron cannot reach another job's tab.
+  so a cron cannot reach another job's tab. A slot a script cron opens through
+  the chat routes carries `_created_by` as well, set to its `cron:<job id>` key,
+  so that slot reads as the job's and never as the user's own tab, and the chat
+  routes apply the same fence: a `cron:` caller that names another creator's
+  slot, live or persisted, is refused with `not_creator`.
 - **The global switch still gates a cron.** Unlike a member, a cron gets no
   bypass: the switch is the user's statement that agents may open and drive
   sessions at all, and a job running while they are asleep is the last caller
-  that should be exempt from it.
+  that should be exempt from it. A script cron that presents its `cron:` key
+  meets the same refusal on the two chat routes it writes to. The
+  `agent.session_control` entry under Configuration states that rule and its
+  scope.
 
 **An APP-owned cron is refused, and ownership is read from the job.** This is the
 one place admitting a cron would otherwise open something. `_app` is how every
@@ -1355,6 +1391,32 @@ backwards, so they would be skipped permanently while the response read as
 "nothing new". A cursor exactly AT the end is not stale and still returns an empty
 window.
 
+## Ending a wait early
+
+`session_end_wait(target)` is the other half of the poll loop: a caller that has
+already seen the condition its worker is sleeping on can wake that worker instead
+of letting the `wait` run out. `end_wait_target` runs `authorize_target` like the
+other verbs and then applies a creator fence of its own: a target whose
+`_created_by` is not the caller is refused `not_creator` (403) even for an owner
+session, which the shared gate does not fence. Waking a sleep moves another
+session's turn forward on the caller's schedule, and the caller that armed the
+worker's wait is the one that knows when that is safe.
+
+It reuses the End-wait button's mechanism rather than adding one. It reads the
+`wait_id` currently tracked in `_wait_state` at request time (an MCP caller has no
+countdown to name a stale id from), parks it in `_end_wait_request`, and records
+the caller in `_end_wait_by`. The sleeping tool collects it from its next
+keepalive reply, which then carries `end_wait_by`, and returns a normal result
+naming the session that ended it. The turn is not cancelled and nothing is
+discarded.
+
+A target with no tracked sleep, or with `_wait_contested` set (two sleeps share
+one session key, so neither can be aimed at), gets `ok: true, ended: false` with
+an `info` string and nothing is parked. The SEL audit detail records
+`requested`, `not_waiting` or `contested`. Channel agents are blocked from the
+verb, and it is withheld from the conductor and member auto-approve grants; see
+the comment on `_CONDUCTOR_DASHBOARD_GRANTS` in `agent.py`.
+
 ## Stopping is safe to re-send
 
 The Stop button escalates: a second press while the first cancel is still pending
@@ -1572,6 +1634,38 @@ conductor is in the second class for `session_create` and `session_read_message`
 loop runs with nobody at the keyboard and must not block on an approval no one is
 there to give. An operator who wants folder tools without session control names the
 folder tools individually.
+
+The chat routes check the switch for a script cron as well. While it is off, the
+gateway refuses a caller that presents a `cron:` session key on
+`POST /api/chat/slots` and `POST /api/chat` with `session_control_disabled`. These
+are the two routes `ScriptContext.open_session` and
+`ScriptContext.send_to_session` call. The check is `_cron_session_control_refusal`
+in `private_chat_route_refusal`, the gate every internal chat-route call passes
+after the internal secret validates, and it answers with the same 403 body the
+session-control routes send. The same two routes apply this module's creator
+fence to a `cron:` caller: `cron_creator_refusal` in the chat handlers refuses a
+key whose slot was not created by that `cron:` key with 403 `not_creator`, the
+code `authorize_target` answers. A live slot is judged on its `_created_by`
+through `_created_by_other`. A key with no live slot is judged on the
+`created_by` its persisted metadata line records, so a cron cannot mint a
+closed session's key as its own, and a key with neither a slot nor a transcript
+is left to mint as the cron's own. `_cron_session_control_refusal` and
+`cron_creator_refusal` are mirrors of this module's cron gate, the switch gate
+and the `_created_by_other` fence, not a second rule: a change to how this
+module gates a cron must change those helpers with it. Both checks key on the
+key the caller presents, so they are a courtesy for `ScriptContext` callers and
+do not stop a holder of the internal secret. Owner and member callers are
+unaffected and keep their own gates. The folder routes are not gated, because
+folders are not session control.
+
+A slot a `cron:` caller opens on either route is labelled cron-created:
+`cron_slot_creator` reads the attested key off the scope the gate resolved, and
+the slot is minted with `origin` `CRON` and `_created_by` set to that
+`cron:<job id>` key. It is not counted as a user-created session, the
+`slots:user` scope does not expose it, and the owner sees it in the sidebar as
+any cron tab. The seeded first message is still queued as a user-role turn, a
+trade-off the PR that added these methods records. A slot that already exists
+under the name a cron sends is never re-labelled.
 
 `agent.member_dispatch` (bool, default **true**). The operator ceiling on the
 member switch bypass described under "Member callers". At its default a member DM

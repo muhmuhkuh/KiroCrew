@@ -435,7 +435,8 @@ async def test_monitor_create_uses_bounded_defaults(monkeypatch: pytest.MonkeyPa
     kwargs = authorize.await_args.kwargs
     assert kwargs["svc"] is svc
     assert kwargs["monitor"].budgets.max_runtime_secs == 14_400
-    assert kwargs["monitor"].budgets.max_agent_turns == 8
+    # 0 is the wake budget's shipped default and means unlimited.
+    assert kwargs["monitor"].budgets.max_agent_turns == 0
     assert kwargs["monitor"].budgets.max_tokens == 250_000
     assert kwargs["monitor"].budgets.max_provider_errors == 3
     assert kwargs["replace_existing"] is False
@@ -1163,6 +1164,11 @@ async def test_structured_legacy_row_carries_exactly_the_entitled_keys(
         # whether it can act, not a fact about what it watches. A structured
         # monitor never writes it, so the row carries 0 truthfully.
         "consecutive_start_failures",
+        # Same class and same reason as ``consecutive_start_failures``: the
+        # loop's own reading of whether its cycles can make progress, not a fact
+        # about the subject. A structured monitor never writes it, so the row
+        # carries 0 truthfully.
+        "consecutive_failed_cycles",
         "next_due_ts",
         "self_armed",
         "terminal_notification_outcome",
@@ -1356,6 +1362,11 @@ async def test_both_legacy_reads_return_a_monitor_armed_through_the_create_route
                 "target": "https://github.com/acme/widgets/pull/7",
                 "wake_instructions": "fix the red lane",
                 "cadence_secs": 900,
+                # An EXPLICIT positive wake budget, not the shipped default. The
+                # default is 0, which the legacy shape already spells as
+                # unlimited, so a default row could not tell a mapped value from
+                # a withheld one.
+                "max_agent_turns": 6,
             },
         )
     )
@@ -1384,9 +1395,8 @@ async def test_both_legacy_reads_return_a_monitor_armed_through_the_create_route
         assert row["idle_secs"] == 900
         for withheld in ("monitor", "message", "banner", "stop_sentinel_path"):
             assert withheld not in row
-        # Mapped, not withheld: the real turn budget rather than a 0 that reads
-        # as unlimited.
-        assert row["max_cycles"] == 8  # the create route's default budget
+        # Mapped, not withheld: the wake budget this arm actually asked for.
+        assert row["max_cycles"] == 6
     for blob in (json.dumps(listed), json.dumps(per_slot)):
         assert "fix the red lane" not in blob
         assert "acme/widgets" not in blob
@@ -1606,6 +1616,9 @@ async def test_update_forwards_raw_fields_to_the_authorizer(
     assert kwargs["idle_secs"] == "900"
     assert kwargs["active"] is False
     assert kwargs["max_cycles"] is None and kwargs["max_runtime_secs"] is None
+    # The dashboard route is the user's own press: a revival through it is a
+    # resume, so the authorizer is told to run the loop on a fresh budget.
+    assert kwargs["fresh_run"] is True
 
 
 @pytest.mark.asyncio

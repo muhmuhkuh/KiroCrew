@@ -21,6 +21,7 @@ from kiro_crew.config.loader import (
     config_path,
     update_config_locked,
 )
+from kiro_crew.config.paths import data_home
 from kiro_crew.constants import BANNER
 from kiro_crew.hooks import (
     TOOL_DENY,
@@ -43,6 +44,8 @@ from kiro_crew.providers.base import (
 from kiro_crew.sandbox import SandboxCeilingUnsealable
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.shell_audit_log import rotate_shell_audit_log
+from kiro_crew.start_priority import StartPriority
 from kiro_crew.terminal_safe import safe_terminal_line
 
 logger = logging.getLogger(__name__)
@@ -284,6 +287,8 @@ async def _chat(message: str | None, model: str | None, agent: str | None = None
     provider: LLMProvider = build_provider_factory(cfg)(
         _CLI_SESSION_KEY, agent=agent_name, channel_id=channel_id
     )
+    # The person at the terminal waits on every start (kiro_crew.start_priority).
+    provider.start_priority = StartPriority.FOREGROUND
     # This consumer implements the low-fidelity child downgrade, so opt in:
     # without this the handle-level fail-close gate rejects every low-fidelity
     # child permission request before it reaches `_answer_permission`, audited
@@ -301,6 +306,21 @@ async def _chat(message: str | None, model: str | None, agent: str | None = None
     # Built once per process, not per request: a permission request must not
     # depend on a config read succeeding while the turn is parked.
     gate = _build_tool_gate(agent_name or "")
+    # The bundled ``postToolUse`` hook appends every ``execute_bash`` call to
+    # ``<data home>/audit.log`` from inside kiro-cli, whichever process launched
+    # it, and the sweep that bounds that file runs on the gateway's cleanup loop
+    # (``SessionCleanup``), which this process never starts. An install that
+    # only ever runs ``kirocrew chat`` would therefore never rotate the file, so
+    # the same sweep runs here once, before the backend that will append is
+    # spawned: the live file is bounded on entry to every chat session and
+    # overshoots the cap by at most one session's shell activity. The data home
+    # is resolved in this process with ``data_home()``, the resolve-only helper:
+    # it honours the ``KIROCREW_HOME`` override the hook's own path expansion
+    # reads and runs no start-of-process maintenance, which has no place on the
+    # event loop. Blocking filesystem work over an agent-writable tree, so it
+    # runs on a worker thread; the sweep never raises by contract, and a file
+    # under the cap costs one ``stat`` and creates nothing.
+    await asyncio.to_thread(rotate_shell_audit_log, data_home())
     # A permission prompt cancelled at the terminal raises through the turn by
     # design (the request is deliberately left unanswered, see
     # `_answer_permission`), so the teardown belongs in `finally` rather than on

@@ -113,35 +113,38 @@ _LOADER_MEMBERS = {
         _ALLOWED_CANDIDATE_TOP
     """,
     "method": """
-        __init__ _admit_snapshot_path _adopt_catalog _adopt_extra_paths
+        __init__ _adopt_extra_paths _adopt_snapshot
         _append_project_skill_bodies _archive_root _audit_project_skill_enforcement
         _auto_activity _auto_created_ts _auto_slug_available _auto_slug_claim_lock
         _body_hits _body_matches _cached_frontmatter _candidate_layout_findings_at
         _candidate_layout_ok _catalog_fingerprint_hint _catalog_scope_id
         _catalog_scope_key _catalog_worker_loop _collect_scripts_pinned
         _confined_frontmatter_and_size _create_skill_pinned _delivery_count
-        _exact_read_while_building _get_disabled_app_names _invalidate_iter_cache _iter
-        _iter_uncached _iter_visible _legacy_context _load_catalog_snapshot
+        _exact_read_while_building _get_disabled_app_names _invalidate_iter_cache _is_user_authored
+        _iter _iter_uncached _iter_visible _legacy_context _load_catalog_snapshot
         _max_triggered_now _on_config_change _owned_hint _owning_app _pending_root
         _pending_scripts_verdict _pending_scripts_verdict_at _prune_versions _rank_key
-        _read_candidate_pinned _read_enumerated_skill_bytes _read_global_skill_text
-        _read_pending_meta _recency_boost _record_use _redact_deep _redact_file_in_place
+        _read_candidate_pinned _read_enumerated_skill_bytes _read_exact_key
+        _read_global_skill_text
+        _read_pending_meta _readable_frontmatter _recency_boost _record_use _redact_deep
+        _redact_file_in_place
         _redact_validation_report _request_catalog_refresh _resolve_path
         _resolve_path_and_root _resolve_snapshot_version _run_catalog_build
         _scoped_entries _served_key_by_realpath _snapshot_admitted_roots
-        _trusted_project_key _validate_and_redact_candidate _versions_root
+        _trusted_project_key _user_first _validate_and_redact_candidate _versions_root _vet_unconfined_path
         approve_pending_skill approve_pending_skill_checked approve_pending_update
         approve_pending_update_checked archive_auto_skill catalog_project_skills
-        catalog_status close create_auto_skill create_skill credit_skill_reads
+        catalog_status close confined_triggered create_auto_skill create_skill credit_skill_reads
         delete_skill dismiss_all_pending dismiss_pending_skill dismiss_pending_slugs
         find_similar get_always_skills get_auto_skill_version get_context
         get_pending_skill get_triggered_skills is_auto_generated
         list_archived_auto_skills list_auto_skills list_pending_skills list_skills
         load_skill pending_candidate_is_staged preview_pending_update prune_pending
-        read_auto_skill_body read_scoped_skill reconfigure resolve_dollar_skills
+        read_auto_skill_body read_scoped_skill read_scoped_skill_page reconfigure
+        resolve_dollar_skills
         resolve_ledger_aliases resolve_tool_read_keys restore_auto_skill
-        run_skill_lifecycle scoped_skills search_skills set_inject_on_trigger set_pinned
-        split_triggered stage_skill_candidate sync_builtins trigger_hint
+        run_skill_lifecycle scoped_skills search_skills search_skills_report
+        set_inject_on_trigger set_pinned split_triggered stage_skill_candidate sync_builtins trigger_hint
         update_auto_skill update_skill
     """,
     "static": """
@@ -157,10 +160,9 @@ _LOADER_MEMBERS = {
 _LOADER_SIGNATURES = {
     "_ALLOWED_CANDIDATE_TOP": "['.meta.json', 'SKILL.md', 'scripts']",
     "__init__": "(self, skills_path: 'Path | None' = None, install_builtins: 'bool' = True, config: 'KiroCrewConfig | None' = None)",
-    "_admit_snapshot_path": "(self, path: 'Path') -> 'bool'",
-    "_adopt_catalog": "(self, project_key: 'str', rows: 'list[tuple[str, Path, str | None]]', fingerprints: 'dict[str, str]', *, complete: 'bool') -> 'None'",
+    "_adopt_snapshot": "(self, project_key: 'str', snapshot: '_StoredCatalog', *, generation: 'int') -> 'list[tuple[str, Path, str | None]] | None'",
     "_adopt_extra_paths": "(self, resolved_paths: 'list[Path]') -> 'None'",
-    "_append_project_skill_bodies": "(self, parts: 'list[str]', project_skills: 'list[dict]', project_dir: 'str | Path | None', budget: 'int | None') -> 'None'",
+    "_append_project_skill_bodies": "(self, parts: 'list[str]', project_skills: 'list[dict]', project_dir: 'str | Path | None', budget: 'int | None', pinned: 'set[str] | None' = None) -> '_delivery.SkippedProjectSkills'",
     "_archive_root": "(self) -> 'Path'",
     "_audit_project_skill_enforcement": "(self, project_dir: 'str | Path', key: 'str | None', allowed: 'bool') -> 'None'",
     "_auto_activity": "(self, key: 'str', path_str: 'str', meta: 'dict') -> 'tuple[int, float]'",
@@ -169,8 +171,8 @@ _LOADER_SIGNATURES = {
     "_auto_slug_claim_lock": "(self) -> 'Iterator[bool]'",
     "_auto_slug_from_name": "(name: 'str') -> 'str'",
     "_body_hits": "(self, skills: 'list[dict]', terms: 'Iterable[str]', live_keys: 'list[str]', project_dir: 'str | Path | None') -> 'dict[str, int]'",
-    "_body_matches": "(self, skills: 'list[dict]', terms: 'Iterable[str]', live_keys: 'list[str]', project_dir: 'str | Path | None') -> 'dict[str, set[str]]'",
-    "_cached_frontmatter": "(self, path: 'Path', mtime: 'float | None' = None, *, within: 'str | None', canonical_root: 'str | None' = None) -> 'dict[str, str]'",
+    "_body_matches": "(self, skills: 'list[dict]', terms: 'Iterable[str]', live_keys: 'list[str]', project_dir: 'str | Path | None') -> 'tuple[dict[str, set[str]], bool]'",
+    "_cached_frontmatter": "(self, path: 'Path', mtime: 'float | None' = None, *, within: 'str | None', canonical_root: 'str | None' = None, for_write: 'bool' = False) -> 'dict[str, str]'",
     "_candidate_has_symlink": "(pdir: 'Path') -> 'bool'",
     "_candidate_layout_findings_at": "(self, root_fd: 'int') -> 'list[str]'",
     "_candidate_layout_ok": "(self, src: 'Path', name: 'str') -> 'bool'",
@@ -186,16 +188,17 @@ _LOADER_SIGNATURES = {
     "_cron_referenced_skills": "() -> 'set[str]'",
     "_delivery_count": "(self, key: 'str') -> 'int | None'",
     "_emit_lazy_load_metric": "(t0: 'float', *, hit: 'bool') -> 'None'",
-    "_exact_read_while_building": "(self, key: 'str', only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int') -> 'str | None'",
+    "_exact_read_while_building": "(self, key: 'str', only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int', refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "_get_disabled_app_names": "(self) -> 'frozenset[str]'",
     "_invalidate_iter_cache": "(self) -> 'None'",
     "_is_pending_slug_safe": "(slug: 'str') -> 'bool'",
+    "_is_user_authored": "(self, s: 'dict') -> 'bool'",
     "_iter": "(self, project_dir: 'str | Path | None' = None) -> 'list[tuple[str, Path, str | None]]'",
     "_iter_uncached": "(self, project_key: 'str | None' = None) -> 'list[tuple[str, Path, str | None]]'",
     "_iter_visible": "(self, project_dir: 'str | Path | None' = None) -> 'list[tuple[str, Path, str | None]]'",
     "_key_denotes_path": "(key: 'str', absolute: 'str', own_roots: 'tuple[Path, ...]', provider_roots: 'tuple[str, ...]') -> 'bool'",
     "_legacy_context": "(self, all_skills: 'list[dict]', restricted: 'bool' = False, project_dir: 'str | Path | None' = None, project_body_budget: 'int | None' = None) -> 'str'",
-    "_load_catalog_snapshot": "(self, project_key: 'str') -> 'tuple[list[tuple[str, Path, str | None]], float] | None'",
+    "_load_catalog_snapshot": "(self, project_key: 'str') -> '_StoredCatalog | None'",
     "_max_triggered_now": "(self) -> 'int'",
     "_on_config_change": "(self, change: \"'live.ConfigChange'\") -> 'None'",
     "_owned_hint": "(self, skill_file: 'Path') -> 'bool'",
@@ -209,7 +212,9 @@ _LOADER_SIGNATURES = {
     "_rank_key": "(self, s: 'dict') -> 'tuple[float, float]'",
     "_read_candidate_pinned": "(self, pdir: 'Path') -> 'tuple[str, dict, list[dict]] | None'",
     "_read_enumerated_skill_bytes": "(self, path: 'Path', within: 'str | None', *, max_bytes: 'int | None' = None, refusal_reasons: 'list[str] | None' = None, canonical_root: 'str | None' = None) -> 'bytes | None'",
-    "_read_global_skill_text": "(self, path: 'Path', max_bytes: 'int | None', *, canonical_root: 'str | None' = None) -> 'str | None'",
+    "_read_exact_key": "(self, key: 'str', *, only: 'list[str] | None', project_dir: 'str | Path | None', max_bytes: 'int') -> '_ExactRead'",
+    "_read_global_skill_text": "(self, path: 'Path', max_bytes: 'int | None', *, canonical_root: 'str | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
+    "_readable_frontmatter": "(self, path: 'Path', *, within: 'str | None', mtime: 'float | None' = None, canonical_root: 'str | None' = None) -> 'dict[str, str] | None'",
     "_read_pending_meta": "(self, slug: 'str') -> 'dict'",
     "_recency_boost": "(self, path_str: 'str', fingerprint: 'str' = '') -> 'float'",
     "_record_use": "(self, key: 'str') -> 'None'",
@@ -231,7 +236,9 @@ _LOADER_SIGNATURES = {
     "_short_desc": "(desc: 'str', suffix: 'str' = '...') -> 'str'",
     "_snapshot_admitted_roots": "(self) -> 'tuple[str, ...]'",
     "_trusted_project_key": "(self, project_dir: 'str | Path | None') -> 'str'",
+    "_user_first": "(self, ranked: 'list[dict]') -> 'list[dict]'",
     "_validate_and_redact_candidate": "(self, src: 'Path', name: 'str') -> 'dict[Path, bytes]'",
+    "_vet_unconfined_path": "(self, path: 'Path') -> 'bool'",
     "_versions_root": "(self, target_slug: 'str') -> 'Path'",
     "_write_skill_md": "(skill_file: 'Path', content: 'str', *, dir_fd: 'int | None') -> 'bool'",
     "approve_pending_skill": "(self, slug: 'str') -> 'str | None'",
@@ -242,6 +249,7 @@ _LOADER_SIGNATURES = {
     "catalog_project_skills": "(self, project_dir: 'str | Path') -> 'list[dict]'",
     "catalog_status": "(self, project_dir: 'str | Path | None' = None) -> 'str'",
     "close": "(self) -> 'None'",
+    "confined_triggered": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'set[str]'",
     "create_auto_skill": "(self, slug: 'str', *, description: 'str', triggers: 'str', procedure_md: 'str', provenance: 'AutoSkillProvenance', refusal: 'ClaimRefusal | None' = None) -> 'str | None'",
     "create_skill": "(self, name: 'str', content: 'str') -> 'bool'",
     "credit_skill_reads": "(self, keys: 'list[str]') -> 'None'",
@@ -261,12 +269,13 @@ _LOADER_SIGNATURES = {
     "list_auto_skills": "(self) -> 'list[dict]'",
     "list_pending_skills": "(self) -> 'list[dict]'",
     "list_skills": "(self, project_dir: 'str | Path | None' = None, *, _entries: 'list[_ScopedSkillEntry] | None' = None) -> 'list[dict]'",
-    "load_skill": "(self, name: 'str', project_dir: 'str | Path | None' = None, *, max_bytes: 'int | None' = None) -> 'str | None'",
+    "load_skill": "(self, name: 'str', project_dir: 'str | Path | None' = None, *, max_bytes: 'int | None' = None, refusal_reasons: 'list[str] | None' = None) -> 'str | None'",
     "pending_candidate_is_staged": "(self, slug: 'str') -> 'bool'",
     "preview_pending_update": "(self, slug: 'str') -> 'dict | None'",
     "prune_pending": "(self, ttl_days: 'int', *, now: 'float | None' = None) -> 'int'",
     "read_auto_skill_body": "(self, name: 'str') -> 'str | None'",
     "read_scoped_skill": "(self, key: 'str', *, only: 'list[str] | None' = None, project_dir: 'str | Path | None' = None, max_bytes: 'int' = 99000) -> 'str | None'",
+    "read_scoped_skill_page": "(self, key: 'str', *, only: 'list[str] | None' = None, project_dir: 'str | Path | None' = None, offset: 'int | None' = None, limit: 'int | None' = None, capacity: 'int' = 99000) -> 'SkillBodyPage | SkillReadRefusal'",
     "reconfigure": "(self, cfg: 'KiroCrewConfig') -> 'None'",
     "resolve_dollar_skills": "(self, text: 'str', project_dir: 'str | Path | None' = None, *, only: 'list[str] | None' = None) -> 'list[tuple[str, str, str]]'",
     "resolve_ledger_aliases": "(self) -> 'dict[str, list[str]]'",
@@ -275,6 +284,7 @@ _LOADER_SIGNATURES = {
     "run_skill_lifecycle": "(self, *, max_auto_skills: 'int', stale_after_days: 'int', archive_after_days: 'int', cron_referenced: 'set[str] | None' = None, exempt: 'set[str] | None' = None, now: 'float | None' = None) -> 'dict'",
     "scoped_skills": "(self, *, project_dir: 'str | Path | None' = None, only: 'list[str] | None' = None) -> 'list[dict]'",
     "search_skills": "(self, query: 'str', limit: 'int' = 20, *, project_dir: 'str | Path | None' = None, only: 'list[str] | None' = None, offset: 'int' = 0, browse: 'bool' = False) -> 'list[dict]'",
+    "search_skills_report": "(self, query: 'str', limit: 'int' = 20, *, project_dir: 'str | Path | None' = None, only: 'list[str] | None' = None, offset: 'int' = 0, browse: 'bool' = False) -> 'SkillSearchReport'",
     "set_inject_on_trigger": "(self, name: 'str', inject: 'bool') -> 'bool'",
     "set_pinned": "(self, name: 'str', pinned: 'bool') -> 'bool'",
     "split_triggered": "(self, names: 'list[str]', project_dir: 'str | Path | None' = None) -> 'tuple[list[str], list[str]]'",
@@ -445,11 +455,21 @@ class TestSurface:
         }
         assert current == _LOADER_SIGNATURES
 
-    def test_search_incomplete_is_declared_but_never_preset(self) -> None:
-        """Readers take the flag through ``getattr(..., False)``: it must stay absent
-        until a search has run, while moved code may still assign it."""
-        assert "search_incomplete" in SkillsLoader.__annotations__
-        assert not hasattr(SkillsLoader, "search_incomplete")
+    def test_no_search_leaves_its_answer_on_the_shared_loader(self, tmp_path) -> None:
+        """Whether a search is incomplete travels with that call's result.
+
+        One loader serves every concurrent search, so a flag kept on it would be
+        read by whichever caller looked last, not the one that searched.
+        """
+        assert "search_incomplete" not in getattr(SkillsLoader, "__annotations__", {})
+        loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        try:
+            before = set(vars(loader))
+            loader.search_skills_report("anything")
+            assert set(vars(loader)) == before
+            assert not hasattr(loader, "search_incomplete")
+        finally:
+            loader.close()
 
     def test_every_module_name_still_resolves_on_the_facade(self) -> None:
         missing = [name for name in _MODULE_NAMES if not hasattr(sk, name)]

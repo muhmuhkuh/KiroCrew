@@ -1026,17 +1026,21 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     "kiro_crew/acp/skill_projection.py": [
         ("native_skill_projection", "acp"),
     ],
-    # Two reads, deliberately labelled apart: the session-MCP translation resolves
+    # Three reads, deliberately labelled apart: the session-MCP translation resolves
     # the PROJECT checkout first (kiro-cli resolves --agent there before the user
     # level) and falls back to the user-level spec, so a refusal names which of the
-    # two was refused rather than leaving the reader to guess.
+    # two was refused rather than leaving the reader to guess. The third is the same
+    # project read made for Crew-fired spec hooks (``project_agent_spec``), named
+    # for that surface so a refusal there is not filed under the MCP projection.
     "kiro_crew/acp/session_mcp.py": [
         ("session_mcp_project_agent", "unknown"),
         ("session_mcp_servers", "unknown"),
+        ("spec_hooks_project_agent", "unknown"),
     ],
     "kiro_crew/agent.py": [
         ("agent_spec_lookup", "unknown"),
         ("migrate_agent_specs", "unknown"),
+        ("migrate_relocated_skill_uris", "unknown"),
     ],
     "kiro_crew/agent_capabilities.py": [("capability_publish", "dashboard")],
     "kiro_crew/agent_discovery.py": [
@@ -1077,6 +1081,25 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("steering_resources", "unknown"),
     ],
     "kiro_crew/cron_script.py": [("cron_resolve_mcp_server", "cron")],
+    "kiro_crew/dashboard/agent_admin/agent_detail.py": [
+        ("api_agent_detail", "dashboard"),
+        ("api_agent_detail", "dashboard"),
+        # PATCH's locked overwrite re-reads the spec INSIDE agents_spec_lock so
+        # the merge+sanitize applies to the current disk state, not a stale
+        # pre-lock snapshot.
+        ("api_agent_detail", "dashboard"),
+    ],
+    "kiro_crew/dashboard/agent_admin/fork_publish.py": [
+        # Fork/publish create closures re-read the SOURCE inside the lock too —
+        # the pre-lock snapshot can miss a concurrent refresh's writes (GPT
+        # round-10 stale-copy finding).
+        ("api_agent_fork", "dashboard"),
+        ("api_agent_publish", "dashboard"),
+    ],
+    "kiro_crew/dashboard/agent_admin/installed_agents.py": [("api_agents_sync", "dashboard")],
+    # The fork/publish endpoints share _load_template_specs, which forwards
+    # its ``operation`` argument -- each caller still names itself.
+    "kiro_crew/dashboard/agent_admin/template_lineage.py": [("forward:operation", "dashboard")],
     # The templates tab's read-only rule for a definition PATCH reads the spec
     # file the PATCH targets, so it labels itself as that PATCH; create re-reads
     # the SOURCE it copies inside the spec lock (the fork/publish shape).
@@ -1085,23 +1108,6 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("api_agent_template_create", "dashboard"),
         ("api_agent_template_delete", "dashboard"),
         ("api_agent_template_delete", "dashboard"),
-    ],
-    "kiro_crew/dashboard/handlers/agents.py": [
-        ("api_agent_detail", "dashboard"),
-        ("api_agent_detail", "dashboard"),
-        # PATCH's locked overwrite re-reads the spec INSIDE agents_spec_lock so
-        # the merge+sanitize applies to the current disk state, not a stale
-        # pre-lock snapshot.
-        ("api_agent_detail", "dashboard"),
-        # Fork/publish create closures re-read the SOURCE inside the lock too —
-        # the pre-lock snapshot can miss a concurrent refresh's writes (GPT
-        # round-10 stale-copy finding).
-        ("api_agent_fork", "dashboard"),
-        ("api_agent_publish", "dashboard"),
-        ("api_agents_sync", "dashboard"),
-        # The fork/publish endpoints share _load_template_specs, which forwards
-        # its ``operation`` argument -- each caller still names itself.
-        ("forward:operation", "dashboard"),
     ],
     "kiro_crew/dashboard/handlers/hooks.py": [("api_kiro_hooks", "dashboard")],
     "kiro_crew/dashboard/handlers/mcp.py": [
@@ -1204,6 +1210,16 @@ _EXPECTED_WARM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
+# The user-level snapshot's warm wrapper, held to the same contract: it forwards
+# to ``parsed_agent_specs``, so its one caller -- the background session's
+# creation, which warms the snapshot so the provider factory's on-loop model
+# lookup is a hit -- names the surface a denial during that first parse belongs
+# to. The channel is ``unknown``: the background session serves several.
+_EXPECTED_WARM_SPECS_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
+    "kiro_crew/session_background.py": [("ensure_background", "unknown")],
+}
+
+
 @functools.lru_cache(maxsize=None)
 def _labelled_call_sites(target: str) -> dict[str, list[tuple[str | None, str | None]]]:
     """Return every *target* call site and its label pair.
@@ -1273,8 +1289,11 @@ _EXPECTED_PARSED_SPECS_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # ``cached_agent_specs`` is the on-loop face of the same snapshot: it
     # forwards its caller's labels into the pool-side refresh, so the surface
     # that asked still owns the denial. Pinned as forwarding, like the wrapper.
+    # ``warm_agent_specs`` is the awaited face: it hands the parse to the pool
+    # by reference and forwards for the same reason.
     "kiro_crew/agent_discovery.py": [
         ("agent_skill_globs", "unknown"),
+        ("forward:operation", "forward:source"),
         ("forward:operation", "forward:source"),
     ],
     # The named-agent model resolver runs on the event loop from the provider
@@ -1349,6 +1368,7 @@ _RATCHET_INVENTORY: dict[str, dict[str, list[tuple[str, str]]]] = {
     "project_agent_names": _EXPECTED_PROJECT_NAMES_CALL_SITE_LABELS,
     "read_agent_spec_strict": _EXPECTED_STRICT_CALL_SITE_LABELS,
     "spec_by_declared_name": _EXPECTED_DECLARED_NAME_CALL_SITE_LABELS,
+    "warm_agent_specs": _EXPECTED_WARM_SPECS_CALL_SITE_LABELS,
     "warm_project_agent_names": _EXPECTED_WARM_CALL_SITE_LABELS,
 }
 

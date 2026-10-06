@@ -906,7 +906,8 @@ def _expected_node_base(version: str) -> str:
     """The artifact basename the installer will ask for ON THIS HOST.
 
     Hardcoding one platform would pass on the Linux shard and fail on the macOS
-    and arm64 runners, so the mapping mirrors the script's own uname cases.
+    and arm64 runners. Linux/x64 also needs the native libc version so the
+    fixture serves the older-glibc artifact when the installer requests it.
     """
     system = platform.system()
     node_os = {"Darwin": "darwin", "Linux": "linux"}[system]
@@ -917,6 +918,14 @@ def _expected_node_base(version: str) -> str:
         "aarch64": "arm64",
         "armv7l": "armv7l",
     }[platform.machine().lower()]
+    if node_os == "linux" and node_arch == "x64":
+        try:
+            libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
+        except (OSError, ValueError):
+            libc = ""
+        match = re.fullmatch(r"glibc (\d+)\.(\d+)(?:\.\d+)*", libc)
+        if match and (int(match[1]), int(match[2])) < (2, 28):
+            return f"node-v{version}-linux-x64-glibc-217"
     return f"node-v{version}-{node_os}-{node_arch}"
 
 
@@ -1254,6 +1263,24 @@ def test_a_log_that_cannot_be_scrubbed_is_never_printed() -> None:
     guard = tail.index("$script:LogSuppressed")
     printer = tail.index("-Tail 20")
     assert guard < printer, "Show-LogTail must consult the flag before printing the log"
+
+
+def test_every_not_writable_handler_in_the_windows_installer_reports_the_cause() -> None:
+    """Exit 17 is a classification, not a diagnosis. A handler that catches the
+    exception and prints only its own sentence hides the one fact the user needs:
+    a `Set-Acl` refused by a broken domain trust reads as "cannot restrict the
+    install log to owner-only", which sends them chasing permissions. Every
+    `catch` whose remedy is `Die $ExNotWritable` must carry the exception text.
+    """
+    ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
+    handlers = [
+        match.group("body")
+        for match in re.finditer(r"\}\s*catch\s*\{(?P<body>.*?)\n\s*\}", ps1, re.DOTALL)
+        if "Die $ExNotWritable" in match.group("body")
+    ]
+    assert len(handlers) >= 5, "the handler scan no longer finds the exit-17 catch blocks"
+    silent = [body.strip() for body in handlers if "$_.Exception.Message" not in body]
+    assert not silent, f"exit-17 handlers that drop the underlying exception: {silent}"
 
 
 @posix_only

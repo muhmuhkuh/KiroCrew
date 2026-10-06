@@ -51,6 +51,7 @@ def test_thread_name_prefixes_distinguish_pools() -> None:
     # Named for the crew log rather than "ledger": three other mechanisms in this
     # codebase are also called a ledger, and a stack dump has to name which one.
     assert ex.crew_log_executor()._thread_name_prefix == "mc-crewlog"
+    assert ex.update_executor()._thread_name_prefix == "mc-update"
 
 
 def test_pools_are_bounded() -> None:
@@ -59,6 +60,22 @@ def test_pools_are_bounded() -> None:
     assert ex.cron_executor()._max_workers == ex._MAX_CRON_WORKERS
     assert ex.maintenance_executor()._max_workers == ex._MAX_MAINT_WORKERS
     assert ex.subprocess_executor()._max_workers == ex._MAX_SUBPROCESS_WORKERS
+    # One apply holds the exclusive update lock for its whole run.
+    assert ex.update_executor()._max_workers == ex._MAX_UPDATE_WORKERS == 1
+
+
+def test_memory_preparation_pool_is_one_named_worker_and_fresh_per_pass() -> None:
+    # Fresh per pass: a stopped pass's worker can still hold its thread, and the
+    # next gateway's pass must not queue behind it.
+    first = ex.memory_preparation_executor()
+    second = ex.memory_preparation_executor()
+    try:
+        assert first is not second
+        assert first._max_workers == 1
+        assert first._thread_name_prefix == "mc-memprep"
+    finally:
+        first.shutdown(wait=False)
+        second.shutdown(wait=False)
 
 
 def test_shutdown_is_idempotent_and_resets() -> None:
@@ -74,9 +91,11 @@ def test_shutdown_is_idempotent_and_resets() -> None:
 
 
 def test_pools_execute_work() -> None:
-    assert ex.maintenance_executor().submit(lambda: 1 + 1).result(timeout=5) == 2
-    assert ex.subprocess_executor().submit(lambda: 4 + 4).result(timeout=5) == 8
-    assert ex.cron_executor().submit(lambda: 2 + 3).result(timeout=5) == 5
+    # The timeout only stops a dead pool from hanging the run. A loaded CI
+    # shard can take seconds to start a fresh worker thread, so keep it wide.
+    assert ex.maintenance_executor().submit(lambda: 1 + 1).result(timeout=60) == 2
+    assert ex.subprocess_executor().submit(lambda: 4 + 4).result(timeout=60) == 8
+    assert ex.cron_executor().submit(lambda: 2 + 3).result(timeout=60) == 5
 
 
 def test_path_resolve_pool_is_isolated_bounded_named_and_reset() -> None:

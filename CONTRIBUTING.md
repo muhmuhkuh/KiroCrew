@@ -83,13 +83,13 @@ The contributor workflow is codified as agent-loadable skills in
 
 - **`kirocrew-worktree-dev`** — the HARD RULE workflow: every change in a git
   worktree, the blocking build gates, the built-dist gotcha, preview paths.
-- **`prepare-pr`** — drives working-tree changes to a review-ready PR
+- **`kirocrew-prepare-pr`** — drives working-tree changes to a review-ready PR
   (commit → sync → squash → open → poll CI/review bots → fix findings).
 - **`babysit`** — same-session monitoring loop that keeps a PR moving through
   CI and review rounds.
 
 An agent contributing to Kiro Crew loads this suite and follows the same
-worktree → build gate → prepare-pr → review loop human contributors use, so
+worktree → build gate → kirocrew-prepare-pr → review loop human contributors use, so
 the PR process stays consistent regardless of who is writing the code. If you
 change the workflow, change it THERE. The checked-in workflows and
 [CI and review guide](docs/ci/ci-and-reviews.md) are canonical for the gate list;
@@ -115,6 +115,11 @@ KIROCREW_HOME=.kirocrew-dev KIROCREW_PORT=6777 kirocrew gateway
 ```
 
 Browse at `http://localhost:6777`. The backend serves the built frontend assets directly.
+When `src/kiro_crew/static/dist` links to `website/dist` (what `make build` and the
+gateway set up for a stock checkout), a hand-run `npm run build` is live as soon as it
+finishes, on a running gateway too; under an edition `static/dist` links to a private
+copy, which only the next stage replaces. See the runtime dist resolution notes in
+[learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md).
 
 | Env var | Purpose | Default |
 |---------|---------|---------|
@@ -259,7 +264,7 @@ get it merged.
 
 When your change is ready, the workflow is already codified rather than left to
 taste. See Development Skills above: `kirocrew-worktree-dev` covers building and
-verifying in a worktree, and `prepare-pr` takes it from there, driving the change
+verifying in a worktree, and `kirocrew-prepare-pr` takes it from there, driving the change
 to a review-ready pull request by committing, syncing onto the base, squashing to
 the one or two commits this repo allows, opening or updating the PR, then polling CI
 and the review bots and fixing what they find. An agent that loads it follows the
@@ -288,15 +293,22 @@ git push --force-with-lease origin <feature-branch>
    git fetch origin
    git checkout -b feat/my-feature origin/main
    ```
-3. **Make your change** and add tests (new functions/components should be tested).
-4. **Run the [gate before you commit](AGENTS.md#the-gate-before-you-commit)**
+3. **Start from an issue.** Every PR must name an issue of this repository
+   that has been given a tier, on a line of its own in the description: `Closes #N`
+   closes the issue when the PR merges; `Part of #N` leaves it open for the
+   rest of the work. The `Issue Gate` check enforces it once the Captain's
+   triage scan is running (it is paused until then). No issue yet? Open one
+   and let it be tiered first -- see
+   [Reporting Bugs and Requesting Features](#reporting-bugs-and-requesting-features).
+4. **Make your change** and add tests (new functions/components should be tested).
+5. **Run the [gate before you commit](AGENTS.md#the-gate-before-you-commit)**
    before opening a PR; its test step is:
    ```bash
    python3 scripts/local-gate.py
    ```
-5. **Commit** using [Conventional Commits](https://www.conventionalcommits.org/)
+6. **Commit** using [Conventional Commits](https://www.conventionalcommits.org/)
    (see below), push to your fork, and open a **Pull Request against `main`**.
-6. A maintainer will review. Address feedback by pushing additional commits to
+7. A maintainer will review. Address feedback by pushing additional commits to
    your branch.
 
 Two things are worth knowing before you start something large.

@@ -8,7 +8,7 @@ default (:func:`published_config_timezone`), never a config load, because the
 timer tick and prompt assembly call these on the event loop.
 
 The service owns the state these read (the job list, which jobs are running);
-nothing here holds any.
+nothing here holds any, bar a bounded warn-once memo for bad cron expressions.
 """
 
 from __future__ import annotations
@@ -55,6 +55,12 @@ _MAX_SKIP_DATE_LOOKAHEAD = 500_000  # absolute safety ceiling (anti-infinite-loo
 # Jitter bounds (seconds) to spread job execution and avoid traffic spikes
 _JITTER_HOURLY_MAX = 5 * 60  # 0–5 minutes for hourly jobs
 _JITTER_DAILY_MAX = 59 * 60  # 0–59 minutes for daily jobs
+# Longest single sleep inside the jitter wait. The wait ends on a WALL-CLOCK
+# deadline, but asyncio sleeps on time.monotonic(), which on macOS
+# (mach_absolute_time) does not advance while the host is asleep. Slicing the
+# wait bounds how long a resumed host keeps sleeping past a deadline the wall
+# clock already crossed: at most one slice of awake time.
+_JITTER_WALL_SLICE_SECS = 30
 
 
 def cron_expr_matches(expr: str, dt: datetime) -> bool:
@@ -382,6 +388,13 @@ def compute_next_run_ts(job: CronJob, now: float | None = None) -> float | None:
     return result
 
 
+# hash(job id) -> hash(cron expression) already warned about by _next_cron_boundary_ts.
+# Fixed-size ints, so the count cap below bounds the bytes too.
+_BAD_CRON_WARNED: dict[int, int] = {}
+_BAD_CRON_WARNED_MAX = 1024
+_BAD_CRON_REFUSED = [0]  # evaluations the full memo refused a row
+
+
 def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
     """Return the immediate next cron boundary as a UTC epoch, ignoring skip_dates.
 
@@ -403,9 +416,19 @@ def _next_cron_boundary_ts(job: CronJob, now: float) -> float | None:
         tz = _job_tz(job)
         base = seams.datetime.fromtimestamp(now, tz=tz)
         nxt = croniter(sched.cron_expr, base).get_next(float)
-    except Exception:
-        logger.warning("Failed to compute next cron boundary for job %s", job.id, exc_info=True)
+    except Exception as exc:  # CroniterBadDateError for an unsatisfiable expression
+        # Re-armed every poll: warn once per job+expression; a full memo refuses rows, said once.
+        key, val = hash(job.id), hash(sched.cron_expr)
+        if key in _BAD_CRON_WARNED or len(_BAD_CRON_WARNED) < _BAD_CRON_WARNED_MAX:
+            if _BAD_CRON_WARNED.get(key) != val:
+                _BAD_CRON_WARNED[key] = val
+                logger.warning("Bad cron %r for job %s: %r", sched.cron_expr, job.id, exc)
+        else:
+            if not _BAD_CRON_REFUSED[0]:
+                logger.warning("Bad cron warn-once memo is full; further jobs are not logged")
+            _BAD_CRON_REFUSED[0] = min(_BAD_CRON_REFUSED[0] + 1, 2**31)  # saturating count
         return None
+    _BAD_CRON_WARNED.pop(hash(job.id), None)
     if isinstance(nxt, float) and not math.isfinite(nxt):
         return None
     return nxt

@@ -20,9 +20,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
+from off_loop_helpers import off_loop
 
 from kiro_crew import work_ledger as wl
-from kiro_crew.crew_log import entry_types, projection, schema
+from kiro_crew.crew_log import eager, entry_types, projection, schema
 from kiro_crew.dashboard.handlers import work_ledger as routes
 
 CONDUCTOR = "chat-9-conductor"
@@ -2300,11 +2301,17 @@ async def test_a_nested_legacy_boards_baseline_carries_its_lineage(monkeypatch):
 
     status, body = await _report(WORKER, {"status": "progress", "summary": "first recorded"})
     assert status == 200, body
-    entries = [
-        e.data
-        for e in projection.open_session_log("u-worker").iter_from(1, known=projection.KNOWN_TYPES)
-        if e.type == "work/recorded"
-    ]
+
+    def _worker_entries() -> list[dict[str, Any]]:
+        handle = projection.open_session_log("u-worker")
+        return [
+            e.data
+            for e in handle.iter_from(1, known=projection.KNOWN_TYPES)
+            if e.type == "work/recorded"
+        ]
+
+    # Off the loop: the eager folder reads the unit on its own thread after the append.
+    entries = off_loop(_worker_entries)
     assert (entries[-1]["baseline"], entries[-1]["depth"], entries[-1]["parent_item"]) == (
         True,
         1,
@@ -2337,7 +2344,8 @@ async def test_a_pruned_worker_unit_refuses_the_rebuild_instead_of_erasing_its_r
 
     from kiro_crew import crew_log as lg
 
-    shutil.rmtree(store.crew_log_dir(lg.KIND_SESSION, "u-worker"))
+    with eager.paused():
+        shutil.rmtree(store.crew_log_dir(lg.KIND_SESSION, "u-worker"))
     with pytest.raises(wl.WorkLedgerError) as caught:
         wl.rebuild_from_projection(CONDUCTOR)
     assert caught.value.code == "crew_log_incomplete"
@@ -2378,7 +2386,8 @@ async def test_a_rebuild_keeps_the_completeness_marker_so_a_later_prune_still_re
     assert rebuilt.recorded_at == stamped.recorded_at
     assert (rebuilt.status, rebuilt.summary) == ("progress", "half way")
 
-    shutil.rmtree(store.crew_log_dir(lg.KIND_SESSION, "u-worker"))
+    with eager.paused():
+        shutil.rmtree(store.crew_log_dir(lg.KIND_SESSION, "u-worker"))
     with pytest.raises(wl.WorkLedgerError) as caught:
         wl.rebuild_from_projection(CONDUCTOR)
     assert caught.value.code == "crew_log_incomplete"

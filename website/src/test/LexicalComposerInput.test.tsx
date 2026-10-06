@@ -32,6 +32,7 @@ function ControlledHost({
   sentMessages,
   historyScope,
   showFullPastes,
+  onEditLastRequest,
 }: {
   initial?: string
   initialBlocks?: PasteBlock[]
@@ -44,6 +45,7 @@ function ControlledHost({
   sentMessages?: string[]
   historyScope?: string
   showFullPastes?: boolean
+  onEditLastRequest?: () => void
 }) {
   const [value, setValue] = useState(initial)
   const [blocks, setBlocks] = useState(initialBlocks)
@@ -64,6 +66,7 @@ function ControlledHost({
         onSelectionChange={onSelectionChange}
         sentMessages={sentMessages?.map(text => ({ text }))}
         historyScope={historyScope}
+        onEditLastRequest={onEditLastRequest}
       />
       <output data-testid="value">{value}</output>
       <output data-testid="blocks">{JSON.stringify(blocks)}</output>
@@ -119,10 +122,31 @@ describe('LexicalComposerInput', () => {
     const host = chip.parentElement as HTMLElement
     const rect = { left: 42, top: 18, right: 142, bottom: 38, width: 100, height: 20, x: 42, y: 18, toJSON: () => ({}) }
     vi.spyOn(host, 'getBoundingClientRect').mockReturnValue(rect as DOMRect)
-    fireEvent.mouseEnter(chip)
+    fireEvent.pointerEnter(chip, { pointerType: 'mouse' })
     await vi.advanceTimersByTimeAsync(300)
     const preview = screen.getByTestId('lexical-paste-preview-1')
     expect(preview).toHaveStyle({ left: '42px', top: '42px' })
+  })
+
+  it('a touch tap does not open the preview on hover; the tap itself toggles it', async () => {
+    vi.useFakeTimers()
+    render(<ControlledHost initial={formatToken(block)} initialBlocks={[block]} />)
+    const chip = screen.getByTestId('paste-token-1')
+    fireEvent.pointerEnter(chip, { pointerType: 'touch' })
+    fireEvent.mouseEnter(chip)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(screen.queryByTestId('lexical-paste-preview-1')).toBeNull()
+    fireEvent.click(chip)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(screen.getByTestId('lexical-paste-preview-1')).toBeInTheDocument()
+  })
+
+  it('keyboard focus still previews', async () => {
+    vi.useFakeTimers()
+    render(<ControlledHost initial={formatToken(block)} initialBlocks={[block]} />)
+    fireEvent.focus(screen.getByTestId('paste-token-1'))
+    await vi.advanceTimersByTimeAsync(300)
+    expect(screen.getByTestId('lexical-paste-preview-1')).toBeInTheDocument()
   })
 
   it('applies parent-driven controlled value and sidecar updates', async () => {
@@ -514,6 +538,81 @@ describe('LexicalComposerInput', () => {
     act(() => controlRef.current!.setSelection('second!'.length))
     expect(pressArrow(editorRef.current!, 'ArrowDown')).toBe(false)
     expect(screen.getByTestId('value')).toHaveTextContent('second!')
+  })
+
+  it('fires the edit-last-message request on ⌘↑/Ctrl+↑ from an empty composer (#11402)', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    const onEditLastRequest = vi.fn()
+    render(
+      <ControlledHost
+        initial=""
+        editorRef={editorRef}
+        controlRef={controlRef}
+        sentMessages={['first', 'second']}
+        onEditLastRequest={onEditLastRequest}
+      />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => {
+      editorRef.current!.dispatchCommand(
+        KEY_ARROW_UP_COMMAND,
+        new KeyboardEvent('keydown', { key: 'ArrowUp', ctrlKey: true, cancelable: true }),
+      )
+    })
+    await waitFor(() => expect(onEditLastRequest).toHaveBeenCalledTimes(1))
+    // The chord is claimed, so the plain-↑ history recall must not have run.
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent(''))
+  })
+
+  it('does not fire the edit-last-message request when the composer has content', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    const onEditLastRequest = vi.fn()
+    render(
+      <ControlledHost
+        initial="draft text"
+        editorRef={editorRef}
+        controlRef={controlRef}
+        sentMessages={['first', 'second']}
+        onEditLastRequest={onEditLastRequest}
+      />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => {
+      editorRef.current!.dispatchCommand(
+        KEY_ARROW_UP_COMMAND,
+        new KeyboardEvent('keydown', { key: 'ArrowUp', ctrlKey: true, cancelable: true }),
+      )
+    })
+    expect(onEditLastRequest).not.toHaveBeenCalled()
+    // Unclaimed: with content the chord must do nothing (not even recall).
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('draft text'))
+  })
+
+  it('leaves plain ↑ history recall untouched alongside the ⌘↑ binding', async () => {
+    const editorRef = createRef<LexicalEditor>()
+    const controlRef: MutableRefObject<ComposerControl | null> = { current: null }
+    const onEditLastRequest = vi.fn()
+    render(
+      <ControlledHost
+        initial=""
+        editorRef={editorRef}
+        controlRef={controlRef}
+        sentMessages={['first', 'second']}
+        onEditLastRequest={onEditLastRequest}
+      />,
+    )
+    await waitFor(() => expect(controlRef.current).not.toBeNull())
+    act(() => controlRef.current!.setSelection(0))
+    act(() => {
+      editorRef.current!.dispatchCommand(
+        KEY_ARROW_UP_COMMAND,
+        new KeyboardEvent('keydown', { key: 'ArrowUp' }),
+      )
+    })
+    await waitFor(() => expect(screen.getByTestId('value')).toHaveTextContent('second'))
+    expect(onEditLastRequest).not.toHaveBeenCalled()
   })
 
 })

@@ -72,6 +72,33 @@ _START_FAILURE_BACKOFF_AFTER = 3
 _START_FAILURE_STANDDOWN_AFTER = 5
 
 
+# Persisted reason for a loop stood down because its own delivered cycles kept
+# FAILING -- turns that reached a model session and dispatched but died (a
+# backend error after retries were spent, a persistent tool error, a prompt
+# timeout), the turn outcome ``error`` or ``timeout``. The three narrower bounds
+# each cover one deterministic sub-case: ``structural_terminal`` a malformed
+# payload the backend rejects by shape, ``approval_stalled`` an unanswered
+# approval, ``session_start_failures`` a cycle that never got a session at all.
+# A cycle that got a session, dispatched, and then errored is none of those, so
+# without this bound a loop firing every interval into a turn that always fails
+# spends its whole cycle cap producing nothing -- the exact waste
+# ``session_start_failures`` was built to end, for the broader class the three
+# narrow bounds leave uncovered. System-imposed like them (the remedy -- the
+# backend recovering, the tool being fixed -- is not something the loop can
+# arrange), so it is re-armable, and evidence-driven: only a DELIVERED cycle of
+# this loop's own that ended in a fault advances it, and a single landed turn on
+# the slot clears it, so a loop that recovers is never held back.
+CONSECUTIVE_FAILURE_REASON = "consecutive_failures"
+
+
+# Consecutive failed own-cycles before the loop stands down. Higher than the
+# start-failure stand-down because a failed turn is a broader, noisier signal
+# than a session that never started -- a couple of transient backend errors are
+# weather, five in a row with nothing landing between them is a loop that cannot
+# make progress and is only spending turns to keep failing.
+_CONSECUTIVE_FAILURE_STANDDOWN_AFTER = 5
+
+
 # Persisted reason for a loop stopped because its LAST delivered cycle ended on
 # a STRUCTURAL terminal error -- the backend rejected the prompt's shape as
 # malformed, deterministically, so re-firing the identical context every
@@ -108,6 +135,20 @@ class NudgeAdmissionRefused(RuntimeError):
     """The session authorized for an arm disappeared before its commit point."""
 
 
+# The two stops where a bound the user typed ran out, each the ending ``_timer``
+# records when that bound trips. The user's resume (``fresh_run``) resets the
+# counter BEHIND the spent bound alone: a spent cap zeroes ``cycle_count``, a
+# spent budget re-anchors ``created_ts``, and each is read either from the reason
+# the loop stopped with or from the bounds as they stand at the press (the wall
+# clock keeps running through a pause). Play on a spent bound is otherwise a dead
+# press, re-stopped on its first tick unless the bound is raised first; the other
+# counter describes an allowance that is not spent and is kept, because the cap is
+# a lifetime limit the user typed and a pause must not quietly mint a fresh one.
+CYCLE_CAP_REASON = "cycle_cap"
+RUNTIME_BUDGET_REASON = "runtime_budget"
+_BUDGET_EXHAUSTED_REASONS = frozenset({CYCLE_CAP_REASON, RUNTIME_BUDGET_REASON})
+
+
 # System-imposed terminal bounds. Membership here gives a reason TWO properties:
 # (1) ``update`` refuses to overwrite an ALREADY-inactive loop with one of these
 # (the no-op branch in ``_update_locked``), so a stop these mark cannot clobber a
@@ -116,15 +157,12 @@ class NudgeAdmissionRefused(RuntimeError):
 # make it directive-revivable; and (2) they are re-armable (folded into
 # ``_REPLACEABLE_LOOP_STOP_REASONS`` below). ``structural_terminal`` needs both,
 # for the same reason ``cycle_cap``/``runtime_budget`` do.
-_TERMINAL_BOUND_REASONS = frozenset(
-    {
-        "cycle_cap",
-        "runtime_budget",
-        APPROVAL_STALL_REASON,
-        STRUCTURAL_TERMINAL_REASON,
-        SESSION_START_FAILURE_REASON,
-    }
-)
+_TERMINAL_BOUND_REASONS = _BUDGET_EXHAUSTED_REASONS | {
+    APPROVAL_STALL_REASON,
+    STRUCTURAL_TERMINAL_REASON,
+    SESSION_START_FAILURE_REASON,
+    CONSECUTIVE_FAILURE_REASON,
+}
 
 
 # Persisted reason for a loop ``_load`` deactivated because its kill-switch path
@@ -206,9 +244,10 @@ def _stopped_row_is_replaceable(loop: "NudgeLoop") -> bool:
 #
 # Membership therefore does NOT assert deliverability; it asserts "this key names
 # a conversation rather than a chat slot". Whether a nudge can actually be
-# delivered stays with the fail-closed ladder in ``dashboard/chat_runner.py``
-# (``_resolve_channel_target``: governance, then a REGISTERED transport, then
-# ``supports_proactive_send``), which logs its reason and degrades to a no-op.
+# delivered stays with the fail-closed ladder ``chat_runner._resolve_channel_target``
+# (defined in ``dashboard/chat_turn/recipient.py``: governance, then a REGISTERED
+# transport, then ``supports_proactive_send``), which logs its reason and degrades
+# to a no-op.
 # So a namespace is listed even when nothing can currently be delivered to it,
 # and the two clearest cases are both here: ``whatsapp`` has no transport package
 # in this fork at all, and ``feishu`` ships one that declares
@@ -287,7 +326,14 @@ class NudgeLoop:
     # A cycle cap alone cannot bound COST: a loop whose turns are slow or whose
     # idle gap is long can run for days within its cycle budget. Anchoring on
     # the persisted ``created_ts`` (not arm time) makes the budget restart-proof
-    # — a gateway restart re-arms the loop but never resets its clock.
+    # — a gateway restart re-arms the loop but never resets its clock, and the
+    # clock keeps running through a pause. The user's RESUME of a loop whose
+    # TIME budget is spent does: a revival flagged ``fresh_run`` on a row that
+    # stopped on ``runtime_budget``, or whose budget has elapsed by the press,
+    # re-anchors ``created_ts`` (``_update_unserialized``); a spent CAP zeroes
+    # ``cycle_count`` on its own, each bound resetting only its own counter. A
+    # resume with that allowance left, a reconciler re-arm or a ``monitor_update``
+    # bound raise keeps both.
     max_runtime_secs: int = 0
     #: Whether this loop may be observation-gated. Defaults to FALSE, which is what
     #: a record stored before this field existed decodes to.
@@ -410,6 +456,20 @@ class NudgeLoop:
     # that produces it routinely outlives a restart, and cleared on every revival
     # so a recovered loop is not stood down by stale evidence.
     consecutive_start_failures: int = 0
+    # How many of this loop's OWN delivered cycles in a row ended in a fault --
+    # a turn that reached a model session and dispatched but died (turn outcome
+    # ``error`` or ``timeout``). Raised by ``notify_cycle_failed`` and zeroed by
+    # ``notify_cycle_landed`` (any landed turn on the slot proves progress is
+    # possible), both driven by evidence from the slot's own turns. Consumed by
+    # ``_timer``: past ``_CONSECUTIVE_FAILURE_STANDDOWN_AFTER`` the loop stops
+    # with ``CONSECUTIVE_FAILURE_REASON``. Distinct from
+    # ``consecutive_start_failures`` because the two measure different failures
+    # with different remedies -- a cycle that never got a session versus one that
+    # ran and errored -- and a loop can hit either. Persisted, because the
+    # condition that produces it (a wedged backend, a broken tool) routinely
+    # outlives a restart, and cleared on every revival so a recovered loop is not
+    # stood down by stale evidence.
+    consecutive_failed_cycles: int = 0
     # Absolute wall-clock deadline for the next fire (0 = unset: the next arm
     # starts a fresh full countdown). This is what makes the countdown
     # deadline-preserving — user turns cancel the pending timer TASK but never
@@ -523,6 +583,36 @@ def runtime_budget_exceeded(loop: "NudgeLoop", now: float | None = None) -> bool
     if not loop.max_runtime_secs or not loop.created_ts:
         return False
     return (now if now is not None else time.time()) - loop.created_ts >= loop.max_runtime_secs
+
+
+def cap_reached(loop: "NudgeLoop") -> bool:
+    """True when *loop* has a cycle cap and its count has reached it.
+
+    The cap check ``_timer`` makes before a fire, asked at resume time so the
+    user's resume cannot read "cycles left" on a loop the timer would re-stop
+    unfired. Read defensively through ``_positive_number``, as
+    ``nudge_cycle_header`` reads the same fields: ``_load`` leaves the bounds as
+    the store wrote them, and this runs inside a revival after ``active`` has
+    flipped and before the write, so a non-numeric value an agent wrote must
+    read as "no cap" rather than raise and leave the loop half-revived in memory.
+    """
+    cap = _positive_number(loop.max_cycles)
+    return bool(cap) and _positive_number(loop.cycle_count) >= cap
+
+
+def budget_elapsed(loop: "NudgeLoop", now: float | None = None) -> bool:
+    """True when *loop* has a wall-clock budget and the clock has run it out.
+
+    ``runtime_budget_exceeded`` asked at resume time, with the same defensive
+    reads as :func:`cap_reached` and for the same reason. The clock keeps running
+    through a pause, so a loop paused with an hour of budget left and resumed the
+    next day reads as spent here exactly as the timer would read it.
+    """
+    budget = _positive_number(loop.max_runtime_secs)
+    anchor = _positive_number(loop.created_ts)
+    if not budget or not anchor:
+        return False
+    return (now if now is not None else time.time()) - anchor >= budget
 
 
 #: Share of a loop's cycle or runtime cap at or under which the nudge header
