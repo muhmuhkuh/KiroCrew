@@ -13,6 +13,10 @@ model-route grammar: empty inherits; provider-qualified IDs have nonempty,
 alphanumeric-led segments. Traversal components, empty segments and shell
 metacharacters are rejected without maintaining a static model catalogue.
 
+Pi provider construction follows the upstream factory and shared advertised-effort
+capability tables. It has no fork-specific unpinned-effort override or Tool Search
+parameter suppression.
+
 The config package loads runtime configuration from `~/.kiro/crew/config.json`
 using stdlib dataclasses with sensible defaults. `config/sections.py` and
 `config/loader.py` are the two facades callers import. Each composes the owner

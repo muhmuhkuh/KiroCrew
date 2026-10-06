@@ -102,10 +102,6 @@ def _kiro_cfg() -> SimpleNamespace:
     return SimpleNamespace(agent=SimpleNamespace(provider="kiro"))
 
 
-def _pi_cfg() -> SimpleNamespace:
-    return SimpleNamespace(agent=SimpleNamespace(acp_backend="pi"))
-
-
 def _run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -140,40 +136,6 @@ class _FakeProc:
 
     async def communicate(self):
         return self._stdout, self._stderr
-
-
-def test_pi_model_list_uses_standalone_catalog(tmp_path):
-    models = [
-        {
-            "model_name": "anthropic/claude-sonnet-4-6",
-            "display_name": "anthropic/claude-sonnet-4-6",
-            "description": "",
-        }
-    ]
-    with (
-        patch.object(agents.KiroCrewConfig, "load", return_value=_pi_cfg()),
-        patch(
-            "kiro_crew.dashboard.handlers.agents._pi_models_from_cli",
-            new=AsyncMock(return_value=models),
-        ),
-    ):
-        resp = _run(agents.api_models(_kiro_request(tmp_path)))
-
-    assert resp.status == 200
-    assert _body(resp) == models
-
-
-def test_pi_model_list_failure_returns_error_code(tmp_path):
-    with (
-        patch.object(agents.KiroCrewConfig, "load", return_value=_pi_cfg()),
-        patch.object(
-            agents, "_pi_models_from_cli", new=AsyncMock(side_effect=RuntimeError("unavailable"))
-        ),
-    ):
-        resp = _run(agents.api_models(_kiro_request(tmp_path)))
-
-    assert resp.status == 503
-    assert _body(resp)["code"] == "pi_models_unavailable"
 
 
 def test_kiro_binary_unresolved_returns_503(tmp_path):

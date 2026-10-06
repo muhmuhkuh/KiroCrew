@@ -35,7 +35,6 @@ import subprocess
 import time
 import uuid
 from collections.abc import Sequence  # noqa: F401
-from decimal import Decimal
 from pathlib import Path  # noqa: F401
 from typing import Any
 
@@ -48,7 +47,6 @@ from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
-    ACP_BACKEND_PI,
     model_registry_namespace,
     selectable_backend_values,
 )
@@ -317,8 +315,6 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     configured_sandbox_mode,
-    create_subprocess_limited,
-    sandboxed_spawn_argv_async,
     scrub_agent_subprocess_env,
     wrap_argv,
 )
@@ -499,106 +495,6 @@ def _normalize_model_key(name: str) -> str:
     if resolved is not None:
         return resolved
     return string_fold
-
-
-def _parse_pi_model_list(output: bytes) -> list[dict]:
-    """Convert Pi's whitespace-delimited ``--list-models`` table to picker rows.
-
-    Pi's model ids are provider-qualified and must remain verbatim: unlike the
-    kiro catalog, their provider prefix selects the upstream model provider.
-    Unknown or malformed rows are ignored so a new Pi table column cannot make
-    the dashboard cache an empty successful response.
-    """
-    rows: list[dict] = []
-    for line in output.decode(errors="replace").splitlines()[1:]:
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        provider, model, context = parts[:3]
-        match = re.fullmatch(r"(\d+(?:\.\d+)?)([KMG])", context, re.IGNORECASE)
-        if not match:
-            continue
-        scale = {"K": 1_000, "M": 1_000_000, "G": 1_000_000_000}[match.group(2).upper()]
-        model_id = f"{provider}/{model}"
-        rows.append(
-            {
-                "model_name": model_id,
-                "display_name": model_id,
-                "description": "",
-                "context_window_tokens": int(Decimal(match.group(1)) * scale),
-            }
-        )
-    return rows
-
-
-async def _pi_models_from_cli() -> list[dict]:
-    """Read Pi's installed model catalog without invoking the Kiro CLI path."""
-    from kiro_crew.pi_support import _resolve_pi_bin
-
-    pi_bin = await asyncio.to_thread(_resolve_pi_bin)
-    if not pi_bin:
-        raise RuntimeError("Pi executable not found")
-    argv, env, cleanup = await sandboxed_spawn_argv_async(
-        [pi_bin, "--list-models"],
-        mode="standard",
-        env=scrub_agent_subprocess_env({**os.environ}),
-    )
-    try:
-        proc = await create_subprocess_limited(
-            *argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-            env=env,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            raise RuntimeError("Pi model list timed out") from None
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode(errors="replace")[-_MODEL_LIST_STDERR_TAIL_CHARS:])
-        rows = _parse_pi_model_list(stdout)
-        if not rows:
-            raise RuntimeError("Pi model list returned no usable rows")
-        return rows
-    finally:
-        if cleanup:
-            Path(cleanup).unlink(missing_ok=True)
-
-
-def _advertised_pi_models(request: web.Request) -> list[dict]:
-    """Return the first live Pi session's advertised model metadata."""
-    try:
-        providers = request.app["state"].sessions.active_providers()
-    except (KeyError, AttributeError):
-        return []
-    for provider in providers:
-        client_backend = getattr(getattr(provider, "client", None), "backend", None)
-        is_pi_provider = (
-            getattr(provider, "is_pi_backend", False) is True or client_backend == ACP_BACKEND_PI
-        )
-        if not is_pi_provider:
-            continue
-        getter = getattr(provider, "available_models", None)
-        if not callable(getter):
-            continue
-        try:
-            models = getter()
-        except Exception:
-            continue
-        if models:
-            return [
-                {
-                    "model_name": m.get("modelId", ""),
-                    "display_name": m.get("name", "") or m.get("modelId", ""),
-                    "description": m.get("description", ""),
-                }
-                for m in models
-                if m.get("modelId")
-            ]
-    return []
 
 
 def _advertised_cc_models(request: web.Request, namespace: str) -> list[dict]:
@@ -1362,21 +1258,6 @@ async def api_models(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "invalid backend", "code": "invalid_backend"}, status=400
         )
-    if backend == ACP_BACKEND_PI:
-        pi_rows = _advertised_backend_models(request, backend)
-        if len(pi_rows) > 1:
-            return web.json_response(pi_rows)
-        advertised = _advertised_pi_models(request)
-        if advertised:
-            return web.json_response(advertised)
-        try:
-            return web.json_response(await _pi_models_from_cli())
-        except Exception as exc:
-            logger.warning("api_models: Pi model list unavailable: %s", exc)
-            return web.json_response(
-                {"error": "Pi model list unavailable", "code": "pi_models_unavailable"},
-                status=503,
-            )
     if backend == ACP_BACKEND_CLAUDE:
         return web.json_response(
             _cc_models(request, configured_default=_scoped_default(cfg, backend))

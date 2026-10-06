@@ -1,6 +1,9 @@
 # Session Manager Module
 
-Warm-pool entries are available only to ACP-runtime backends. Process-per-session adapters, including Pi, keep a zero-sized pool at startup and provider-factory reload. Pi opaque resume IDs persist under the `pi` provider label and are never translated into Kiro session IDs.
+Warm-pool eligibility follows the shared backend capability checks. Provider-factory
+reload adopts the configured pool size with the upstream clamp, without a
+fork-specific Pi override. Pi opaque resume IDs persist under the `pi` provider
+label and are never translated into Kiro session IDs.
 
 ## Overview
 

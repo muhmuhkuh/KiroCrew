@@ -230,9 +230,6 @@ _FACADE_DEFS = (
     "_supply_live_enum",
     "api_config_schema",
     "_normalize_model_key",
-    "_parse_pi_model_list",
-    "_pi_models_from_cli",
-    "_advertised_pi_models",
     "_advertised_cc_models",
     "_entitled_kiro_models",
     "_cc_models",
@@ -543,7 +540,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 124
+    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 121
 
 
 def test_the_owners_log_as_the_facade() -> None:

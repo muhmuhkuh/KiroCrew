@@ -573,9 +573,7 @@ def user_text_span(
     return offset, offset + length
 
 
-def is_harness_slash_command(
-    first_word: str, *, cc_provider: bool, pi_backend: bool = False
-) -> bool:
+def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
     """Whether *first_word* should be forwarded to the harness as a command.
 
     Two rules, and the second exists because of a trap. A member of
@@ -586,17 +584,6 @@ def is_harness_slash_command(
     would hand the harness a command it has no definition for, and the token would
     silently do nothing on that provider while working everywhere else.
     """
-    if pi_backend and first_word in {
-        "/ponytail",
-        "/caveman",
-        "/skill:ponytail",
-        "/skill:ponytail-review",
-        "/skill:ponytail-audit",
-        "/skill:ponytail-gain",
-        "/skill:ponytail-debt",
-        "/skill:ponytail-help",
-    }:
-        return True
     if first_word in _SLASH_COMMANDS:
         return True
     if not (cc_provider and first_word.startswith("/")):
