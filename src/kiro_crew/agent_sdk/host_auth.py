@@ -70,6 +70,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_KNOWN,
 )
 
@@ -738,6 +739,37 @@ AGENT_AUTH_DECLARATIONS: Tuple[AgentAuthDeclaration, ...] = (
         # ``session/prompt`` with -32603 ``... no API key for provider route
         # "deepseek-official"; store DEEPSEEK_API_KEY ...``.
         signed_out_signature="no API key for provider route",
+    ),
+    AgentAuthDeclaration(
+        backend=ACP_BACKEND_VIBE,
+        # Vibe stores its Mistral API key in ``~/.vibe/.env`` (written by
+        # ``vibe --setup`` or on first run). Environment variables take precedence
+        # over this file, but the file is where the key persists, so it belongs on
+        # the credential floor.
+        credential_leaves=(".vibe/.env",),
+        # ``VIBE_HOME`` relocates Vibe's whole home directory -- config, credentials
+        # and sessions together -- so it stands in for the leaf's parent.
+        home_override_env_vars=("VIBE_HOME",),
+        # Nothing excluded from the mask: this harness's routing is UNVERIFIED today,
+        # so ``adapter_hidden_credential_dirs`` returns empty for it and there is
+        # nothing to carve an exception out of. When routing is verified and the
+        # harness is enforced, revisit whether it needs a carve-out.
+        adapter_own_leaves=(),
+        sign_in_remedy=(
+            "Mistral Vibe needs a Mistral API key — run vibe setup in a "
+            "terminal and enter your key, or set MISTRAL_API_KEY in your "
+            "environment. Get a key at https://console.mistral.ai."
+        ),
+        signed_out_message=(
+            "Mistral Vibe has no API key. Run vibe setup in a terminal and "
+            "enter your Mistral API key, or set MISTRAL_API_KEY in your "
+            "environment, then start a new chat."
+        ),
+        # Excluded deliberately: it signs in through its own credential file, so a
+        # ``kiro-cli logout`` says nothing about whether a running vibe session is
+        # still authenticated.
+        host_logout_retires_children=False,
+        entitlement_source=ENTITLEMENT_OWN_CREDENTIAL_FILE,
     ),
 )
 

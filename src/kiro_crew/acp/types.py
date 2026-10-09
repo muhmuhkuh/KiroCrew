@@ -23,6 +23,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CLIENT_META_SETTINGS,
@@ -59,6 +60,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
+    ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR,
     ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
     effort_config_option_id,
     effort_config_option_value,
@@ -301,6 +303,7 @@ PROVIDER_LABEL_OPENCODE = "opencode"
 PROVIDER_LABEL_PI = "pi"
 PROVIDER_LABEL_GOOSE = "goose"
 PROVIDER_LABEL_DEEPSEEK = "deepseek"
+PROVIDER_LABEL_VIBE = "vibe"
 
 #: Backend id -> its label. The mapping is what ``provider_label`` resolves
 #: through, so a harness's label and the answer a session persists under are one
@@ -320,6 +323,7 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
     ACP_BACKEND_PI: PROVIDER_LABEL_PI,
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
     ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
+    ACP_BACKEND_VIBE: PROVIDER_LABEL_VIBE,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
@@ -603,7 +607,7 @@ class JsonRpcMessage:
     fanout_no_owner: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "JsonRpcMessage":
+    def from_dict(cls, data: dict[str, Any]) -> JsonRpcMessage:
         """Build a JsonRpcMessage from a parsed JSON-RPC frame."""
         return cls(
             id=data.get("id"),
@@ -805,7 +809,7 @@ class AcpEvent:
     #: dashboard has one branch, and the structured fields travel alongside.
     #: ``None`` on every other terminal, including a plain ``end_turn`` whose
     #: metadata said nothing about a refusal.
-    refusal: "RefusalInfo | None" = None
+    refusal: RefusalInfo | None = None
     #: True when Kiro Crew fabricated this terminal event because the provider
     #: omitted its result frame. Consumers must not treat it as raw completion
     #: evidence even when compatibility requires ``stop_reason=end_turn``.
@@ -868,6 +872,14 @@ class AcpEvent:
     #: layer: a consumer that re-parsed the text would be re-deciding a protocol
     #: question it does not own.
     control_notice: bool = False
+    #: True when this ``agent_message_chunk`` named no ``messageId``. Provenance
+    #: only, and only meaningful for a harness in
+    #: ``ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR``: there model text always names
+    #: its item and the adapter's own chunks never do, so the missing id is what
+    #: tells a provider failure written as text apart from the model's answer
+    #: (``AcpSessionHandle._run_turn``). Other harnesses leave the id off model
+    #: text too, and nothing reads the flag for them.
+    unattributed: bool = False
     #: True when this event was SYNTHESIZED by the client rather than read off a
     #: backend frame. Only the claude compaction terminal sets it: an automatic
     #: compaction sends no terminal of its own, so one is manufactured once the
@@ -962,7 +974,7 @@ class AcpEvent:
     #: every other event. Populated ONLY by the execution layer — never from a
     #: text chunk — so a consumer may trust ``wait_reason`` without re-checking
     #: provenance.
-    status: "StructuredStatus | None" = None
+    status: StructuredStatus | None = None
 
     @property
     def shell_command(self) -> str | None:
@@ -1042,9 +1054,7 @@ class AcpEvent:
             return True
         if not self.shell_classified:
             return True
-        if self.is_shell and not self.shell_command:
-            return True
-        return False
+        return bool(self.is_shell and not self.shell_command)
 
     @property
     def child_mcp_identity_trusted(self) -> bool:
@@ -1191,9 +1201,9 @@ class AcpPromptStats:
     # notification precedes the terminal by milliseconds and describes only
     # this turn, so ``carry_over()`` drops it -- a refusal that survived into
     # the next turn would brand an ordinary answer as declined.
-    refusal: "RefusalInfo | None" = None
+    refusal: RefusalInfo | None = None
 
-    def carry_over(self) -> "AcpPromptStats":
+    def carry_over(self) -> AcpPromptStats:
         """Return fresh per-turn stats carrying this turn's context state.
 
         Event/tool/credit counters are per-turn and start at zero; the context
@@ -1250,7 +1260,7 @@ class AcpPromptStats:
         """
         self.context_pct_unknown = False
 
-    def terminal_refusal(self, stop_reason: str) -> tuple[str, "RefusalInfo | None"]:
+    def terminal_refusal(self, stop_reason: str) -> tuple[str, RefusalInfo | None]:
         """Fold this turn's refusal evidence onto a terminal's stop reason.
 
         A structured refusal recorded from metadata wins: the terminal's own
@@ -1304,7 +1314,7 @@ class AcpPromptStats:
         self.cache_read_tokens += int(cache_read_tokens)
         self.cache_write_tokens += int(cache_write_tokens)
 
-    def to_turn_usage(self) -> "TurnUsage":
+    def to_turn_usage(self) -> TurnUsage:
         """One ``TurnUsage`` carrying every billing dimension this turn filled.
 
         The single source of truth for stats → event conversion: every
@@ -1545,7 +1555,7 @@ class StructuredStatus:
         return self.phase == STATUS_PHASE_WAITING and bool(self.wait_reason)
 
     @classmethod
-    def from_meta(cls, meta: object) -> "tuple[StructuredStatus | None, str]":
+    def from_meta(cls, meta: object) -> tuple[StructuredStatus | None, str]:
         """Parse ``params._meta`` into a status, or explain why not.
 
         Returns ``(status, "")`` on success and ``(None, reason)`` otherwise.

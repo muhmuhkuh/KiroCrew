@@ -35,21 +35,27 @@ import asyncio
 import inspect
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from kiro_crew.acp import client as client_mod
+from kiro_crew.acp import launch as launch_mod
 from kiro_crew.acp import runtime as runtime_mod
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.harness import claude as claude_mod
 from kiro_crew.acp.harness import codex as codex_harness_mod
+from kiro_crew.acp.harness import deepseek as deepseek_mod
+from kiro_crew.acp.harness import opencode as opencode_mod
+from kiro_crew.acp.harness import pi as pi_mod
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.skill_projection import NativeSkillProjection
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_KNOWN,
@@ -78,6 +84,7 @@ _DSH_PATCH = "/opt/run/kiro_crew_dsh_gate.patch.yml"
 _OPENCODE_BIN = "/opt/bin/opencode"
 _GOOSE_BIN = "/opt/bin/goose"
 _DEEPSEEK_BIN = "/opt/bin/dsh"
+_VIBE_BIN = "/opt/bin/vibe-acp"
 _SEARCH_PATH = "/opt/bin"
 _OPENCODE_CONFIG = '{"permission":"ask"}'
 
@@ -87,8 +94,6 @@ VOLATILE_ENV = {
     "PATH": "<augmented-path>",
     "KIROCREW_RUNTIME_PYTHON": "<interpreter>",
     "KIROCREW_PI_GATE_SESSION": "<nonce>",
-    "KIROCREW_PI_STATE": "<state-file>",
-    "KIROCREW_PI_EFFORT": "<effort-file>",
     "KIROCREW_DSH_GATE_SESSION": "<nonce>",
     # Minted from ``secrets`` on every client, so it can never match a golden twice.
     # That a one-session client's child RECEIVES it is the fact being pinned: it is
@@ -296,9 +301,15 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
         return True
 
     # The pass-through collaborators, each accepting what the live object accepts.
+    # Patched on the client, whose bindings the launch tail is handed, AND on every
+    # host adapter that binds the same name for its own routing read-back: the
+    # read-back is wrapped and scrubbed exactly like the session spawn, and stubbing
+    # only the tail would leave the read-back on the real sandbox.
     stack.extend(
-        patch.object(client_mod, name, side_effect=_stub_for(getattr(client_mod, name), answer))
+        patch.object(module, name, side_effect=_stub_for(getattr(module, name), answer))
         for name, answer in _PASSTHROUGH_STUBS.items()
+        for module in (client_mod, *_READBACK_MODULES)
+        if module is client_mod or name in vars(module)
     )
     # The Windows cleanup admission is not a launch answer either: it charges a
     # process-wide capacity slot and pins the REAL child's original handle. The
@@ -314,10 +325,10 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
         )
     )
     stack.extend(
-        patch.object(
-            client_mod, name, side_effect=_async_stub_for(getattr(client_mod, name), answer)
-        )
+        patch.object(module, name, side_effect=_async_stub_for(getattr(module, name), answer))
         for name, answer in _ASYNC_PASSTHROUGH_STUBS.items()
+        for module in (client_mod, *_READBACK_MODULES)
+        if module is client_mod or name in vars(module)
     )
 
     stack.extend(
@@ -374,7 +385,7 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
                     "KIRO_CHAT_LOG_FILE": "<scratch-log>",
                 },
             ),
-            patch.object(client_mod, "_run_preflight_bounded", new=AsyncMock(return_value=())),
+            patch.object(launch_mod, "_run_preflight_bounded", new=AsyncMock(return_value=())),
             patch("kiro_crew.session._track_pid", return_value=None),
             patch("kiro_crew.session._track_session_pid", return_value=None),
             patch.object(
@@ -400,51 +411,31 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
             patch.object(
                 client_mod, "delegated_workspace_exposes_sealed_target", return_value=None
             ),
-            # The adapter resolvers.
+            # The adapter resolvers, each at the host adapter that owns it.
             patch.object(
-                client_mod,
+                claude_mod,
                 "_resolve_claude_acp_bin",
                 return_value=(_CLAUDE_ACP_ARGV, _SEARCH_PATH),
             ),
             patch.object(
                 client_mod, "_resolve_codex_acp_bin", return_value=(_CODEX_ACP_ARGV, _SEARCH_PATH)
             ),
-            patch.object(
-                client_mod, "_resolve_pi_acp_bin", return_value=(_PI_ACP_ARGV, _SEARCH_PATH)
-            ),
-            patch.object(client_mod, "_resolve_pi_bin", return_value=(_PI_BIN, _SEARCH_PATH)),
-            # Native Pi preparation writes prompt/MCP files and resolves a host
-            # package; pin its contribution just like scratch_env above.
-            patch.object(
-                client_mod,
-                "prepare_pi_environment",
-                side_effect=_stub_for(
-                    client_mod.prepare_pi_environment,
-                    lambda call: call["env"].update(
-                        {
-                            "PI_ACP_PI_COMMAND": _PI_LAUNCHER,
-                            "KIROCREW_PI_MCP_CONFIG": "/opt/run/pi-mcp.json",
-                            "KIROCREW_PI_MCP_ADAPTER": "/opt/lib/pi-mcp-adapter/index.ts",
-                            "KIROCREW_PI_PROMPT": "/opt/run/pi-prompt.md",
-                            "KIROCREW_PI_STATE": "/opt/run/pi-state.json",
-                            "KIROCREW_PI_EFFORT": "/opt/run/pi-effort.json",
-                            "MCP_UI_VIEWER": "none",
-                        }
-                    ),
-                ),
-            ),
-            patch.object(client_mod, "_resolve_claude_code_executable", return_value=""),
+            patch.object(pi_mod, "_resolve_pi_acp_bin", return_value=(_PI_ACP_ARGV, _SEARCH_PATH)),
+            patch.object(pi_mod, "_resolve_pi_bin", return_value=(_PI_BIN, _SEARCH_PATH)),
+            patch.object(claude_mod, "_resolve_claude_code_executable", return_value=""),
             patch.object(AcpClient, "_write_claude_local_settings", return_value=None),
-            patch.object(client_mod, "_seal_pi_gate_extension", return_value=_PI_EXTENSION),
-            patch.object(client_mod, "_ensure_pi_gate_launcher", return_value=_PI_LAUNCHER),
-            patch.object(AcpClient, "_verify_pi_gate", return_value=("", "")),
-            patch.object(client_mod, "_seal_deepseek_gate_extension", return_value=_DSH_EXTENSION),
-            patch.object(client_mod, "_write_deepseek_gate_patch", return_value=_DSH_PATCH),
-            patch.object(client_mod, "_pi_gate_artifact_dir", return_value="/opt/run"),
-            patch.object(AcpClient, "_verify_deepseek_gate", return_value=("", "")),
-            patch.object(AcpClient, "_verify_opencode_routing", return_value=("", "")),
-            patch.object(AcpClient, "_opencode_routing_config", return_value=_OPENCODE_CONFIG),
-            patch.object(client_mod, "_unlink_readback_launcher", return_value=None),
+            patch.object(pi_mod, "_seal_pi_gate_extension", return_value=_PI_EXTENSION),
+            patch.object(pi_mod, "_ensure_pi_gate_launcher", return_value=_PI_LAUNCHER),
+            patch.object(pi_mod, "_verify_pi_gate", return_value=("", "")),
+            patch.object(
+                deepseek_mod, "_seal_deepseek_gate_extension", return_value=_DSH_EXTENSION
+            ),
+            patch.object(deepseek_mod, "_write_deepseek_gate_patch", return_value=_DSH_PATCH),
+            patch.object(pi_mod, "_pi_gate_artifact_dir", return_value="/opt/run"),
+            patch.object(deepseek_mod, "_verify_deepseek_gate", return_value=("", "")),
+            patch.object(opencode_mod, "_verify_opencode_routing", return_value=("", "")),
+            patch.object(opencode_mod, "_opencode_routing_config", return_value=_OPENCODE_CONFIG),
+            patch.object(launch_mod, "_unlink_readback_launcher", return_value=None),
             # The DEFAULT data home, pinned to this run's temp dir. Required rather
             # than incidental: the parent environment above carries no
             # ``KIROCREW_HOME``, so anything on the spawn path that resolves
@@ -465,28 +456,33 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
             # ``agent.deepseek_env`` provider-key mapping.
             patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
             patch.object(
-                client_mod,
+                launch_mod,
                 "_resolve_self_served_bin",
                 side_effect=lambda backend: {
                     ACP_BACKEND_OPENCODE: (_OPENCODE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_GOOSE: (_GOOSE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_DEEPSEEK: (_DEEPSEEK_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_VIBE: (_VIBE_BIN, _SEARCH_PATH),
                 }[backend],
             ),
         ]
     )
 
 
-#: The module-level resolver caches a capture disturbs. Each is resolved once per
-#: process behind an ``_UNRESOLVED`` sentinel, so a capture has to clear them to make
-#: every backend resolve afresh -- and has to put them back, because the stubbed
-#: resolvers WRITE synthetic paths into them during the spawn.
-_ADAPTER_CACHE_NAMES = (
-    "_claude_acp_argv_cache",
-    "_codex_acp_argv_cache",
-    "_pi_acp_argv_cache",
-    "_pi_bin_cache",
-)
+#: The module-level resolver caches a capture disturbs, each with the module that owns
+#: it. Each is resolved once per process behind an ``_UNRESOLVED`` sentinel, so a
+#: capture has to clear them to make every backend resolve afresh -- and has to put them
+#: back, because the stubbed resolvers WRITE synthetic paths into them during the spawn.
+_ADAPTER_CACHES: dict[str, Any] = {
+    "_claude_acp_argv_cache": claude_mod,
+    "_codex_acp_argv_cache": client_mod,
+    "_pi_acp_argv_cache": pi_mod,
+    "_pi_bin_cache": pi_mod,
+}
+_ADAPTER_CACHE_NAMES = tuple(_ADAPTER_CACHES)
+
+#: The host adapters whose routing read-back binds its own sandbox wrap and scrub.
+_READBACK_MODULES = (pi_mod, opencode_mod, deepseek_mod)
 
 
 def snapshot_bin_caches() -> dict[str, Any]:
@@ -495,8 +491,10 @@ def snapshot_bin_caches() -> dict[str, Any]:
     The self-served mapping is copied rather than referenced: it is the same dict
     object the spawn path mutates, so holding the reference would snapshot nothing.
     """
-    saved: dict[str, Any] = {name: getattr(client_mod, name) for name in _ADAPTER_CACHE_NAMES}
-    saved["_self_served_bin_caches"] = dict(client_mod._self_served_bin_caches)
+    saved: dict[str, Any] = {
+        name: getattr(module, name) for name, module in _ADAPTER_CACHES.items()
+    }
+    saved["_self_served_bin_caches"] = dict(launch_mod._self_served_bin_caches)
     return saved
 
 
@@ -509,18 +507,18 @@ def restore_bin_caches(saved: dict[str, Any]) -> None:
     see ``/opt/bin/...`` and pass or fail on this file's fiction. The mapping is
     updated in place, so a caller holding the same dict object sees the restore.
     """
-    for name in _ADAPTER_CACHE_NAMES:
-        setattr(client_mod, name, saved[name])
-    client_mod._self_served_bin_caches.clear()
-    client_mod._self_served_bin_caches.update(saved["_self_served_bin_caches"])
+    for name, module in _ADAPTER_CACHES.items():
+        setattr(module, name, saved[name])
+    launch_mod._self_served_bin_caches.clear()
+    launch_mod._self_served_bin_caches.update(saved["_self_served_bin_caches"])
 
 
 def _reset_bin_caches() -> None:
     """Drop the module-level resolver caches so each backend resolves afresh."""
-    unresolved = client_mod._UNRESOLVED
-    for name in _ADAPTER_CACHE_NAMES:
-        setattr(client_mod, name, unresolved)
-    client_mod._self_served_bin_caches.clear()
+    unresolved = launch_mod._UNRESOLVED
+    for name, module in _ADAPTER_CACHES.items():
+        setattr(module, name, unresolved)
+    launch_mod._self_served_bin_caches.clear()
 
 
 #: Hosts launched ONLY by ``AcpRuntime``. The kiro family is on the runtime too but
@@ -562,8 +560,11 @@ def _env_delta(parent_env: dict, child_env: dict) -> tuple[dict[str, str], list[
     return added, removed
 
 
-def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> dict[str, Any]:
-    """The launch of a runtime-only host, driven through ``AcpRuntime._spawn_admitted``.
+def _capture_runtime_served(
+    backend: str, tmp_path: Path, parent_env: dict, extra_patches: Sequence[Any] = ()
+) -> dict[str, Any]:
+    """A host's launch driven through ``AcpRuntime._spawn_admitted``: the only launch of a
+    runtime-only host, and the runtime launch of a kiro-family one.
 
     The full runtime spawn path with the same collaborators stubbed as the client
     capture, so what is recorded is what the runtime hands the process factory: the
@@ -647,6 +648,7 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
             patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
         ]
     )
+    stack.extend(extra_patches)
     saved_caches = snapshot_bin_caches()
     _reset_bin_caches()
     entered: list = []
@@ -685,16 +687,26 @@ def _capture_runtime_served(backend: str, tmp_path: Path, parent_env: dict) -> d
     }
 
 
-def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
+def capture(
+    backend: str,
+    tmp_path: Path,
+    *,
+    extra_patches: Sequence[Any] = (),
+    observe: Callable[[Any], None] | None = None,
+) -> dict[str, Any]:
     """Drive the launch for *backend* and return its answers.
 
     A runtime-only host is captured from its harness (see
     :func:`_capture_runtime_served`); every other id is driven through ``_spawn``.
     ``tmp_path`` is the work dir the client is built against; nothing is written
-    inside the repository.
+    inside the repository. *extra_patches* are entered after every stub here, so a
+    test can replace one collaborator -- to record what the launch handed it -- and
+    leave the rest of the capture as the golden takes it. *observe*, when given, is
+    handed the client once its spawn returned, still inside the patches, so a test
+    can read what the spawn left on it.
     """
     if backend in RUNTIME_ONLY_BACKENDS:
-        return _capture_runtime_served(backend, tmp_path, fixed_parent_env())
+        return _capture_runtime_served(backend, tmp_path, fixed_parent_env(), extra_patches)
     rec = _Recorder()
     # The environment the spawn runs under: this fixed parent, so ``env_added`` is
     # what _spawn contributes rather than what this host happened not to have already.
@@ -708,6 +720,7 @@ def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
     _reset_bin_caches()
     stack: list = [patch.dict(os.environ, parent_env, clear=True)]
     _stub_common(stack, rec, tmp_path, backend)
+    stack.extend(extra_patches)
     entered: list = []
     # The environment the child inherits, read back from ``os.environ`` inside the
     # patched context (see :func:`_env_delta`).
@@ -723,6 +736,8 @@ def capture(backend: str, tmp_path: Path) -> dict[str, Any]:
             model="auto",
         )
         asyncio.run(client._spawn())
+        if observe is not None:
+            observe(client)
     finally:
         for ctx in reversed(stack):
             try:
