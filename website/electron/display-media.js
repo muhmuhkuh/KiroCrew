@@ -116,7 +116,10 @@ function createDisplayMediaHandler(deps) {
         callback({});
         return;
       }
-      callback({ video: source });
+      callback({
+        video: source,
+        ...(request.audioRequested ? { audio: "loopback" } : {}),
+      });
     } catch (err) {
       // Never throw out of the handler: a rejection here would crash the
       // request. Deny gracefully so the renderer's catch path runs.

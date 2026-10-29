@@ -27,7 +27,7 @@ from kiro_crew.dashboard.chat_persistence import (
     restore_open_slots,
     restore_open_slots_async,
 )
-from kiro_crew.testing.wait import async_wait_until
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 # --- durability across an unclean reboot ------------------------------------ #
 
@@ -362,7 +362,7 @@ def test_cancelled_restore_keeps_the_keys_it_never_read(tmp_path, monkeypatch):
             task.cancel()
             release_second_read.set()
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await await_until(task, what="cancelled open-slot restore")
 
     asyncio.run(_cancel_at_the_second_tab())
 

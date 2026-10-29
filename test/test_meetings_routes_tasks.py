@@ -626,7 +626,7 @@ class TestNoStoreCallRunsOnTheEventLoop:
         )
 
     def test_the_reported_handler_lists_meetings_off_the_loop(self):
-        """``handle_list_meetings`` lists meetings via ``asyncio.to_thread``."""
+        """The exact call site the CI reviewer flagged."""
         import inspect
 
         from kiro_crew.apps.builtins.meetings.backend.routes import meeting_lifecycle as ml

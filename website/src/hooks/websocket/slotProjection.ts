@@ -148,10 +148,7 @@ export function fetchingAnyFoldQuery(queryClient: QueryClient, frame: FoldedSlot
  *  while a read never raises the floor and the next frame always applies. The
  *  check is made against the CACHED value, which is the only thing that knows.
  *  When the held value's revision is at or above the frame's, it stays, and the
- *  key is already current. A `work` value a REST read labelled with
- *  `published_revision` (a gateway publish revision, comparable to a frame's)
- *  stays the same way; when a newer frame does replace it, the label is dropped,
- *  because it named the old value and a delta on it would apply to the wrong board.
+ *  key is already current.
  *
  *  The caller owes `fetchingAnyFoldQuery` first: an in-flight read is not yet held. */
 export function seedFoldedProjection(
@@ -162,15 +159,12 @@ export function seedFoldedProjection(
   const key = foldQueryKey(root, frame.fold)
   if (!key) return false
   queryClient.setQueryData(key, (held: unknown) => {
-    const current = typeof held === 'object' && held !== null ? held as Record<string, unknown> : undefined
-    const atOrAbove = (n: unknown) => typeof n === 'number' && Number.isFinite(n) && n >= frame.revision
-    if (atOrAbove(current?.revision) || atOrAbove(current?.published_revision)) {
+    const current = typeof held === 'object' && held !== null ? held : undefined
+    const revision = (current as { revision?: unknown } | undefined)?.revision
+    if (typeof revision === 'number' && Number.isFinite(revision) && revision >= frame.revision) {
       return held
     }
-    // The held `published_revision` labels the value being replaced, not this one,
-    // so it goes: the next `slot_fold` delta then has no base and pulls a snapshot.
-    const { published_revision: _dropped, ...rest } = current ?? {}
-    return { ...rest, value: frame.value, revision: frame.revision }
+    return { ...(current ?? {}), value: frame.value, revision: frame.revision }
   })
   return true
 }

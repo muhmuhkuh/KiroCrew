@@ -55,10 +55,7 @@ SECTIONS = agent_state.CAPABILITY_SECTIONS
 MAX_OPERATIONS = 300
 MAX_DOCUMENT_BYTES = 1024 * 1024
 
-#: Managed servers a member's copy may carry when its Parent does not: the
-#: crewmate's own record, which every crewmate is meant to have. Its transport
-#: is never the request's: it is the entry the default template carries
-#: (:func:`_member_platform_transport`), refreshed on every projection.
+#: Managed servers a member copy may carry even when its parent does not.
 MEMBER_PLATFORM_SERVERS = frozenset({"kirocrew-mate"})
 
 
@@ -69,14 +66,8 @@ def _member_platform_transport(name: str) -> dict | None:
 
 
 def _platform_entry(transport: dict, disabled: bool) -> dict:
-    """*transport* as the copy's entry: ``disabled`` only when it is a mute.
-
-    An enabled entry carries no ``disabled`` key at all, exactly as the default
-    template's does. A ``"disabled": false`` would be a key a per-session element
-    cannot express, so the session mount would withhold the server's identity
-    element and every call would refuse ``identity_unattested``.
-    """
-    entry = {k: v for k, v in transport.items() if k != "disabled"}
+    """Apply the current managed transport while representing only a mute."""
+    entry = {key: value for key, value in transport.items() if key != "disabled"}
     if disabled:
         entry["disabled"] = True
     return entry
@@ -845,9 +836,7 @@ def _maintain_owned(snap: dict, spec: dict) -> None:
             key: value for key, value in spec.get("mcpServers", {}).items() if key in selected
         }
     else:
-        # A platform server the copy carries and its Parent does not is Crew's own
-        # entry, so it is kept current here the way an owned Parent's refresh keeps
-        # it, and retracted when a fresh build would not emit it.
+        # The member-owned platform server stays current even without a parent row.
         parent_servers = snap["parent_spec"].get("mcpServers") or {}
         for key in MEMBER_PLATFORM_SERVERS & selected.keys() - parent_servers.keys():
             current = _member_platform_transport(key)
@@ -855,8 +844,6 @@ def _maintain_owned(snap: dict, spec: dict) -> None:
                 spec.get("mcpServers", {}).pop(key, None)
                 continue
             entry = _platform_entry(current, selected[key].get("disabled") is True)
-            # A per-tool restriction the copy already holds survives the refresh:
-            # the transport is Crew's to keep current, the restriction is not.
             retained = selected[key].get("disabledTools")
             if retained:
                 entry["disabledTools"] = list(retained)

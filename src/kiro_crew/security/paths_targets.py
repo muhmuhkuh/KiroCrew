@@ -109,9 +109,9 @@ class _BuiltTargets(set[str]):
     of path and no others: ``$HOME``, ``KIROCREW_OS_HOME``, every entry of the
     CALLER'S ``home_dirs`` list anchored under ``$HOME``, each such entry that
     carries a crew prefix, re-anchored under ``KIROCREW_HOME``, each path in
-    ``_KIRO_CLI_WRITE_TIER_LEAVES`` -- the agents dir, the MCP registry leaf, the
-    crewmate folder and its state files -- re-anchored under ``KIRO_HOME``, and each
-    harness credential leaf re-anchored under its own home override. Every other member of the set -- the
+    ``_KIRO_CLI_WRITE_TIER_LEAVES`` -- the agents dir, the MCP registry leaf and the
+    crewmate folder -- re-anchored under ``KIRO_HOME``, and each harness credential leaf
+    re-anchored under its own home override. Every other member of the set -- the
     copies re-anchored under the logical home, the home's realpath and
     ``KIROCREW_OS_HOME`` -- comes from ``_anchor`` or ``_anchor_both_separators``,
     neither of which touches the filesystem, so those copies cannot report a
@@ -353,7 +353,7 @@ def _anchor_targets(
         full_real = resolve_target(os.path.join(home, *_leaf_segments(d)))
         if full_real is not None:
             sensitive_targets.add(full_real.casefold())
-    # Both kiro-cli leaves follow ``KIRO_HOME`` — kiro-cli's own home override,
+    # Kiro CLI write-tier leaves follow ``KIRO_HOME`` — kiro-cli's own home override,
     # honoured by ``kiro_agents_dir()`` and by the registry's own resolver. When it
     # is set, the specs the gateway execs live at ``<KIRO_HOME>/agents`` and the
     # registry whose ``autoApprove`` skips the tool gate at
@@ -363,8 +363,8 @@ def _anchor_targets(
     # ``KIROCREW_HOME`` expansion directly above (the ~/-rooted default forms stay,
     # so every location is always covered).
     #
-    # Driven from the tuple rather than one arm per leaf, so a third kiro-cli leaf is
-    # one tuple entry and not a third arm someone has to remember to add; its
+    # Driven from the tuple rather than one arm per leaf, so another kiro-cli leaf is
+    # one tuple entry and not another arm someone has to remember to add; its
     # ``$HOME``-rooted half is the every-entry loop above. The tail comes off the
     # leaf spec (``_leaf_segments(leaf)[1:]`` drops the ``.kiro`` the override
     # replaces), so no leaf's path is spelled twice and the two spellings cannot
@@ -991,7 +991,7 @@ def _resolved_root_key() -> _ResolvedRoots:
     # canonically, within the budget.  Anything else -- a stall, an open
     # cooldown, a pinned or faulted pool -- raises, and every gate turns that
     # into a refusal, exactly as it does for a stalled candidate.  Three
-    # weaker fallbacks are each open: lexical spellings (a
+    # weaker fallbacks were each found open in review: lexical spellings (a
     # symlinked override root on another mount loses its canonical target), a
     # UNC skip (same, via a junction in a UNC home), and serving the previous
     # canonical resolution (a symlink repointed during the stall moves the

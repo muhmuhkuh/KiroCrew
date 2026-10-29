@@ -37,6 +37,7 @@ import sys as _sys
 import threading
 import time
 from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace  # noqa: F401
@@ -247,17 +248,13 @@ class AgentRunner:
         try:
             kill_process_tree(popen.pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError, ValueError):
-            try:
+            with suppress(Exception):
                 popen.kill()
-            except Exception:  # noqa: BLE001
-                pass
         try:
             popen.wait(timeout=3.0)
         except subprocess.TimeoutExpired:
-            try:
+            with suppress(Exception):
                 kill_process_tree(popen.pid, SIGKILL)
-            except Exception:  # noqa: BLE001
-                pass
 
     @staticmethod
     def available() -> bool:
@@ -373,12 +370,12 @@ class AgentRunner:
             "--mcp-config",
             '{"mcpServers":{}}',
         ]
-        # `if allowed_tools:` is WRONG for an empty list: `[]` means "no tools at all"
-        # (agent_discovery's forced-answer pass), but falsy-empty omits the flag entirely
+        # `if allowed_tools:` was WRONG for an empty list: `[]` means "no tools at all"
+        # (agent_discovery's forced-answer pass), but falsy-empty omitted the flag entirely
         # and this path also passes `--dangerously-skip-permissions` — so the supposedly
-        # tool-free agent would get everything. The SESSION path's `_tool_permitted` makes
-        # the same decision; the subprocess path has its own copy of it. `None` still means
-        # "no restriction imposed".
+        # tool-free agent got everything. Same inversion I had just fixed in the SESSION
+        # path's `_tool_permitted`; review caught that the subprocess path has its own copy
+        # of the decision. `None` still means "no restriction imposed".
         if allowed_tools is not None:
             if allowed_tools:
                 cmd += ["--allowed-tools", *allowed_tools]
@@ -398,8 +395,8 @@ class AgentRunner:
         # `--dangerously-skip-permissions`, so the whole subprocess is one unattended
         # blanket approval and the SEL entry is the only record it happened. Without it
         # the two runner paths disagree: the session path refuses an unauditable tool
-        # while this one would run a permissionless agent silently, an asymmetry that
-        # amounts to a sandbox bypass.
+        # while this one ran a permissionless agent silently. Raised by review of this
+        # branch, which read that asymmetry as a sandbox bypass.
         #
         # The containment argument for the spawn itself is unchanged and recorded in
         # test_spawn_audit (argv[0] is a module constant, the agent edits only files
@@ -417,10 +414,12 @@ class AgentRunner:
         # worktree must stay VISIBLE (there would be nothing to edit otherwise) while the
         # operator's credential directories are hidden and the environment is scrubbed.
         #
-        # Sandboxed rather than deleted: the sandbox keeps a malicious repository prompt
-        # from reaching credentials outside the worktree without removing the only path
+        # Raised by review of this branch, which asked for the fallback to be DELETED.
+        # Sandboxing it addresses the same concern — a malicious repository prompt can no
+        # longer reach credentials outside the worktree — without removing the only path
         # that works when no in-process provider is configured. Deleting it would turn
         # "no provider" from "degraded but functional" into "silently does nothing".
+        cleanup = None
         try:
             popen, cleanup = self._spawn_sandboxed_agent(cmd, cwd)
         except FileNotFoundError:
@@ -472,31 +471,28 @@ class AgentRunner:
                 ok=False, error=f"{type(e).__name__}: {e}", duration_s=time.monotonic() - t0
             )
 
-        proc = type("P", (), {"returncode": popen.returncode, "stdout": stdout, "stderr": stderr})()
-
         dur = time.monotonic() - t0
-        if proc.returncode != 0:
-            # Redact BEFORE the tail cut: a credential straddling the bound keeps its
-            # right half otherwise, a fragment no downstream pass can match. Tail (not
-            # a head bound) because the END of stderr carries the
-            # actionable error; slicing redacted text can at worst split a marker.
+        if popen.returncode != 0:
             return AgentResult(
                 ok=False,
-                error=f"exit {proc.returncode}: {redact_via_context(proc.stderr or '')[-400:]}",
+                error=f"exit {popen.returncode}: {redact_via_context(stderr or '')[-400:]}",
                 duration_s=dur,
             )
         try:
-            envelope = json.loads(proc.stdout)
+            envelope = json.loads(stdout)
         except json.JSONDecodeError:
             return AgentResult(
                 ok=False,
                 error="unparseable claude json envelope",
                 duration_s=dur,
-                raw={"stdout": proc.stdout[-400:]},
+                raw={"stdout": stdout[-400:]},
             )
 
         result_text = envelope.get("result", "")
-        cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        try:
+            cost = float(envelope.get("total_cost_usd", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            cost = 0.0
         with self._cost_lock:
             self._total_cost_usd += cost
         if envelope.get("is_error"):
@@ -517,10 +513,8 @@ class AgentRunner:
         )
 
     def _emit_activity(self, ev: dict) -> None:
-        try:
+        with suppress(Exception):
             self._on_activity(ev)  # type: ignore[misc]
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def _run_streaming(
         self, popen, t0: float, timeout_s: float, *, cwd: str | None = None
@@ -576,7 +570,7 @@ class AgentRunner:
                     # blocks (that is what drives the UI feed), so the information was
                     # present and simply not persisted. This brings the subprocess
                     # fallback to the same per-tool visibility the session path gets from
-                    # its approval hook.
+                    # its approval hook. Raised repeatedly by the GPT review of this branch.
                     if act.get("kind") == "tool":
                         _audit_fallback_tool(
                             tool=str(act.get("tool") or "tool"),
@@ -802,10 +796,8 @@ class SessionAgentRunner:
     def _emit_activity(self, ev: dict) -> None:
         if self._on_activity is None:
             return
-        try:
+        with suppress(Exception):
             self._on_activity(ev)
-        except Exception:  # noqa: BLE001 — a sink error must never break the run
-            pass
 
     def run(
         self,
@@ -953,8 +945,8 @@ class SessionAgentRunner:
                 # EVERY path (stop / timeout / max_turns / success), so the driver's live
                 # ``--max-cost`` meter (cost_meter=runner.total_cost_usd) sees real spend.
                 # The tool calls billed before an early return are real money — omitting
-                # them (accruing only on success) would make the ceiling under-count
-                # for timeout/max_turns, the EXPECTED common outcomes.
+                # them (the old behavior, which only accrued on success) made the ceiling
+                # under-count for timeout/max_turns, the EXPECTED common outcomes.
                 nonlocal cost_accounted
                 with self._cost_lock:
                     self._total_cost_usd += cost
@@ -1176,10 +1168,8 @@ class SessionAgentRunner:
                 with self._cost_lock:
                     self._total_cost_usd += cost
             if provider is not None and owns_provider:
-                try:
+                with suppress(Exception):
                     await provider.shutdown()
-                except Exception:  # noqa: BLE001
-                    pass
 
     @staticmethod
     async def _reject(
@@ -1304,7 +1294,7 @@ class SessionAgentRunner:
             except Exception:  # noqa: BLE001 - the agent's own timeout covers this
                 logger.debug("reject_tool after audit failure also failed: %s", exc)
             return
-        try:
+        with suppress(Exception):
             # ONE-SHOT, never `always=True`. Persistent approval tells the provider to stop
             # sending permission requests for matching calls (the base contract: "the user
             # picked 'always allow'", and ACP backends may turn it into an `addRules`
@@ -1327,8 +1317,6 @@ class SessionAgentRunner:
                 request_id=rid,
                 metadata={"unattended": True, "containment": "worktree+allowlist+gate"},
             )
-        except Exception:  # noqa: BLE001
-            pass
 
 
 # This module is the facade of the spine agent runner and the path every caller imports.

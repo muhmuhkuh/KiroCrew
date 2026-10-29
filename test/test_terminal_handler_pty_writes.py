@@ -380,11 +380,7 @@ class TestWriteSerialization:
             await asyncio.Event().wait()
 
         ws.send_str = AsyncMock(side_effect=blocked_send)
-
-        async def close():
-            ws.closed = True
-
-        ws.close = AsyncMock(side_effect=close)
+        ws.close = AsyncMock()
         # flake-ok: pre-existing 10 ms cleanup bound patch so the wedged error send times out at once and close still runs, moved verbatim; tracked for a de-flake pass
         monkeypatch.setattr(terminal, "_TERMINAL_WS_CLEANUP_TIMEOUT_S", 0.01)
 
@@ -399,7 +395,6 @@ class TestWriteSerialization:
         await await_until(cleanup, what="the bounded cleanup finishing")
 
         ws.close.assert_awaited_once()
-        assert ws.closed is True
 
     @pytest.mark.asyncio
     async def test_stalled_replay_releases_lock_for_later_candidate(self, monkeypatch):

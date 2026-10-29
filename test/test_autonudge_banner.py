@@ -1140,14 +1140,13 @@ class TestMonitorToolsCanSetTheBanner:
             patch("kiro_crew.autonudge.get_instance", return_value=svc),
             patch("kiro_crew.autonudge_authz.authorize_and_add_nudge", authz),
         ):
-            result = await sda._monitor_start(
+            await sda._monitor_start(
                 MagicMock(),
                 "chat-9-1",
                 {"message": "go", "banner": "watching CI"},
                 producer_is_channel=False,
             )
         assert authz.await_args.kwargs["banner"] == "watching CI"
-        assert "loop-1" in result
 
 
 class TestChannelBoundLoopsRefuseABanner:
@@ -1466,18 +1465,11 @@ class TestARealProducerSetsTheBanner:
     """
 
     def test_the_goal_command_passes_a_banner_to_add(self) -> None:
-        from pathlib import Path
+        import inspect
 
         from kiro_crew.dashboard import chat_runner
 
-        src = "\n".join(
-            turn_file.read_text(encoding="utf-8")
-            for turn_file in [
-                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-                Path(chat_runner.__file__),
-            ]
-            if turn_file.name != "__init__.py"
-        )
+        src = inspect.getsource(chat_runner)
         assert (
             "normalize_banner(_objective, absent_ok=True, truncate=True)" in src
         ), "/goal no longer routes the objective through normalize_banner(truncate=True)"

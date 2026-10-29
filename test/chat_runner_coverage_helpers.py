@@ -118,7 +118,6 @@ def _permission(
     tool_name: str = "",
     mcp_server_name: str = "",
     raw_tool_params: dict | None = None,
-    mcp_identity_trusted: bool = False,
 ) -> LLMEvent:
     return LLMEvent(
         kind=EVENT_PERMISSION_REQUEST,
@@ -131,7 +130,6 @@ def _permission(
         tool_name=tool_name,
         mcp_server_name=mcp_server_name,
         raw_tool_params=raw_tool_params,
-        mcp_identity_trusted=mcp_identity_trusted,
     )
 
 

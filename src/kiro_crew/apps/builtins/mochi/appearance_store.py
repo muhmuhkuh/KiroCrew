@@ -282,8 +282,6 @@ def list_packs(data_dir: Path) -> list[dict[str, Any]]:
         manifest_path = child / MANIFEST_FILE
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict):
-                raise ValueError("manifest is not an object")
             meta = manifest.get("meta")
             if isinstance(meta, dict):
                 out.append((manifest_path.stat().st_mtime, meta))

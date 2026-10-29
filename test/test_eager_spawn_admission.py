@@ -113,6 +113,20 @@ class TestFreshSpawnPopulationCap:
         assert key in chat_runner._armed_prefetches
 
     @pytest.mark.asyncio
+    async def test_fresh_spawn_uses_slot_backend(self):
+        slot = _ChatSlot("backend")
+        slot.acp_backend = "pi"
+        state = _mock_state(slot)
+        with (
+            patch.object(chat_runner.KiroCrewConfig, "load", _cfg(True)),
+            patch.object(chat_runner, "resolve_agent_bindings", return_value=_bindings()),
+        ):
+            await _eager_spawn(state, slot)
+        kwargs = state.sessions.get_or_create.await_args.kwargs
+        assert kwargs["acp_backend_override"] == "pi"
+        assert kwargs["model"] == "auto"
+
+    @pytest.mark.asyncio
     async def test_fresh_spawns_beyond_cap_evict_the_oldest_unclaimed(self):
         shared_sessions = MagicMock()
         shared_sessions.get_or_create = AsyncMock(return_value=(MagicMock(), True, False))

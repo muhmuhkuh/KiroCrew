@@ -194,7 +194,12 @@ function FeaturePreviewIntroDialog({ open, onOpenChange, title, intro, checked, 
           <DialogDescription id={descId} className="text-[13px] text-text">
             {intro.summary}
           </DialogDescription>
-          <p className="m-0 text-[12px] leading-relaxed text-muted">{intro.whereToFind}</p>
+          <div className="flex flex-col gap-0.5">
+            <span className="text-[11px] font-semibold uppercase tracking-[.04em] text-muted">
+              {i18nT('components.featurePreviewIntro.where_to_find')}
+            </span>
+            <p className="m-0 text-[12px] leading-relaxed text-muted">{intro.whereToFind}</p>
+          </div>
         </DialogBody>
         <DialogFooter className="justify-between">
           {/* The label follows the switch: "Turn this preview on" beside a

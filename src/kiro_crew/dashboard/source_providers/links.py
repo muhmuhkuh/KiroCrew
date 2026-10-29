@@ -21,8 +21,6 @@ from kiro_crew.dashboard.source_providers.contract import RepoRef, SourceRef
 _GITLAB_PATH_MARKERS: tuple[tuple[str, str], ...] = (
     ("/-/merge_requests/", "change"),
     ("/-/issues/", "issue"),
-    # GitLab's newer work-item URL for an issue; it shares the issue number space.
-    ("/-/work_items/", "issue"),
 )
 # GitHub keeps issues and pull requests in one number space under two path
 # segments. The captured segment is what derives the kind.
@@ -92,7 +90,7 @@ def _parse_gitlab_path(path: str) -> tuple[str, int, str]:
     """Split a GitLab MR/issue path into (project, number, kind) or raise ``ValueError``."""
     # String ops instead of a regex: the previous /(.+)/-/merge_requests/
     # pattern backtracked polynomially on adversarial paths. The
-    # markers are scanned independently and the RIGHTMOST valid one wins,
+    # two markers are scanned independently and the RIGHTMOST valid one wins,
     # preserving the original ``rfind`` semantics (a project path that itself
     # contains the marker text is still split at the last occurrence) without
     # reintroducing an alternating pattern.
@@ -106,10 +104,6 @@ def _parse_gitlab_path(path: str) -> tuple[str, int, str]:
         project = path[1:idx]
         number_text = path[idx + len(marker) :]
         if not project or not number_text.isdigit():
-            continue
-        # A group-level work item (an epic, /groups/<g>/-/work_items/<n>) is
-        # not a project issue: the project issues API can never fetch it.
-        if marker == "/-/work_items/" and project.lower().startswith("groups/"):
             continue
         best_idx = idx
         best = (project, int(number_text), kind)

@@ -799,8 +799,7 @@ def test_no_panel_prose_claims_the_count_identifies_the_evicted_crew():
     that field lives on the owner's own record, so telling a reader its history was
     trimmed is something the fold can keep.
     """
-    folds = sorted(Path(crew_log.__file__).parent.glob("projection*.py"))
-    source = "".join(path.read_text(encoding="utf-8") for path in folds)
+    source = Path(crew_log.__file__).read_text(encoding="utf-8")
 
     assert "exactly like a crew that never published on this slot" not in source
     # The correction is present, so this pin cannot pass by the prose being deleted.

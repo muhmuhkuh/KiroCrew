@@ -3,7 +3,7 @@
  *
  * Three module-level tables rendered untranslated copy in every locale because
  * `eslint-plugin-i18next` exempts ALL-CAPS declarators, so no gate ever counted
- * them: the session filter rows and sort menu in `chat-sidebar/SearchDock.tsx`, and the
+ * them: the session filter rows and sort menu in `ChatSidebar`, and the
  * reasoning-effort levels in `lib/effort.ts` (the `强度 High` in the bug report).
  *
  * The Overview status tiles (`UPTIME` / `SESSIONS` / … above the big numbers) had a
@@ -40,9 +40,7 @@ function flatten(obj: unknown, prefix = ''): Record<string, string> {
 const en = flatten((CATALOGS.en as { translation: unknown }).translation)
 const zh = flatten((CATALOGS['zh-CN'] as { translation: unknown }).translation)
 
-// `null` is a legitimate value in NEW_MENU_DESC_KEY: a row whose label already
-// says it all renders no second line, so there is no key to resolve.
-const TABLES: Record<string, Record<string, string | null>> = {
+const TABLES: Record<string, Record<string, string>> = {
   EFFORT_LABEL_KEY,
   FILTER_LABEL_KEY,
   FILTER_DESCRIPTION_KEY,
@@ -55,10 +53,8 @@ const TABLES: Record<string, Record<string, string | null>> = {
 
 describe('user-visible label tables hold catalog keys', () => {
   for (const [name, table] of Object.entries(TABLES)) {
-    const keys = Object.values(table).filter((key): key is string => key !== null)
-
     it(`${name}: every value is a key that exists in English`, () => {
-      const missing = keys.filter(key => !(key in en))
+      const missing = Object.values(table).filter(key => !(key in en))
       expect(missing).toEqual([])
     })
 
@@ -79,7 +75,7 @@ describe('user-visible label tables hold catalog keys', () => {
         // locale ships it verbatim (matching components.gitPanel.title, which
         // the sidecar documents as do-not-translate).
         'pages.chat.sidePanel.menu_git'])
-      const untranslated = keys
+      const untranslated = Object.values(table)
         .filter(key => !SYMBOLIC.has(key) && !BORROWED.has(key))
         .filter(key => zh[key] === en[key])
       expect(untranslated).toEqual([])

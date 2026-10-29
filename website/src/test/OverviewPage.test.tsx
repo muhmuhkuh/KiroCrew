@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { screen, fireEvent } from '@testing-library/react'
 import { renderWithProviders, createTestStore } from './helpers'
 import OverviewPage from '../pages/OverviewPage'
-import { KIRO_SIGN_IN_BACKEND } from '../pages/developer/kiroSignInLink'
+import { KIRO_SIGN_IN_BACKEND, KIRO_SIGN_IN_PATH } from '../pages/developer/kiroSignInLink'
 import type { RootState } from '../store'
 
 // Mock the two drill-in surfaces to isolate the mission-control shell.
@@ -185,10 +185,10 @@ describe('OverviewPage — mission control', () => {
     expect(api.kasLoginStatus).not.toHaveBeenCalled()
   })
 
-  it('carries no "sign-in moved" signpost either, whichever backend is selected', async () => {
+  it('signposts the sign-in card only while KAS is the selected backend', async () => {
     const { api } = await import('../api/client')
-    // The time-boxed pointer to Settings > Agent Harness is retired: the page
-    // neither renders it nor reads the backend to decide whether to.
+    // Kiro CLI (the default, spelled as the empty string): no pointer, and no
+    // wrapper left behind where the card used to sit.
     const first = renderWithProviders(<OverviewPage />, { store: statusStore() })
     expect(await screen.findByText('Memory')).toBeInTheDocument()
     expect(screen.queryByTestId('kiro-sign-in-moved')).not.toBeInTheDocument()
@@ -196,9 +196,10 @@ describe('OverviewPage — mission control', () => {
 
     vi.mocked(api.kirocrewConfig).mockResolvedValueOnce({ agent: { acp_backend: KIRO_SIGN_IN_BACKEND } })
     renderWithProviders(<OverviewPage />, { store: statusStore() })
-    expect(await screen.findByText('Memory')).toBeInTheDocument()
-    expect(screen.queryByTestId('kiro-sign-in-moved')).not.toBeInTheDocument()
-    expect(screen.queryByText(/sign-in moved/i)).not.toBeInTheDocument()
+    const pointer = await screen.findByTestId('kiro-sign-in-moved')
+    expect(pointer).toHaveTextContent('Kiro sign-in moved to Settings > Agent Harness')
+    // Same destination as the chat error row, so the two doors cannot drift.
+    expect(pointer).toHaveAttribute('href', KIRO_SIGN_IN_PATH)
     expect(api.kasLoginStatus).not.toHaveBeenCalled()
   })
 })

@@ -89,7 +89,6 @@ from kiro_crew.config.sections import (
     MemoryStoreConfig,
     MessagingConfig,
     MonitoringConfig,
-    PowerConfig,
     PublishConfig,
     ResourceLimitsConfig,
     SessionConfig,
@@ -109,7 +108,6 @@ from kiro_crew.config.sections import (
     WeComConfig,
     WeixinConfig,
     WhatsAppConfig,
-    WorkLedgerConfig,
     WorkspaceConfig,
     _meta,
     coerce_effort,
@@ -240,14 +238,6 @@ class KiroCrewConfig:
     watchdog: WatchdogConfig = field(
         default_factory=WatchdogConfig,
         metadata=_meta("Watchdog", "ACP per-session watchdog / liveness-oracle windows."),
-    )
-    work_ledger: WorkLedgerConfig = field(
-        default_factory=WorkLedgerConfig,
-        metadata=_meta("Work ledger", "Work-ledger nesting: how many levels may conduct."),
-    )
-    power: PowerConfig = field(
-        default_factory=PowerConfig,
-        metadata=_meta("Power", "What Knowledge Library sweeps do while on battery."),
     )
     resource_limits: ResourceLimitsConfig = field(
         default_factory=ResourceLimitsConfig,
@@ -682,8 +672,6 @@ class KiroCrewConfig:
             "mcp": asdict(self.mcp),
             "taskrunner": asdict(self.taskrunner),
             "watchdog": asdict(self.watchdog),
-            "work_ledger": asdict(self.work_ledger),
-            "power": asdict(self.power),
             "resource_limits": asdict(self.resource_limits),
             "messaging": asdict(self.messaging),
             "cron_history": asdict(self.cron_history),
@@ -1360,6 +1348,9 @@ class KiroCrewConfig:
             # NAMED so it is never swallowed by the catch-all: the session would
             # silently start on the configured default. ``None`` = no override.
             backend_override: str | None = None,
+            # Dashboard chat's session-local backend choice is distinct from a
+            # spawn request override and never changes the configured default.
+            acp_backend_override: str | None = None,
             # Per-session opt-in for the claude backend's own permission
             # classifier. NAMED rather than left to ``**_kwargs`` on purpose: a
             # caller passing it into the catch-all would be swallowed here and
@@ -1426,6 +1417,12 @@ class KiroCrewConfig:
                 self.agent.acp_backend,
                 backend_override=backend_override,
             )
+            if acp_backend_override is not None:
+                from kiro_crew.agent_sdk.backends import selectable_backends
+
+                if acp_backend_override not in selectable_backends():
+                    raise ValueError("backend is not selectable")
+                _backend = acp_backend_override
             # Resolved BEFORE the model, and threaded into the resolution: the
             # model's namespace translation and its pin-scope check both have to
             # key on the backend this session actually gets, not on the

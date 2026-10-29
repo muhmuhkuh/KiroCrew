@@ -531,21 +531,21 @@ describe('ChatInput + menu trigger shortcuts', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} value="look at" onChange={onChange} onFileSelect={vi.fn()} />)
     openPlusMenu()
-    fireEvent.click(screen.getByText('Reference a file'))
+    fireEvent.click(screen.getByTitle('Reference a file'))
     expect(onChange).toHaveBeenCalledWith('look at @')
   })
 
   it('the File item is withheld when the host provides no file-select handler', () => {
     renderWithProviders(<ChatInput {...base} />)
     openPlusMenu()
-    expect(screen.queryByText('Reference a file')).toBeNull()
+    expect(screen.queryByTitle('Reference a file')).toBeNull()
   })
 
   it('the Skill item appends the $ sigil without doubling an existing space', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} value="run " onChange={onChange} />)
     openPlusMenu()
-    fireEvent.click(screen.getByText('Use a skill'))
+    fireEvent.click(screen.getByTitle('Use a skill'))
     expect(onChange).toHaveBeenCalledWith('run $')
   })
 
@@ -553,7 +553,7 @@ describe('ChatInput + menu trigger shortcuts', () => {
     const onChange = vi.fn()
     renderWithProviders(<ChatInput {...base} onChange={onChange} />)
     openPlusMenu()
-    fireEvent.click(screen.getByText('Use a skill'))
+    fireEvent.click(screen.getByTitle('Use a skill'))
     expect(onChange).toHaveBeenCalledWith('$')
     await nextFrame()
     // The composer is refocused with the caret parked at the end, so the user
@@ -564,9 +564,9 @@ describe('ChatInput + menu trigger shortcuts', () => {
   it('picking a trigger closes the + menu', () => {
     renderWithProviders(<ChatInput {...base} onChange={vi.fn()} />)
     openPlusMenu()
-    expect(screen.getByText('Use a skill')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('Use a skill'))
-    expect(screen.queryByText('Use a skill')).toBeNull()
+    expect(screen.getByTitle('Use a skill')).toBeInTheDocument()
+    fireEvent.click(screen.getByTitle('Use a skill'))
+    expect(screen.queryByTitle('Use a skill')).toBeNull()
   })
 
   it('a mousedown outside the portaled menu closes it', () => {
@@ -656,7 +656,6 @@ const AGENT_SOURCE = 'Set per agent in config.json (agents.orchestrator.autocomp
 describe('ChatInput context-usage popover', () => {
   // The context chip lives on the shelf row, which only mounts when the host
   // supplies at least one shelf control — onProjectClick is the cheapest.
-  // The popover has no heading; its "Remaining" row is the open/closed signal.
   const base = { value: '', onChange: vi.fn(), onSend: vi.fn(), onProjectClick: vi.fn() }
 
   it('opens a breakdown with used and remaining token counts', () => {
@@ -664,7 +663,7 @@ describe('ChatInput context-usage popover', () => {
       <ChatInput {...base} contextPct={42} contextWindowTokens={200_000} contextUsedTokens={84_000} />,
     )
     fireEvent.click(screen.getByLabelText('Context usage'))
-    expect(screen.getByText('Remaining')).toBeInTheDocument()
+    expect(screen.getByText('Context window')).toBeInTheDocument()
     expect(screen.getByText('42%')).toBeInTheDocument()
     expect(screen.getByText('84K')).toBeInTheDocument()
     expect(screen.getByText('116K')).toBeInTheDocument()
@@ -684,16 +683,16 @@ describe('ChatInput context-usage popover', () => {
     renderWithProviders(<ChatInput {...base} contextPct={10} contextWindowTokens={100_000} />)
     const chip = screen.getByLabelText('Context usage')
     fireEvent.click(chip)
-    expect(screen.getByText('Remaining')).toBeInTheDocument()
+    expect(screen.getByText('Context window')).toBeInTheDocument()
     fireEvent.click(chip)
-    expect(screen.queryByText('Remaining')).toBeNull()
+    expect(screen.queryByText('Context window')).toBeNull()
   })
 
   it('a mousedown outside the popover closes it', () => {
     renderWithProviders(<ChatInput {...base} contextPct={10} contextWindowTokens={100_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
     fireEvent.mouseDown(document.body)
-    expect(screen.queryByText('Remaining')).toBeNull()
+    expect(screen.queryByText('Context window')).toBeNull()
   })
 
   it('renders no context chip at all when the host reports no percentage', () => {
@@ -767,7 +766,7 @@ describe('ChatInput context-usage popover', () => {
     vi.spyOn(api, 'chatSlotAutocompact').mockRejectedValue(new Error('offline'))
     renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
-    expect(await screen.findByText('Remaining')).toBeInTheDocument()
+    expect(await screen.findByText('Context window')).toBeInTheDocument()
     await waitFor(() => expect(api.chatSlotAutocompact).toHaveBeenCalled())
     expect(screen.queryByText('Auto-compact at')).toBeNull()
     // The learned control must not vanish unexplained: a muted one-liner

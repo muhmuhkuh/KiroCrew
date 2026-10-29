@@ -361,6 +361,7 @@ export function useSessionStatusFilters({ unreadSlots, activeFilters, filtersPau
     () => new Set(automationRunningKeys),
     [automationRunningKeys],
   )
+  // NOT dashboardSlice.subagentRunning — that only broadcasts on "done", not spawn.
   const subagentCounts = useAppSelector(selectSidebarSubagentCounts, shallowEqual)
   // Started children only: what the board's Working lane reads.
   const subagentStartedCounts = useAppSelector(selectSidebarStartedSubagentCounts, shallowEqual)

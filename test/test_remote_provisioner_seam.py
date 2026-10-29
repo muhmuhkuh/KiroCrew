@@ -624,17 +624,13 @@ class TestTheAliasRefusalSitsWhereTheFileIsConsumed:
         here, which is the property that was missed when the behaviour moved one function over.
         """
         import ast
-        import importlib
         import inspect
 
         import kiro_crew.sandbox as sandbox_mod
 
-        # The module and the owners carved out of it, which share its namespace.
-        modules = [sandbox_mod, *map(importlib.import_module, sandbox_mod._CARVED_OWNERS)]
-        trees = [ast.parse(inspect.getsource(module)) for module in modules]
+        tree = ast.parse(inspect.getsource(sandbox_mod))
         callers = {
             fn.name
-            for tree in trees
             for fn in ast.walk(tree)
             if isinstance(fn, ast.FunctionDef)
             for c in ast.walk(fn)

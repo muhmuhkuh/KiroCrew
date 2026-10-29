@@ -157,7 +157,7 @@ class TestTools:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(mcp_server.progress, "read_progress", lambda: {"points": []})
-        monkeypatch.setattr(mcp_server.deps, "check_deps", lambda: {"ok": True})
+        monkeypatch.setattr(mcp_server.deps, "check_deps", lambda *args: {"ok": True})
         assert mcp_server._tool_get_progress({}) == {"points": []}
         assert mcp_server._tool_get_deps({}) == {"ok": True}
 
@@ -204,7 +204,7 @@ class TestGetFinding:
             mcp_server._tool_get_finding({})
 
     def test_an_unknown_fp_is_a_client_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(mcp_server.progress, "read_findings", lambda: [])
+        monkeypatch.setattr(mcp_server.progress, "read_findings", list)
         with pytest.raises(ValueError, match="no finding with fingerprint"):
             mcp_server._tool_get_finding({"fp": "zz1"})
 
@@ -365,7 +365,7 @@ class TestToolsCallDispatch:
     def test_a_value_error_from_a_handler_becomes_invalid_params(
         self, recorder: _FakeSel, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(mcp_server.progress, "read_findings", lambda: [])
+        monkeypatch.setattr(mcp_server.progress, "read_findings", list)
         reply = _call("get_finding", arguments={"fp": "zz9"})
         assert reply is not None
         assert reply["error"]["code"] == mcp_server._INVALID_PARAMS

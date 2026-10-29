@@ -377,6 +377,7 @@ describe('AutoNudgePopover next-trigger countdown', () => {
     __resetForTests()
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) })) as unknown as typeof fetch)
     vi.useFakeTimers()
+    vi.setSystemTime(1_791_091_200_000)
   })
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
@@ -530,6 +531,7 @@ describe('AutoNudgePopover cycle cap readout', () => {
     // from cycle_count/max_cycles only, so an armed ticker changes the title and
     // leaves the label alone.
     vi.useFakeTimers()
+    vi.setSystemTime(1_791_091_200_000)
     renderPopover(makeLoop({ cycle_count: 3, max_cycles: 24, next_due_ts: Date.now() / 1000 + 125 }))
     const trigger = screen.getByRole('button', { name: 'Goal active (cycle 3/24)' })
     expect(trigger.getAttribute('title')).toMatch(/Next cycle in/i)
@@ -545,6 +547,7 @@ describe('AutoNudgePopover cycle cap readout', () => {
  *  2026-10-01). */
 describe('AutoNudgePopover status line and Pause | Play controls', () => {
   beforeEach(() => {
+    vi.setSystemTime(1_791_091_200_000)
     localStorage.clear()
     __resetForTests()
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve({ ok: true, json: () => Promise.resolve({ loop: null }) })) as unknown as typeof fetch)

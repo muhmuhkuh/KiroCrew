@@ -48,6 +48,7 @@
       "extendInfo": {
         "CFBundleDisplayName": "Kiro Crew",
         "NSMicrophoneUsageDescription": "Kiro Crew uses the microphone for voice input and dictation in chat. Audio is captured only while you hold or toggle the mic button.",
+        "NSAudioCaptureUsageDescription": "Kiro Crew captures meeting audio for live transcription when you choose to share meeting audio.",
         "NSLocalNetworkUsageDescription": "Kiro Crew connects to devices on your local network so agent commands can reach your own servers, NAS, containers, and dev machines. Only the addresses a command names are contacted."
       }
     },
@@ -86,8 +87,7 @@
         "libatspi2.0-0 | libatspi2.0-0t64",
         "libuuid1",
         "libsecret-1-0",
-        "libasound2 | libasound2t64",
-        "lsof"
+        "libasound2 | libasound2t64"
       ]
     },
     "rpm": {
@@ -109,8 +109,7 @@
         "at-spi2-core",
         "libuuid",
         "libsecret",
-        "alsa-lib",
-        "lsof"
+        "alsa-lib"
       ]
     },
     "dmg": {
@@ -136,6 +135,7 @@
     },
     "files": [
       "main.js",
+      "launch-log.js",
       "gateway-supervisor.js",
       "runtime/gateway/launch-preflight.js",
       "runtime/gateway/port-holders.js",
@@ -179,7 +179,6 @@
       "runtime/update/managed-lane.js",
       "runtime/update/freshness-gate.js",
       "runtime/update/feed-lane.js",
-      "runtime/update/policy-channel.js",
       "update-logger.js",
       "bundle-location.js",
       "gateway-auth-hint.js",
@@ -197,7 +196,6 @@
       "home-dir.js",
       "local-token.js",
       "local-gateway.js",
-      "close-action.js",
       "wsl-detection.js",
       "mochi-session-token.js",
       "window-state.js",
@@ -219,7 +217,6 @@
       "gpu-crash-fallback.js",
       "early-boot-guard.js",
       "memory-watch-log.js",
-      "launch-log.js",
       "frame-load-log.js",
       "pane-asset-journal.js",
       "cage-trace.js",

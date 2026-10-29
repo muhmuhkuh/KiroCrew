@@ -98,7 +98,6 @@ FROZEN_NAMES: tuple[str, ...] = (
     "Iterable",
     "Iterator",
     "Literal",
-    "NATIVE_WINDOWS_HOOK_REFUSAL",
     "Path",
     "PinnedPathRefusal",
     "PlatformCompositionError",

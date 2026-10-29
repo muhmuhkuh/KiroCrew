@@ -10,6 +10,8 @@ probe, the retry budget and the fallback story in ``test_llm_helpers_fallback_re
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -245,7 +247,11 @@ class TestStreamAndCollectUnfinishedTurn:
         self, stop_reason: str
     ) -> None:
         completed: list = []
-        with patch("asyncio.sleep", new_callable=AsyncMock) as slept:
+        slept = AsyncMock()
+        with patch(
+            "kiro_crew.llm_helpers.asyncio",
+            SimpleNamespace(**{**vars(asyncio), "sleep": slept}),
+        ):
             with pytest.raises(AcpTimeoutError) as excinfo:
                 await stream_and_collect(
                     self._provider(stop_reason), "test", on_complete=completed.append

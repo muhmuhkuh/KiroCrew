@@ -39,7 +39,6 @@ from kiro_crew.auth.store import (
     TokenStore,
     TokenStoreError,
 )
-from kiro_crew.auth.whoami import START_URL_EXTRA_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +136,6 @@ class _PendingOidcLogin:
     identity: str
     provider: str
     resolve_profile: bool
-    # The start URL the authorization was begun against, recorded on the stored
-    # token (``KasToken.extra["start_url"]``) so a later ``whoami`` can say WHICH
-    # organisation an Identity Center sign-in belongs to. Configuration, not a
-    # credential.
-    start_url: str = ""
     # Same budget as _PendingLogin.transport_failures, for the SSO-OIDC poll.
     transport_failures: int = 0
 
@@ -241,12 +235,7 @@ class KasLoginService:
         # credential lands (see _persist_and_finish). Kept beside, not inside, the
         # pending entries: it is a property of the request, not of the flow.
         self._replaces: dict[str, str] = {}
-        # login_id -> the store's sign-out generation when that login began. Checked
-        # again before the credential is persisted: a different value means a
-        # sign-out landed meanwhile in SOME process on this host (this gateway or a
-        # `kirocrew kas logout` in a shell), and the credential must not re-fill
-        # the vault that sign-out emptied. The epoch below is the same guard for
-        # this process alone, read without a file.
+        # Cross-process sign-out generation captured when each login begins.
         self._signout_gen: dict[str, str] = {}
         # Bumped by every sign-out. A begin reads it before its first await and
         # hands it to _register_pending, which refuses to register a login that
@@ -401,7 +390,6 @@ class KasLoginService:
                 identity=identity,
                 provider=provider,
                 resolve_profile=resolve_profile,
-                start_url=start_url,
             ),
             user_code=auth.user_code,
             verification_uri_complete=auth.verification_uri_complete,
@@ -600,8 +588,6 @@ class KasLoginService:
         await self._clear_transport_failures(login_id)
         if token is None:
             return {"status": "pending"}
-        if pending.start_url:
-            token.extra[START_URL_EXTRA_KEY] = pending.start_url
         if pending.resolve_profile:
             # An IdC token is unusable without a profile ARN (the store itself drops
             # it), so resolution failures must end the login loudly, not save junk.
@@ -645,16 +631,6 @@ class KasLoginService:
         async with self._lock:
             if login_id not in self._pending:
                 raise UnknownLoginError(login_id)
-            # A sign-out in ANOTHER process (`kirocrew kas logout`, or a second
-            # gateway on this data home) cannot bump this process's epoch, so the
-            # store's own sign-out generation is compared before the write -- and
-            # the compare and the write run under the store-wide sign-out flock,
-            # the same one every sign-out holds across its deletes and its bump,
-            # so a sign-out cannot land between the two. A login begun before that
-            # sign-out does not re-fill the vault it emptied. Terminal for this
-            # login, as an in-process sign-out is; the poll handler answers it as
-            # the same 409 a begin does, so the card ends the sign-in rather than
-            # retrying it on another transport.
             result = await self._save_token(
                 token,
                 begun_gen=self._signout_gen.get(login_id, ""),
@@ -664,41 +640,19 @@ class KasLoginService:
                 entry = self._drop_records(login_id)
                 if entry is not None:
                     _release(entry)
-                logger.info(
-                    "login %s not persisted: a sign-out landed while it was pending", login_id
-                )
+                logger.info("KAS login was not persisted because sign-out occurred while pending")
                 return result
             self._drop_records(login_id)
         return result
 
     async def _save_token(
-        self, token: KasToken, *, begun_gen: str | None = None, replaces: str = ""
+        self, token: KasToken, *, begun_gen: str, replaces: str = ""
     ) -> dict[str, Any]:
         """Write an approved token to the store and shape the poll's terminal answer.
 
-        Takes no asyncio lock, so ``_persist_and_finish`` can run it while holding
-        ``self._lock`` to keep the login cancellable until the write lands. With
-        *begun_gen* (the sign-out generation the login began under) the write runs
-        under the store's sign-out flock and is skipped -- answering
-        ``signed_out_during_login`` -- when the generation has moved: that is the
-        cross-process half of the sign-out guard (``TokenStore.signout_generation``).
-
-        *replaces* names an explicit account switch. The store resolves by fixed
-        slot priority (external_idp > builder_id > identity_center > social), not
-        by recency, so ANY other stored slot that outranks the new one -- the one
-        the user named, or one they had forgotten about -- would leave the agents
-        on a different account while the card claimed the switch happened. A
-        switch therefore means "this is the one account": every other slot is
-        removed, only after the new credential is on disk (so a failed sign-in
-        never leaves the vault empty) and INSIDE the same flock as the save, so a
-        second login finishing in another process (the shell verb beside the
-        dashboard) cannot interleave its own save and deletes with these and
-        leave the vault holding neither credential. The delete is unconditional
-        (a no-op on an empty slot): ``load`` only decides what to REPORT as
-        replaced, never whether to delete, because a slot whose read failed
-        transiently is exactly the one that would otherwise survive and resolve
-        later. A removal that fails is reported, not hidden: the re-read status
-        will still show the account that won, and Sign out clears it by hand.
+        The generation compare, token write and any account-switch deletions share
+        the store-wide sign-out lock, so another process cannot sign out between
+        the compare and write.
         """
 
         def _locked_save() -> tuple[bool, list[str], bool]:
@@ -708,7 +662,7 @@ class KasLoginService:
 
             def _compare_save_replace() -> None:
                 nonlocal saved, failed
-                if begun_gen is not None and self._store.signout_generation() != begun_gen:
+                if self._store.signout_generation() != begun_gen:
                     return
                 self._store.save(token)
                 saved = True
@@ -907,13 +861,9 @@ class KasLoginService:
             self._pending.clear()
             self._replaces.clear()
             self._signout_gen.clear()
-            # Released BEFORE the store is touched: a delete that raises must not
-            # leave a loopback listener holding its port with no entry left to
-            # find it by.
             for entry in entries:
                 _release(entry)
-            # An unknown kind raises before any write -- checked here against the
-            # store's own list, with no filesystem call on the serving loop.
+            # The named slot first: an unknown kind raises before any write.
             if identity not in KNOWN_IDENTITIES:
                 raise ValueError(f"unknown identity kind: {identity!r}")
 
@@ -922,11 +872,6 @@ class KasLoginService:
                 for other in KNOWN_IDENTITIES:
                     if other != identity:
                         self._store.delete(other)
-                # Then tell every OTHER process on this host: a login pending in
-                # the gateway while this runs in a shell (or the reverse) compares
-                # this before it persists, and refuses. Deletes and bump sit under
-                # one sign-out flock with that compare-and-save, so no login can
-                # slip a write between them.
                 self._store.bump_signout_generation()
 
             await asyncio.to_thread(self._store.with_signout_lock, _delete_all_and_bump)
@@ -936,13 +881,7 @@ class KasLoginService:
                 raise TokenStoreError("a stored Kiro identity survived sign-out")
 
     def _drop_records(self, login_id: str) -> _PendingKind | None:
-        """Remove every per-login record (caller holds ``self._lock``); returns the entry.
-
-        The three tables are keyed by one id and must leave together: a login that
-        drops out of ``_pending`` but keeps its ``_signout_gen`` row is never swept
-        again (the eviction in ``_register_pending`` walks ``_pending`` only) and
-        the table grows by one row per abandoned login.
-        """
+        """Remove all state for one login; the caller holds ``self._lock``."""
         entry = self._pending.pop(login_id, None)
         self._replaces.pop(login_id, None)
         self._signout_gen.pop(login_id, None)

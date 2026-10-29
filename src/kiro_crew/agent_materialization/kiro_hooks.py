@@ -1246,17 +1246,12 @@ def _user_kiro_hooks_locked() -> bool:
 
 
 def _drop_refused_kiro_hook_events(hooks: dict) -> dict:
-    """*hooks* without the events the policy's ``script_hooks`` events list refuses.
-
-    Enterprise builds only, for the reason :func:`_user_kiro_hooks_locked` gives;
-    an ``oss`` build returns *hooks* without asking. kiro-cli spells an event
-    ``preToolUse`` where a policy writes ``PreToolUse``; the identifier matcher is
-    case-insensitive, so one list covers both. An unreadable answer drops the event.
-    """
+    """Remove user kiro hooks whose events the enterprise policy refuses."""
     from kiro_crew.edition_locks import locked_off
 
     if not locked_off():
         return hooks
+
     from kiro_crew.hook_event_governance import event_refusal
     from kiro_crew.platform.governance_profiles import HOST_SESSION_KEY
 
@@ -1269,8 +1264,6 @@ def _drop_refused_kiro_hook_events(hooks: dict) -> dict:
         if reason is None:
             kept[event] = entries
             continue
-        # Event keys come from config before event-name validation, so both values
-        # go through the same diagnostic scrub as the neighbouring rejections.
         agent_mod.logger.info(
             "kiro_hooks[%s]: not installed: %s",
             agent_mod._hook_diagnostic(event),

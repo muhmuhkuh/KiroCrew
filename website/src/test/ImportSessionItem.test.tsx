@@ -449,9 +449,8 @@ describe('ImportSessionItem', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Open' }))
     // A later click, not the create race: a session that fails to load by
-    // then must be explained, so the switch announces. The click is the user
-    // opening the session, so it is a gesture too.
-    expect(switched).toEqual([{ key: 'imported-1', announceOnMissing: true, gesture: true }])
+    // then must be explained, so the switch announces.
+    expect(switched).toEqual([{ key: 'imported-1', announceOnMissing: true }])
     expect(folderOpens).toEqual([{ key: 'imported-1', folder_id: 'f-imported' }])
     expect(screen.queryByText('Imported: chat (from mac)')).not.toBeInTheDocument()
   })
@@ -480,7 +479,7 @@ describe('ImportSessionItem', () => {
     expect(screen.getByTestId('where')).toHaveTextContent('/settings/overview')
     await userEvent.click(screen.getByRole('button', { name: 'Open' }))
     expect(screen.getByTestId('where')).toHaveTextContent('/chat')
-    expect(switched).toEqual([{ key: 'imported-1', announceOnMissing: true, gesture: true }])
+    expect(switched).toEqual([{ key: 'imported-1', announceOnMissing: true }])
     expect(folderOpens).toEqual([{ key: 'imported-1', folder_id: 'f-imported' }])
   })
 

@@ -448,9 +448,8 @@ def pooled_session_servers(
             # Not a broker stub: leave it to the agent spec entirely.
             continue
         if is_unpoolable(str(name)):
-            # Never pooled (a credential vendor), even if an overlay written
-            # before it was listed still holds its stub: the session resolves it
-            # from the agent spec, inside its own sandbox.
+            # An old overlay may still carry a vendor stub; let its session-local
+            # agent-spec entry provide the backend inside the chat sandbox.
             continue
         if exempt is not None and str(name) not in exempt:
             # Registry ceiling (:func:`_registry_ceiling_exemptions`): withheld,
@@ -505,7 +504,6 @@ def injection_server_names(
         for name, entry in servers.items()
         if isinstance(entry, dict)
         and (entry.get(_WRAPPER_MARKER) or entry.get(_WRAPPER_MARKER_LEGACY))
-        # Same skips as pooled_session_servers: naming a server that is not
-        # injected would withhold the spec's only copy of it.
-        and not is_unpoolable(str(name)) and (exempt is None or str(name) in exempt)
+        and not is_unpoolable(str(name))
+        and (exempt is None or str(name) in exempt)
     )

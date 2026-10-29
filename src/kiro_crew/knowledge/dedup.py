@@ -184,10 +184,7 @@ def normalize_filename(name: str) -> str:
     Dates are stripped (not placeheld) so the stem captures only the title; the
     date itself is compared separately by _dates_compatible.
     """
-    # A Windows local_folder source stores file_path as a backslash OS path, so
-    # normalise the separator before taking the basename, or the folder prefix
-    # survives into the stem and two copies of one note never collapse.
-    stem = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = name.rsplit("/", 1)[-1]
     if "." in stem:
         stem = stem.rsplit(".", 1)[0]
     stem = stem.lower()
@@ -203,11 +200,7 @@ def _extract_dates(name: str) -> list[tuple[int | None, int, int | None]]:
     Used ONLY to block a fuzzy filename match when two otherwise-similar names
     carry materially different dates; it can never create a new match.
     """
-    # Normalise a Windows backslash OS path to the basename first (see
-    # normalize_filename), or a date in a folder NAME would be read as the
-    # file's date and wrongly block (or, with a shared folder date, wrongly
-    # allow) a fuzzy collapse.
-    stem = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = name.rsplit("/", 1)[-1]
     out: list[tuple[int | None, int, int | None]] = []
 
     iso_spans: list[tuple[int, int]] = []
@@ -536,9 +529,7 @@ DEFAULT_FORMAT_RANK = 60
 
 def _file_ext(name: str) -> str:
     """Lowercased filename extension without the dot ('' if the name has none)."""
-    # Normalise a Windows backslash OS path to the basename first (see
-    # normalize_filename), so a '.' in a folder name is not read as an extension.
-    stem = name.replace("\\", "/").rsplit("/", 1)[-1]
+    stem = name.rsplit("/", 1)[-1]
     if "." not in stem:
         return ""
     return stem.rsplit(".", 1)[-1].lower()

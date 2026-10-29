@@ -29,6 +29,7 @@ const themeState = {
   crewmatesFlowSeen: true,
   themeBootReady: true,
   themes: [],
+  allThemes: [],
   markOnboarded: vi.fn(),
   markImportOnboarded: vi.fn(),
   markPrivacyAcked: vi.fn(),

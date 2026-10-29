@@ -165,7 +165,6 @@ from kiro_crew.dashboard.chat_api.prompt_queue import (  # noqa: F401
     api_chat_slot_queue_cancel,
     api_chat_slot_queue_edit,
     api_chat_slot_queue_reorder,
-    api_chat_slot_steer_retract,
 )
 from kiro_crew.dashboard.chat_api.resume import (  # noqa: F401
     _hydrate_slot_from_history,
@@ -181,6 +180,7 @@ from kiro_crew.dashboard.chat_api.resume import (  # noqa: F401
     resume_slot_from_history,
 )
 from kiro_crew.dashboard.chat_api.session_relaunch import (  # noqa: F401
+    _resolve_project_directory,
     api_chat_slot_project,
     api_chat_slot_reload,
     api_chat_slot_workspace,
@@ -247,7 +247,6 @@ from kiro_crew.dashboard.chat_api.slot_guards import (  # noqa: F401
 from kiro_crew.dashboard.chat_api.slot_lifecycle import (  # noqa: F401
     _await_guarded_history_write,
     _close_slot,
-    _drain_file_changes_flush,
     _NudgeRetireFailed,
     _pending_guarded_history_writes,
     _release_closed_execution,
@@ -367,6 +366,7 @@ from kiro_crew.dashboard.chat_runner import (  # noqa: F401
     schedule_eager_spawn,
     subagents_hold_user_messages,
 )
+from kiro_crew.dashboard import chat_runner as _chat_runner
 from kiro_crew.dashboard.chat_slack import maybe_auto_link_slack, slot_is_live  # noqa: F401
 from kiro_crew.dashboard.chat_summary import (  # noqa: F401
     generate_session_summary,
@@ -447,7 +447,6 @@ from kiro_crew.dashboard.slot_buffers import (  # noqa: F401
     note_hold_durable,
     persist_deferred_notes_sync,
 )
-from kiro_crew.dashboard.slot_color import write_slot_color  # noqa: F401
 from kiro_crew.dashboard.slot_ownership import (  # noqa: F401
     SESSION_CONTROL_DENIED,
     app_may_control_session,
@@ -913,14 +912,6 @@ class SlotCloseError(Exception):
 # while a worker thread is still on its way to the rename.
 _GUARDED_WRITE_WAIT_SECS = 5.0
 
-#: Seconds a close waits for the turn's in-flight file-change flush before it
-#: archives without the chips. The loop watchdog
-#: (``dashboard.loop_stall_exit_after_secs``, 25 s) is the bound the same read
-#: had when it ran ON the event loop: past it the whole gateway was killed, so a
-#: read this long never produced chips there either. Here only this close waits,
-#: and past the bound it goes on to archive what the window holds.
-_FILE_CHANGES_DRAIN_SECS = 25.0
-
 
 # Serializes slot SWITCH transactions that share one session, keyed by
 # ``effective_session_key``. The per-slot locks the switch handlers take
@@ -968,6 +959,92 @@ _FILE_CHANGES_DRAIN_SECS = 25.0
 # the runner cannot import it from here without a cycle. The local name is
 # kept for the acquisition sites below.
 _slot_switch_session_lock = slot_switch_session_lock
+
+
+async def api_chat_slot_backend(request: web.Request) -> web.Response:
+    """POST /api/chat/slots/{slot}/backend — nullable, chat-local harness override."""
+    from kiro_crew.agent_sdk.backends import selectable_backends
+    from kiro_crew.dashboard.chat_backend import backend_selection_supported
+
+    state: DashboardState = request.app["state"]
+    slot = state._slots.get(request.match_info["slot"])
+    if slot is None:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    denied = deny_app_slot_access(request.get("app", ""), slot, slot.key, "slot_backend")
+    if denied is not None:
+        return denied
+    body, error = await read_bounded_json(request)
+    if error is not None:
+        return error
+    assert body is not None
+    backend = body.get("acp_backend")
+    if "acp_backend" not in body or (
+        backend is not None
+        and (not isinstance(backend, str) or backend not in selectable_backends())
+    ):
+        return web.json_response(
+            {"error": "invalid backend", "code": "invalid_backend"}, status=400
+        )
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    async with contextlib.AsyncExitStack() as stack:
+        await stack.enter_async_context(slot._lock)
+        if not backend_selection_supported(slot):
+            return web.json_response(
+                {
+                    "error": "backend selection is unavailable for managed chats",
+                    "code": "backend_managed",
+                },
+                status=409,
+            )
+        key = effective_session_key(slot)
+        await stack.enter_async_context(_slot_switch_session_lock(key))
+        await stack.enter_async_context(slot._model_pick_lock)
+        target = cfg.agent.acp_backend if backend is None else backend
+        if target not in selectable_backends():
+            return web.json_response(
+                {"error": "backend is not selectable", "code": "backend_not_selectable"},
+                status=400,
+            )
+        provider = state.sessions.get_provider(key)
+        resident_backend = getattr(getattr(provider, "client", None), "backend", None)
+        previous = cfg.agent.acp_backend if slot.acp_backend is None else slot.acp_backend
+        changed = (
+            target != previous
+            or (slot.model_backend is not None and slot.model_backend != target)
+            or (isinstance(resident_backend, str) and resident_backend != target)
+        )
+        if slot.acp_backend == backend and not changed:
+            return web.json_response({"ok": True, "acp_backend": backend, "model": slot.model})
+        eager = slot._eager_spawn_task
+        if (
+            _switch_target_busy(state, slot, key, provider)
+            or slot._queue
+            or (eager is not None and not eager.done())
+        ):
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
+        attached = await _subagents_attached_response(state, slot, key, "slot_backend")
+        if attached is not None:
+            return attached
+        if changed:
+            reset = await _reset_slot_session(state, slot, key, skip_if_busy=True)
+            if not reset and state.sessions.get_provider(key) is not None:
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
+            slot.model = "auto"
+            slot._model_pick_gen += 1
+            slot.forget_session_model_state()
+            slot.reasoning_effort = ""
+            getattr(_chat_runner, "_clear_fallback_sticky_state")(slot, provider)
+            _broadcast_context_reset(state, slot.key, None)
+        slot.acp_backend = backend
+        slot.model_backend = target
+        slot._dirty = True
+        await save_slot_off_loop(state, slot, force=True, best_effort=False)
+        state.push_slots_update()
+    return web.json_response({"ok": True, "acp_backend": backend, "model": slot.model})
 
 
 #: The chat picker's "Auto (Jev)" entry, as the id a client sends for it. NOT a

@@ -197,6 +197,7 @@ class TestCommentStore:
         )
         store.add_comment("test-art", c)
 
+        # Read raw file
         path = store.root / "test-art" / "comments.json"
         assert path.exists()
         raw = json.loads(path.read_text(encoding="utf-8"))

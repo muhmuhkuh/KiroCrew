@@ -224,6 +224,7 @@ class TestUpdateAutoSkill:
 
     def test_updates_auto_skill(self, tmp_path):
         loader = SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False)
+        # Create then refine
         loader.create_auto_skill(
             "refine-me",
             description="original desc",
@@ -291,7 +292,7 @@ class TestListAutoSkills:
 
 
 class TestUpdateAutoSkillPreservesCreatedAt:
-    """Refine must not clobber created_at."""
+    """Regression test for #5: refine must not clobber created_at."""
 
     def test_created_at_preserved_across_refine(self, tmp_path):
         from kiro_crew.skills import AutoSkillProvenance

@@ -6,13 +6,17 @@ import { createSlice, createAsyncThunk, createSelector, type PayloadAction } fro
 import { api } from '../api/client'
 import { streamFlush } from './streamFlush'
 import { ApiError } from '../api/apiError'
-import { isUnsafeKey } from '../utils/sanitize'
+import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import { bumpLastTsOverlay, dropCaughtUpLastTs, pruneLastTsOverlay, slotLastTsOf } from './slotLastTs'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { slotListHoldTest } from '../utils/slotListHold'
 import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
+
+export interface SubagentDetail {
+  id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
+}
 
 /** A close tombstone entry (see `applySlots`). */
 interface CloseHold {
@@ -167,9 +171,6 @@ export interface DashboardState {
   approvalMode: string
   channelTrusted: boolean
   refreshTrigger: number
-  /** Bumped when the cron caches are re-read (see `invalidateRefreshQueries`):
-   *  what the Schedule page reloads its job list on. */
-  cronRefreshTrigger: number
   unreadSlots: string[]
   /** Watermarks for relayed clears: slot -> newest message ts that marked it
    *  unread. A cross-window `slot_read` clears the badge only when its read
@@ -211,6 +212,9 @@ export interface DashboardState {
   // downloaded). Drives the Settings nav dot + the About tab dot. Mirrored
   // from the Electron update-state events by useUpdateSubscription.
   desktopUpdateAvailable: boolean
+  subagentRunning: Record<string, number>
+  subagentDetails: Record<string, SubagentDetail[]>
+  subagentText: Record<string, Record<string, string>>
   sessionDefaultColor: DefaultColorSetting
   sessionColorsMode: SessionColorMode
   sessionColorsPalette: PaletteName
@@ -251,7 +255,6 @@ const initialState: DashboardState = {
   approvalMode: 'normal',
   channelTrusted: false,
   refreshTrigger: 0,
-  cronRefreshTrigger: 0,
   ...(() => { const since = restoreUnreadSince(); return { unreadSlots: restoreUnreadBadges(since), unreadSince: since } })(),
   unreadDrainHeld: true,
   slotsListPartial: false,
@@ -261,6 +264,9 @@ const initialState: DashboardState = {
   slotsFetchFailed: false,
   updateProgress: null,
   desktopUpdateAvailable: false,
+  subagentRunning: {},
+  subagentDetails: {},
+  subagentText: {},
   sessionDefaultColor: (() => { try { return (JSON.parse(localStorage.getItem('mc-session-default-color') ?? 'null') as DefaultColorSetting) ?? null } catch { return null } })(),
   sessionColorsMode: safeGet('mc-session-colors-mode', 'tint') as SessionColorMode,
   sessionColorsPalette: safeGet('mc-session-colors-palette', 'horizon') as PaletteName,
@@ -310,6 +316,17 @@ export const changeApprovalMode = createAsyncThunk<
   },
 )
 
+/** Drop one slot's live sub-agent state.
+ *
+ *  These three maps are keyed by the bare slot key and are otherwise cleared
+ *  only wholesale on reconnect, so a departed slot's counters and rows would
+ *  otherwise survive for the tab's lifetime.
+ *
+ *  Driven by the AUTHORITATIVE slot-list writers — `sseSlots` and
+ *  `fetchSlots.fulfilled` — and deliberately NOT by `removeSlotOptimistic`: that
+ *  reducer runs before the delete is confirmed, and `sseSubagentText` drops every
+ *  frame for a slot with no `subagentRunning` entry, so evicting optimistically
+ *  would leave a slot whose delete failed alive but permanently mute. */
 /** Reconcile per-slot dashboard state against an authoritative slot list. Both
  *  authoritative writers (`sseSlots`, `fetchSlots.fulfilled`) drive teardown
  *  through here, so the two cannot drift apart the way the eviction lists this
@@ -341,7 +358,10 @@ const reconcileSlots = (
   // frames that arrived while it travelled, and would then delete a slot the
   // stream has since created.
   if (!evictStale) return
-  // A write stamp for a key the authoritative list has
+  for (const key of Object.keys(state.subagentRunning ?? {})) {
+    if (!liveKeys.has(key)) evictSlotSubagents(state, key)
+  }
+  // Same guard, same reason: a write stamp for a key the authoritative list has
   // dropped protects nothing, and keeping it would let the record grow for the
   // tab's lifetime. Pruned only when the caller vouches for the list, so an HTTP
   // reply that merely predates a newly created slot cannot strip its protection.
@@ -352,6 +372,12 @@ const reconcileSlots = (
     if (!liveKeys.has(slotKeyOfStamp(stamped))) delete state.slotMemberAt[stamped]
   }
   pruneLastTsOverlay(state, liveKeys)
+}
+
+const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
+  delete state.subagentRunning[slotKey]
+  delete state.subagentDetails[slotKey]
+  delete state.subagentText[slotKey]
 }
 
 /** Apply an authoritative slot list, reusing the object identity of every row
@@ -1037,6 +1063,9 @@ const dashboardSlice = createSlice({
       state.slotsListPartial = false
       state.slotsHeldKeys = []
       state.slotsHoldChannels = false
+      state.subagentRunning = {}
+      state.subagentDetails = {}
+      state.subagentText = {}
       relayUnreadIfHolding(state, hadUnreadRelayHold)
     },
     sseDisconnected(state) { state.connected = false; state.unreadDrainHeld = true },
@@ -1464,7 +1493,6 @@ const dashboardSlice = createSlice({
     setPendingManualOrder(state, action: PayloadAction<string[] | null>) { state.pendingManualOrder = action.payload },
     setManualOrderError(state, action: PayloadAction<string>) { state.manualOrderError = action.payload },
     triggerRefresh(state) { state.refreshTrigger += 1 },
-    triggerCronRefresh(state) { state.cronRefreshTrigger += 1 },
     /** DUAL PAYLOAD SHAPE — the form IS the semantics. String payload =
      *  MANUAL reminder: records the relay-immune sentinel; only a local read
      *  in this window clears it. Object payload `{slot, ts?}` = message
@@ -1584,6 +1612,36 @@ const dashboardSlice = createSlice({
     },
     setDesktopUpdateAvailable(state, action: PayloadAction<boolean>) {
       state.desktopUpdateAvailable = action.payload
+    },
+    sseSubagentStatus(state, action: PayloadAction<{ running: number; slot: string; agents?: SubagentDetail[] }>) {
+      const { slot, running, agents } = action.payload
+      // `slot` is an untrusted key from the SSE payload; __proto__/constructor/
+      // prototype would write through Object.prototype in the else-branch below.
+      if (!slot || isUnsafeKey(slot)) return
+      if (running <= 0) {
+        evictSlotSubagents(state, slot)
+      } else {
+        state.subagentRunning[slot] = running
+        if (agents) state.subagentDetails[slot] = agents.map(a => ({
+          ...a,
+          agent: sanitizeLlmOutput(a.agent || ''),
+          last_tool: sanitizeLlmOutput(a.last_tool || ''),
+          task: sanitizeLlmOutput(a.task || ''),
+        }))
+      }
+    },
+    sseSubagentText(state, action: PayloadAction<{ slot: string; id: string; text: string }>) {
+      const { slot, id, text } = action.payload
+      // Both `slot` and `id` are untrusted keys from the SSE payload. A value of
+      // __proto__/constructor/prototype would pollute Object.prototype via the
+      // `state.subagentText[slot][id] = ...` assignment below — and the
+      // `subagentRunning[slot]` check does NOT stop `slot="__proto__"` because
+      // it resolves truthily through the prototype chain. Guard both keys.
+      if (isUnsafeKey(slot) || isUnsafeKey(id)) return
+      if (!slot || !state.subagentRunning[slot]) return
+      if (!state.subagentText[slot]) state.subagentText[slot] = {}
+      const cur = (state.subagentText[slot][id] || '') + sanitizeLlmOutput(text)
+      state.subagentText[slot][id] = cur.length > 4096 ? cur.slice(-4096) : cur
     },
     sseSlotColor(state, action: PayloadAction<{ key: string; color_index?: number | null; color_hex?: string | null }>) {
       patchSlotRow(state, action.payload.key, slot => {
@@ -1848,8 +1906,8 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, sseSlotsPartial, sseSlotListHolds, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, triggerCronRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
-  setDesktopUpdateAvailable, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError, setManualRanks, setPendingManualOrder, setManualOrderError } = dashboardSlice.actions
+export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, sseSlotsPartial, sseSlotListHolds, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
+  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError, setManualRanks, setPendingManualOrder, setManualOrderError } = dashboardSlice.actions
 
 export { slotSurfaceKey, slotIsRemoteBound } from './slotIdentity'
 
@@ -1933,10 +1991,3 @@ export const selectSlotListPending = (state: { dashboard: DashboardState }): boo
 }
 
 export default dashboardSlice.reducer
-
-/** True when the local bundled gateway's policy provider governs this install.
- * Shared by `usePolicyGovernedNotification`, `UpdateFoundModal`, `AboutPanel`. */
-export function selectPolicyGoverned(s: { dashboard: DashboardState }): boolean {
-  const st = s.dashboard.status
-  return st?.update_bundled_by_app === true && st?.update_managed_by === 'command' && st?.update_can_apply === true
-}

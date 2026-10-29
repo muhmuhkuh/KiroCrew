@@ -11,7 +11,6 @@ one reads, imports and patches as ``kiro_crew.work_ledger.<name>``.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -19,7 +18,6 @@ from typing import Any
 from kiro_crew.work_vocab import (
     WORK_BLOCKED_REASONS,
     WORK_ITEM_STATES,
-    WORK_MAX_DEPTH_DEFAULT,
     WORK_STORED_ITEM_LIMIT,
     WORK_VERDICTS,
     WORK_WORKER_STATUSES,
@@ -84,16 +82,10 @@ ACCEPTANCE_PLACEHOLDERS: frozenset[str] = frozenset({"tbd", ""})
 #: A test derives this map's keys from the script's own dispatch and fails on drift.
 ACCEPTANCE_READ_FIELDS: dict[str, tuple[str, ...]] = {
     "pr_checks": ("pr", "repo"),
-    "pr_merged": ("pr", "repo"),
     "file": ("path", "exists"),
     "human_approval": (),
     "cmd": (),
 }
-
-#: ``accept_eval.py``'s own ``pr_merged`` ``repo`` pattern, mirrored so a bar it can
-#: only answer ``error`` to is not called concrete. Applied with ``fullmatch``, as
-#: there. A test pins the two equal.
-ACCEPTANCE_GH_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}")
 
 #: The ``kind`` values that script dispatches on at all. Anything else is an error-only
 #: spec (its closing ``return ("error", f"unknown accept kind ...")``), so it is not
@@ -159,24 +151,18 @@ DEFAULT_GOAL_ITEM_CAP = 20
 #: The highest ``item_cap`` a goal write accepts.
 MAX_GOAL_ITEM_CAP = WORK_STORED_ITEM_LIMIT
 MAX_EVENTS_PER_ITEM = 200
-#: How many levels may CONDUCT: the root at depth 0 and the conductors below it, up
-#: to but not including depth :data:`MAX_DEPTH`. Depth ``MAX_DEPTH`` itself is the
-#: first level that may only work -- it may neither open a ledger nor create an item
-#: -- so a conductor dispatched by the last conducting level is refused at its first
-#: ledger call (:func:`child_depth` denies the open), before any ledger exists for it.
-#: ``MAX_DEPTH`` is the DEFAULT of the cap, two levels: root at depth 0 and one
-#: conductor at depth 1. Two rather than three because each level multiplies
-#: sessions -- three levels of three items is twenty-seven -- and because a summary
-#: of summaries of summaries is not evidence any more; that number is a guess
-#: informed by session multiplication, not a measurement (RFC Q5).
-#:
-#: The cap in force is :func:`work_ledger_rules.max_depth`: this default, or the
-#: ``work_ledger.max_depth`` config key, kept inside
-#: ``[WORK_MAX_DEPTH_MIN, WORK_MAX_DEPTH_MAX]`` (the bounds live in ``work_vocab``). Read ONLY through :func:`may_conduct`,
-#: which every depth guard asks, so the level a dispatch admits, the level a ledger
-#: may open at and the level that may create an item are one level and cannot drift
-#: apart.
-MAX_DEPTH = WORK_MAX_DEPTH_DEFAULT
+#: How many levels may CONDUCT: the root at depth 0 and the one conductor it may
+#: dispatch at depth 1. Depth ``MAX_DEPTH`` itself is the first level that may
+#: only work -- it may neither open a ledger nor create an item -- so a conductor
+#: dispatched by a depth-1 conductor is refused at its first ledger call
+#: (:func:`child_depth` denies the open), before any ledger exists for it. Two levels rather
+#: than three because each level multiplies sessions -- three levels of three items
+#: is twenty-seven -- and because a summary of summaries of summaries is not
+#: evidence any more; that number is a guess informed by session multiplication,
+#: not a measurement (RFC Q5). Read ONLY through :func:`may_conduct`, which every
+#: depth guard asks, so the level a dispatch admits, the level a ledger may open at
+#: and the level that may create an item are one level and cannot drift apart.
+MAX_DEPTH = 2
 
 MAX_GOAL_CHARS = 2000
 MAX_TITLE_CHARS = 200

@@ -34,11 +34,11 @@ export function useChatPaneStop({ slotKey, busy, paneSlot, dispatch }: {
     // fetch", "NetworkError…", "Load failed"): it is ambiguous, so it is `lost`.
     return /fetch|network|load failed/i.test(failure.error)
       ? { kind: 'lost' }
-      : { kind: 'refused', ...failure }
+      : { kind: 'refused', error: failure.error }
   }, [dispatch, slotKey])
-  const { stopState: paneStopState, onStop, stopError, stopErrorDetail, dismissStopError } =
+  const { stopState: paneStopState, onStop, stopError, dismissStopError } =
     useStopPress({ slotKey, busy, serverStopState: paneSlot?.stop_state, sendStop })
-  return { stopError, stopErrorDetail, dismissStopError, paneStopState, onStop }
+  return { stopError, dismissStopError, paneStopState, onStop }
 }
 
 export function useChatPaneRunSync({ slotKey, paneSlot, dispatch }: {

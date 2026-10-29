@@ -609,6 +609,7 @@ class TestPoolEffortPostClaim:
         cfg.session.timeout_secs = 3600
         cfg.agent.default_agent = ""
         cfg.agent.model = "auto"
+        cfg.agent.acp_backend = ""
 
         pooled = MagicMock(spec=AcpProvider)
         pooled.client = MagicMock()
@@ -648,6 +649,7 @@ class TestPoolEffortPostClaim:
         cfg.session.timeout_secs = 3600
         cfg.agent.default_agent = ""
         cfg.agent.model = "auto"
+        cfg.agent.acp_backend = ""
 
         pooled = MagicMock(spec=AcpProvider)
         pooled.client = MagicMock()
@@ -692,6 +694,7 @@ class TestPoolEffortPostClaim:
         cfg.session.timeout_secs = 3600
         cfg.agent.default_agent = ""
         cfg.agent.model = "auto"
+        cfg.agent.acp_backend = ""
 
         pooled = MagicMock(spec=AcpProvider)
         pooled.client = MagicMock()

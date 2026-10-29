@@ -5,7 +5,6 @@ import { useAppSelector } from '../store'
 import ChatPage from './ChatPage'
 
 import { i18nT } from '../i18n/t'
-import { slotRowByKey } from '../store/slotIndex'
 
 /**
  * The window shell for a popped-out chat session (`/popout/chat/:slug?sid=…`).
@@ -21,7 +20,7 @@ import { slotRowByKey } from '../store/slotIndex'
 export default function PopoutFrame() {
   const [params] = useSearchParams()
   const sid = params.get('sid') || params.get('slot') || ''
-  const title = useAppSelector(s => slotRowByKey(s.dashboard.slots, sid)?.title)
+  const title = useAppSelector(s => s.dashboard.slots.find(x => x.key === sid)?.title)
 
   // Announce presence for `sid` and wire the heartbeat/control responder.
   useEffect(() => {

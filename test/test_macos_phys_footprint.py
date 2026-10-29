@@ -27,10 +27,6 @@ import pytest
 from kiro_crew import platform_compat as pc
 from kiro_crew.acp import runtime as rt
 
-# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
-# so the shared macOS handle caches are put back after each one (see conftest.py).
-pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
-
 # --------------------------------------------------------------------------- #
 # The reader
 # --------------------------------------------------------------------------- #
@@ -79,6 +75,8 @@ class TestFootprintReader:
         lib = types.SimpleNamespace(proc_pidinfo=lambda *a: 0)
         monkeypatch.setattr(pc.ctypes.util, "find_library", lambda _n: "libproc.dylib")
         monkeypatch.setattr(pc.ctypes, "CDLL", lambda _p: lib)
+        monkeypatch.setattr(pc, "_darwin_libproc", None)
+        monkeypatch.setattr(pc, "_darwin_libproc_loaded", False)
 
         assert pc._darwin_libproc_handle() is lib
         assert pc._darwin_process_phys_footprint_bytes(4242) is None

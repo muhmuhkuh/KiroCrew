@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 /**
@@ -16,28 +16,14 @@ import { resolve } from 'node:path'
  * real rendering against that live registry; the layout itself is measured in a
  * real browser by the matching capture runner.
  */
-const SURFACE = 'src/pages/ChatPage.tsx'
-
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-function surfaces(): string[] {
-  const pages = resolve(__dirname, '..', 'pages')
-  const owners = resolve(pages, 'chat', 'page')
-  return [
-    SURFACE,
-    ...readdirSync(owners).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => `src/pages/chat/page/${f}`),
-    ...readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => `src/pages/${f}`),
-  ]
-}
+const SURFACE = 'src/pages/chat/page/transcriptRendering.tsx'
 
 /** The inject row is the only warn-tinted bubble, so this identifies it. */
 const MARKER = 'bg-warn-subtle'
 
 /** Collapse whitespace so a reflow across lines cannot hide a match. */
-function flat(paths: readonly string[]): string {
-  return paths.map(path => readFileSync(resolve(__dirname, '..', '..', path), 'utf8')).join('\n').replace(/\s+/g, ' ')
+function flat(path: string): string {
+  return readFileSync(resolve(__dirname, '..', '..', path), 'utf8').replace(/\s+/g, ' ')
 }
 
 function markerClassNames(src: string): string[] {
@@ -47,7 +33,7 @@ function markerClassNames(src: string): string[] {
 }
 
 describe('inject bubble: markdown layout is not subject to preserved whitespace', () => {
-  const src = flat(surfaces())
+  const src = flat(SURFACE)
   const classNames = markerClassNames(src)
 
   // Positive control: without it the assertions below pass vacuously once the

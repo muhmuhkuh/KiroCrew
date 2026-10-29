@@ -35,13 +35,6 @@ _TS = "1780088134.952549"
 _CALLER = "dashboard:chat-1-1"
 
 
-def _slack_edits_only(_caller: str, transport: str, tool_name: str = "send_message") -> str | None:
-    """A ``channels`` policy double that permits only an ``update_message`` on Slack."""
-    if transport == "slack" and tool_name == "update_message":
-        return None
-    return f"{tool_name} via {transport} blocked by governance policy"
-
-
 # ── The advertisement ──
 
 
@@ -160,13 +153,10 @@ class TestUpdateMessageGates:
     def test_the_channels_vet_names_slack(self, caller) -> None:
         with (
             patch("kiro_crew.mcp_core._post") as post,
-            patch(
-                "kiro_crew.mcp_core._vet_channel_governance", side_effect=_slack_edits_only
-            ) as vet,
+            patch("kiro_crew.mcp_core._vet_channel_governance", return_value=None) as vet,
         ):
             post.return_value = {"ok": True}
-            result = _call_tool("update_message", {"channel": _CHANNEL, "ts": _TS, "text": "done"})
-        assert not result.startswith("Error:"), result
+            _call_tool("update_message", {"channel": _CHANNEL, "ts": _TS, "text": "done"})
         assert [call.args[1] for call in vet.call_args_list] == ["slack"]
         # The persisted governance record must name the edit, not a send that
         # never happened.

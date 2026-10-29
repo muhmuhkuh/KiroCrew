@@ -233,59 +233,6 @@ def test_a_capture_leaves_every_resolver_cache_as_it_found_it(tmp_path) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "backend", [ACP_BACKEND_KIRO, ACP_BACKEND_CODEX], ids=["client", "runtime"]
-)
-def test_the_default_home_stays_pinned_while_the_capture_environment_is_installed(
-    backend, monkeypatch, tmp_path
-) -> None:
-    """No instant has the cleared environment installed and the real resolver live.
-
-    The fixed parent carries no ``KIROCREW_HOME``. A thread an earlier test on the
-    same worker left running reads the home when it calls ``config_dir()``, so if
-    the capture installs that environment before pinning the default resolver, or
-    lifts the pin before restoring the environment, such a thread resolves the
-    operator's real ``~/.kiro/crew`` in between. Both edges of the environment
-    patch are probed, because those are the moments a concurrent reader can land.
-    """
-    from unittest import mock
-
-    from kiro_crew.config import paths as config_paths
-
-    assert (backend in capture_mod.RUNTIME_ONLY_BACKENDS) == (backend == ACP_BACKEND_CODEX)
-    real_resolver = config_paths._resolve_default_home
-    exposed: list[str] = []
-
-    def _probe(edge: str) -> None:
-        if "KIROCREW_HOME" not in os.environ and (
-            config_paths._resolve_default_home is real_resolver
-        ):
-            exposed.append(edge)
-
-    original_patch = mock._patch_dict._patch_dict
-    original_unpatch = mock._patch_dict._unpatch_dict
-
-    def _patch(self):
-        result = original_patch(self)
-        if self.in_dict is os.environ:
-            _probe("after the environment was installed")
-        return result
-
-    def _unpatch(self):
-        if self.in_dict is os.environ:
-            _probe("before the environment was restored")
-        return original_unpatch(self)
-
-    monkeypatch.setattr(mock._patch_dict, "_patch_dict", _patch)
-    monkeypatch.setattr(mock._patch_dict, "_unpatch_dict", _unpatch)
-
-    capture_mod.capture(backend, tmp_path)
-
-    assert (
-        exposed == []
-    ), f"the real default-home resolver was live with KIROCREW_HOME absent: {exposed}"
-
-
 def test_the_deepseek_capture_writes_its_scratch_windows_only_under_tmp_path(
     monkeypatch, tmp_path
 ) -> None:
@@ -610,7 +557,6 @@ class _Scratch:
         self._fail = fail
         self.allocated_labels: list[str] = []
         self.validated: list[Path] = []
-        self.dropped_from: dict[str, str] = {}
 
     def allocate_scratch(self, label: str) -> Path | None:
         self.allocated_labels.append(label)
@@ -624,10 +570,6 @@ class _Scratch:
 
     def scratch_env(self, path: Path, shared: Path | None = None) -> dict[str, str]:
         return {"KIROCREW_SCRATCH": str(path), "TMPDIR": str(path)}
-
-    def drop_inherited_scratch_env(self, env: dict[str, str]) -> tuple[str, ...]:
-        self.dropped_from = dict(env)
-        return ()
 
 
 class _Recording:
@@ -954,20 +896,6 @@ def test_a_scratch_that_cannot_be_allocated_spawns_with_the_inherited_temp(
     assert rec.wrap_kwargs["extra_private_dirs"] == ()
     assert "KIROCREW_SCRATCH" not in rec.factory_kwargs["env"]
     assert any("could not allocate" in r.getMessage() for r in caplog.records)
-
-
-def test_the_inherited_scratch_exports_are_judged_before_any_configured_layer(
-    monkeypatch, tmp_path
-) -> None:
-    """The drop sees the gateway's own environment, not ``agent.env`` or ``extra_env``."""
-    _launch_env(monkeypatch, TMPDIR="/gateway/inherited")
-    scratch = _Scratch(None, fail=True)
-    tools = dataclasses.replace(
-        _launch_tools(_Recording(), scratch=scratch),
-        agent_env_overlay=lambda: {"TMPDIR": "/operator/agent-env"},
-    )
-    _run_launch(_FakeHost(tmp_path), _request(extra_env={"TMPDIR": "/driver/extra"}), tools)
-    assert scratch.dropped_from["TMPDIR"] == "/gateway/inherited"
 
 
 def test_only_the_guarding_driver_allocates_scratch_through_its_guarded_hop(

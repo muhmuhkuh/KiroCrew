@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 /**
@@ -33,34 +33,15 @@ import { resolve } from 'node:path'
  * Asserted against SOURCE TEXT: the wiring spans a constant, a hook and two JSX
  * attributes, and happy-dom has no layout for a ResizeObserver to fire against.
  */
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so
-// the pins read the page and those owners.
-const PAGES_DIR = resolve(__dirname, '../pages')
-const OWNER_DIR = resolve(PAGES_DIR, 'chat/page')
-const CHAT_PAGE = [
-  readFileSync(resolve(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
-  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(OWNER_DIR, f), 'utf8')),
-  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(PAGES_DIR, f), 'utf8')),
-].join('\n')
+const CHAT_PAGE = readFileSync(resolve(__dirname, '../pages/chat/page/ChatTranscriptView.tsx'), 'utf8')
+const COMPOSER_DOCK = readFileSync(resolve(__dirname, '../pages/chat/page/ComposerDockView.tsx'), 'utf8')
+const CHAT_PAGE_DOCK = readFileSync(resolve(__dirname, '../pages/chat/page/messageActions.ts'), 'utf8')
 // The dock's measurement and clearance live in one module shared with the
 // pane; the page mounts the box.
 const DOCK = readFileSync(resolve(__dirname, '../pages/chat/composerDockMetrics.ts'), 'utf8')
 // ChatPane (split panes, a crewmate's chat) floats its composer the same way
 // (#18279): same hook, same clearance, same dock root.
 const CHAT_PANE = readFileSync(resolve(__dirname, '../components/ChatPane.tsx'), 'utf8')
-// The pane's code also lives in its owner modules; the "never" pins read them too.
-const CHAT_PANE_WITH_OWNERS = [CHAT_PANE, ...[
-  'ChatPanePickerMenus.tsx',
-  'ChatPaneProps.ts',
-  'ChatPaneTranscript.tsx',
-  'useChatPaneDraft.ts',
-  'useChatPanePickers.ts',
-  'useChatPaneSend.ts',
-  'useChatPaneTurnControl.ts',
-  'useChatPaneUploads.ts',
-].map(f => readFileSync(resolve(__dirname, '../components', f), 'utf8'))].join('\n')
 const WELCOME_VIEW = readFileSync(resolve(__dirname, '../components/WelcomeView.tsx'), 'utf8')
 
 const num = (re: RegExp, src: string): number => {
@@ -75,12 +56,12 @@ describe('composer dock clearance', () => {
     expect(CHAT_PANE).toMatch(/scrollerStyle: \{ paddingTop: 12 \+ topInset, paddingBottom: dockH \+ DOCK_CLEARANCE_PX,/)
     expect(num(/export const DOCK_CLEARANCE_PX = (\d+)/, DOCK)).toBeGreaterThan(0)
     // One clearance for both hosts: neither re-declares its own number.
-    for (const src of [CHAT_PAGE, CHAT_PANE_WITH_OWNERS]) expect(src).not.toMatch(/const DOCK_CLEARANCE_PX =/)
+    for (const src of [CHAT_PAGE, CHAT_PANE]) expect(src).not.toMatch(/const DOCK_CLEARANCE_PX =/)
     expect(num(/const TRANSCRIPT_TAIL_SPACER_PX = (\d+)/, CHAT_PAGE)).toBeGreaterThan(0)
   })
 
   it('measures the dock root from a callback ref through a ResizeObserver', () => {
-    expect(CHAT_PAGE).toMatch(/<div ref=\{dockRef\} className="[^"]*\babsolute\b[^"]*\bbottom-0\b[^"]*" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/)
+    expect(COMPOSER_DOCK).toMatch(/<div ref=\{dockRef\} className="[^"]*\babsolute\b[^"]*\bbottom-0\b[^"]*" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/)
     // A callback ref, not a `[]` layout effect: the dock sits inside the pane's
     // conditional branch, so a mount-once effect can run before it exists and
     // never measure. The ref fires on every mount/unmount of the box.
@@ -89,8 +70,10 @@ describe('composer dock clearance', () => {
     // leaves the thumb uncovered — hence `scrollerRef` in the deps.
     const hook = /const dockRef = useCallback\(\(el: HTMLDivElement \| null\) => \{[\s\S]*?if \(!el\) \{ setDockH\(0\); setDockGutter\(0\); return \}[\s\S]*?setDockH\(el\.offsetHeight\)[\s\S]*?setDockGutter\(sc \? Math\.max\(0, sc\.offsetWidth - sc\.clientWidth\) : 0\)[\s\S]*?new ResizeObserver\(measure\)[\s\S]*?ro\.observe\(el\)[\s\S]*?\}, \[scrollerRef\]\)/
     expect(DOCK).toMatch(hook)
-    for (const src of [CHAT_PAGE, CHAT_PANE]) {
+    for (const src of [CHAT_PAGE_DOCK, CHAT_PANE]) {
       expect(src, 'the host takes dockRef from the shared measurement').toMatch(/const \{ inputAreaRef, dockH, dockGutter, dockRef \} = useComposerDockMetrics\(scrollerRef\)/)
+    }
+    for (const src of [COMPOSER_DOCK, CHAT_PANE]) {
       expect(src).toMatch(/<div ref=\{dockRef\} className="[^"]*\babsolute\b[^"]*\bbottom-0\b[^"]*" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/)
     }
     // `dock-inert` goes on the two inner wrapper boxes, never on the root: the
@@ -98,20 +81,20 @@ describe('composer dock clearance', () => {
     // pointer-inert strip that `.dock-inert>*` would turn back on, so with the
     // root inert the strip above the composer swallowed clicks and wheel over
     // the rows behind it whenever the pill was showing (#18283 review).
-    for (const [src, own] of [[CHAT_PAGE, CHAT_PAGE], [CHAT_PANE, CHAT_PANE_WITH_OWNERS]]) {
-      expect(own).not.toMatch(/<div ref=\{dockRef\} className="[^"]*\bdock-inert\b[^"]*"/)
+    for (const src of [COMPOSER_DOCK, CHAT_PANE]) {
+      expect(src).not.toMatch(/<div ref=\{dockRef\} className="[^"]*\bdock-inert\b[^"]*"/)
       expect(src).toMatch(/<div ref=\{inputAreaRef\} className="relative z-10 dock-inert">/)
       expect(src).toMatch(/className="[^"]*\bdock-inert\b[^"]*" data-testid="composer-status-stack">/)
     }
     // No opaque bottom fade in either host: the transcript scrolls under the glass.
-    for (const src of [CHAT_PAGE, CHAT_PANE_WITH_OWNERS]) expect(src).not.toMatch(/<EdgeFade side="bottom"/)
-    for (const src of [CHAT_PAGE, CHAT_PANE_WITH_OWNERS, DOCK]) expect(src).not.toMatch(/useLayoutEffect\(\(\) => \{\s*const el = dockRef\.current/)
+    for (const src of [CHAT_PAGE, COMPOSER_DOCK, CHAT_PANE]) expect(src).not.toMatch(/<EdgeFade side="bottom"/)
+    for (const src of [CHAT_PAGE, CHAT_PANE, DOCK]) expect(src).not.toMatch(/useLayoutEffect\(\(\) => \{\s*const el = dockRef\.current/)
   })
 
   it('states the clearance in px, never in viewport units', () => {
     // A spacer sized in vh/dvh/svh/lvh reads as px to the arithmetic while still
     // shrinking on a phone.
-    for (const src of [CHAT_PAGE, CHAT_PANE_WITH_OWNERS, DOCK]) expect(src).not.toMatch(/height:\s*['"]?\d+(\.\d+)?(vh|dvh|svh|lvh)/)
+    for (const src of [CHAT_PAGE, CHAT_PANE, DOCK]) expect(src).not.toMatch(/height:\s*['"]?\d+(\.\d+)?(vh|dvh|svh|lvh)/)
     expect(CHAT_PAGE).toMatch(/<div style=\{\{ height: TRANSCRIPT_TAIL_SPACER_PX \}\} \/>/)
   })
 
@@ -167,7 +150,7 @@ describe('composer dock clearance', () => {
   })
 
   it('keeps the memory chip row transparent, so the conversation shows through the glass', () => {
-    const row = /<div className="([^"]*)" data-testid="composer-memory-chip">/.exec(CHAT_PAGE)
+    const row = /<div className="([^"]*)" data-testid="composer-memory-chip">/.exec(COMPOSER_DOCK)
     expect(row).not.toBeNull()
     expect(row![1]).not.toMatch(/\bbg-bg\b/)
   })

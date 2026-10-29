@@ -36,6 +36,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
 )
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.members import MEMBER_DISPATCH_SERVER
 from kiro_crew.providers.mirrors import Concern, Disposition, mirror_for
 from kiro_crew.providers.mirrors.codex import (
@@ -235,14 +236,14 @@ class TestIdentityEnvCarriage:
         assert _env(el) == {}
 
     def test_an_OPT_IN_crew_server_gets_no_identity_EITHER(self):
-        """The deliberate line: opt-in crew servers carry no identity.
+        """The deliberate line, and the one that shrank this PR.
 
         ``kirocrew-work`` and ``kirocrew-dashboard`` are Crew's own binaries, but
         they are ``opt_in`` sets that arrive from the agent spec UNREPLACED — so the
-        spec chose their command, args and env. A provenance check cannot make them
-        safe to hand the key: a borrowed name, or a spec-supplied ``PYTHONPATH``
-        beside a genuine command, gets through it. The credential rides only what
-        Crew derives itself.
+        spec chose their command, args and env. Earlier revisions tried to hand them
+        the key behind a provenance check, and the reviewer found two ways through it
+        in two rounds (a borrowed name, then a spec-supplied ``PYTHONPATH`` beside a
+        genuine command). The credential now rides only what Crew derives itself.
 
         Reaching this function at all would be a bug — ``codex_withheld_servers``
         drops them upstream — so this pins the second half of the rule rather than
@@ -984,10 +985,11 @@ def _codex_runtime(work_dir) -> AcpRuntime:
     return rt
 
 
-def _stub(name: str) -> dict:
+def _stub(name: str, *, token: str | None = None) -> dict:
     """A broker stub as ``pooled_session_servers`` shapes one: the SAME name as the
     agent-spec entry it rewrites, which is what makes an unnarrowed append dangerous."""
-    return {"name": name, "type": "stdio", "command": "/stub", "args": [], "env": []}
+    env = [] if token is None else [{"name": STUB_SESSION_TOKEN_ENV, "value": token}]
+    return {"name": name, "type": "stdio", "command": "/stub", "args": [], "env": env}
 
 
 class TestTheRuntimePathAppliesTheProjection:
@@ -1108,6 +1110,124 @@ class TestTheRuntimePathAppliesTheProjection:
                 )
                 is None
             )
+
+    def test_runtime_tokened_work_stub_reaches_the_codex_stdio_array(self, tmp_path, agents_dir):
+        """The runtime stamps the work stub before the mirror projects it."""
+        _write_spec(
+            agents_dir,
+            servers={"kirocrew-work": {"command": "/untrusted", "args": ["mcp-work"]}},
+            tools=["@kirocrew-work"],
+        )
+        rt = _codex_runtime(tmp_path)
+        rt._agent_capabilities = {"mcpCapabilities": dict(_CODEX_1_11_CAPS)}
+        out = self._projected(rt, [_stub("kirocrew-work")], referenced=frozenset({"kirocrew-work"}))
+        assert out is not None
+        wire = CodexHarness().session_mcp_servers(
+            out.servers, agent_capabilities={"mcpCapabilities": dict(_CODEX_1_11_CAPS)}
+        )
+        work = _by_name(wire)["kirocrew-work"]
+        assert _env(work)[STUB_SESSION_TOKEN_ENV] == out.stub_token
+        assert "KIROCREW_SESSION_KEY" not in _env(work)
+
+
+@pytest.mark.parametrize(
+    ("stub_token", "session_token", "mounted"),
+    [
+        ("owner-token", "owner-token", True),
+        (None, "owner-token", False),
+        ("other-token", "owner-token", False),
+        ("owner-token", "", False),
+    ],
+)
+def test_work_ledger_stub_requires_this_sessions_gateway_token(
+    agents_dir, stub_token, session_token, mounted
+):
+    _write_spec(
+        agents_dir,
+        servers={"kirocrew-work": {"command": "/untrusted", "args": ["mcp-work"]}},
+        tools=["@kirocrew-work"],
+    )
+    projection = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-work",),
+        stub_elements=[_stub("kirocrew-work", token=stub_token)],
+        session_token=session_token,
+    )
+    assert ("kirocrew-work" in _by_name(projection.params["mcpServers"])) is mounted
+
+
+def test_work_ledger_token_does_not_override_a_tool_restriction(agents_dir):
+    _write_spec(
+        agents_dir,
+        servers={
+            "kirocrew-work": {
+                "command": "/untrusted",
+                "args": ["mcp-work"],
+                "disabledTools": ["work_ledger_record"],
+            }
+        },
+        tools=["@kirocrew-work"],
+    )
+    projection = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-work",),
+        stub_elements=[_stub("kirocrew-work", token="owner-token")],
+        session_token="owner-token",
+    )
+    assert "kirocrew-work" not in _by_name(projection.params["mcpServers"])
+
+
+def test_work_ledger_token_does_not_override_a_server_disable(agents_dir):
+    _write_spec(
+        agents_dir,
+        servers={
+            "kirocrew-work": {
+                "command": "/untrusted",
+                "args": ["mcp-work"],
+                "disabled": True,
+            }
+        },
+        tools=["@kirocrew-work"],
+    )
+    projection = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-work",),
+        stub_elements=[_stub("kirocrew-work", token="owner-token")],
+        session_token="owner-token",
+    )
+    assert "kirocrew-work" not in _by_name(projection.params["mcpServers"])
+
+
+def test_work_ledger_stub_with_duplicate_session_tokens_is_withheld(agents_dir):
+    _write_spec(
+        agents_dir,
+        servers={"kirocrew-work": {"command": "/untrusted", "args": ["mcp-work"]}},
+        tools=["@kirocrew-work"],
+    )
+    stub = _stub("kirocrew-work", token="owner-token")
+    stub["env"].append({"name": STUB_SESSION_TOKEN_ENV, "value": "owner-token"})
+    projection = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-work",),
+        stub_elements=[stub],
+        session_token="owner-token",
+    )
+    assert "kirocrew-work" not in _by_name(projection.params["mcpServers"])
+
+
+def test_other_identity_bound_stubs_remain_withheld(agents_dir):
+    _write_spec(
+        agents_dir,
+        servers={"kirocrew-debug": {"command": "/untrusted", "args": ["mcp-debug"]}},
+        tools=["@kirocrew-debug"],
+    )
+    projection = codex_projection(
+        "kirocrew",
+        stub_server_names=("kirocrew-debug",),
+        stub_elements=[_stub("kirocrew-debug", token="owner-token")],
+        session_token="owner-token",
+    )
+    assert "kirocrew-debug" not in _by_name(projection.params["mcpServers"])
 
 
 def test_granted_dashboard_is_rebuilt_and_bound(agents_dir, monkeypatch):

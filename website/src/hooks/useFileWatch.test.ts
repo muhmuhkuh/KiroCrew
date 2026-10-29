@@ -66,12 +66,11 @@ describe('useFileWatch reconnect guard', () => {
     act(() => {
       MockEventSource.instances[0].onopen?.()
       MockEventSource.instances[0].onmessage?.({ data: JSON.stringify({ content: 'hi' }) })
+      MockEventSource.instances[0].onmessage?.({ data: JSON.stringify({ content: 'updated' }) })
     })
     expect(result.current.status).toBe('open')
-    expect(onContent).toHaveBeenCalledWith('hi', { initial: true })
-    // Every later frame of the same stream follows a write.
-    act(() => { MockEventSource.instances[0].onmessage?.({ data: JSON.stringify({ content: 'hi' }) }) })
-    expect(onContent).toHaveBeenLastCalledWith('hi', { initial: false })
+    expect(onContent).toHaveBeenNthCalledWith(1, 'hi', { initial: true })
+    expect(onContent).toHaveBeenNthCalledWith(2, 'updated', { initial: false })
 
     // Clearing the path tears down and returns to idle.
     rerender({ p: null })

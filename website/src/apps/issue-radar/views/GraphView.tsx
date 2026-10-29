@@ -33,7 +33,6 @@ import {
 } from '../lib/deps'
 import { i18nT } from '../../../i18n/t'
 import { splitOnPlaceholder } from '../../../lib/splitOnPlaceholder'
-import { sliceCodePoints } from '../../../components/CommentOverlay'
 
 /** The theme token a node state paints with. `open`/`done` are drawn muted. */
 function stateColor(state: NodeState): string {
@@ -245,7 +244,7 @@ export default function GraphView() {
           </label>
           <datalist id="ir-graph-open-items">
             {opens.map((n) => (
-              <option key={n.id} value={n.id}>{sliceCodePoints(n.title || '', 0, 50)}</option>
+              <option key={n.id} value={n.id}>{(n.title || '').slice(0, 50)}</option>
             ))}
           </datalist>
           <button
@@ -616,7 +615,7 @@ function FocusTree({ root, nodes, liveEdges, reduceMotion, onReRoot, onOpen }: {
           const sel = n.id === root
           const c = stateColor(n.state)
           const title = n.title || ''
-          const shown = title.length > 26 ? `${sliceCodePoints(title, 0, 26)}…` : title
+          const shown = title.length > 26 ? `${title.slice(0, 26)}…` : title
           const ledLabel = n.state === 'ready'
             ? i18nT('apps.issueRadar.views.graphView.led_ready')
             : model.edges.some((e) => e.blocked === n.id)

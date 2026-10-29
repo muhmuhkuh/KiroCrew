@@ -86,10 +86,7 @@ async def api_capability_mcp_install(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    # A non-string value (``{"server_id": 1}``) is a 400 like a missing one, not
-    # an AttributeError -> 500; ``_mutate_agent_package`` guards the same way.
-    server_id = body.get("server_id")
-    server_id = server_id.strip() if isinstance(server_id, str) else ""
+    server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
     # Ownership BEFORE the first mutation: the package manager runs ahead of
@@ -145,10 +142,7 @@ async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    # A non-string value (``{"server_id": 1}``) is a 400 like a missing one, not
-    # an AttributeError -> 500; ``_mutate_agent_package`` guards the same way.
-    server_id = body.get("server_id")
-    server_id = server_id.strip() if isinstance(server_id, str) else ""
+    server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
     # Ownership BEFORE the first mutation: the package manager runs ahead of
@@ -220,10 +214,7 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    # A non-string value (``{"package": []}``) is a 400 like a missing one, not
-    # an AttributeError -> 500; ``_mutate_agent_package`` guards the same way.
-    package = body.get("package")
-    package = package.strip() if isinstance(package, str) else ""
+    package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
     mgr = _capability_manager()
@@ -259,10 +250,7 @@ async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    # A non-string value (``{"package": []}``) is a 400 like a missing one, not
-    # an AttributeError -> 500; ``_mutate_agent_package`` guards the same way.
-    package = body.get("package")
-    package = package.strip() if isinstance(package, str) else ""
+    package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
     mgr = _capability_manager()

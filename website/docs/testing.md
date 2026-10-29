@@ -311,6 +311,9 @@ says why): run `python -m pytest -n0 test/test_flake_pattern_ratchet.py` before 
   with `mock.timers.enable({ apis: ['Date'] })` and resets a top-level `mock.timers` the
   same way; a test-context `t.mock.timers` is reset by the runner. A relative age ("3
   minutes ago") is computed from the pinned instant, never from the real `Date.now()`.
+  Fixture timestamps are fixed too: a hoisted mock factory or module-level fixture
+  runs before `beforeEach`, so pinning the render clock cannot undo an earlier live
+  clock read.
 - **Locale and zone.** An expectation built with `toLocale*String()` names its locale:
   vitest pins `TZ=UTC` but not the locale, and the Electron suite pins neither, so an
   Electron test names the zone too.
@@ -323,6 +326,9 @@ says why): run `python -m pytest -n0 test/test_flake_pattern_ratchet.py` before 
 - **A `findBy*` on one element does not settle a sibling query** whose content comes
   from a different async source (another query, an effect, a timer or a fetch). Wait
   for every such value the assertion reads, in the file's `…Ready()` helper.
+  A page-level anchor-payload test uses a stable plaintext viewer stand-in: a lazy
+  viewer can replace the selected fallback DOM, detaching the test's fake range.
+  The viewer's own rendering and shadow-DOM behavior belong in its separate tests.
 - **An `act()` warning is a finding.** "not wrapped in act(...)" means a state update
   landed after the test's last barrier. Fix the barrier; never add the warning to a
   filter. `integration/setup.ts` counts these warnings per file. A file listed in
@@ -381,7 +387,8 @@ one is a rule:
   under test, so the prefix match read back empty; `window-lifecycle.test.js`
   scanned module source for `"}\n"` and a `core.autocrlf` checkout gave it `"}\r\n"`.
   Build fixture keys with `path.normalize`, and normalise `\r\n` before regex-scanning
-  a source file. Run `npm test` on a Windows checkout before calling an Electron test
+  a source file. Download reservation fixtures use `fsPathKey`, matching the
+  production case-folding on macOS and Windows. Run `npm test` on a Windows checkout before calling an Electron test
   done — CI's Electron job is Linux-only, so nothing else will.
 - **`mkdtempSync` without an `after()` is a leak on every run.** `petOverlay.test.js`
   created a `cc-pet-test-*` user-data dir per `stubElectron()` call and its

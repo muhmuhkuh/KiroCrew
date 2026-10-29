@@ -1577,18 +1577,11 @@ def test_pipe_death_and_stop_recovery_budgets_share_the_ladder_constant():
     one ladder limit for both budgets -- rather than one spelling of it.
     """
     import ast
-    from pathlib import Path
+    import inspect
 
     from kiro_crew.dashboard import chat_runner
 
-    src = "\n".join(
-        turn_file.read_text(encoding="utf-8")
-        for turn_file in [
-            *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-            Path(chat_runner.__file__),
-        ]
-        if turn_file.name != "__init__.py"
-    )
+    src = inspect.getsource(chat_runner)
     tree = ast.parse(src)
 
     # Locals carrying the counter's value: the attribute itself, plus the target

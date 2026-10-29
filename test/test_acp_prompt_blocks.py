@@ -131,8 +131,14 @@ class TestBuildPromptBlocks:
         # renamed): the emitted mimeType tracks the header-DETECTED format,
         # because the backend validates the bytes, not the file extension.
         pil = pytest.importorskip("PIL.Image")
-        fmt = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG",
-               ".gif": "GIF", ".webp": "WEBP", ".bmp": "BMP"}[suffix]
+        fmt = {
+            ".png": "PNG",
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".gif": "GIF",
+            ".webp": "WEBP",
+            ".bmp": "BMP",
+        }[suffix]
         p = tmp_path / f"img{suffix}"
         mode = "P" if fmt == "GIF" else "RGB"
         pil.new(mode, (2, 2)).save(p, format=fmt)
@@ -204,10 +210,14 @@ class TestOnePromptImageRules:
         # a whole-text replace would rewrite them too.
         blocks = build_prompt_blocks(f"see {p} and the mirror at https://example.com{p}")
         assert [b["type"] for b in blocks] == ["text", "image"]
-        assert blocks[0]["text"] == f"see [image: shot.png] and the mirror at https://example.com{p}"
+        assert (
+            blocks[0]["text"] == f"see [image: shot.png] and the mirror at https://example.com{p}"
+        )
 
     @pytest.mark.parametrize("tail", [".backup", "x", "/other", "-v2", "_old", "~", "~1"])
-    def test_a_longer_name_that_starts_with_a_picture_path_is_not_that_picture(self, tmp_path, tail):
+    def test_a_longer_name_that_starts_with_a_picture_path_is_not_that_picture(
+        self, tmp_path, tail
+    ):
         p = _png(tmp_path)
         text = f"restore {p}{tail} please"
         blocks = build_prompt_blocks(text)
@@ -266,7 +276,7 @@ class TestOnePromptImageRules:
 
         assert build_prompt_blocks(text) == [{"type": "text", "text": text}]
 
-    @pytest.mark.parametrize("glue", ["\U0001F4C1", "\\"])
+    @pytest.mark.parametrize("glue", ["\U0001f4c1", "\\"])
     def test_two_paths_glued_by_a_symbol_inline_nothing(self, tmp_path, glue):
         # A symbol is neither a path character nor punctuation: no path may
         # start after it, so the pair is one token naming no file -- never the
@@ -283,7 +293,10 @@ class TestOnePromptImageRules:
         blocks = build_prompt_blocks(f"see {a} and the banner is at https://example.com/logo.png")
 
         assert [block["type"] for block in blocks] == ["text", "image"]
-        assert blocks[0]["text"] == "see [image: a.png] and the banner is at https://example.com/logo.png"
+        assert (
+            blocks[0]["text"]
+            == "see [image: a.png] and the banner is at https://example.com/logo.png"
+        )
 
     def test_a_long_message_of_path_fragments_scans_in_linear_time(self):
         # Space is both a delimiter and a legal path character, so every "/" here
@@ -291,12 +304,16 @@ class TestOnePromptImageRules:
         # what keeps this linear.
         text = (" /a" * 20000) + ".png~"
 
-        started = time.perf_counter()
+        started = time.thread_time()
         blocks = build_prompt_blocks(text)
-        elapsed = time.perf_counter() - started
+        elapsed = time.thread_time() - started
 
         assert blocks == [{"type": "text", "text": text}]
-        assert elapsed < 5.0, f"image-path scan took {elapsed:.3f}s"
+        assert (
+            elapsed < 5.0
+        ), (  # flake-ok: thread-CPU guard for nonlinear scans
+            f"image-path scan used {elapsed:.3f}s of thread CPU"
+        )
 
     def test_a_path_component_after_an_image_suffix_belongs_to_the_longer_path(self, tmp_path):
         _png(tmp_path, "a.png")
@@ -452,7 +469,9 @@ class TestOnePromptImageRules:
         both = len(build_prompt_blocks(f"{a} {b}")[1]["data"]) + len(
             build_prompt_blocks(f"{a} {b}")[2]["data"]
         )
-        assert [x["type"] for x in build_prompt_blocks(f"{a} {b}", max_prompt_image_b64_bytes=both)] == [
+        assert [
+            x["type"] for x in build_prompt_blocks(f"{a} {b}", max_prompt_image_b64_bytes=both)
+        ] == [
             "text",
             "image",
             "image",
@@ -708,7 +727,9 @@ class TestPlatformPathGrammar:
 
     def test_windows_pattern_ignores_urls(self):
         """``//`` acceptance must not make ``https://host/x.png`` a candidate."""
-        assert prompt_blocks._WINDOWS_PATH_RE.search("see https://example.com/docs/logo.png") is None
+        assert (
+            prompt_blocks._WINDOWS_PATH_RE.search("see https://example.com/docs/logo.png") is None
+        )
         assert prompt_blocks._WINDOWS_PATH_RE.search("see http://host/a.png here") is None
 
     def test_windows_pattern_requires_an_absolute_path(self):
@@ -812,7 +833,7 @@ class TestPlatformPathGrammar:
         ]
 
     def test_windows_pattern_starts_no_path_after_a_symbol(self):
-        assert prompt_blocks._WINDOWS_PATH_RE.search("look C:/x/a.png\U0001F4C1C:/y/b.png") is None
+        assert prompt_blocks._WINDOWS_PATH_RE.search("look C:/x/a.png\U0001f4c1C:/y/b.png") is None
 
     def test_windows_pattern_reads_a_backslash_glued_pair_as_one_token(self):
         # A backslash is a Windows path character, so the glued spelling is one
@@ -865,9 +886,7 @@ class TestUncProbeGate:
         assert hooks.is_unc_shape(raw) is want
 
     def test_attacker_host_is_refused(self, monkeypatch, tmp_path):
-        monkeypatch.setattr(
-            "kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home"
-        )
+        monkeypatch.setattr("kiro_crew.config.paths.peek_data_home", lambda: tmp_path / "home")
         assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
         assert hooks.unc_probe_allowed("//evil/share/x.png") is False
 
@@ -877,12 +896,8 @@ class TestUncProbeGate:
             "kiro_crew.config.paths.peek_data_home",
             lambda: Path(r"\\fileserver\home\me\.kiro\crew"),
         )
-        allowed = hooks.unc_probe_allowed(
-            r"\\fileserver\home\me\.kiro\crew\uploads\shot.png"
-        )
-        forward = hooks.unc_probe_allowed(
-            "//fileserver/home/me/.kiro/crew/uploads/shot.png"
-        )
+        allowed = hooks.unc_probe_allowed(r"\\fileserver\home\me\.kiro\crew\uploads\shot.png")
+        forward = hooks.unc_probe_allowed("//fileserver/home/me/.kiro/crew/uploads/shot.png")
         # normcase/normpath only fold separators and case on Windows, so the
         # cross-separator equivalence holds there; on POSIX the gate is never
         # consulted (the probe loop is os.name == "nt" scoped).

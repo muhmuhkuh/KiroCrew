@@ -38,7 +38,6 @@ _SENSITIVE_RELATIVE_DIRS = (
     ".claude/.credentials.json",
     ".codex/auth.json",
     ".config/gcloud",
-    ".copilot/config.json",
     ".config/goose/secrets.yaml",
     ".docker/config.json",
     ".dsh/.credentials.yaml",

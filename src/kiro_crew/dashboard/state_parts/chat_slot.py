@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any, Callable
 
-from kiro_crew._facade_bindings import own_methods
 from kiro_crew.dashboard.recovery_replays import RecoveryReplays
 from kiro_crew.dashboard.side_state import SideState
 from kiro_crew.dashboard.slot_buffers import SlotBufferCoordinator
@@ -17,6 +16,7 @@ from kiro_crew.dashboard.slot_queue_repository import (
     durable_queue_view,
     queue_persist_signature,
 )
+from kiro_crew.dashboard.state_parts import own_methods
 from kiro_crew.dashboard.state_parts import slot_ladder as _slot_ladder
 from kiro_crew.dashboard.state_parts import slot_session as _slot_session
 from kiro_crew.dashboard.state_parts import slot_sidebar as _slot_sidebar
@@ -36,7 +36,6 @@ from kiro_crew.security.credential_sources import CredentialEvidence
 if TYPE_CHECKING:
     from kiro_crew.dashboard.git_repo_touches import TouchCandidates
     from kiro_crew.dashboard.state_parts.dashboard_state import DashboardState
-    from kiro_crew.dashboard.steer_retract import SteerClear, SteerRetract
     from kiro_crew.subagent import SubagentDelivery
     from kiro_crew.trust_patterns import GrantDeadline
 
@@ -64,9 +63,10 @@ class _ChatSlot:
         "title",
         "agent",
         "agent_kind",
-        "crew_mode_agent",
         "app_agent_owner",
         "model",
+        "acp_backend",
+        "model_backend",
         "jev_route",
         "_model_withheld",
         "_model_withheld_for",
@@ -131,7 +131,6 @@ class _ChatSlot:
         "_last_stop_reason",
         "_created_by",
         "_created_by_sid",
-        "_saved_created_by",
         "_lineage_minted",
         "_reports_to_creator",
         "_revived_by",
@@ -290,7 +289,6 @@ class _ChatSlot:
         "_git_repo_walk_pending",
         "_git_repo_walk_task",
         "_turn_reply_mids",
-        "_file_changes_flush",
         "linked_session_key",
         # Relay-archive marker: an older build ran this slot's turns on a peer
         # crew. See ``dashboard/relay_archive.py``.
@@ -306,7 +304,6 @@ class _ChatSlot:
         "_last_turn_awaiting_permission",
         "_last_turn_children_announced",
         "_steer_segment_cut",
-        "_owed_segment_cut",
         "_native_subagent_tracker",
         "_native_subagent_output",
         "_steer_confirmed",
@@ -322,8 +319,6 @@ class _ChatSlot:
         "_steer_decision_strips",
         "_steer_possibly_delivered",
         "_steer_rpc_in_flight",
-        "_steer_retract",
-        "_steer_clear",
         "_steer_audience_fences",
         "_steer_audience_fence_holders",
         "_steer_attachment_meta",
@@ -374,7 +369,6 @@ class _ChatSlot:
 
     # Initialised by state_parts/slot_session.py.
     agent_kind: str
-    crew_mode_agent: str
     app_agent_owner: str
     _welcomed_agent: str
     jev_route: bool
@@ -414,7 +408,6 @@ class _ChatSlot:
     _last_stop_reason: str
     _created_by: str
     _created_by_sid: str
-    _saved_created_by: str
     _lineage_minted: bool
     _reports_to_creator: bool
     _revived_by: str
@@ -518,7 +511,6 @@ class _ChatSlot:
     _git_repo_walk_pending: list[str]
     _git_repo_walk_task: asyncio.Task[None] | None
     _turn_reply_mids: list[str]
-    _file_changes_flush: asyncio.Future[None] | None
     linked_session_key: str
     _active_turn_session_key: str
     _responsive: Any
@@ -582,7 +574,6 @@ class _ChatSlot:
     _compaction_fail_streak: int
     _compaction_fail_cooldown_until: float
     _steer_segment_cut: Callable[[], None] | None
-    _owed_segment_cut: Callable[[], None] | None
     _native_subagent_tracker: dict[str, dict[str, Any]]
     _native_subagent_output: dict[str, list[str]]
     _steer_confirmed: set[str]
@@ -598,8 +589,6 @@ class _ChatSlot:
     _steer_decision_strips: dict[str, dict]
     _steer_possibly_delivered: set[str]
     _steer_rpc_in_flight: set[str]
-    _steer_retract: SteerRetract | None
-    _steer_clear: SteerClear | None
     _steer_audience_fences: dict[str, dict]
     _steer_audience_fence_holders: dict[str, int]
     _steer_attachment_meta: dict[str, dict[str, Any]]
@@ -649,6 +638,9 @@ class _ChatSlot:
         self.agent = agent
         _slot_session.init_session_fields(self)
         self.model = model
+        # None inherits the global backend; "" explicitly selects Kiro.
+        self.acp_backend: str | None = None
+        self.model_backend: str | None = None
         # "" = default chat; app workers may carry their own mode (design-critique)
         self.mode = mode
         self.workspace = workspace
@@ -1135,17 +1127,4 @@ class _ChatSlot:
     to_dict = _slot_transcript.to_dict
 
 
-#: The owners whose functions :class:`_ChatSlot` binds as its members, this shell included.
-_MEMBER_OWNERS = frozenset(
-    {
-        "kiro_crew.dashboard.state_parts.chat_slot",
-        "kiro_crew.dashboard.state_parts.slot_session",
-        "kiro_crew.dashboard.state_parts.slot_sidebar",
-        "kiro_crew.dashboard.state_parts.slot_todo",
-        "kiro_crew.dashboard.state_parts.slot_transcript",
-        "kiro_crew.dashboard.state_parts.slot_turns",
-        "kiro_crew.dashboard.state_parts.source_links",
-    }
-)
-
-own_methods(_ChatSlot, _MEMBER_OWNERS)
+own_methods(_ChatSlot)

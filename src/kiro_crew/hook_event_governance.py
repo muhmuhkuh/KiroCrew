@@ -1,18 +1,4 @@
-"""Which hook trigger events may fire a script hook: ``capabilities.script_hooks`` ``events``.
-
-A policy names the events in the row's inner ``events`` ruleset (RFC
-``rfc-crew-enterprise-edition``, appendix row "Hook trigger events"), e.g.
-``{"capabilities": {"script_hooks": {"enabled": true, "scopes": {"events":
-{"mode": "allow", "allow": ["PreToolUse"]}}}}}``. Event names are the
-``hooks.HOOK_EVENT_*`` values; the identifier matcher is case-insensitive, so
-kiro-cli's ``preToolUse`` reads as ``PreToolUse``.
-
-Each place a hook fires asks :func:`event_refusal` right after the capability
-check (``hook_runtime.governance_gate._script_hooks_capability_denied``), which
-already decides whether hooks run at all and, in an enterprise build, that only
-the policy can turn them on. A list the policy does not name permits every event,
-so with no policy nothing changes.
-"""
+"""Policy floor for the trigger events on which script hooks may fire."""
 
 from __future__ import annotations
 
@@ -20,19 +6,19 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-#: The governed row whose inner ``events`` ruleset names the permitted events.
 SCRIPT_HOOKS_SCOPE = "capabilities.script_hooks"
 
 
-def event_refusal(session_key: str, event: str) -> "str | None":
-    """Why the policy refuses a script hook on *event*; ``None`` when it permits.
+def event_refusal(session_key: str, event: str) -> str | None:
+    """Return why policy refuses *event*, or ``None`` when it permits it.
 
-    Asked on *session_key*, as the capability check is. An empty *event* is not
-    asked. An evaluation error refuses in an enterprise build and permits in an
-    ``oss`` one, matching the capability check. Blocking: call off the event loop.
+    An absent event or unnamed inner ruleset preserves existing behavior. Policy
+    evaluation runs off the event loop at asynchronous call sites. Enterprise
+    evaluation errors fail closed; OSS keeps the capability gate's fail-soft rule.
     """
     if not event:
         return None
+
     from kiro_crew.edition_locks import locked_off
     from kiro_crew.platform.context import PlatformCompositionError
 

@@ -246,6 +246,7 @@ def register_routes(ctx):
         assert "_kirocrew_app_app-a.backend.routes" in sys.modules
         assert "_kirocrew_app_app-b.backend.routes" in sys.modules
 
+        # Cleanup
         unload_app_modules("app-a")
         unload_app_modules("app-b")
 
@@ -261,6 +262,7 @@ def setup(ctx):
         assert key in sys.modules
         assert key == "_kirocrew_app_my-app.handlers"
 
+        # Cleanup
         unload_app_modules("my-app")
 
     def test_path_containment_rejects_escape(self, tmp_path: Path) -> None:
@@ -307,6 +309,7 @@ def other_func():
         with pytest.raises(ImportError, match="no attribute"):
             load_app_module("test-app", tmp_path, "mymod:missing_func")
 
+        # Cleanup
         unload_app_modules("test-app")
 
     def test_non_callable_raises(self, tmp_path: Path) -> None:
@@ -356,6 +359,7 @@ class TestModuleUnload:
         assert count == 4
         assert not is_app_module_loaded("test-app")
 
+        # Verify specific keys are gone
         assert "_kirocrew_app_test-app.mod_a" not in sys.modules
         assert "_kirocrew_app_test-app.sub.mod_b" not in sys.modules
         assert "_kirocrew_app_test-app.sub" not in sys.modules
@@ -376,6 +380,7 @@ class TestModuleUnload:
         assert not is_app_module_loaded("app-a")
         assert is_app_module_loaded("app-b")
 
+        # Cleanup
         unload_app_modules("app-b")
 
     def test_unload_empty_is_noop(self) -> None:

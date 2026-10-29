@@ -130,6 +130,85 @@ class TestSlotProbeWrapsSharedRestoreBody:
         assert slot._active_fallback_model == "fb-1"
         assert slot._fallback_primary_model == "primary-m"
 
+    def test_cold_handler_import_uses_composed_fallback_clear(self, tmp_path):
+        """A fresh process must resolve the handler's clear through the runner facade."""
+        import subprocess
+        import sys
+        import textwrap
+        from pathlib import Path
+
+        repo_src = Path(__file__).resolve().parents[1] / "src"
+        home = tmp_path / "home"
+        home.mkdir()
+        env = {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / "config"),
+            "XDG_DATA_HOME": str(home / "data"),
+            "XDG_CACHE_HOME": str(home / "cache"),
+            "KIRO_HOME": str(home / "kiro"),
+            "KIROCREW_HOME": str(home / "kirocrew"),
+            "TMPDIR": str(tmp_path),
+            "PYTHONPATH": str(repo_src),
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONUTF8": "1",
+        }
+        script = textwrap.dedent(
+            """
+            import inspect
+            import socket
+            from types import SimpleNamespace
+
+            def deny_connection(*args, **kwargs):
+                raise AssertionError("cold import attempted a network connection")
+
+            socket.socket.connect = deny_connection
+            socket.socket.connect_ex = deny_connection
+            socket.create_connection = deny_connection
+
+            import kiro_crew.dashboard.chat_handlers as handlers
+            import kiro_crew.dashboard.chat_runner as runner
+            from kiro_crew.llm_helpers import TURN_FALLBACK_ATTR
+
+            assert handlers._chat_runner is runner
+            assert handlers.api_chat_slot_backend.__globals__["_chat_runner"] is runner
+            assert 'getattr(_chat_runner, "_clear_fallback_sticky_state")(slot, provider)' in inspect.getsource(
+                handlers.api_chat_slot_backend
+            )
+            clear = runner._clear_fallback_sticky_state
+            assert clear.__globals__ is runner.__dict__
+
+            def raise_on_marker_read(_instance):
+                raise RuntimeError("marker read refused")
+
+            class HostileClient:
+                pass
+
+            setattr(HostileClient, TURN_FALLBACK_ATTR, property(raise_on_marker_read))
+            slot = SimpleNamespace(
+                _active_fallback_model="fb-1",
+                _fallback_primary_model="primary-m",
+                _fallback_slot_model="fb-1",
+            )
+            handlers._chat_runner._clear_fallback_sticky_state(slot, HostileClient())
+            assert (
+                slot._active_fallback_model,
+                slot._fallback_primary_model,
+                slot._fallback_slot_model,
+            ) == ("fb-1", "primary-m", "fb-1")
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", script],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, f"cold-import regression failed:\n{result.stderr}\n{result.stdout}"
+
 
 # ── Bulk model switch (api_chat_slots_model) ──
 

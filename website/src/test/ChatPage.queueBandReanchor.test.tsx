@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 /**
@@ -27,19 +27,12 @@ import { resolve } from 'node:path'
  * can exercise (happy-dom has no layout, so a real ResizeObserver never fires).
  *
  * The wiring spans two files because the two ends have different owners: the
- * JSX attribute belongs to the page, while the observer belongs to the same
+ * JSX attribute belongs to the composer dock, while the observer belongs to the same
  * controller that owns `scrollBottom`, the FOLLOW ref, and the sibling
  * tip/survey compensation effect. Reading both is what keeps the attribute and
  * the callback it names from drifting apart.
  */
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the attribute pin reads the page and those owners.
-const PAGES = resolve(__dirname, '..', 'pages')
-const OWNER_DIR = resolve(PAGES, 'chat/page')
-const CHAT_PAGE = [
-  readFileSync(resolve(PAGES, 'ChatPage.tsx'), 'utf8'),
-  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(resolve(OWNER_DIR, f), 'utf8')),
-  ...readdirSync(PAGES).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => readFileSync(resolve(PAGES, f), 'utf8')),
-].join('\n')
+const COMPOSER_DOCK = readFileSync(resolve(__dirname, '..', 'pages/chat/page/ComposerDockView.tsx'), 'utf8')
 const TRANSCRIPT_CONTROLLER = readFileSync(
   resolve(__dirname, '..', 'pages/chat/useChatPageTranscriptController.tsx'), 'utf8',
 )
@@ -49,7 +42,7 @@ describe('composer status stack re-anchors the transcript while it resizes', () 
     // The ref must sit on the SAME element statusStackLayering pins as the
     // stack wrapper — observing anything narrower (one child) goes blind when
     // a different band mounts.
-    expect(CHAT_PAGE).toMatch(
+    expect(COMPOSER_DOCK).toMatch(
       /<div ref=\{composerBandRef\} className="[^"]*" data-testid="composer-status-stack">/,
     )
   })

@@ -613,6 +613,22 @@ class TestContextBuilder:
         assert msg.index("[THEME PERSONA]") < msg.index(marker)
         assert msg.index(marker) < msg.index(header) < msg.index(request)
 
+    def test_build_message_has_no_native_ponytail_policy(self, tmp_path):
+        """Prompt modes belong to the selected harness, not Crew context."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        message, _ = builder.build_message(
+            "build it",
+            is_new_session=False,
+            session_key="dashboard:chat-1",
+            interactive=False,
+        )
+        assert "PONYTAIL MODE" not in message
+        assert "Ponytail coding mode" not in message
+
     def test_request_prefix_without_trailing_newline_does_not_swallow_the_next_block(
         self, tmp_path
     ):

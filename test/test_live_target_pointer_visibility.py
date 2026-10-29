@@ -22,7 +22,6 @@ any one of them is a second diagnosis of one file, and the drift guard here fail
 from __future__ import annotations
 
 import argparse
-import importlib
 import inspect
 import json
 import os
@@ -485,16 +484,11 @@ def _detail_formatters() -> list[tuple[str, object]]:
     list here. A hand-written enumeration is exactly how the next formatter would ship
     printing raw bytes while this file stayed green.
     """
-    # The module and the owners carved out of it, one entry per name.
-    modules = (sandbox, *map(importlib.import_module, sandbox._CARVED_OWNERS))
-    found = list(
-        {
-            name: fn
-            for module in modules
-            for name, fn in vars(module).items()
-            if name.startswith("_live_target_") and name.endswith("_detail") and callable(fn)
-        }.items()
-    )
+    found = [
+        (name, fn)
+        for name, fn in vars(sandbox).items()
+        if name.startswith("_live_target_") and name.endswith("_detail") and callable(fn)
+    ]
     assert found, "no _live_target_*_detail formatters found -- the discovery broke"
     return sorted(found)
 

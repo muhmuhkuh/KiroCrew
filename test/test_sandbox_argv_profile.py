@@ -862,14 +862,18 @@ class TestBuildSeatbeltProfile:
         # Standard mode doesn't hide .aws
         assert f'(subpath "{home}/.aws")' not in profile
 
-    def test_cc_mode_hides_aws_except_config_on_macos(self):
+    def test_cc_mode_masks_aws_except_config_on_macos(self):
         profile = _build_seatbelt_profile("cc")
-        aws = os.path.join(str(Path.home()), ".aws")
-        # CC hides .aws and re-exposes only config, so credential_process resolves
-        assert (
+        home = str(Path.home())
+        aws = os.path.join(home, ".aws")
+        config = os.path.join(aws, "config")
+        read_rule = (
             f'(deny file-read* (require-all (subpath "{aws}")'
-            f' (require-not (literal "{aws}/config"))))'
-        ) in profile.splitlines()
+            f' (require-not (literal "{config}"))))'
+        )
+        assert read_rule in profile.splitlines()
+        assert f'(deny file-link (subpath "{aws}"))' in profile.splitlines()
+        assert f'(deny file-read* (subpath "{aws}"))' not in profile
 
     def test_cc_mode_denies_individual_files(self):
         profile = _build_seatbelt_profile("cc")
@@ -877,12 +881,14 @@ class TestBuildSeatbeltProfile:
         for f in _CC_FILES:
             assert os.path.join(home, f) in profile
 
-    def test_cc_mode_denies_aws_hardlinks_and_no_whole_dir_read(self):
-        """CC denies hardlinking out of .aws; the read deny carries the config exception."""
+    def test_cc_mode_aws_exception_is_only_the_config_file(self):
         profile = _build_seatbelt_profile("cc")
-        aws = os.path.join(str(Path.home()), ".aws")
-        assert f'(deny file-link (subpath "{aws}"))' in profile.splitlines()
-        assert f'(deny file-read* (subpath "{aws}"))' not in profile
+        home = str(Path.home())
+        aws = os.path.join(home, ".aws")
+        config = os.path.join(aws, "config")
+        assert f'(require-not (literal "{config}"))' in profile
+        assert f'(require-not (subpath "{config}"))' not in profile
+        assert f'(require-not (subpath "{aws}"))' not in profile
 
     # ── hardlink bypass ──
     def test_strict_denies_hardlink_creation_to_dirs(self):

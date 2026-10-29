@@ -69,7 +69,7 @@ class TestEveryWorkflowGrantsTheScopesItsCallsNeed:
 
 
 class TestTheOverrideHandlerReadsItsIssue:
-    """Class `deferred` reads a release issue."""
+    """The reviewer's case: class `deferred` reads a release issue."""
 
     NAME = "ai-review-human-override.yml"
 

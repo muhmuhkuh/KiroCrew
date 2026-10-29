@@ -16,30 +16,14 @@
 // files together go red for every meaningful line mutation in the region.
 
 import { describe, it, expect } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
-const PAGE_FILES = [
-  '../pages/ChatPage.tsx',
-  ...readdirSync(resolve(__dirname, '../pages/chat/page'))
-    .filter((f) => /\.tsx?$/.test(f) && !/\.test\./.test(f))
-    .sort()
-    .map((f) => `../pages/chat/page/${f}`),
-  ...readdirSync(resolve(__dirname, '../pages'))
-    .filter((f) => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
-    .sort()
-    .map((f) => `../pages/${f}`),
-]
-const PAGE = PAGE_FILES.map((f) => readFileSync(resolve(__dirname, f), 'utf8')).join('\n')
-
-// The shell's source may live inline in ChatPage or in extracted components —
-// the net follows the CODE, not the file: assertions are identical either way,
-// and a migration retargets nothing here.
+// The shared scroller skeleton and the page-owned transcript composition live
+// in separate modules after extraction. Keep both owners in this contract net.
 const SHELL_FILES = [
-  ...PAGE_FILES,
-  '../pages/chat/TranscriptScrollShell.tsx', // post-extraction home (absent pre-extraction)
-  '../app-sdk/ChatScrollChrome.tsx',
+  '../pages/chat/TranscriptScrollShell.tsx',
+  '../pages/chat/page/ChatTranscriptView.tsx',
 ]
 const SRC = SHELL_FILES.map((f) => {
   // Fail LOUD on a missing file: a swallowed read would let a rename of any
@@ -64,6 +48,11 @@ function between(startAnchor: string | RegExp, endAnchor: string | RegExp): stri
  *  it says is not. Ordering assertions hold because each ordered group lives
  *  (and moves) together in one file. */
 const SHELL = SRC
+const TRANSCRIPT_VIEW = readFileSync(resolve(__dirname, '../pages/chat/page/ChatTranscriptView.tsx'), 'utf8')
+const TRANSCRIPT_RENDERING = readFileSync(resolve(__dirname, '../pages/chat/page/transcriptRendering.tsx'), 'utf8')
+const TITLE_OVERLAY = readFileSync(resolve(__dirname, '../pages/chat/page/ChatTitleOverlay.tsx'), 'utf8')
+const COMPOSER_DOCK = readFileSync(resolve(__dirname, '../pages/chat/page/ComposerDockView.tsx'), 'utf8')
+const CHAT_PAGE = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
 
 describe('scroll shell: header fade', () => {
   it('mounts the shared top fade anchored to the header row bottom edge', () => {
@@ -71,7 +60,7 @@ describe('scroll shell: header fade', () => {
     // variants consumed 24px of layout and pushed the pinned card off the
     // header. The gradient recipe itself is pinned in ChatScrollChrome's
     // consumer suites; what belongs to THIS page is the anchored mount.
-    expect(SRC).toContain('<EdgeFade side="top" anchor="below" />')
+    expect(TITLE_OVERLAY).toContain('<EdgeFade side="top" anchor="below" />')
   })
 
   it('mounts the phone fade at the fold sentinel, behind the pinned card', () => {
@@ -79,11 +68,10 @@ describe('scroll shell: header fade', () => {
     // pinned band: its opaque edge would sit under a one-line card and mask
     // the transcript line below it. It overlays from the fold sentinel in a
     // zero-height relative wrapper, and the pinned card paints above it.
-    const page = PAGE
-    expect(page).not.toContain('{titleInTopbar && <EdgeFade side="top" anchor="below" />}')
-    const fold = page.indexOf('<div ref={pinFoldRef} aria-hidden className="h-0" />')
+    expect(TITLE_OVERLAY).not.toContain('{titleInTopbar && <EdgeFade side="top" anchor="below" />}')
+    const fold = TITLE_OVERLAY.indexOf('<div ref={pinFoldRef} aria-hidden className="h-0" />')
     expect(fold, 'fold sentinel not found').toBeGreaterThanOrEqual(0)
-    const afterFold = page.slice(fold)
+    const afterFold = TITLE_OVERLAY.slice(fold)
     const pinnedCard = afterFold.indexOf('<PinnedPrompt')
     expect(pinnedCard, 'pinned card mount not found after the fold').toBeGreaterThan(0)
     expect(afterFold.slice(0, pinnedCard)).toMatch(
@@ -113,7 +101,7 @@ describe('scroll shell: the scroller element contract', () => {
     // applies to a transcript too short to scroll (dockClearance pins the
     // wiring). HOST-owned geometry: the page supplies it, wherever the scroller
     // lives, as the dock's measured height plus a px constant.
-    expect(SRC).toContain('paddingBottom: dockH + DOCK_CLEARANCE_PX')
+    expect(TRANSCRIPT_VIEW).toContain('paddingBottom: dockH + DOCK_CLEARANCE_PX')
   })
 
   it('pins overflow-x so one over-wide child cannot give the list a horizontal scrollbar', () => {
@@ -138,7 +126,7 @@ describe('scroll shell: the scroller element contract', () => {
     expect(scroller()).toContain('aria-live="polite"')
     // PAGE-owned wiring: the single scroll controller's handler reaches the
     // scroller no matter which file renders the element.
-    expect(SRC).toContain('onScrollPin}')
+    expect(TRANSCRIPT_VIEW).toContain('onScroll={onScrollPin}')
   })
 })
 
@@ -169,9 +157,9 @@ describe('scroll shell: element order inside the scroller', () => {
   })
 
   it('keeps the page-owned tail composition: footer, survey width cap, px tail spacer', () => {
-    expect(SHELL).toContain('<ChatFooter')
-    expect(SHELL).toContain('<SessionPulseSurveyCard')
-    expect(SHELL).toContain('<div style={{ height: TRANSCRIPT_TAIL_SPACER_PX }} />')
+    expect(TRANSCRIPT_VIEW).toContain('<ChatFooter')
+    expect(TRANSCRIPT_VIEW).toContain('<SessionPulseSurveyCard')
+    expect(TRANSCRIPT_VIEW).toContain('<div style={{ height: TRANSCRIPT_TAIL_SPACER_PX }} />')
   })
 
   it('keeps both sentinels 1px, decorative, and bound to the virtualizer refs', () => {
@@ -197,7 +185,7 @@ describe('scroll shell: element order inside the scroller', () => {
   it('gates the earlier-messages bar on the cursor belonging to the active slot', () => {
     // Mid-switch slotHasMore still describes the OUTGOING chat; the cursor key
     // gate mirrors the paging thunk's own precondition.
-    expect(SHELL).toContain('{slotHasMore && cursorIsForActiveSlot && (')
+    expect(TRANSCRIPT_VIEW).toContain('{slotHasMore && cursorIsForActiveSlot && (')
   })
 
   it('keeps the loading spinner an ABSOLUTE overlay below the header, anchor-exempt, badge-backed', () => {
@@ -230,16 +218,16 @@ describe('scroll shell: row wrapper contract (what the shell must pass through)'
   // render contract: identity key, measureRef, the debug index, and the
   // unmounted-row placeholder. A migration that re-wraps rows must keep these.
   it('mounts only windowed rows; unmounted rows render null (spacers stand in)', () => {
-    expect(SHELL).toContain('if (!vi.mounted) return null')
+    expect(TRANSCRIPT_VIEW).toContain('if (!vi.mounted) return null')
   })
 
   it('keeps key + measureRef + data-display-index on BOTH row shapes (turn and single)', () => {
-    const wrappers = SHELL.match(/key=\{vi\.key\} ref=\{virt\.measureRef\(vi\.index\)\} data-display-index=\{displayIdx\}/g) ?? []
+    const wrappers = TRANSCRIPT_VIEW.match(/key=\{vi\.key\} ref=\{virt\.measureRef\(vi\.index\)\} data-display-index=\{displayIdx\}/g) ?? []
     expect(wrappers.length).toBe(2)
   })
 
   it('caps single rows at the theme content width', () => {
-    expect(SHELL).toContain("maxWidth: 'var(--mc-content-width, 900px)'")
+    expect(TRANSCRIPT_VIEW).toContain("maxWidth: 'var(--mc-content-width, 900px)'")
   })
 })
 
@@ -267,14 +255,13 @@ describe('scroll shell: extraction wiring (the seams the split created)', () => 
   it('page threads the controller wiring onto the shell call', () => {
     // The import IS the extraction: its deletion is the "silently undone"
     // mutation, and a collection failure alone names no pin.
-    expect(SRC).toContain("import TranscriptScrollShell from '../TranscriptScrollShell'")
-    expect(SRC).toContain("import { useTranscriptWidth } from './chat/TranscriptScrollShell'")
-    expect(SRC).toContain('scrollerRef={scrollerRef}')
-    expect(SRC).toContain('virt={virt}')
-    // Two consumers thread loadingOlder (the pinned-banner row props and the
-    // shell call); a bare contain() would let either deletion hide behind the
-    // other, so pin the count.
-    expect((SRC.match(/loadingOlder=\{loadingOlder\}/g) ?? []).length).toBeGreaterThanOrEqual(2)
+    expect(TRANSCRIPT_VIEW).toContain("import TranscriptScrollShell from '../TranscriptScrollShell'")
+    expect(CHAT_PAGE).toContain("import { useTranscriptWidth } from './chat/TranscriptScrollShell'")
+    expect(TRANSCRIPT_VIEW).toContain('scrollerRef={scrollerRef}')
+    expect(TRANSCRIPT_VIEW).toContain('virt={virt}')
+    expect(TRANSCRIPT_RENDERING).toContain('loadingOlder={loadingOlder}')
+    expect(TRANSCRIPT_VIEW.match(/loadingOlder=\{loadingOlder\}/g)?.length).toBe(1)
+    expect(CHAT_PAGE).toContain('onScrollPin={onScrollPin}')
   })
 })
 
@@ -282,14 +269,15 @@ describe('scroll shell: floating dock and jump pill', () => {
   it('follows the scroller with the floating dock root (geometry itself is pinned by dockClearance)', () => {
     // The dock is the next positioned sibling after the scroller: that DOM order,
     // not a z-index, is what paints it over the transcript.
-    const shellEnd = SRC.indexOf('<TranscriptScrollShell')
-    const dock = SRC.indexOf('data-testid="composer-dock-root"')
-    expect(shellEnd).toBeGreaterThan(0)
-    expect(dock).toBeGreaterThan(shellEnd)
+    const transcript = CHAT_PAGE.indexOf('<ChatTranscriptView')
+    const dock = CHAT_PAGE.indexOf('<ComposerDockView')
+    expect(transcript).toBeGreaterThan(0)
+    expect(dock).toBeGreaterThan(transcript)
+    expect(COMPOSER_DOCK).toContain('data-testid="composer-dock-root"')
     // No bottom fade under the floating dock: the transcript reads through the
     // glass. Scoped to the page — the shared <EdgeFade side="bottom"> in
     // ChatScrollChrome stays for its other consumers (ChatPane).
-    const page = PAGE
+    const page = readFileSync(resolve(__dirname, '../pages/ChatPage.tsx'), 'utf8')
     expect(page).not.toContain('<EdgeFade side="bottom"')
     expect(page).not.toContain('bg-gradient-to-t from-bg')
   })
@@ -298,6 +286,6 @@ describe('scroll shell: floating dock and jump pill', () => {
     // The pill's own markup (geometry, classes, catalog label) is pinned by
     // the ChatScrollChrome consumers' suites; what belongs to THIS page is the
     // visibility gate and the controller wiring.
-    expect(SRC).toContain('<JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />')
+    expect(COMPOSER_DOCK).toContain('<JumpToBottomButton visible={!isAtBottom && messages.length > 0} onClick={() => scrollBottom(true)} />')
   })
 })

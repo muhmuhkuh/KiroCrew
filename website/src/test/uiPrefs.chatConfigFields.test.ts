@@ -1211,30 +1211,43 @@ describe('uiPrefs', () => {
       // on boot with no recovery, and the raw-blob merge in saveChatConfig()
       // threw the same way. The fix catches per-field and drops only the
       // unserializable field, keeping every valid sibling. (uiPrefs.ts:162.)
-      // At this depth JSON.parse of the stored blob SUCCEEDS (so the composite
-      // parses and the field materializes), but JSON.stringify of the parsed
-      // field OVERFLOWS the stack -- exactly GPT's scenario: the value fits the
-      // store yet re-serializing it crashes. Build the JSON by hand so the TEST
-      // setup never stringifies the deep value itself.
+      // Some JS runtimes use a recursive JSON serializer and overflow at this
+      // depth; newer V8 versions serialize it iteratively. Build the JSON by
+      // hand, then inject the serializer failure only for this field and blobs
+      // carrying it so the recovery path stays deterministic across runtimes.
       const depth = 8000
       const deepJson = '['.repeat(depth) + '0' + ']'.repeat(depth)
       localStorage.setItem(CFG, `{"showTimestamps":true,"pinLastPrompt":${deepJson}}`)
       __resetUiPrefsSyncForTests()
 
-      // The boot path must NOT throw: expandComposite drops the bad field and
-      // the valid sibling still registers as an unreconciled child.
-      expect(() => hasUnreconciledKeys()).not.toThrow()
+      const nativeStringify = JSON.stringify
+      const stringifySpy = vi.spyOn(JSON, 'stringify').mockImplementation((value, replacer, space) => {
+        const isDeepArray = (candidate: unknown) => Array.isArray(candidate) && Array.isArray(candidate[0])
+        const carriesBadField = isDeepArray(value) || (
+          !!value && typeof value === 'object' &&
+          isDeepArray((value as Record<string, unknown>).pinLastPrompt)
+        )
+        if (carriesBadField) throw new RangeError('Maximum call stack size exceeded')
+        return nativeStringify(value, replacer, space)
+      })
+      try {
+        // The boot path must NOT throw: expandComposite drops the bad field and
+        // the valid sibling still registers as an unreconciled child.
+        expect(() => hasUnreconciledKeys()).not.toThrow()
 
-      // A later edit must NOT throw either: saveChatConfig's raw-blob merge
-      // carries the bad field forward from priorBlob, and the serialize guard
-      // excludes it while persisting the edited + valid fields.
-      const cfg = loadChatConfig()
-      cfg.showTimestamps = false
-      expect(() => saveChatConfig(cfg)).not.toThrow()
-      const blob = JSON.parse(localStorage.getItem(CFG)!) as Record<string, unknown>
-      // The unserializable field is gone; the valid edited field is kept.
-      expect(blob.pinLastPrompt).toBeUndefined()
-      expect(blob.showTimestamps).toBe(false)
+        // A later edit must NOT throw either: saveChatConfig's raw-blob merge
+        // carries the bad field forward from priorBlob, and the serialize guard
+        // excludes it while persisting the edited + valid fields.
+        const cfg = loadChatConfig()
+        cfg.showTimestamps = false
+        expect(() => saveChatConfig(cfg)).not.toThrow()
+        const blob = JSON.parse(localStorage.getItem(CFG)!) as Record<string, unknown>
+        // The unserializable field is gone; the valid edited field is kept.
+        expect(blob.pinLastPrompt).toBeUndefined()
+        expect(blob.showTimestamps).toBe(false)
+      } finally {
+        stringifySpy.mockRestore()
+      }
     })
 
     it('an unserializable prior value in the DIRTY COMPARISON does NOT crash the save; the serializable replacement persists (c558 GPT 6.1 F1)', () => {
@@ -1252,24 +1265,47 @@ describe('uiPrefs', () => {
       // replacement is written -- exactly the repair the user is performing.
       // (ChatSettings.tsx:189.)
       //
-      // At depth 8000, JSON.parse of the stored blob SUCCEEDS (collapseAllSteps
-      // materializes as a deep array) but JSON.stringify of it OVERFLOWS the
-      // stack. Build the blob JSON by hand so the TEST setup never stringifies
-      // the deep value itself.
+      // At depth 8000, JSON.parse of the stored blob succeeds. Whether
+      // JSON.stringify overflows there depends on the runtime, so inject the
+      // failure specifically for that prior field as the c516 test above does.
+      // Build the blob JSON by hand so setup never stringifies the deep value.
       const depth = 8000
       const deepJson = '['.repeat(depth) + '0' + ']'.repeat(depth)
       localStorage.setItem(CFG, `{"collapseAllSteps":${deepJson},"showTimestamps":true}`)
       __resetUiPrefsSyncForTests()
 
-      // loadChatConfig keeps the deep array (collapseAllSteps isn't type-checked
-      // there), so the compare loop meets it. The save must NOT throw.
-      const cfg = loadChatConfig()
-      cfg.collapseAllSteps = false // the user's "Show thinking inline" toggle
-      expect(() => saveChatConfig(cfg)).not.toThrow()
+      const nativeStringify = JSON.stringify
+      let injectedPriorValueFailure = false
+      const isDepth8000Array = (value: unknown) => {
+        let nested = value
+        for (let level = 0; level < depth; level++) {
+          if (!Array.isArray(nested) || nested.length !== 1) return false
+          nested = nested[0]
+        }
+        return nested === 0
+      }
+      const stringifySpy = vi.spyOn(JSON, 'stringify').mockImplementation((value, replacer, space) => {
+        if (isDepth8000Array(value)) {
+          injectedPriorValueFailure = true
+          throw new RangeError('Maximum call stack size exceeded')
+        }
+        return nativeStringify(value, replacer, space)
+      })
+      try {
+        // loadChatConfig keeps the deep array (collapseAllSteps isn't type-checked
+        // there), so the dirty-comparison path must attempt to serialize it.
+        // The save must recover and persist the user's serializable replacement.
+        const cfg = loadChatConfig()
+        cfg.collapseAllSteps = false // the user's "Show thinking inline" toggle
+        expect(() => saveChatConfig(cfg)).not.toThrow()
+        expect(injectedPriorValueFailure).toBe(true)
 
-      // The serializable replacement boolean persisted; the deep array is gone.
-      const blob = JSON.parse(localStorage.getItem(CFG)!) as Record<string, unknown>
-      expect(blob.collapseAllSteps).toBe(false)
+        // The serializable replacement boolean persisted; the deep array is gone.
+        const blob = JSON.parse(localStorage.getItem(CFG)!) as Record<string, unknown>
+        expect(blob.collapseAllSteps).toBe(false)
+      } finally {
+        stringifySpy.mockRestore()
+      }
     })
 
     it('an unrelated PUT ack does NOT discard a chat edit made while it was in flight (c549 GPT 6.1 F1)', async () => {

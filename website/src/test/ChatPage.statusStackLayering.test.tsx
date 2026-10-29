@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readFileSync, readdirSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { readIndexCss } from './indexCssSource'
 
@@ -26,26 +26,15 @@ import { readIndexCss } from './indexCssSource'
  * the comparison BETWEEN them.
  */
 const SRC = (p: string) => readFileSync(resolve(__dirname, '..', p), 'utf8')
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
-const CHAT_PAGE = [
-  SRC('pages/ChatPage.tsx'),
-  ...readdirSync(resolve(__dirname, '..', 'pages/chat/page'))
-    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
-    .sort()
-    .map(f => SRC(`pages/chat/page/${f}`)),
-  ...readdirSync(resolve(__dirname, '..', 'pages'))
-    .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
-    .sort()
-    .map(f => SRC(`pages/${f}`)),
-].join('\n')
+const COMPOSER_DOCK = SRC('pages/chat/page/ComposerDockView.tsx')
 
 /** The dock root: the one positioned box that floats over the scroller. */
-const DOCK = /<div ref=\{dockRef\} className="([^"]*)" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/.exec(CHAT_PAGE)
+const DOCK = /<div ref=\{dockRef\} className="([^"]*)" style=\{\{ right: dockGutter \}\} data-testid="composer-dock-root"[^>]*>/.exec(COMPOSER_DOCK)
 /** The composer's own layer. A bar at or above it would paint over the input box,
  *  and QueueStack's -OVERLAP fuse would surface ON TOP of the composer. */
-const COMPOSER_Z = /<div ref=\{inputAreaRef\} className="relative z-(\d+) dock-inert">/.exec(CHAT_PAGE)
+const COMPOSER_Z = /<div ref=\{inputAreaRef\} className="relative z-(\d+) dock-inert">/.exec(COMPOSER_DOCK)
 /** The stack wrapper's own className, and the JSX block it encloses. */
-const STACK = /<div ref=\{composerBandRef\} className="([^"]*)" data-testid="composer-status-stack">([\s\S]*?)\n {14}<\/div>/.exec(CHAT_PAGE)
+const STACK = /<div ref=\{composerBandRef\} className="([^"]*)" data-testid="composer-status-stack">([\s\S]*?)\n {14}<\/div>/.exec(COMPOSER_DOCK)
 
 /** Every component the stack renders, paired with the z-index its own outermost
  *  wrapper declares. Each value is read out of that component's real source. */
@@ -69,9 +58,9 @@ describe('composer dock layering', () => {
     // A regex that silently stopped matching would make the assertions below
     // pass on `undefined` vacuity, so failing loudly here is what gives the rest
     // of the file its meaning.
-    expect(DOCK, 'composer-dock-root not found in ChatPage.tsx').not.toBeNull()
-    expect(COMPOSER_Z, 'inputAreaRef wrapper not found in ChatPage.tsx').not.toBeNull()
-    expect(STACK, 'composer-status-stack block not found in ChatPage.tsx').not.toBeNull()
+    expect(DOCK, 'composer-dock-root not found in ComposerDockView.tsx').not.toBeNull()
+    expect(COMPOSER_Z, 'inputAreaRef wrapper not found in ComposerDockView.tsx').not.toBeNull()
+    expect(STACK, 'composer-status-stack block not found in ComposerDockView.tsx').not.toBeNull()
   })
 
   it('renders exactly the children this file has checked, and no others', () => {
@@ -116,7 +105,7 @@ describe('composer dock layering', () => {
     expect(DOCK![1]).toMatch(/\bpointer-events-none\b/)
     expect(STACK![1]).toMatch(/\bdock-inert\b/)
     expect(STACK![1]).not.toMatch(/\bpointer-events-auto\b/)
-    expect(CHAT_PAGE).toMatch(/<div ref=\{inputAreaRef\} className="relative z-\d+ dock-inert">/)
+    expect(COMPOSER_DOCK).toMatch(/<div ref=\{inputAreaRef\} className="relative z-\d+ dock-inert">/)
     expect(readIndexCss()).toMatch(/\.dock-inert\{pointer-events:none\}\.dock-inert>\*\{pointer-events:auto\}/)
     // The stack is a scroll box: while it overflows its cap, its own scrollbar
     // must be a hit target, and a scrollbar belongs to the box, not a child. The

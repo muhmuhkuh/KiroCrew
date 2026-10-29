@@ -18,7 +18,6 @@ from __future__ import annotations
 import ast
 import inspect
 import sys
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -38,15 +37,6 @@ from kiro_crew.slack.gateway import GatewayOrchestrator
 #: these tests are about. The fixture below creates it under ``tmp_path`` and it stays
 #: distinguishable from ``sys.executable``, which is the whole point of the assertion.
 _STABLE_INTERPRETER_NAME = "managed-current-python-sentinel"
-
-
-def _gateway_source() -> str:
-    """The facade's text followed by its composed owners' (``gateway_runtime/*.py``)."""
-    facade = Path(gw.__file__)
-    return "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (facade, *sorted((facade.parent / "gateway_runtime").glob("*.py")))
-    )
 
 
 def _make_orchestrator() -> GatewayOrchestrator:
@@ -122,7 +112,7 @@ class TestResolverIsLoadedBeforeTheApply:
 
     @staticmethod
     def _method(name: str) -> ast.AsyncFunctionDef:
-        tree = ast.parse(_gateway_source())
+        tree = ast.parse(inspect.getsource(gw))
         for node in ast.walk(tree):
             if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
                 return node
@@ -189,7 +179,7 @@ class TestResolverIsLoadedBeforeTheApply:
         cached ``sys.executable``, which an update may have pruned. Walk every
         such call in gateway.py instead of a list of known ones.
         """
-        tree = ast.parse(_gateway_source())
+        tree = ast.parse(inspect.getsource(gw))
         calls = [
             node
             for node in ast.walk(tree)
@@ -313,9 +303,7 @@ class TestAutoApplyGitUpdate:
         monkeypatch.setattr(gw, "is_primary_branch", lambda _branch: True)
         monkeypatch.setattr(gw, "repo_exec_config_reason", lambda _proj: "")
         monkeypatch.setattr(gw, "tracks_upstream", lambda _proj, _branch: True)
-        monkeypatch.setattr(
-            gw, "resolve_remote_url", lambda _proj, remote, **_k: "https://example/r.git"
-        )
+        monkeypatch.setattr(gw, "resolve_remote_url", lambda _proj, remote: "https://example/r.git")
         monkeypatch.setattr(
             "kiro_crew.platform.update_governance.update_blocked_reason", lambda _url: None
         )

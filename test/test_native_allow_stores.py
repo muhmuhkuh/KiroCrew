@@ -100,7 +100,7 @@ def test_a_symlinked_harness_dir_is_refused_at_its_real_path(
 
 @_POSIX_ONLY
 @pytest.mark.parametrize("rel", PROJECT_ALLOW_STORES)
-def test_a_project_claude_settings_file_is_refused_in_any_directory(
+def test_a_project_harness_permission_file_is_refused_in_any_directory(
     rel: str, tmp_path: Path
 ) -> None:
     project = tmp_path / "some" / "project"
@@ -108,6 +108,21 @@ def test_a_project_claude_settings_file_is_refused_in_any_directory(
     assert is_sensitive_write_path(rel, str(project))
     assert not is_sensitive_write_path(_under(project, ".claude/notes.json"))
     assert not is_sensitive_write_path(_under(project, "settings.json"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize(
+    "rel",
+    [
+        ".pi/skills/example.md",
+        ".opencode-backup/config.json",
+        "opencode.json.bak",
+        ".pi/settings.json.bak",
+    ],
+)
+def test_neighboring_project_files_remain_writable(rel: str, tmp_path: Path) -> None:
+    project = tmp_path / "some" / "project"
+    assert not is_sensitive_write_path(_under(project, rel))
 
 
 def test_agent_env_refuses_every_variable_that_moves_a_store() -> None:

@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 import uuid
 from pathlib import Path
@@ -113,37 +112,18 @@ def enqueue(
     return admitted
 
 
-def _priority(item: dict) -> float:
-    """An item's priority, or 0.0 when the stored value is not a finite number.
-
-    The queue file is agent-writable (see ``load_queue``), so ``priority`` may
-    be ``null``, a word, or ``"nan"``/``"inf"``; that must rank last, not fail
-    the round or reorder the queue. Ingest clamps real priorities to [0, 1].
-    """
-    try:
-        value = float(item.get("priority", 0.0))
-    except (TypeError, ValueError):
-        return 0.0
-    return value if math.isfinite(value) else 0.0
-
-
 def dequeue_top_k(queue: dict, k: int) -> list[dict]:
     """Remove and return up to ``k`` highest-priority pending items.
 
     Ties broken by current position (stable). Items are removed from
     ``pending``; the caller investigates them, then calls ``mark_analyzed``.
-    A pending entry that is not a dict with non-empty ``text`` cannot be
-    investigated, so it is skipped and dropped from ``pending``.
     """
     if k <= 0:
         return []
-    pending = [
-        it for it in queue.get("pending", [])
-        if isinstance(it, dict) and isinstance(it.get("text"), str) and it["text"].strip()
-    ]
+    pending = queue.get("pending", [])
     ordered = sorted(
         range(len(pending)),
-        key=lambda i: (-_priority(pending[i]), i),
+        key=lambda i: (-float(pending[i].get("priority", 0.0)), i),
     )
     take = ordered[:k]
     take_set = set(take)
@@ -182,14 +162,11 @@ def next_depth(queue: dict) -> int:
     so each successive exploration round is one level deeper — letting the
     caller decay priority by depth so deeper leads rank lower.
     """
-    depths: list[int] = []
-    for it in queue.get("analyzed", []):
-        if not isinstance(it, dict):
-            continue
-        try:
-            depths.append(int(it.get("depth", 0)))
-        except (TypeError, ValueError):
-            continue  # hand-edited depth: no level to extend
+    depths = [
+        int(it.get("depth", 0))
+        for it in queue.get("analyzed", [])
+        if isinstance(it, dict)
+    ]
     return (max(depths) + 1) if depths else 1
 
 
@@ -206,9 +183,8 @@ def load_queue(campaign_dir: Path) -> dict:
     data = read_json_or(p, None, logger=logger, what="subquestion queue")
     if not isinstance(data, dict):
         return new_queue()
-    for bucket in ("pending", "analyzed"):
-        if not isinstance(data.get(bucket), list):
-            data[bucket] = []
+    data.setdefault("pending", [])
+    data.setdefault("analyzed", [])
     return data
 
 

@@ -28,7 +28,6 @@ import {
 } from './contributedCommands'
 import { useImeGuard } from '../../hooks/useImeGuard'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { usePointerMotion } from '../../hooks/usePointerMotion'
 import { PREVIEW_CREW } from '../../utils/previewFlags'
 import { ARTIFACTS_ROW_LIMIT, COPY_KEY, DEBOUNCE_MS, ENTER_KEY, SKELETON_WIDTHS, actionLabel, headerOf, rootRowCopyable, type Scope } from './commandBarOverlayModel'
 import { useCommandBarOverlayEngines } from './useCommandBarOverlayEngines'
@@ -114,13 +113,31 @@ export default function CommandBarOverlay({
 
   const [selected, setSelected] = useState(0)
   /**
-   * Hover selects a row only on REAL pointer motion, so a row re-ranked under a
-   * resting pointer cannot overwrite the reset to row 0 that every keystroke makes
-   * (see `usePointerMotion`). The trail is cleared each time the bar opens.
+   * Where the pointer was at the last mousemove anywhere over the bar, so hover
+   * selects a row only on REAL motion.
+   *
+   * The browser fires mouseover, mouseenter and even mousemove when rows re-render
+   * or scroll under a pointer that has not moved. None of those is the reader
+   * pointing at a row, and selecting on them would let a resting pointer overwrite
+   * the reset to row 0 that every keystroke makes, so Enter would act on whatever row
+   * landed under the cursor.
+   *
+   * The position is recorded by the backdrop, which every mousemove inside the bar
+   * bubbles to: over a row, a group header, the empty notice or the backdrop itself.
+   * A row compares against it before the event reaches the backdrop. Recording only
+   * over rows would compare a pointer resting on a header against an older row
+   * position and read the re-render as motion. The first event only records: with
+   * nothing to compare against it cannot be told apart from a re-render under a
+   * resting pointer, and one swallowed pixel of motion is the cost.
    */
-  const pointerMoved = usePointerMotion(open)
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null)
+  const recordPointer = (e: { clientX: number; clientY: number }) => {
+    lastPointerRef.current = { x: e.clientX, y: e.clientY }
+  }
   const selectOnPointerMove = (i: number, e: { clientX: number; clientY: number }) => {
-    if (pointerMoved(e)) setSelected(i)
+    const last = lastPointerRef.current
+    if (!last || (last.x === e.clientX && last.y === e.clientY)) return
+    setSelected(i)
   }
   /**
    * Whether the reader asked to see every session waiting on them. Until then the
@@ -220,6 +237,7 @@ export default function CommandBarOverlay({
     setScope(null)
     setArgCommand(null)
     setSelected(0)
+    lastPointerRef.current = null
     setUsage(loadUsage())
     setActionError(null)
     setPendingRow(null)
@@ -629,6 +647,9 @@ export default function CommandBarOverlay({
       onMouseDown={e => {
         if (e.target === e.currentTarget) onClose()
       }}
+      // Every mousemove in the bar ends here, after a row has compared against the
+      // previous position. See `lastPointerRef`.
+      onMouseMove={recordPointer}
     >
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- a dialog owns the keyboard dismissal of its own subtree; the handler below is Escape only, and every gesture inside is on a real control */}
       <div

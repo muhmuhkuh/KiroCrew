@@ -299,22 +299,6 @@ def detect_install_layout() -> InstallLayout:
     )
 
 
-def policy_release_channel() -> str:
-    """The channel the policy requires, or ``""`` when the local file decides.
-
-    The policy's ``updates.channel`` pin; with none, ``stable`` in an enterprise
-    build. :func:`release_channel` and the channel-switch API both read this, so
-    the channel followed and the channel a switch may pick cannot disagree.
-    """
-    from kiro_crew.edition import is_enterprise
-    from kiro_crew.platform.governance import active_update_pins
-
-    pinned = active_update_pins().channel
-    if pinned in RELEASE_CHANNELS:
-        return pinned
-    return "stable" if is_enterprise() else ""
-
-
 def release_channel() -> str:
     """The release channel this install follows, from ``$KIROCREW_HOME/channel``.
 
@@ -326,13 +310,13 @@ def release_channel() -> str:
     ``shutil.rmtree``. Doing that on the event loop as a side effect of asking
     where a directory is is the blocking hazard this avoids.
 
-    A channel the policy pins (``updates.channel``) wins over the file; with no
-    pin an enterprise build follows ``stable`` whatever the file says (RFC
-    enterprise edition D3, appendix row "Update channel").
+    An enterprise build follows ``stable`` whatever the file says
+    (:mod:`kiro_crew.edition_locks`, RFC D3).
     """
-    required = policy_release_channel()
-    if required:
-        return required
+    from kiro_crew.edition_locks import local_enable_locked
+
+    if local_enable_locked("updates.channel"):
+        return "stable"
     try:
         raw = (data_home() / "channel").read_text(encoding="utf-8", errors="replace")
     except OSError:

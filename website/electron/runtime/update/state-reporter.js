@@ -12,7 +12,6 @@ function createUpdateReporter({
   app,
   getFlavor,
   getChannelPreference,
-  getRequiredChannel = () => "",
   getAutoDownloadPreference,
   onUpdateState,
   uiDriven,
@@ -80,26 +79,9 @@ function createUpdateReporter({
   // the UI. Read the preference FRESH on every call: configureFeed() runs
   // per check, so a Settings channel switch takes effect on the next check
   // with no re-init. Flavor stays the unstamped-dev display fallback.
-  // A channel the policy requires replaces the preference (resolveChannel).
-  // A build that cannot follow it reports the lane it is on (policyRefusal
-  // keeps the feed off); getInfo names the required one beside it.
   function currentChannel() {
     const stamped = channelForVersion(app.getVersion());
-    return resolveChannel(stamped, getChannelPreference(), getRequiredChannel())
-      || (getRequiredChannel() ? stamped : null)
-      || channelForFlavor(getFlavor());
-  }
-  /**
-   * Why this build may not update under the policy's channel, or "". The feed
-   * lane asks it before every check, so a requirement this build cannot follow
-   * never falls back to the stable feed currentChannel() reports for display.
-   */
-  function policyRefusal() {
-    const required = getRequiredChannel();
-    if (!required) return "";
-    const stamped = channelForVersion(app.getVersion());
-    if (stamped === null || resolveChannel(stamped, "", required) !== null) return "";
-    return `policy requires the ${required} channel, which this ${stamped} build cannot follow`;
+    return resolveChannel(stamped, getChannelPreference()) || channelForFlavor(getFlavor());
   }
   function emit(state, extra = {}) {
     if (!uiDriven) return;
@@ -149,11 +131,7 @@ function createUpdateReporter({
       // (nightly is pinned; dev has no lane; an externally-managed install has
       // no lane the marker's owner reads), and the stored preference.
       stampedChannel: stamped,
-      // A channel the policy requires is not the user's to switch.
-      channelSwitchable: !managed && !getRequiredChannel() && (stamped === "insider" || stamped === "stable"),
-      channelLockedByPolicy: !!getRequiredChannel(),
-      // The channel the policy requires, "" when none.
-      requiredChannel: getRequiredChannel() || "",
+      channelSwitchable: !managed && (stamped === "insider" || stamped === "stable"),
       channelPreference: getChannelPreference() || "",
       // What the FOLLOWED channel publishes, and whether these bytes are ahead
       // of it — i.e. that lane never shipped this build, so the install is not
@@ -175,18 +153,13 @@ function createUpdateReporter({
       platform,
       packaged: !!app.isPackaged,
       // Escape hatch for a failed install (see manualDownloadUrl).
-      // For a build that cannot follow the required channel, that channel's
-      // app: installing it is the way back to updates.
-      downloadUrl: manualDownloadUrl(
-        policyRefusal() ? getRequiredChannel() : currentChannel(),
-        osPlatform, osArch, linux.format, macDistArch,
-      ),
+      downloadUrl: manualDownloadUrl(currentChannel(), osPlatform, osArch, linux.format, macDistArch),
       // Replay seed for a freshly mounted renderer (see lastEmittedState).
       lastState: lastEmittedState,
     };
   }
 
-  return { currentChannel, emit, getInfo, policyRefusal, recordLaneVersion };
+  return { currentChannel, emit, getInfo, recordLaneVersion };
 }
 
 module.exports = { createUpdateReporter };

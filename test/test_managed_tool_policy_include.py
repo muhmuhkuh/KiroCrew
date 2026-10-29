@@ -220,8 +220,10 @@ class _Loop:
         monkeypatch.setattr(sys, "stdin", self._stdin)
         monkeypatch.setattr(mcp_shared, "respond", self._record)
         monkeypatch.setattr(mcp_shared, "_resolve_tool_policy", lambda *a, **k: policy)
-        # ``call_tool`` below stands in for a managed server's own handler.
-        monkeypatch.setattr(mcp_shared, "serves_managed_tools", lambda _fn: True)
+        # The local fake handler lives in this test module, so the managed-server
+        # detector correctly classifies it as user code unless the fixture marks
+        # it as the managed handler whose policy this test exercises.
+        monkeypatch.setattr(mcp_shared, "serves_managed_tools", lambda _handler: True)
         self.sel_mock = MagicMock()
         monkeypatch.setattr(mcp_shared, "sel", lambda: self.sel_mock)
 
@@ -314,6 +316,29 @@ class TestManagedServerHonoursInclude:
         finally:
             loop.close()
 
+
+class TestManagedServerPolicy:
+    def test_a_withheld_server_answers_an_empty_include_list(self, tmp_path: Path) -> None:
+        assert _policy_for(
+            tmp_path,
+            {"managedToolPolicy": {"excludeServers": ["managed-without-declaration"]}},
+        ) == {"include": {"managed-without-declaration": []}}
+
+    def test_the_empty_include_withholds_tools_list_and_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ran: list[str] = []
+        policy = mcp_shared.ToolPolicy(
+            frozenset(), "", included=types.MappingProxyType({CORE: frozenset()})
+        )
+        loop = _Loop(monkeypatch, CORE, policy, ran)
+        try:
+            assert loop.listed(1) == []
+            assert "not available for this agent" in loop.call(2, "spawn_run")
+            assert ran == []
+        finally:
+            loop.close()
+
     def test_a_policy_with_no_include_lists_and_runs_everything(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -325,57 +350,3 @@ class TestManagedServerHonoursInclude:
             assert ran == ["spawn_run"]
         finally:
             loop.close()
-
-
-# --------------------------------------------------------------------------- #
-# ``excludeServers``: a managed server withheld whole
-# --------------------------------------------------------------------------- #
-
-
-class TestExcludeServers:
-    def test_each_named_server_is_answered_as_an_empty_include(self, tmp_path: Path) -> None:
-        policy = _policy_for(
-            tmp_path,
-            {"managedToolPolicy": {"exclude": ["x"], "excludeServers": ["kirocrew-cron"]}},
-        )
-        assert policy == {"exclude": ["x"], "include": {"kirocrew-cron": []}}
-
-    def test_it_overrides_an_opted_in_per_tool_include(self, tmp_path: Path) -> None:
-        policy = _policy_for(
-            tmp_path,
-            {
-                "tools": [f"@{CORE}/skill_search"],
-                "managedToolPolicy": {"honourToolRefs": True, "excludeServers": [CORE]},
-            },
-        )
-        assert policy == {"honourToolRefs": True, "include": {CORE: []}}
-
-    @pytest.mark.parametrize("value", ["kirocrew-cron", None, [3], [""], {"a": 1}])
-    def test_a_malformed_value_is_unreadable(self, tmp_path: Path, value: Any) -> None:
-        with pytest.raises(sessions_mod.ManagedToolPolicyUnreadable, match="excludeServers"):
-            _policy_for(tmp_path, {"managedToolPolicy": {"excludeServers": value}})
-
-    def test_the_server_lists_and_runs_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ran: list[str] = []
-        withheld = mcp_shared.ToolPolicy(
-            frozenset(), "", included=types.MappingProxyType({CORE: frozenset()})
-        )
-        loop = _Loop(monkeypatch, CORE, withheld, ran)
-        try:
-            assert loop.listed(1) == []
-            refused = loop.call(2, "skill_search")
-            assert f"withholds every {CORE} tool" in refused
-            assert ran == []
-            errors = [
-                c.kwargs.get("error") for c in loop.sel_mock.log_tool_invocation.call_args_list
-            ]
-            assert "managedToolPolicy.excludeServers" in errors
-        finally:
-            loop.close()
-
-    def test_the_answer_round_trips_through_the_server_read(self, gateway) -> None:
-        gateway["body"] = json.dumps({"include": {"kirocrew-cron": []}}).encode()
-        policy = mcp_shared._resolve_tool_policy("dashboard:dave")
-        assert policy.unresolved == ""
-        assert policy.include_for("kirocrew-cron") == frozenset()
-        assert policy.include_for(CORE) is None

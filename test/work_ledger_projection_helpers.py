@@ -200,9 +200,7 @@ def _real_units(monkeypatch, *, worker_lands: bool = True) -> None:
     CrewLog.create(lg.KIND_SESSION, "u-worker", owner="raymond", agent="kirocrew", slot=WORKER)
 
     def _append(unit: str, data: dict[str, Any]) -> bool:
-        # ``worker_lands=False`` is a worker's report whose record does not land: the
-        # board's copy in the conductor's unit (the one the fold reads) is refused.
-        if data.get("actor") == "worker" and not worker_lands:
+        if unit == "u-worker" and not worker_lands:
             return False
         projection.open_session_log(unit).append("work/recorded", data, src="gateway")
         return True

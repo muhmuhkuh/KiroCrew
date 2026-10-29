@@ -684,7 +684,10 @@ async def test_cron_continuation_loss_is_marked_as_activity():
 
     with (
         patch("kiro_crew.slack.gateway.stream_and_collect", side_effect=stream),
-        patch("kiro_crew.slack.gateway.asyncio.sleep", new=AsyncMock()),
+        patch(
+            "kiro_crew.slack.gateway.asyncio",
+            SimpleNamespace(**{**vars(asyncio), "sleep": AsyncMock()}),
+        ),
         patch("kiro_crew.slack.gateway.provider_last_turn_usage") as usage,
     ):
         usage.return_value = SimpleNamespace(credits=0.0)

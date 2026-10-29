@@ -1469,6 +1469,15 @@ def _make_app_with_sessions() -> tuple[web.Application, MagicMock]:
 
 class TestDefaultModelPatch:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("model", ["vendor/model-v1", "vendor/group/model-v1", "model[1m]"])
+    async def test_provider_qualified_id_persists(self, tmp_config, model) -> None:
+        app, _ = _make_app_with_sessions()
+        async with TestClient(TestServer(app)) as client:
+            assert (await _patch(client, "agent.model", model)).status == 200
+        data = json.loads(tmp_config.read_text(encoding="utf-8"))
+        assert data["agent"]["model"] == model
+
+    @pytest.mark.asyncio
     async def test_kiro_style_id_persists(self, tmp_config) -> None:
         app, _ = _make_app_with_sessions()
         async with TestClient(TestServer(app)) as c:
@@ -1553,14 +1562,30 @@ class TestDefaultModelPatch:
             "claude opus",  # whitespace
             "model;rm -rf /",  # shell metacharacters
             "../../etc/passwd",  # path traversal
+            "vendor/../model",
+            "vendor/./model",
+            "vendor//model",
+            "vendor/model/",
+            "vendor/..",
+            "vendor/.",
             "model$(id)",  # command substitution
             "model\nnewline",
         ],
     )
-    async def test_malformed_ids_rejected(self, tmp_config, bad) -> None:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "agent.model",
+            "agent.role_models.background",
+            "agent.role_models.subagent",
+            "agent.fallback_model",
+            "agent.refusal_fallback_model",
+        ],
+    )
+    async def test_malformed_ids_rejected(self, tmp_config, bad, field) -> None:
         app, _ = _make_app_with_sessions()
         async with TestClient(TestServer(app)) as c:
-            assert (await _patch(c, "agent.model", bad)).status == 400
+            assert (await _patch(c, field, bad)).status == 400
         data = json.loads(tmp_config.read_text(encoding="utf-8"))
         assert "model" not in data["agent"]
 

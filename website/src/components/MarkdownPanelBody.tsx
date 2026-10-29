@@ -3,7 +3,6 @@ import { MessageSquare, X, FileDiff, TriangleAlert, CaseSensitive, ChevronUp, Ch
 import { CommentList, type InlineComment } from './CommentOverlay'
 import { PierreFilePair, PierrePatch } from '../pierre'
 import { i18nT } from '../i18n/t'
-import { Badge } from './ui'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 import type { useImeGuard } from '../hooks/useImeGuard'
 import type { useMarkdownPanelFind } from './useMarkdownPanelFind'
@@ -16,10 +15,8 @@ import type { useMarkdownPanelFind } from './useMarkdownPanelFind'
  * them out in both the side-panel and the full-screen layouts.
  */
 
-/** Comment hint banner for markdown files, shown until the reader dismisses it.
- *  `image` names the image gesture, and `isNew` badges the tip when it is back
- *  for a reader who closed the text-only one (see `useCommentHint`). */
-export function CommentHint({ image, isNew, onDismiss }: { image: boolean; isNew: boolean; onDismiss: () => void }) {
+/** Comment hint banner — shown once per session for markdown files */
+export function CommentHint({ onDismiss }: { onDismiss: () => void }) {
   return (
     <div
       className="flex items-center gap-2.5 px-3 py-2.5 bg-bg-elevated border rounded-lg text-[12px] animate-scale-in mx-1 mb-2"
@@ -27,10 +24,7 @@ export function CommentHint({ image, isNew, onDismiss }: { image: boolean; isNew
     >
       <span className="text-muted shrink-0"><MessageSquare className="lucide-inline" /></span>
       <span className="flex-1 text-text">
-        {isNew && <Badge variant="aim" className="me-1.5 align-middle text-[11px] font-sans">{i18nT('components.markdownPanel.new_badge')}</Badge>}
-        <strong className="text-text-strong font-semibold">{i18nT('components.markdownPanel.tip')}</strong> {image
-          ? i18nT('components.markdownPanel.select_any_text_or_drag_across_an_image_to_add_i')
-          : i18nT('components.markdownPanel.select_any_text_to_add_inline_comments_then_subm')}
+        <strong className="text-text-strong font-semibold">{i18nT('components.markdownPanel.tip')}</strong> {i18nT('components.markdownPanel.select_any_text_to_add_inline_comments_then_subm')}
       </span>
       <button className="text-accent hover:text-accent-hover cursor-pointer bg-transparent border-none text-[11px] font-medium shrink-0" onClick={onDismiss}>{i18nT('components.markdownPanel.got_it')}</button>
     </div>
@@ -131,16 +125,14 @@ export function DiffViewBlock({ diffMode, fileName, originalContent, content, gi
 
 /** Shared comment overlay — the pending-comment list. (The input itself lives
  *  in `SelectionToolbar`'s composer, which opens on selection.) */
-export const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true, onEditingChange, draftKey }: {
+export const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true, onEditingChange }: {
   onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; connected?: boolean
   onEditingChange?: (id: string, editing: boolean) => void
-  /** The document the pending instruction belongs to (kept across an unmount). */
-  draftKey?: string
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!onSubmitComments) return null
   return (
-    <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} onEditingChange={onEditingChange} draftKey={draftKey} />
+    <CommentList comments={comments} onEdit={editComment} onRemove={removeComment} onSubmitAll={submitAllComments} enableExtraPrompt connected={connected} onEditingChange={onEditingChange} />
   )
 })
 

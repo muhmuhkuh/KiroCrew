@@ -69,11 +69,7 @@ concurrency:
 jobs:
   fork-ux-review:
     name: Fork UX Review
-    # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
-    # "Larger runners for the review lanes and CodeQL" in
-    # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     # Only for a SUCCESSFUL Stage 1 run that was itself a fork pull_request.
     if: >-
@@ -358,9 +354,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr.outputs.base_sha }}
-          # Depth 1: the diff step fetches the head and the merge-base it
-          # needs, one commit each.
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       # Re-derive the diff AUTHORITATIVELY from GitHub, pinned to the trusted
@@ -370,7 +364,6 @@ jobs:
       # reviewer reads changed frontend files from the diff, and can open only
       # screenshots the evidence step copied into runner.temp); nothing runs it.
       - name: Fetch authentic diff (data only — never applied to the tree)
-        id: authentic
         if: steps.pr.outputs.obsolete != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -383,7 +376,7 @@ jobs:
           set -uo pipefail
           # COMPLETE diff via git, NOT the compare API: the compare endpoint
           # truncates very large diffs, which would let a big fork PR slip a defect
-          # past the cap and still pass. Fetch the PR head as OBJECTS only
+          # past the cap and still pass. Fetch the PR head history as OBJECTS only
           # (never checked out — the working tree stays the trusted base, so no
           # fork file/symlink is materialized) and diff locally, which has no cap.
           # GitHub's git smart-HTTP transport authenticates with BASIC auth
@@ -394,38 +387,16 @@ jobs:
           # logged and the raw token stays masked.
           auth_b64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           echo "::add-mask::$auth_b64"  # mask the derived header so it can never surface in logs
-          # Pin to the exact CI-reviewed head SHA: fetch that one commit at
-          # depth 1, by SHA, and fail closed if it is missing.
           git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
-            fetch --no-tags --quiet --depth=1 origin "$HEAD_SHA" \
-            || { echo "::error::could not fetch PR head $HEAD_SHA for #$PR"; exit 1; }
+            fetch --no-tags --quiet origin "refs/pull/$PR/head" \
+            || { echo "::error::could not fetch PR head history for #$PR"; exit 1; }
+          # Pin to the exact CI-reviewed head SHA; fail closed if it is missing
+          # (e.g. the fork rewrote history out from under the review).
           if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
             echo "::error::head SHA $HEAD_SHA not present after fetch; failing closed."
             exit 1
           fi
-          # Both commits are shallow, so git cannot find the merge-base a
-          # three-dot range needs. GitHub's compare API names it -- only its
-          # SHA is read; the diff still comes from git, uncapped. That commit
-          # is fetched at depth 1 and the diff is the two-dot
-          # MERGE_BASE..HEAD_SHA: two trees, no history, and the same diff the
-          # three-dot range from BASE_SHA gave on a full clone.
-          compare_base() { gh api "repos/$REPO/compare/$1...$2?per_page=1" --jq '.merge_base_commit.sha'; }
-          merge_base=""
-          for attempt in 1 2 3; do
-            merge_base="$(compare_base "$BASE_SHA" "$HEAD_SHA")" && break
-            sleep "$attempt"
-          done
-          if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::could not read the merge-base of $BASE_SHA and $HEAD_SHA; failing closed."
-            exit 1
-          fi
-          if ! git cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
-            git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
-              fetch --no-tags --quiet --depth=1 origin "$merge_base" \
-              || { echo "::error::could not fetch merge-base $merge_base for #$PR"; exit 1; }
-          fi
-          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
-          git diff --no-color "$merge_base..$HEAD_SHA" > "$PATCH"
+          git diff --no-color "$BASE_SHA...$HEAD_SHA" > "$PATCH"
           # git diff has no API size cap, so an oversized diff is a real signal —
           # fail CLOSED rather than review only a prefix.
           if [ "$(wc -c < "$PATCH" 2>/dev/null || echo 0)" -gt 1000000 ]; then
@@ -433,7 +404,7 @@ jobs:
             exit 1
           fi
           if [ ! -s "$PATCH" ]; then
-            echo "::error::empty diff for $merge_base..$HEAD_SHA; failing closed."
+            echo "::error::empty diff for $BASE_SHA...$HEAD_SHA; failing closed."
             exit 1
           fi
           # The patch is deliberately NOT applied to the working tree. The checkout
@@ -513,8 +484,6 @@ jobs:
           PR: ${{ steps.pr.outputs.pr }}
           BASE_SHA: ${{ steps.pr.outputs.base_sha }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          MERGE_BASE: ${{ steps.authentic.outputs.merge_base }}
-          WORKFLOW_SHA: ${{ github.workflow_sha }}
           FETCH_DIR: ${{ runner.temp }}/ux-fetch
           ATTACH_DIR: ${{ runner.temp }}/ux-attachments
           SHOTS: ${{ runner.temp }}/ux-attachments.txt
@@ -538,30 +507,6 @@ jobs:
           # the user-attachments allowlist, downloads anonymously, types each file
           # by its bytes, and lists recordings without keeping their bytes.
           DEST_DIR="$ATTACH_DIR"
-          # A fork PR whose base predates the shallow checkout carries an older
-          # copy of pr-committed-evidence.sh (sourced below) that lists media
-          # over a three-dot range, which
-          # this shallow clone cannot compute. Swap in this workflow's own
-          # revision of it (the default branch, as trusted as the base), the
-          # one this step's MERGE_BASE was written for. A failure
-          # is the script's own failure: `unfetched`, then out.
-          committed="$GITHUB_WORKSPACE/.github/scripts/pr-committed-evidence.sh"
-          if ! grep -q 'MERGE_BASE' "$committed" 2>/dev/null; then
-            auth_b64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
-            echo "::add-mask::$auth_b64"
-            if git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
-                fetch --no-tags --quiet --depth=1 origin "$WORKFLOW_SHA" \
-              && git show "$WORKFLOW_SHA:.github/scripts/pr-committed-evidence.sh" > "$committed.new" \
-              && grep -q 'MERGE_BASE' "$committed.new"; then
-              mv -f -- "$committed.new" "$committed"
-              echo "The base's committed-evidence script predates MERGE_BASE; using $WORKFLOW_SHA's copy."
-            else
-              rm -f -- "$committed.new"
-              echo "::error::Could not read this workflow's committed-evidence script at $WORKFLOW_SHA, and the base's copy cannot list media in a shallow clone; re-run the workflow."
-              echo "unfetched=true" >> "$GITHUB_OUTPUT"
-              exit 1
-            fi
-          fi
           NAME_STEM=attachment
           . "$GITHUB_WORKSPACE/.github/scripts/pr-attachment-evidence.sh"
           # Committed media second, continuing $n and $clips under the same
@@ -899,11 +844,6 @@ jobs:
                - Redundancy effect: icon + label + tooltip all restating the
                  same words is a violation (delete the restatement), as is
                  helper text paraphrasing its label.
-               - Avoid unnecessary secondary labels and descriptions. Let the
-                 layout do the explaining. A subtitle, menu-row description,
-                 caption, helper line or tooltip the diff ADDS or CHANGES is a
-                 finding when the label, icon, heading or placement already
-                 says it; quote the line and name what already says it.
                - Errors: what happened + what to do next, ≤2 sentences, in the
                  user's vocabulary — never raw codes, exception text, or a bare
                  "Something went wrong".
@@ -981,29 +921,6 @@ jobs:
                  in components/appstore/gradient.ts, the session 'gradient'
                  color mode) — the rule is documented in
                  website/docs/theming-contract.md.
-               - Scrollbars: none is visible at rest, on any surface, for any
-                 pointer (recorded maintainer decision,
-                 docs/decisions/2026-10-23-scrollbars-are-never-always-visible.md;
-                 the global rule lives in website/src/index.css). A scroll box
-                 either hides its scrollbar entirely (`scrollbar-none`) or shows
-                 a thin thumb only while it is being scrolled (`data-scrolling`,
-                 set by lib/scrollReveal.ts), in a column it reserves anyway so
-                 the reveal moves no content. A diff that paints one at rest is a
-                 finding: a coloured `::-webkit-scrollbar-thumb` or
-                 `scrollbar-color` whose selector lacks `[data-scrolling]`,
-                 `scrollbar-width: auto`, a hover-revealed thumb (the pointer
-                 lives over the chat transcript, so hover is "at rest" there), a
-                 revived `.scrollbar-overlay` / `.scroll-fade`, or a screenshot
-                 of a dashboard surface showing a scrollbar while nothing
-                 scrolls. A reveal that changes the box's width (a scrollbar
-                 that appears and pushes content) is a finding too. "The box
-                 needs a scroll affordance" is not an exception: the cue for a
-                 box whose edge does not show that it scrolls is an edge fade
-                 (`.edge-fade-x`, `useScrollEdges`) or a "more below"
-                 affordance (`MORE_BELOW_MASK`, `JumpToBottomButton`), never a
-                 resting thumb. Hiding one is never a regression to flag; the
-                 decision outranks the report (AUTOSDE
-                 `recorded-decisions-are-not-regressions`).
                - Habituation: flag diffs that MOVE or REORDER existing controls
                  without functional need (breaks muscle memory), and duplicate
                  new paths to an already-reachable action.
@@ -1719,7 +1636,7 @@ jobs:
             } >> "${RUNNER_TEMP:-/tmp}/ux-comment.md"
           fi
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
+          # lane; test_ai_review_workflows.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
@@ -2159,7 +2076,7 @@ jobs:
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
+          # byte-identically in every review lane; test_ai_review_workflows.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {

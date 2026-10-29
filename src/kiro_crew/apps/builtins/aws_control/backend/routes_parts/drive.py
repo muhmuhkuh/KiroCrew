@@ -64,9 +64,7 @@ async def _handle_drive_status(request: web.Request) -> web.Response:
     except AWSError as exc:
         return _aws_failed(exc)
     if not bucket:
-        return web.json_response(
-            {"exists": False, "searched_region": storage_mod.searched_region(region)}
-        )
+        return web.json_response({"exists": False})
     refresh = request.rel_url.query.get("refresh") == "1"
     cached = _usage_cache.get(account)
     if cached and not refresh and (time.monotonic() - cached[0]) < _USAGE_TTL_SECS:
@@ -195,7 +193,7 @@ async def _require_drive(request: web.Request) -> tuple[str, str, str, str] | we
     except AWSError as exc:
         return _aws_failed(exc)
     if not bucket:
-        return _conflict(storage_mod.no_drive_message(region), "drive_missing")
+        return _conflict("this account has no drive yet", "drive_missing")
     return account, profile, region, bucket
 
 

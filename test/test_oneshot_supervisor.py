@@ -481,6 +481,7 @@ def test_api_models_spawns_the_list_under_the_reaping_supervisor(tmp_path: Path)
         assume_ready=True,
     )
     request = MagicMock()
+    request.query = {}
     request.app = {"kiro_prerequisite_service": service}
     cfg = SimpleNamespace(agent=SimpleNamespace(provider="kiro"))
     with (

@@ -296,8 +296,9 @@ def build_pooled_agent_fn(
     distinct ``(agent, model, cwd)`` identity gets its OWN warm sub-pool (so a
     multi-specialist fan-out still gets warm reuse per specialist, and a worker
     built for one identity never serves a call that asked for another). Calls
-    with no override share the default sub-pool. ``pool.shutdown()`` tears down
-    every sub-pool.
+    with no override share the default sub-pool. Backend-pinned calls bypass
+    pooling and acquire an isolated session on the selected ACP harness.
+    ``pool.shutdown()`` tears down every sub-pool.
     """
     worker_ids = itertools.count()
 
@@ -365,13 +366,15 @@ def build_pooled_agent_fn(
             if named is not None:
                 key = memory_scope.worker_key(f"named:{named}")
             await memory_scope.prepare(context_builder, key)
-        provider, is_new, _resumed = await sessions.get_or_create(
-            key,
-            agent=opts.get("agent") or default_agent,
-            model=opts.get("model") or default_model,
-            cwd=opts.get("cwd") or cwd,
-            extra_env=extra_env,
-        )
+        factory_kwargs = {
+            "agent": opts.get("agent") or default_agent,
+            "model": opts.get("model") or default_model,
+            "cwd": opts.get("cwd") or cwd,
+            "extra_env": extra_env,
+        }
+        if opts.get("backend") is not None:
+            factory_kwargs["acp_backend_override"] = opts["backend"]
+        provider, is_new, _resumed = await sessions.get_or_create(key, **factory_kwargs)
         try:
             # Same identity publication as the pooled worker (see
             # _WorkflowSessionWorker.send_message): a named ``session=`` chain
@@ -431,7 +434,7 @@ def build_pooled_agent_fn(
             # Launch in the RESOLVED directory and key the warm sub-pool on it, so
             # a worker is never built for an unresolved spelling of a path.
             opts = {**opts, "cwd": step_cwd}
-        if opts.get("session") is not None:
+        if opts.get("session") is not None or opts.get("backend") is not None:
             return await _run_unpooled(prompt, opts)
         target = _pool_for(opts.get("agent"), opts.get("model"), opts.get("cwd"))
         if target is None:

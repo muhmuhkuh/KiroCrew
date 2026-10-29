@@ -156,9 +156,11 @@ class TestNotificationPersistence:
         )
         state.notify("cron", "Test Job", "Result text")
 
+        # Check in-memory
         assert len(state._notification_log) == 1
         assert state._notification_log[0]["title"] == "Test Job"
 
+        # Check on disk
         loaded = _load_notifications()
         assert len(loaded) == 1
         assert loaded[0]["title"] == "Test Job"

@@ -632,6 +632,7 @@ class TestLessonEmbeddingStorage:
         s = opened(VectorMemoryStore(db_path=db))
         s.init()
 
+        # Write first lesson with embedding
         s.embed_fn = lambda text: [1.0, 0.0, 0.0]
         s.write_lesson("always use type hints in Python", "preference")
 

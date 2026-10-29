@@ -28,6 +28,8 @@ import Clickable from '../../components/Clickable'
 import { Badge, Card, CardTitle, StatCard } from '../../components/ui'
 import { i18nT } from '../../i18n/t'
 
+import { commitUrlOf } from './lib/links'
+
 import FindingDetail from './FindingDetail'
 import SetupPanel from './SetupPanel'
 import { useAgentSession, truncate } from './lib/agentSession'
@@ -108,23 +110,6 @@ const DRAFTED_STATUSES = new Set(['filed'])
 
 /** Already landed on the branch — there is nothing left to commit, only to view. */
 const COMMITTED_STATUS = 'committed'
-
-/** A short commit sha, as the direct-commit path records it in the ledger's `cr`. */
-const SHA_RE = /^[0-9a-f]{7,40}$/i
-
-/** The GitHub URL for a committed finding's sha, or null when we cannot build one.
- *
- *  The direct-commit path stores a bare sha (e.g. `1537c449`) rather than a url, so
- *  the generic `prUrlOf` — which only accepts `http…` — rendered NOTHING for a
- *  committed finding and the row instead showed a re-commit button. `repo` is the
- *  `owner/name` display string the config already carries. */
-function commitUrlOf(finding: Finding, repo: string): string | null {
-  const sha = (finding.pr || finding.cr || '').trim()
-  if (!SHA_RE.test(sha)) return null
-  // Only build a url for an `owner/name` we recognize; never guess a host.
-  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return null
-  return `https://github.com/${repo}/commit/${sha}`
-}
 
 /** Map a watcher verdict onto the shared badge vocabulary. */
 function verdictVariant(verdict?: string): 'ok' | 'err' | 'warn' | 'muted' {
@@ -270,6 +255,10 @@ export default function AutoImprovementPage() {
   const qc = useQueryClient()
   const findings = findingsResp?.findings ?? []
   const repo = String(config?.target_display || config?.target_url || 'repository')
+  const provider = String(config?.provider || 'github')
+  const host = String(
+    config?.host || (provider === 'gitlab' ? 'gitlab.com' : 'github.com'),
+  )
   // The branch this run's findings belong to. Shown so it is always clear WHICH
   // repository+branch the list is scoped to — the findings set changes when
   // either does.
@@ -448,10 +437,10 @@ export default function AutoImprovementPage() {
                         : f.status}
                     </span>
                     {/* Already committed: offer the COMMIT, not a re-commit action. The
-                        ledger stores a bare sha here, so this is a link out to GitHub. */}
-                    {f.status === COMMITTED_STATUS && commitUrlOf(f, repo) ? (
+                        ledger stores a bare sha here, so this is a link out to the forge. */}
+                    {f.status === COMMITTED_STATUS && commitUrlOf(f, repo, provider, host) ? (
                       <a
-                        href={commitUrlOf(f, repo) as string}
+                        href={commitUrlOf(f, repo, provider, host) as string}
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label={i18nT('autoImprovement.viewCommit')}

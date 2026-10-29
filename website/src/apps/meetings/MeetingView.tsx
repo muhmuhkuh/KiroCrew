@@ -32,6 +32,7 @@ import type { MeetingsConfig } from './api'
 import AgentPanel from './components/AgentPanel'
 import AgentPillBar from './components/AgentPillBar'
 import BroadcastBar from './components/BroadcastBar'
+import MeetingAudioControl from './components/MeetingAudioControl'
 import MeetingTitle from './components/MeetingTitle'
 import MeetingWorkspace from './components/MeetingWorkspace'
 import NoteSidebar from './components/NoteSidebar'
@@ -449,6 +450,12 @@ export default function MeetingView({
 
         {(status === 'active' || status === 'paused') && (
           <BroadcastBar
+            audioControl={session.transcription.meetingAudio && (
+              <MeetingAudioControl
+                audio={session.transcription.meetingAudio}
+                enabled={session.transcription.active && status === 'active' && pending.settingStatus === null && !transcriptFull}
+              />
+            )}
             onSend={actions.broadcast}
             caption={caption}
             // Gated on the pending window as well: during a pending pause the

@@ -20,7 +20,7 @@
  *    roles the registry claims, or are allowlisted as chrome with a reason.
  */
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { defaultMessageRenderers } from '../app-sdk/messageRenderers'
 
@@ -74,23 +74,18 @@ const PAGE_OVERRIDE_IDS: Record<string, string> = {
   undrawn: 'narrower than the SDK default: `system` / `done` stay unclaimed so they keep the bubble fall-through',
 }
 
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-const PAGES_DIR = resolve(__dirname, '../pages')
-const OWNER_DIR = resolve(PAGES_DIR, 'chat', 'page')
-const src = [
-  readFileSync(resolve(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
-  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(OWNER_DIR, f), 'utf8')),
-  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(PAGES_DIR, f), 'utf8')),
-].join('\n')
+const src = readFileSync(resolve(__dirname, '../pages/chat/page/transcriptRendering.tsx'), 'utf8')
+const pageModuleDir = resolve(__dirname, '../pages/chat/page')
+const pageBehaviorSrc = readdirSync(pageModuleDir)
+  .filter((f) => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+  .map((f) => readFileSync(resolve(pageModuleDir, f), 'utf8'))
+  .join('\n')
 
 function rendererBlock(): string {
-  const start = src.indexOf('fallback: bubbleRenderer } = useMemo')
-  const end = src.indexOf('const renderMessage = useCallback', start)
+  const start = src.indexOf('const bubble: MessageRenderer = {')
+  const end = src.indexOf('return { renderers, fallback: bubble }', start)
   if (start < 0 || end < 0) throw new Error('ChatPage renderer block not found -- did the P5-a dispatch move?')
-  return src.slice(start, end)
+  return src.slice(start, end + 'return { renderers, fallback: bubble }'.length)
 }
 
 function chatPageRoleLiterals(): Set<string> {
@@ -98,7 +93,7 @@ function chatPageRoleLiterals(): Set<string> {
   // Both dispatch shapes used in the file: `m.role === 'x'` and
   // `messages[i].role === 'x'` (and their !== variants -- a negative dispatch
   // still means the code KNOWS the role).
-  for (const m of src.matchAll(/\.role\s*[!=]==\s*'([a-z_]+)'/g)) roles.add(m[1])
+  for (const m of pageBehaviorSrc.matchAll(/\.role\s*[!=]==\s*'([a-z_]+)'/g)) roles.add(m[1])
   return roles
 }
 
@@ -128,8 +123,8 @@ function hostEntryIds(): string[] {
 
 describe('chat role parity (ChatPage consumes the app-sdk registry)', () => {
   it('ChatPage dispatches rows through the registry, not an if-chain of its own', () => {
-    expect(src).toMatch(/import \{[^}]*\bmergeRenderers\b[^}]*\} from '\.\.\/\.\.\/\.\.\/app-sdk\/messageRenderers'/)
-    expect(src).toMatch(/import \{[^}]*\bresolveRenderer\b[^}]*\} from '\.\.\/\.\.\/\.\.\/app-sdk\/messageRenderers'/)
+    expect(src).toMatch(/import \{[^}]*\bmergeRenderers\b[^}]*\} from ['"][^'"]*app-sdk\/messageRenderers['"]/)
+    expect(src).toMatch(/import \{[^}]*\bresolveRenderer\b[^}]*\} from ['"][^'"]*app-sdk\/messageRenderers['"]/)
     expect(src).toContain('resolveRenderer(m, chatPageRenderers)')
     // Variant flags INSIDE one entry (`const isUser = m.role === 'user'`) are
     // fine; a dispatch statement is not -- it would select a row the registry

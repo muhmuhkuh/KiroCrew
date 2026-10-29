@@ -648,7 +648,8 @@ class TestPatchReordersManagedSkills:
         monkeypatch.setenv("KIRO_HOME", str(fake_home / "ambient-kiro"))
         _make_skill(fake_home / ".kiro" / "skills", "one")
         _make_skill(fake_home / ".kiro" / "skills", "two")
-        d = _agents_dir(fake_home)
+        d = fake_home / "private-agent-specs"
+        d.mkdir(parents=True, exist_ok=True)
         cfg = d / "victim.json"
         # The handler's own serialisation (``json.dump(..., indent=2)`` plus a newline),
         # so a byte comparison after the PATCH measures the resources merge alone.

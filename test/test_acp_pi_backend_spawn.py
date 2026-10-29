@@ -291,6 +291,37 @@ class TestGateEnvelope:
 # ── Live, when both components are installed ────────────────────────────────
 
 
+def test_live_pi_test_env_ignores_an_inherited_package_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    monkeypatch.setenv("PI_PACKAGE_DIR", str(tmp_path / "other-pi-install"))
+
+    env = _live_pi_test_env(tmp_path, agent_dir)
+
+    assert "PI_PACKAGE_DIR" not in env
+
+
+def _live_pi_test_env(tmp_path: Path, agent_dir: Path) -> dict[str, str]:
+    """Isolate Pi's agent files and avoid package assets from another install."""
+    env = {
+        **os.environ,
+        "PATH": acp_client.augmented_path(os.environ.get("PATH", "")),
+        "PI_CODING_AGENT_DIR": str(agent_dir),
+        "PI_OFFLINE": "1",
+        # pi compiles the .ts extension through a loader that caches under the
+        # temp directory; keep that residue inside this test's own tree.
+        "TMPDIR": str(tmp_path),
+        "TEMP": str(tmp_path),
+        "TMP": str(tmp_path),
+    }
+    # The test resolves a concrete pi executable, so an inherited override to a
+    # different package root can mix its themes/resources with that executable.
+    env.pop("PI_PACKAGE_DIR", None)
+    return env
+
+
 def _pi_installed() -> bool:
     return bool(shutil.which("pi")) and bool(shutil.which("pi-acp"))
 
@@ -314,19 +345,9 @@ def test_live_the_shipped_extension_loads_and_the_read_back_sees_it(tmp_path, mo
     assert pi_bin
     extension = pi_gate_extension_path()
     launcher = _ensure_pi_gate_launcher(pi_bin, extension)
-    # The operator's own environment, as the spawn would carry it (a mise-managed
-    # ``pi`` needs its HOME to resolve), with only pi's agent directory redirected.
-    env = {
-        **os.environ,
-        "PATH": acp_client.augmented_path(os.environ.get("PATH", "")),
-        "PI_CODING_AGENT_DIR": str(agent_dir),
-        "PI_OFFLINE": "1",
-        # pi compiles the .ts extension through a loader that caches under the
-        # temp directory; keep that residue inside this test's own tree.
-        "TMPDIR": str(tmp_path),
-        "TEMP": str(tmp_path),
-        "TMP": str(tmp_path),
-    }
+    # Keep the real agent's environment scratch-scoped and exclude package assets
+    # from an unrelated Pi installation.
+    env = _live_pi_test_env(tmp_path, agent_dir)
     completed = subprocess.run(
         [launcher, *acp_client._PI_RPC_ARGS],
         cwd=str(tmp_path),

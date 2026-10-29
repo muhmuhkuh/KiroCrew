@@ -223,9 +223,8 @@ class TestTheGatewayProfileWatch:
         import inspect
 
         import kiro_crew.slack.gateway as gw
-        from kiro_crew.slack.gateway_runtime import service_boot
 
-        src = Path(service_boot.__file__).read_text(encoding="utf-8")
+        src = Path(gw.__file__).read_text(encoding="utf-8")
         assert "await asyncio.to_thread(reproject_for_profile_change)" in src
         # Started ahead of the block that seeds the baseline and starts the refresher,
         # so a failure there does not take the watch with it.
@@ -362,7 +361,7 @@ class TestConcurrentProjectionsAreSerialized:
                 active["n"] += 1
                 active["max"] = max(active["max"], active["n"])
             inside.set()
-            release.wait(timeout=5)
+            assert release.wait(timeout=30), "the test did not release the held rebuild"
             with lock:
                 active["n"] -= 1
             return Path("/agents/kirocrew.json"), True
@@ -371,14 +370,30 @@ class TestConcurrentProjectionsAreSerialized:
         _save_profile_governing_the_ref(profiles_dir)
         first = threading.Thread(target=agent_mod.reproject_for_ceiling_change)
         first.start()
-        assert inside.wait(timeout=5)
         second = threading.Thread(target=agent_mod.reproject_for_profile_change)
-        second.start()
-        second.join(timeout=0.3)
-        assert second.is_alive(), "the watch ran while a projection was in flight"
-        release.set()
-        first.join(timeout=5)
-        second.join(timeout=5)
+        attempted = threading.Event()
+        projection_lock = agent_mod._REPROJECT_LOCK
+
+        class ObservedLock:
+            def __enter__(self):
+                attempted.set()
+                return projection_lock.__enter__()
+
+            def __exit__(self, *args):
+                return projection_lock.__exit__(*args)
+
+        try:
+            assert inside.wait(timeout=30), "the first rebuild never entered"
+            monkeypatch.setattr(agent_mod, "_REPROJECT_LOCK", ObservedLock())
+            second.start()
+            assert attempted.wait(timeout=30), "the watch never attempted the projection lock"
+            assert second.is_alive(), "the watch ran while a projection was in flight"
+        finally:
+            release.set()
+            first.join(timeout=30)
+            if second.ident is not None:
+                second.join(timeout=30)
+        assert not first.is_alive() and not second.is_alive(), "projection threads did not settle"
         assert active["max"] == 1
         assert agent_mod._projected_ceiling_generation == gp.governance_answer_generation()
 
@@ -458,7 +473,7 @@ class TestTheBaselineSeed:
         assert rebuilds == []
 
     def test_the_gateway_seeds_off_the_loop(self):
-        from kiro_crew.slack.gateway_runtime import service_boot
+        import kiro_crew.slack.gateway as gw
 
-        src = Path(service_boot.__file__).read_text(encoding="utf-8")
+        src = Path(gw.__file__).read_text(encoding="utf-8")
         assert "await asyncio.to_thread(prime_ceiling_projection)" in src

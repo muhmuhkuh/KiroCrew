@@ -1,6 +1,6 @@
 // Pure, side-effect-free helpers + localStorage accessors + constants for
 // Issue Radar. No React, no component imports — safe to pull into any module.
-import { AlertCircle, ArrowDownAZ, Clock, Hash, type LucideIcon } from 'lucide-react'
+import { AlertCircle, ArrowDownAZ, Clock, Flag, Hash, type LucideIcon } from 'lucide-react'
 import { activeLocale, fmtRelative, toDate } from '../../../i18n/format'
 import { DEFAULT_LANGUAGE, SUPPORTED_LANGUAGES, type LanguageEntry } from '../../../i18n/languages'
 import { i18nT } from '../../../i18n/t'
@@ -353,6 +353,7 @@ export function hexToRgba(hex: string, alpha: number): string {
 export const SORT_FIELDS: { key: SortKey; label: string; icon: LucideIcon }[] = [
   { key: 'number', get label() { return i18nT('apps.issueRadar.lib.format.number') }, icon: Hash },
   { key: 'updated', get label() { return i18nT('apps.issueRadar.lib.format.last_update') }, icon: Clock },
+  { key: 'priority', get label() { return i18nT('apps.issueRadar.lib.format.priority') }, icon: Flag },
 ]
 
 /** Sort options for the pull-request list — same fields, and deliberately the
@@ -389,6 +390,7 @@ export interface PersistedUiState {
   selectedIssue: number | null
   query: string
   selectedLabels: string[]
+  selectedStatuses: string[]
   requestedByMe: boolean
   assignedToMe: boolean
   createdByMember: boolean

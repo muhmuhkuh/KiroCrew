@@ -24,7 +24,7 @@ from kiro_crew.validation_parts.input_bounds import MAX_MEDIUM_STRING
 # not nested dicts, so a single ``findings`` dict arg would reach the gateway
 # unvalidated. The tool re-assembles the object from these fields.
 
-_ISSUE_RADAR_PROVIDERS = frozenset({"github", "gitlab"})
+_ISSUE_RADAR_PROVIDERS = frozenset({"github", "gitlab", "jira"})
 _ISSUE_RADAR_ITEM_KINDS = frozenset({"issue", "pull"})
 _ISSUE_RADAR_STATUSES = frozenset({"investigating", "resolved", "archived"})
 # Mirrors ``issue_radar.backend.routes.MAX_ITEM_NUMBER``: bounds the number that

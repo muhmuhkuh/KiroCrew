@@ -23,6 +23,7 @@ import { MeetingsApiError, meetingsApi, type TranscriptSegment } from '../api'
 import { reportIfMicDenied } from '../../../hooks/mic'
 import { dictationSeparator, joinTranscript, transcriptTail } from '../../../lib/dictationText'
 import { withBase } from '../../../lib/basePath'
+import { useMeetingAudio } from './useMeetingAudio'
 
 /** Feature detection mirroring `useStreamingStt` — the dashboard's own hook. */
 export const transcriptionSupported =
@@ -178,6 +179,9 @@ export function useMeetingTranscription({
   const haltedRef = useRef(false)
   const wsRef = useRef<WebSocket | null>(null)
   const ctxRef = useRef<AudioContext | null>(null)
+  const workletRef = useRef<AudioWorkletNode | null>(null)
+  const meetingAudio = useMeetingAudio(ctxRef, workletRef)
+  const stopMeetingAudio = meetingAudio.stop
   const streamRef = useRef<MediaStream | null>(null)
   const watchdogRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const lastFrameRef = useRef(0)
@@ -268,6 +272,8 @@ export function useMeetingTranscription({
 
   const cleanup = useCallback(() => {
     clearWatchdog()
+    stopMeetingAudio()
+    workletRef.current = null
     try { wsRef.current?.close() } catch { /* already closing */ }
     wsRef.current = null
     try { streamRef.current?.getTracks().forEach(t => t.stop()) } catch { /* ignore */ }
@@ -282,7 +288,7 @@ export function useMeetingTranscription({
     onPartialRef.current?.('')
     setActive(false)
     setConnecting(false)
-  }, [clearWatchdog])
+  }, [clearWatchdog, stopMeetingAudio])
 
   // Never leave the microphone open when the page unmounts.
   useEffect(() => () => { cleanup() }, [cleanup])
@@ -449,7 +455,10 @@ export function useMeetingTranscription({
       return
     }
     const source = ctx.createMediaStreamSource(stream)
-    const node = new AudioWorkletNode(ctx, 'pcm-worklet')
+    const node = new AudioWorkletNode(ctx, 'pcm-worklet', {
+      channelCount: 1,
+      channelCountMode: 'explicit',
+    })
 
     // Buffer PCM until the server is ready, then flush and switch to live send.
     // Over the cap, drop the OLDEST frames — the most recent speech wins.
@@ -480,6 +489,7 @@ export function useMeetingTranscription({
     // socket, blocking future start() calls via the session effect's !connecting
     // guard.
     if (wsRef.current !== ws) return
+    workletRef.current = node
     startingRef.current = false
     // Active state is deferred to the 'ready' message handler — see the
     // comment there for why calling setActive earlier leads to a reconnect loop.
@@ -529,6 +539,7 @@ export function useMeetingTranscription({
 
   const stop = useCallback(() => {
     stoppingRef.current = true
+    stopMeetingAudio()
     haltedRef.current = false
     setHalted(false)
     clearWatchdog()
@@ -543,7 +554,7 @@ export function useMeetingTranscription({
     window.setTimeout(() => {
       if (wsRef.current === ws) cleanup()
     }, CLOSE_GRACE_MS)
-  }, [cleanup, clearWatchdog])
+  }, [cleanup, clearWatchdog, stopMeetingAudio])
 
-  return { active, connecting, halted, start, stop, supported: transcriptionSupported }
+  return { active, connecting, halted, start, stop, meetingAudio, supported: transcriptionSupported }
 }

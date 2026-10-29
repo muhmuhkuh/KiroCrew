@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 from gui_user import x11
-from named_cases_helpers import named_cases
 
 
 class TestGeometry:
@@ -50,27 +49,20 @@ class TestGeometry:
 
 class TestDisplayGuard:
     @pytest.mark.parametrize(
-        "display",
-        [
-            *named_cases(
-                "test_refuses_real_or_empty_displays",
-                "display",
-                [":0", ":1", ":0.0", "localhost:0", "host.example:1.0", "", "  "],
-            ),
-            *named_cases(
-                "test_refuses_remote_or_malformed_displays",
-                "display",
-                ["otherhost:99", "10.0.0.5:2", "ninety-nine", ":x"],
-            ),
-        ],
+        "display", [":0", ":1", ":0.0", "localhost:0", "host.example:1.0", "", "  "]
     )
-    def test_refuses_a_display_it_must_not_touch(self, display: str) -> None:
+    def test_refuses_real_or_empty_displays(self, display: str) -> None:
         with pytest.raises(x11.X11Error):
             x11.refuse_real_display(display)
 
     @pytest.mark.parametrize("display", [":99", ":10", ":2", "localhost:99.0", "unix:99"])
     def test_accepts_private_virtual_displays(self, display: str) -> None:
         x11.refuse_real_display(display)
+
+    @pytest.mark.parametrize("display", ["otherhost:99", "10.0.0.5:2", "ninety-nine", ":x"])
+    def test_refuses_remote_or_malformed_displays(self, display: str) -> None:
+        with pytest.raises(x11.X11Error):
+            x11.refuse_real_display(display)
 
     def test_display_number(self) -> None:
         assert x11.display_number(":99") == 99

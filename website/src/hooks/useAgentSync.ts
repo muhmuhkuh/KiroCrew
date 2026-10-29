@@ -8,7 +8,6 @@ import { sessionDisplayTitle } from '../utils/sessionDisplayTitle'
 import { defaultAgentQuery } from '../api/defaultAgentQuery'
 import { recencyEpoch } from '../components/commandPalette/providers/recentsProvider'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
-import { sliceCodePoints } from '../components/CommentOverlay'
 
 export interface AgentSource {
   id: string
@@ -31,7 +30,7 @@ const SPAWN_POLL_MS = 3000
 
 function shortName(s: string, max = 45): string {
   if (s.length <= max) return s
-  return sliceCodePoints(s, 0, max - 1) + '…'
+  return s.slice(0, max - 1) + '…'
 }
 
 export function useAgentSync() {

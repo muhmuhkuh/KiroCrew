@@ -199,14 +199,10 @@ def _read_ledger_unlocked() -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Failed to read dependency ledger: %s", exc)
         return {}
-    if not isinstance(data, dict):
-        logger.warning("Failed to read dependency ledger: not a JSON object")
-        return {}
-    return data
 
 
 def _write_ledger_unlocked(data: dict[str, Any]) -> None:

@@ -38,8 +38,10 @@ class FakeSessions:
     def __init__(self) -> None:
         self.created: list[tuple[str, dict]] = []
         self.released: list[str] = []
+        self.backend_overrides: list[str | None] = []
 
     async def get_or_create(self, key, *, agent=None, model=None, cwd=None, extra_env=None, **kw):
+        self.backend_overrides.append(kw.get("acp_backend_override"))
         self.created.append(
             (key, {"agent": agent, "model": model, "cwd": cwd, "extra_env": extra_env})
         )
@@ -164,6 +166,24 @@ async def test_extra_env_run_level_pin_flows_into_get_or_create() -> None:
     plain = FakeSessions()
     await build_agent_fn(plain, run_id="wf_plain")("p", {})
     assert plain.created[-1][1]["extra_env"] is None
+
+
+async def test_backend_override_reaches_session_factory_through_runner() -> None:
+    from kiro_crew.workflows.runner import WorkflowRunner
+
+    sessions = FakeSessions()
+    runner = WorkflowRunner(
+        agent_fn=build_agent_fn(sessions, run_id="wf_backend"),
+        audit=lambda *a, **k: None,
+    )
+    script = (
+        'META = {"name": "backend-route"}\n'
+        "async def workflow(ctx):\n"
+        "    return await ctx.agent('review', backend='claude')\n"
+    )
+    result = await runner.run(script, run_id="wf_backend", now="2026-10-01T00:00:00Z")
+    assert result.ok, result.error
+    assert sessions.backend_overrides == ["claude"]
 
 
 async def test_end_to_end_through_runner() -> None:

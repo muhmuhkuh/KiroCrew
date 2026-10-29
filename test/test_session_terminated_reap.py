@@ -676,9 +676,9 @@ class TestPendingInjectionIsSpared:
         """
         from pathlib import Path
 
-        from kiro_crew.slack.gateway_runtime import service_boot
+        import kiro_crew.slack.gateway as gateway_mod
 
-        src = Path(service_boot.__file__).read_text(encoding="utf-8")
+        src = Path(gateway_mod.__file__).read_text(encoding="utf-8")
         assert (
             "self.sessions.set_injection_probe(" in src
         ), "the gateway installs no injection probe"

@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
+
 
 @pytest.fixture(autouse=True)
 # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- pre-existing autouse fixture, moved verbatim; it only sets KIROCREW_HOME, and no test in a module that imports it calls monkeypatch.undo()
@@ -42,6 +44,7 @@ def _make_cfg(
     cfg.session.pool_ttl_secs = pool_ttl_secs
     cfg.session.timeout_secs = 3600
     cfg.agent.default_agent = ""
+    cfg.agent.acp_backend = ACP_BACKEND_KIRO
     cfg.agent.model = "auto"  # match real KiroCrewConfig default
     return cfg
 

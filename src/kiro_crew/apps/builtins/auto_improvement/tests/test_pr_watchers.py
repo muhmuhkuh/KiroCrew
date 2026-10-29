@@ -18,7 +18,11 @@ from typing import Any
 
 import pytest
 
-from kiro_crew.apps.builtins.auto_improvement.backend import pr_checks, pr_watchers, store
+from kiro_crew.apps.builtins.auto_improvement.backend import (
+    pr_checks,
+    pr_watchers,
+    store,
+)
 
 WAIT_S = 10.0
 
@@ -632,9 +636,8 @@ class TestRegistrySurface:
 
         # The next reconcile sweep re-files the still-red PR via _start_item →
         # start(). The operator's stop must survive: no fresh thread is launched.
-        reg._start_item({"fp": "fp-u", "pr": pr_url})
-        # Give any (wrongly) launched thread time to come alive before asserting.
-        time.sleep(0.2)
+        stopped = reg._watchers["fp-u"]
+        assert reg._start_item({"fp": "fp-u", "pr": pr_url}) is stopped
         assert not reg.is_alive("fp-u"), "user-stopped watcher was relaunched by reconcile"
         assert (reg.status("fp-u") or {})["status"] == pr_watchers.STATUS_STOPPED
 
@@ -665,8 +668,8 @@ class TestRegistrySurface:
         with reg._lock:
             assert reg._watchers["fp-d2"].stopped_by_disable is False
 
-        reg._start_item({"fp": "fp-d2", "pr": pr_url})
-        time.sleep(0.2)
+        stopped = reg._watchers["fp-d2"]
+        assert reg._start_item({"fp": "fp-d2", "pr": pr_url}) is stopped
         assert not reg.is_alive("fp-d2"), "an operator stop after a disable was relaunched"
 
     def test_watcher_threads_are_daemon_threads(self, loop: Any, scripted: Any) -> None:
@@ -1011,3 +1014,31 @@ class TestWorkItems:
 
     def test_clean_status_has_no_work_items(self) -> None:
         assert pr_watchers._work_items(_status(failing=[])) == []
+
+
+class TestNudgePromptGitLab:
+    """A watched GitLab MR must be taught glab verbs and glab's own limits."""
+
+    @staticmethod
+    def _prompt(pr: str) -> str:
+        st = pr_watchers.WatcherState(fp="fp", pr=pr)
+        return pr_watchers.build_nudge_prompt(st, "/tmp/clone", _status())
+
+    def test_gitlab_mr_uses_glab_verbs(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        assert "glab mr view" in prompt
+        assert "glab ci status" in prompt
+        assert "gh pr view" not in prompt
+
+    def test_gitlab_limits_forbid_merging_and_ready(self) -> None:
+        prompt = self._prompt("https://gitlab.com/group/project/-/merge_requests/7")
+        low = prompt.lower()
+        assert "glab mr merge" in low
+        assert "glab mr update --ready" in low
+        assert "never push" in low
+        assert "gh pr ready" not in low
+
+    def test_github_prompt_still_uses_gh(self) -> None:
+        prompt = self._prompt("https://github.com/owner/repo/pull/7")
+        assert "gh pr view" in prompt
+        assert "glab mr view" not in prompt

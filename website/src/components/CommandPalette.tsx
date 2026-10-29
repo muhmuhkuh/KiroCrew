@@ -428,7 +428,7 @@ export default function CommandPalette({
     [dispatchEnter],
   )
 
-  const { selected, setSelected, selectedRef, itemRefs, claimKey, hoverSelect } = useListKeyboardNav({
+  const { selected, setSelected, selectedRef, itemRefs, claimKey } = useListKeyboardNav({
     open,
     count: results.length,
     wrap: true,
@@ -717,7 +717,7 @@ export default function CommandPalette({
                         isRecents ? '' : 'flex items-start gap-3'
                       }`}
                       title={r.subtitle || r.title}
-                      onMouseMove={e => hoverSelect(i, e)}
+                      onMouseEnter={() => setSelected(i)}
                       onMouseDown={(e) => {
                         e.preventDefault()
                         dispatchEnter(r, e.metaKey || e.ctrlKey)

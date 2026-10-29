@@ -19,10 +19,12 @@ from __future__ import annotations
 import errno
 import json
 import os
+import weakref
 from pathlib import Path
 from typing import Any
 
 import pytest
+from crew_log_drain import assert_drained
 
 from kiro_crew import crew_log as lg
 from kiro_crew.crew_log import CrewLog
@@ -137,7 +139,7 @@ def _ledger(unit_id: str, **fields: Any) -> None:
     payload: dict[str, Any] = {"slot": SLOT}
     payload.update(fields)
     crew_log_emit.on_ledger_recorded(unit_id, payload)
-    crew_log_emit.flush(timeout=5.0)
+    assert_drained()
 
 
 def _stub_directory_sync(
@@ -1171,6 +1173,7 @@ def test_a_rollback_that_cannot_account_for_its_cut_is_retryable_not_a_refusal(m
 
     _unit(UNIT)
     handle = CrewLog.open(lg.KIND_SESSION, UNIT)
+    handle_ref = weakref.ref(handle)
     handle.append("turn/started", {"turn": 1, "actor": "user", "depth": 0}, src="acp")
     real_fsync = os.fsync
     failed = {"once": False}
@@ -1196,9 +1199,12 @@ def test_a_rollback_that_cannot_account_for_its_cut_is_retryable_not_a_refusal(m
     assert (
         crew_log_writer._is_refusal(type(raised.value)) is False
     ), "the writer has to read this as an unknown outcome and retry the event"
+    del raised
     assert (
         b"UNACCOUNTED" in _log(UNIT).read_bytes()
     ), "the refused rollback left the bytes in place, which is why the outcome is unknown"
+    del handle
+    assert handle_ref() is None
 
 
 def test_a_counter_that_cannot_be_read_is_not_evidence_that_it_was_retired(_cheap_writes):
@@ -1307,6 +1313,7 @@ def test_a_torn_tail_repair_that_cannot_account_for_its_cut_keeps_the_event(_che
     # path rather than in an `open`: a long-lived writer holds its handle across a crash
     # somewhere else, so its next append is what finds the torn bytes.
     handle = CrewLog.open(lg.KIND_SESSION, UNIT)
+    handle_ref = weakref.ref(handle)
     _log(UNIT).write_bytes(_log(UNIT).read_bytes() + b'{"type":"activity/tick","seq":9,"ti')
     torn = _log(UNIT).read_bytes()
     real_path = crew_log_store._cuts_path(directory)
@@ -1348,6 +1355,7 @@ def test_a_torn_tail_repair_that_cannot_account_for_its_cut_keeps_the_event(_che
     assert isinstance(raised.value, OSError), "the cause is a storage fault, and it clears"
     assert not isinstance(raised.value, CrewLogError)
     assert raised.value.code == "cut_unaccounted"
+    del raised
     assert _log(UNIT).read_bytes() == torn, "the refusal truncated nothing"
     assert real_path.read_bytes() == real_bytes, "and left the counter saying what it said"
 
@@ -1371,6 +1379,8 @@ def test_a_torn_tail_repair_that_cannot_account_for_its_cut_keeps_the_event(_che
         "BEFORE-THE-TEAR",
         "THE-ENTRY-AT-RISK",
     ]
+    del handle
+    assert handle_ref() is None
 
 
 def test_a_lost_rename_on_a_filesystem_that_cannot_sync_a_directory_proves_nothing(

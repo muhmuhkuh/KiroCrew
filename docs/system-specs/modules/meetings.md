@@ -393,7 +393,7 @@ the second half of `drain_and_clear`.
 Guarded by AST checks over the route modules: no `ACTIVE.clear()` outside the
 draining helper, and no handler calling `ACTIVE.set()` without a drain — so a new
 teardown OR replace path cannot quietly reintroduce the loss.
-`test_meetings_routes_lifecycle.py::TestTeardownDrainsBeforeClearing`.
+`test_meetings_routes.py::TestTeardownDrainsBeforeClearing`.
 
 **Dispatch is in-process.** Upstream POSTed each batch back to its own gateway
 over authenticated loopback HTTP. Here the routes live ON the gateway, so a batch
@@ -727,6 +727,18 @@ they drive both the compact caption and one clearly marked live row, then disapp
 when the recognizer finalizes or the stream closes. The browser keeps only a
 bounded recent-final buffer for the caption because the JSONL file owns history.
 
+During active transcription, **Share meeting audio** requests `getDisplayMedia`
+from a user gesture. The operator selects a meeting tab or screen and enables
+audio sharing. Its audio connects to the microphone's worklet, mixing both into
+the existing mono PCM stream without local playback. Required video tracks stop
+immediately; no screen frames reach the gateway. A missing audio track is reported;
+cancellation leaves microphone transcription running. Available audio sources
+depend on the browser and OS. Electron's trusted display-media fallback grants
+`audio: "loopback"` only when the request asks for audio. Video-only snips retain
+their existing behavior. Sharing ends on pause, stop, unmount, transport teardown,
+or when the shared audio track ends. After reconnecting, the operator shares again
+explicitly. A pending picker result is discarded and stopped after teardown.
+
 `TranscriptPanel` is always present in a meeting and remains available during
 action-item review. With at least one enabled note or diagram agent,
 `MeetingWorkspace` gives the transcript a 360 px right-hand column beside the
@@ -872,9 +884,7 @@ internal-git update-check cron was deleted (a builtin versions with the package)
 `test_meetings_session.py` (dispatcher, breaker, lifecycle, prompts),
 `test_meetings_providers.py` (both registries, the `.ics` parser,
 scheme/address refusals), `test_meetings_routes.py` (the HTTP contract,
-validation, redaction, the enable gate; the lifecycle routes and teardown
-invariants are in `test_meetings_routes_lifecycle.py`, the task and calendar
-routes in `test_meetings_routes_tasks.py`), `test_meetings_calendar_poller.py` (the
+validation, redaction, the enable gate), `test_meetings_calendar_poller.py` (the
 due-event rule, a tick against a real `.ics`, pre-creation as init-not-start, the
 loop surviving a bad tick, the settings round trip), `test_meetings_minutes.py` (the
 editable minutes: sidecar ownership, the read overlay, staleness, the widget

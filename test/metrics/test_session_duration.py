@@ -1017,14 +1017,16 @@ class TestReviewFixes:
         assert len(_crumbs(home)) == 1
 
     def test_a_superseded_start_leaves_only_the_successors_crumb(self, home, rec, monkeypatch):
-        """The crumb is written inline, under the lock that installs the start.
+        """Review rounds 3-5 all lived here; the inline write ended the class.
 
         A deferred write could land after its own session ended, or after a
-        SUCCESSOR registered under the same key. A post-write check cannot guard
-        it: it acts on the path the successor SHARES, so a late predecessor would
-        delete the crumb its successor had just written and lose that session's
-        crash. Writing under the lock removes the interleaving rather than
-        detecting it: there is no window in which two starts are both mid-write.
+        SUCCESSOR registered under the same key. Guarding it with an ended-key
+        set, then with a generation compared before and after the write, both
+        failed -- the post-write check acted on the path the successor SHARES, so
+        a late predecessor deleted the crumb its successor had just written and
+        lost that session's crash. Writing under the lock that installs the start
+        removes the interleaving rather than detecting it: there is no window in
+        which two starts are both mid-write.
         """
         _stamp_starts(monkeypatch, _FIRST_START, _SECOND_START)
         _start("dashboard:chat-1")
@@ -1139,12 +1141,9 @@ class TestReviewFixes:
     def test_the_boot_hook_no_longer_blocks_readiness(self):
         from pathlib import Path
 
-        src = (
-            Path(sess.__file__).resolve().parent.parent
-            / "slack"
-            / "gateway_runtime"
-            / "service_boot.py"
-        ).read_text(encoding="utf-8")
+        src = (Path(sess.__file__).resolve().parent.parent / "slack" / "gateway.py").read_text(
+            encoding="utf-8"
+        )
         i = src.index("_backfill_unclean_session_telemetry")
         window = src[i : i + 900]
         assert "asyncio.to_thread" in window, "the scan must not run on the loop"
@@ -1461,12 +1460,7 @@ class TestTeardownPathsAreWired:
     def test_the_boot_backfill_is_wired_into_gateway_startup(self):
         from pathlib import Path
 
-        gateway = (
-            Path(sess.__file__).resolve().parent.parent
-            / "slack"
-            / "gateway_runtime"
-            / "service_boot.py"
-        )
+        gateway = Path(sess.__file__).resolve().parent.parent / "slack" / "gateway.py"
         src = gateway.read_text(encoding="utf-8")
         assert "backfill_crashed_sessions" in src
         # Ordering against the orphan sweep is deliberately NOT asserted any

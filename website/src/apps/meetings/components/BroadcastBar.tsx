@@ -4,7 +4,7 @@
 // A typed line reaches the agents marked `[chat]`, so they know it is the user
 // speaking to them rather than another meeting participant.
 
-import { useRef } from 'react'
+import { useRef, type ReactNode } from 'react'
 import { Send } from 'lucide-react'
 
 import { i18nT } from '../../../i18n/t'
@@ -13,13 +13,14 @@ import { useImeGuard } from '../../../hooks/useImeGuard'
 
 interface Props {
   onSend: (text: string) => void
+  audioControl?: ReactNode
   caption?: string
   disabled?: boolean
   /** Overrides the compose placeholder, e.g. the paused-meeting explanation. */
   placeholder?: string
 }
 
-export default function BroadcastBar({ onSend, caption, disabled, placeholder }: Props) {
+export default function BroadcastBar({ onSend, caption, disabled, placeholder, audioControl }: Props) {
   const ime = useImeGuard()
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -32,6 +33,7 @@ export default function BroadcastBar({ onSend, caption, disabled, placeholder }:
 
   return (
     <div className="flex-none px-4 md:px-6 py-3 border-t border-border bg-bg">
+      {audioControl}
       {caption && (
         <div
           // Wraps rather than clipping to one line: `truncate` set

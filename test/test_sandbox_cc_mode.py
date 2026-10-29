@@ -283,8 +283,7 @@ class TestBuildSeatbeltProfileCcMode:
         assert f'(deny file-read* (subpath "{leaf}"))' in profile
 
     def test_cc_denies_aws_except_config(self):
-        """CC seatbelt hides ~/.aws (credentials, SSO caches) and re-exposes
-        only ~/.aws/config, the same shape as strict's ~/.ssh/known_hosts."""
+        """CC seatbelt hides ~/.aws and re-exposes only ~/.aws/config."""
         profile = _build_seatbelt_profile("cc")
         aws = _home(".aws")
         rules = profile.splitlines()
@@ -293,7 +292,7 @@ class TestBuildSeatbeltProfileCcMode:
             f' (require-not (literal "{aws}/config"))))'
         ) in rules
         assert f'(deny file-link (subpath "{aws}"))' in rules
-        assert f'(deny file-read* (subpath "{aws}"))' not in rules
+        assert f'(deny file-read* (subpath "{aws}"))' not in profile
         assert f"{aws}/credentials" not in profile
         assert f"{aws}/sso" not in profile
 
@@ -341,7 +340,7 @@ class TestWrapArgvCcMode:
 
     @patch("kiro_crew.sandbox.detect_backend", return_value="sandbox-exec")
     def test_cc_seatbelt_denies_aws_except_config(self, _mock_backend):
-        """The profile wrap_argv writes for cc on macOS hides ~/.aws but config."""
+        """The generated cc profile masks ~/.aws except for its config file."""
         wrapped, cleanup = wrap_argv(["echo", "hi"], mode="cc")
         assert cleanup is not None
         try:
@@ -351,6 +350,8 @@ class TestWrapArgvCcMode:
                 f'(deny file-read* (require-all (subpath "{aws}")'
                 f' (require-not (literal "{aws}/config"))))'
             ) in content.splitlines()
+            assert f'(deny file-link (subpath "{aws}"))' in content
+            assert f'(deny file-read* (subpath "{aws}"))' not in content
         finally:
             os.unlink(cleanup)
 

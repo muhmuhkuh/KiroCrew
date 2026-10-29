@@ -31,7 +31,6 @@ import { screen, waitFor, cleanup } from '@testing-library/react'
 import ArtifactsPage, { VIRTUALIZE_AT } from '../pages/ArtifactsPage'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { readPageFamily } from './pageFamily'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 
@@ -118,9 +117,8 @@ async function renderWith(count: number) {
   await waitFor(() => expect(contentColumn()).toBeTruthy())
 }
 
-// The page and its owners: LibraryMasonry and MasonryGridItem live in
-// ArtifactsPageGallery.tsx.
-const src = () => readPageFamily('ArtifactsPage')
+const src = () => readFileSync(join(__dirname, '..', 'pages', 'ArtifactsPage.tsx'), 'utf8')
+const gallerySrc = () => readFileSync(join(__dirname, '..', 'pages', 'ArtifactsPageGallery.tsx'), 'utf8')
 // WidgetThumb and its THUMB_HEIGHT_SPACE key space were extracted into the
 // shared components/library/ArtifactThumbs.tsx module (so DrivePage can render
 // identical previews); the thumbnail-height assertions below read it there.
@@ -278,14 +276,14 @@ describe('ArtifactsPage keeps the axis on the page at one column', () => {
     // disagreement at a boundary width would have the page yield while the
     // gallery renders a list that also scrolls, which is two same-axis
     // scrollers again at that one width.
-    const text = src()
+    const text = gallerySrc()
     const body = text.slice(
       text.indexOf('function LibraryMasonry('),
       text.indexOf('function MasonryGridItem('),
     )
     expect(body).not.toMatch(/useColumnCount\(/)
     expect(body).toMatch(/cols: number/)
-    expect(text).toMatch(/const \[galleryWidthRef, cols\] = useColumnCount\(/)
+    expect(src()).toMatch(/const \[galleryWidthRef, cols\] = useColumnCount\(/)
   })
 
   it('ties the axis handover to the column count, not just the item count', async () => {

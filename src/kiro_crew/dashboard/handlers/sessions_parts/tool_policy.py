@@ -256,11 +256,7 @@ POLICY_INCLUDE_KEY = "include"
 #: The managed server an opted-in spec's per-tool refs narrow.
 INCLUDE_LIST_SERVER = "kirocrew-core"
 
-#: The spec key, inside ``managedToolPolicy``, naming managed servers the agent is
-#: denied WHOLE. Each one is answered as an empty ``include`` list, so that server
-#: lists nothing and refuses every call. The app framework writes it for a managed
-#: server whose tool names it could not read (``apps.permissions``), where a
-#: name-based ``exclude`` cannot cover the server.
+#: Managed servers the spec withholds whole; each becomes an empty include list.
 EXCLUDE_SERVERS_KEY = "excludeServers"
 
 
@@ -269,10 +265,9 @@ def _policy_answer(
 ) -> dict[str, Any]:
     """The policy body the endpoint answers, given the spec's own ``managedToolPolicy``.
 
-    For a spec without ``honourToolRefs: true`` or ``excludeServers`` that is the
-    policy as written, less any ``include`` key: an include list is derived here,
-    and an ``include`` written by hand is not a field the managed servers read
-    from a spec.
+    For a spec without ``honourToolRefs: true`` or ``excludeServers`` that is
+    the policy as written, less any ``include`` key. Include lists are derived
+    here and an ``include`` written by hand is not read from the spec.
 
     With the opt-in set and the spec granting :data:`INCLUDE_LIST_SERVER` ONLY
     through ``@<server>/<tool>`` refs, its set of tool names goes under
@@ -280,26 +275,24 @@ def _policy_answer(
     A whole-server grant -- ``*``, a bare ``@<server>``, a glob tool part --
     yields no entry, so the server answers exactly as it does without the opt-in.
 
-    Every server named in :data:`EXCLUDE_SERVERS_KEY` is answered as an EMPTY
-    ``include`` entry, overriding any per-tool entry for it: that server lists
-    nothing and refuses every call. The key itself is not answered.
+    Every server in ``excludeServers`` receives an empty include list, which
+    withholds the whole server even if its tool declaration was unreadable.
 
-    Raises :class:`ManagedToolPolicyUnreadable` for an opt-in that is present
-    but not a bool, or an ``excludeServers`` that is present but not a list of
-    server names: the operator wrote something there and whether it narrows
-    the agent is unknown.
+    Raises :class:`ManagedToolPolicyUnreadable` for malformed policy controls:
+    their intended scope cannot be determined safely.
     """
     answer = {k: v for k, v in policy.items() if k not in (POLICY_INCLUDE_KEY, EXCLUDE_SERVERS_KEY)}
     opt_in = policy.get(HONOUR_TOOL_REFS_KEY, False)
     withheld = policy.get(EXCLUDE_SERVERS_KEY, [])
-    for key, bad in (
+    for key, invalid in (
         (HONOUR_TOOL_REFS_KEY, not isinstance(opt_in, bool)),
         (
             EXCLUDE_SERVERS_KEY,
-            not isinstance(withheld, list) or not all(isinstance(s, str) and s for s in withheld),
+            not isinstance(withheld, list)
+            or not all(isinstance(server, str) and server for server in withheld),
         ),
     ):
-        if not bad:
+        if not invalid:
             continue
         value = policy.get(key)
         where = f"in {spec_path.name!r}" if spec_path is not None else "in its spec"

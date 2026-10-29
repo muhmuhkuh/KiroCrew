@@ -637,13 +637,16 @@ async def _get_or_create_impl(
         def resolve_model() -> str | None:
             cfg = self._deps.load_config() if preparation.revision else owner._cfg
             selected = preparation.member or agent
+            backend_override = extra_factory_kwargs.get("acp_backend_override")
+            if backend_override is None:
+                backend_override = extra_factory_kwargs.get("backend_override")
             return self._deps.session_model(
                 cfg,
                 selected,
                 claim_crew,
                 app_name=app_name,
                 session_key=key,
-                backend_override=extra_factory_kwargs.get("backend_override"),
+                backend_override=backend_override,
             )
 
         model = await asyncio.to_thread(resolve_model)
@@ -699,13 +702,12 @@ async def _get_or_create_impl(
         # fixed when it was pre-spawned with no parent. Cold-starting is what
         # makes ``$KIROCREW_SCRATCH`` name the same place as the parent's.
         pool_decision = "bypass_shared_scratch"
-    elif extra_factory_kwargs.get("backend_override") is not None:
-        # An explicit backend (a sub-agent spawned on another harness). A
-        # pooled child was spawned on the factory's DEFAULT backend -- a
-        # different process, which no post-claim switch can change -- so a
-        # warm hit would run the work on the wrong harness. ``is not None``:
-        # ``""`` is a Kiro request, and under a non-Kiro default the pooled
-        # child is on the wrong backend for it too.
+    elif (
+        extra_factory_kwargs.get("backend_override") is not None
+        or extra_factory_kwargs.get("acp_backend_override") is not None
+    ):
+        # A pooled child belongs to the factory's default backend, not an
+        # explicit spawn, workflow or chat override. The empty id is Kiro.
         pool_decision = "bypass_backend_override"
     elif await _session_runs_remotely(key):
         # A pooled child is a LOCAL engine: claiming it would run a remote session here.
@@ -1119,6 +1121,7 @@ async def _get_or_create_impl(
                 # what keeps the id sent and the id read identical.
                 session.requested_model = model or ""
                 session.backend_override = extra_factory_kwargs.get("backend_override")
+                session.acp_backend_override = extra_factory_kwargs.get("acp_backend_override")
                 session.app_launch_agent = app_launch_agent
                 session.extra_env = dict(caller_env) if caller_env else None
                 session.reasoning_effort_override = extra_factory_kwargs.get(

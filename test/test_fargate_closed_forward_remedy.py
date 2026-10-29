@@ -24,7 +24,7 @@ from kiro_crew.instances.ssh_tunnel_manager import (
     _SshTunnel,
     _ssm_close_reason,
 )
-from kiro_crew.testing.wait import finished
+from kiro_crew.testing.wait import await_until, finished
 
 # The exact literals session-manager-plugin writes to stdout, from its source:
 # datachannel HandleChannelClosedMessage and sessionhandler ResumeSessionHandler.
@@ -333,7 +333,7 @@ class TestDeliberateStopSkipsTheDrain:
                 await asyncio.Event().wait()
 
             t._stdout_task = asyncio.create_task(_never_eof())
-            await started.wait()
+            await await_until(started, what="stdout drain entered")
             # The 1 s bound IS the assertion: a zero timeout that awaited EOF
             # would sit on the never-set event past it.
             await finished(

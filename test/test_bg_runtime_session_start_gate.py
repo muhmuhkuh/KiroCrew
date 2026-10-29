@@ -33,16 +33,16 @@ from kiro_crew.start_priority import StartPriority
 
 
 @pytest.fixture(autouse=True)
-def _fresh_gates(monkeypatch):
+def _fresh_gates(_floor_monkeypatch):
     import kiro_crew.acp.session_handle as sh
 
-    monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.05, raising=False)
+    _floor_monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.05, raising=False)
     runtime_mod._session_start_gates.clear()
     runtime_start._bg_runtime_session_start_gates.clear()
     # A one-permit user gate: the tightest case, where one permit held by a
     # ``_bg`` start stalls every person's start on the gateway.
-    monkeypatch.setattr(live_mod, "snapshot", lambda: None)
-    monkeypatch.setattr(runtime_mod, "_resolve_session_start_concurrency", lambda: 1)
+    _floor_monkeypatch.setattr(live_mod, "snapshot", lambda: None)
+    _floor_monkeypatch.setattr(runtime_mod, "_resolve_session_start_concurrency", lambda: 1)
     yield
     runtime_mod._session_start_gates.clear()
     runtime_start._bg_runtime_session_start_gates.clear()

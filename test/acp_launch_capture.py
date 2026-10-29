@@ -52,10 +52,10 @@ from kiro_crew.acp.harness import pi as pi_mod
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.skill_projection import NativeSkillProjection
 from kiro_crew.agent_sdk.backends import (
-    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_KIRO_FAMILY,
     ACP_BACKENDS_KNOWN,
@@ -85,7 +85,7 @@ _DSH_PATCH = "/opt/run/kiro_crew_dsh_gate.patch.yml"
 _OPENCODE_BIN = "/opt/bin/opencode"
 _GOOSE_BIN = "/opt/bin/goose"
 _DEEPSEEK_BIN = "/opt/bin/dsh"
-_COPILOT_BIN = "/opt/bin/copilot"
+_VIBE_BIN = "/opt/bin/vibe-acp"
 _SEARCH_PATH = "/opt/bin"
 _OPENCODE_CONFIG = '{"permission":"ask"}'
 
@@ -451,6 +451,25 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
                 opencode_mod, "_opencode_version_refusal", new=AsyncMock(return_value=("", ""))
             ),
             patch.object(launch_mod, "_unlink_readback_launcher", return_value=None),
+            # The DEFAULT data home, pinned to this run's temp dir. Required rather
+            # than incidental: the parent environment above carries no
+            # ``KIROCREW_HOME``, so anything on the spawn path that resolves
+            # ``config_dir()`` falls through to the operator's real ``~/.kiro/crew``
+            # and CREATES it (``conftest._refuse_a_resolved_real_default_home`` fails
+            # the run for exactly that). Pinning the resolver rather than exporting the
+            # variable keeps the capture host-independent, which is the property the
+            # fixed parent exists to give it.
+            patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
+            # ... and the breadcrumb that default resolution drops OUTSIDE the data
+            # home, at ``~/.kirocrew.breadcrumb``. Pinning the resolver relocates the
+            # data home but not that file: it is written under ``Path.home()``, which
+            # this capture deliberately does not relocate (``fixed_parent_env`` carries
+            # HOME through so the interpreter and the OS still work).
+            # ``conftest._breadcrumb_guard`` fails the run for exactly that write, and
+            # stubbing the writer is the remedy it names -- the breadcrumb is not a
+            # launch answer, and the DeepSeek arm reaches ``config_dir()`` to read its
+            # ``agent.deepseek_env`` provider-key mapping.
+            patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
             patch.object(
                 launch_mod,
                 "_resolve_self_served_bin",
@@ -458,7 +477,7 @@ def _stub_common(stack: list, rec: _Recorder, tmp_path: Path, backend: str = "")
                     ACP_BACKEND_OPENCODE: (_OPENCODE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_GOOSE: (_GOOSE_BIN, _SEARCH_PATH),
                     ACP_BACKEND_DEEPSEEK: (_DEEPSEEK_BIN, _SEARCH_PATH),
-                    ACP_BACKEND_COPILOT: (_COPILOT_BIN, _SEARCH_PATH),
+                    ACP_BACKEND_VIBE: (_VIBE_BIN, _SEARCH_PATH),
                 }[backend],
             ),
         ]
@@ -556,36 +575,6 @@ def _env_delta(parent_env: dict, child_env: dict) -> tuple[dict[str, str], list[
     return added, removed
 
 
-def _default_home_pins(tmp_path: Path) -> list:
-    """The default data home and its breadcrumb, pinned for the whole capture.
-
-    The fixed parent environment carries no ``KIROCREW_HOME``, so anything that
-    resolves ``config_dir()`` while it is installed falls through to the default
-    resolver, which would resolve and CREATE the operator's real ``~/.kiro/crew``
-    (``conftest._refuse_a_resolved_real_default_home`` fails the run for exactly
-    that). Pinning the resolver rather than exporting the variable keeps the capture
-    host-independent, which is the property the fixed parent exists to give it.
-
-    The breadcrumb that default resolution drops OUTSIDE the data home, at
-    ``~/.kirocrew.breadcrumb``, is written under ``Path.home()``, which the capture
-    deliberately does not relocate (``fixed_parent_env`` carries HOME through so the
-    interpreter and the OS still work). ``conftest._breadcrumb_guard`` fails the run
-    for that write, and stubbing the writer is the remedy it names -- the breadcrumb
-    is not a launch answer, and the DeepSeek arm reaches ``config_dir()`` to read its
-    ``agent.deepseek_env`` provider-key mapping.
-
-    The caller enters these BEFORE the environment patch, so they are exited AFTER
-    it: the resolver stays pinned for every instant ``KIROCREW_HOME`` is absent. A
-    thread the capture does not own -- one an earlier test on the same worker left
-    running -- reads the home at call time, so a pin that lifted while the cleared
-    environment was still installed would let that thread resolve the real home.
-    """
-    return [
-        patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
-        patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
-    ]
-
-
 def _capture_runtime_served(
     backend: str, tmp_path: Path, parent_env: dict, extra_patches: Sequence[Any] = ()
 ) -> dict[str, Any]:
@@ -607,7 +596,7 @@ def _capture_runtime_served(
         rec.env = dict(kwargs.get("env") or {})
         raise _Captured()
 
-    stack: list = [*_default_home_pins(tmp_path), patch.dict(os.environ, parent_env, clear=True)]
+    stack: list = [patch.dict(os.environ, parent_env, clear=True)]
     stack.extend(
         patch.object(runtime_mod, name, side_effect=_stub_for(getattr(runtime_mod, name), answer))
         for name, answer in _PASSTHROUGH_STUBS.items()
@@ -660,6 +649,18 @@ def _capture_runtime_served(
                 codex_harness_mod, "resolve_spawn_masks", new=AsyncMock(return_value=((), ()))
             ),
             patch.object(codex_harness_mod, "_sandbox_wrapper_generations", return_value=0),
+            # Same default-home pin as the client capture, for the same reason.
+            patch.object(config_paths, "_resolve_default_home", lambda: tmp_path / "default-home"),
+            # ... and the breadcrumb that default resolution drops OUTSIDE the data
+            # home, at ``~/.kirocrew.breadcrumb``. Pinning the resolver relocates the
+            # data home but not that file: it is written under ``Path.home()``, which
+            # this capture deliberately does not relocate (``fixed_parent_env`` carries
+            # HOME through so the interpreter and the OS still work).
+            # ``conftest._breadcrumb_guard`` fails the run for exactly that write, and
+            # stubbing the writer is the remedy it names -- the breadcrumb is not a
+            # launch answer, and the DeepSeek arm reaches ``config_dir()`` to read its
+            # ``agent.deepseek_env`` provider-key mapping.
+            patch.object(config_paths, "_write_recovery_breadcrumb", lambda _home: None),
         ]
     )
     stack.extend(extra_patches)
@@ -732,7 +733,7 @@ def capture(
     # without the restore a later test in the same worker reads that fiction.
     saved_caches = snapshot_bin_caches()
     _reset_bin_caches()
-    stack: list = [*_default_home_pins(tmp_path), patch.dict(os.environ, parent_env, clear=True)]
+    stack: list = [patch.dict(os.environ, parent_env, clear=True)]
     _stub_common(stack, rec, tmp_path, backend)
     stack.extend(extra_patches)
     entered: list = []

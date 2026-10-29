@@ -36,10 +36,9 @@ vi.mock('../pages/chat/composerFocus', async (importOriginal) => {
   return { ...actual, focusComposer: focusComposerMock }
 })
 
-type OpenInTab = (key: string, opts?: { background?: boolean; requestSeq?: number }) => void
-const sidebarProps: Array<{ onOpenSlotInNewTab?: OpenInTab; onSelectSlot?: (key: string) => void }> = []
+const sidebarProps: Array<{ onOpenSlotInNewTab?: (key: string) => void; onSelectSlot?: (key: string) => void }> = []
 vi.mock('../pages/ChatSidebar', () => ({
-  default: (props: { onOpenSlotInNewTab?: OpenInTab; onSelectSlot?: (key: string) => void }) => {
+  default: (props: { onOpenSlotInNewTab?: (key: string) => void; onSelectSlot?: (key: string) => void }) => {
     sidebarProps.push({ onOpenSlotInNewTab: props.onOpenSlotInNewTab, onSelectSlot: props.onSelectSlot })
     return null
   },
@@ -207,19 +206,7 @@ describe('ChatPage – session tab strip', () => {
     act(() => open?.('chat-2'))
     // Foreground open is a user gesture on a session reference: it dispatches
     // the ANNOUNCED form, so a deleted session explains itself (#6372).
-    expect(switchSlotMock).toHaveBeenCalledWith({ key: 'chat-2', announceOnMissing: true, gesture: true })
-  })
-
-  // #23564: a create opening the session it just made (the sidebar's "New
-  // chat in tab", carrying the create's `requestSeq`) is the page landing a
-  // request, not the user opening a chat, so it is not a gesture and records
-  // no user open.
-  it('a create opening its new tab is not a gesture', () => {
-    renderChatPage()
-    switchSlotMock.mockClear()
-    const open = sidebarProps.at(-1)?.onOpenSlotInNewTab
-    act(() => open?.('chat-2', { background: false, requestSeq: 4 }))
-    expect(switchSlotMock).toHaveBeenCalledWith({ key: 'chat-2', announceOnMissing: true, requestSeq: 4 })
+    expect(switchSlotMock).toHaveBeenCalledWith({ key: 'chat-2', announceOnMissing: true })
   })
 
   it('restores a persisted working set on the next visit', () => {

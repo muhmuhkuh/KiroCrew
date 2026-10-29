@@ -325,9 +325,7 @@ async def _ask_one(
             options=keys + [NONE_OPTION],
         )
     ]
-    answers = await core.decide(
-        POINT, state, questions, session_key=session_key, extra=extra, unclipped=text
-    )
+    answers = await core.decide(POINT, state, questions, session_key=session_key, extra=extra)
     picked = read_answer(answers, keys)
     return picked, (_probability_of(answers) if picked is not None else None)
 

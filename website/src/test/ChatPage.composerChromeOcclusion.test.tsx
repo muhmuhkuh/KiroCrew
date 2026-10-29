@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 /**
@@ -24,29 +24,21 @@ import { resolve } from 'node:path'
  * does: the cap is a viewport unit jsdom cannot resolve into a height, and the
  * real invariant is the ORDER BETWEEN three z-values living in two files.
  */
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-const PAGES_DIR = resolve(__dirname, '..', 'pages')
-const OWNER_DIR = resolve(PAGES_DIR, 'chat', 'page')
-const CHAT_PAGE = [
-  readFileSync(resolve(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
-  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(OWNER_DIR, f), 'utf8')),
-  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(resolve(PAGES_DIR, f), 'utf8')),
-].join('\n')
+const TITLE_ROW_SOURCE = readFileSync(resolve(__dirname, '../pages/chat/page/ChatTitleOverlay.tsx'), 'utf8')
+const SESSIONS_CHROME = readFileSync(resolve(__dirname, '../pages/chat/page/SessionsSidebarChrome.tsx'), 'utf8')
+const COMPOSER_DOCK = readFileSync(resolve(__dirname, '../pages/chat/page/ComposerDockView.tsx'), 'utf8')
 const SUBAGENT_BAR = readFileSync(resolve(__dirname, '../pages/chat/SubagentProgressBar.tsx'), 'utf8')
 const QUEUE_STACK = readFileSync(resolve(__dirname, '../components/QueueStack.tsx'), 'utf8')
 const INDEX_HTML = readFileSync(resolve(__dirname, '../../index.html'), 'utf8')
 
 /** The title-row overlay: `absolute top-0 … ${editingTitle ? 'z-[47]' : 'z-[45]'}`. */
-const TITLE_ROW = /absolute top-0 left-0 right-1\.5 \$\{editingTitle \? 'z-\[(\d+)\]' : 'z-\[(\d+)\]'\}/.exec(CHAT_PAGE)
+const TITLE_ROW = /absolute top-0 left-0 right-1\.5 \$\{editingTitle \? 'z-\[(\d+)\]' : 'z-\[(\d+)\]'\}/.exec(TITLE_ROW_SOURCE)
 /** The mobile sessions scrim, the one layer the resting band must stay under. */
-const SCRIM = /key="sessions-backdrop"[\s\S]{0,240}?z-\[(\d+)\]/.exec(CHAT_PAGE)
+const SCRIM = /key="sessions-backdrop"[\s\S]{0,240}?z-\[(\d+)\]/.exec(SESSIONS_CHROME)
 /** The wave chip's wrapper, lifted to clear ThemeExperienceLayer's ceiling. */
 const CHIP = /className="px-4 mx-auto w-full relative z-\[(\d+)\]"/.exec(SUBAGENT_BAR)
 /** The wrapper introduced around the bar stack. */
-const STACK = /<div ref=\{composerBandRef\} className="([^"]*)" data-testid="composer-status-stack">/.exec(CHAT_PAGE)
+const STACK = /<div ref=\{composerBandRef\} className="([^"]*)" data-testid="composer-status-stack">/.exec(COMPOSER_DOCK)
 /** QueueStack's fuse overhang — the seam that pulls its card into the composer. */
 const OVERLAP = /const OVERLAP = (\d+)/.exec(QUEUE_STACK)
 
@@ -55,10 +47,10 @@ describe('composer status chrome cannot occlude the header rename editor', () =>
     // A regex that silently stopped matching would make every ordering assertion
     // below pass on `undefined < undefined` style vacuity, so failing loudly here
     // is what gives the rest of the file its meaning.
-    expect(TITLE_ROW, 'title-row overlay className not found in ChatPage.tsx').not.toBeNull()
-    expect(SCRIM, 'sessions-backdrop scrim not found in ChatPage.tsx').not.toBeNull()
+    expect(TITLE_ROW, 'title-row overlay className not found in ChatTitleOverlay.tsx').not.toBeNull()
+    expect(SCRIM, 'sessions-backdrop scrim not found in SessionsSidebarChrome.tsx').not.toBeNull()
     expect(CHIP, 'wave-chip wrapper not found in SubagentProgressBar.tsx').not.toBeNull()
-    expect(STACK, 'composer-status-stack wrapper not found in ChatPage.tsx').not.toBeNull()
+    expect(STACK, 'composer-status-stack wrapper not found in ComposerDockView.tsx').not.toBeNull()
     expect(OVERLAP, 'OVERLAP constant not found in QueueStack.tsx').not.toBeNull()
   })
 

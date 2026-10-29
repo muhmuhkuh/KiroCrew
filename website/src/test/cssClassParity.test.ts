@@ -43,6 +43,7 @@ function walk(dir: string, out: string[] = []): string[] {
  * the rule or drop the class. Do not add to this list to silence a new failure.
  */
 const KNOWN_UNSTYLED = new Set([
+  'mc-comment-tooltip',   // components/MarkdownPanel.tsx
   'mc-fe-tab-file',       // apps/file-explorer/TabStrip.tsx
   'mc-fe-tab-folder',     // apps/file-explorer/TabStrip.tsx
 ])

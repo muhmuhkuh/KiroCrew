@@ -10,7 +10,7 @@
  * mountable unit seam for its renderMessage if-chain).
  */
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { isInvisibleOnly, isHiddenInvisibleAssistantRow } from '../utils/invisibleText'
 
@@ -78,38 +78,29 @@ describe('isHiddenInvisibleAssistantRow', () => {
 })
 
 describe('ChatPage inline chain consults the skip (source contract)', () => {
-  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so
-  // the pins read the page and those owners.
-  const pagesDir = resolve(__dirname, '../pages')
-  const ownerDir = resolve(pagesDir, 'chat', 'page')
-  const isSource = (f: string) => /\.tsx?$/.test(f) && !/\.test\./.test(f)
-  const src = [
-    readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'),
-    ...readdirSync(ownerDir).filter(isSource).sort().map(f => readFileSync(resolve(ownerDir, f), 'utf8')),
-    ...readdirSync(pagesDir).filter(f => /^useChatPage/.test(f) && isSource(f)).sort()
-      .map(f => readFileSync(resolve(pagesDir, f), 'utf8')),
-  ].join('\n')
+  const rendering = readFileSync(resolve(__dirname, '../pages/chat/page/transcriptRendering.tsx'), 'utf8')
+  const actions = readFileSync(resolve(__dirname, '../pages/chat/page/turnActions.ts'), 'utf8')
 
   it('skips hidden rows before the conversational branch', () => {
     // Since chat-core P5-a the page dispatches through the app-sdk registry:
     // the skip is a shape entry that draws nothing, ordered before the bubble
     // entry (the last one in the host list).
-    expect(src).toMatch(/id: 'hidden_invisible_assistant',\s*\n\s*roles: \['\*'\],\s*\n\s*match: isHiddenInvisibleAssistantRow,\s*\n\s*render: \(\) => null/)
-    const list = src.indexOf('const renderers = mergeRenderers([')
-    const skip = src.indexOf("id: 'hidden_invisible_assistant'", list)
-    const bubble = src.indexOf('\n      bubble,\n    ])', list)
+    expect(rendering).toMatch(/id: 'hidden_invisible_assistant',\s*\n\s*roles: \['\*'\],\s*\n\s*match: isHiddenInvisibleAssistantRow,\s*\n\s*render: \(\) => null/)
+    const list = rendering.indexOf('const renderers = mergeRenderers([')
+    const skip = rendering.indexOf("id: 'hidden_invisible_assistant'", list)
+    const bubble = rendering.indexOf('\n      bubble,\n    ])', list)
     expect(skip).toBeGreaterThan(list)
     expect(bubble).toBeGreaterThan(skip)
   })
 
   it('passes over hidden rows in the footer-host scan', () => {
-    expect(src).toMatch(/if \(isHiddenInvisibleAssistantRow\(later\)\) continue/)
+    expect(rendering).toMatch(/if \(isHiddenInvisibleAssistantRow\(later\)\) continue/)
   })
 
   it('anchors Regenerate/variant affordances on the last DRAWN reply', () => {
     // lastTextIdx must agree with the renderer's skip, or those affordances
     // silently vanish for the rest of a quiet monitor run.
-    expect(src).toMatch(
+    expect(actions).toMatch(
       /role === 'assistant' && !isHiddenInvisibleAssistantRow\(messages\[i\]\)/,
     )
   })
@@ -120,9 +111,9 @@ describe('ChatPage inline chain consults the skip (source contract)', () => {
     // truncation must scan identically or the UI truncates after a different
     // user row than the history rewrite persists. Hidden invisible-only rows
     // are NOT skipped here — only the drawn-row scans pass over those.
-    const i = src.indexOf('const handleRegenerate = useCallback(')
+    const i = actions.indexOf('const handleRegenerate = useCallback(')
     expect(i).toBeGreaterThan(-1)
-    const body = src.slice(i, src.indexOf('api.regenerateSlot', i))
+    const body = actions.slice(i, actions.indexOf('api.regenerateSlot', i))
     expect(body).toMatch(/if \(messages\[i\]\.role === 'user'\) break/)
     expect(body).toMatch(/if \(messages\[i\]\.role !== 'assistant'\) continue/)
     expect(body).toMatch(/if \(isSystemNoticeRow\(messages\[i\]\)\) continue/)

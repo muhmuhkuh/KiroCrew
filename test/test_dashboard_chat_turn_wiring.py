@@ -148,6 +148,7 @@ class TestRuntimeWiringTurn:
             "kiro_crew.dashboard.chat_runner.resolve_agent_bindings", checked_bindings
         )
 
+        # Import and run _run_chat
         from kiro_crew.dashboard.chat import _run_chat
 
         await _run_chat(state, slot, "test message")

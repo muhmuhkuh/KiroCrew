@@ -403,17 +403,15 @@ def test_the_table_read_is_the_harness_tree_s_and_typed_either_way(tmp_path):
     assert deny_diff.load_shell_deny_tiers(root) == (("exfil", "audit_bash_exfiltration"),)
 
 
-def test_importing_the_harness_alone_reads_no_tier_table(tmp_path):
+def test_importing_the_harness_alone_reads_no_tier_table(tmp_path, monkeypatch):
     """The scope lanes stage ``deny_diff.py`` ALONE into an empty directory and
     import it for its row schema; reading the table at import would break them."""
     lone = tmp_path / "harness" / "deny_diff.py"
     lone.parent.mkdir()
     lone.write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setitem(sys.modules, "deny_diff_alone", sys.modules.get("deny_diff_alone"))
     module = _load("deny_diff_alone", lone)
-    try:
-        assert module.load_corpus(GOLDEN_PATHS)
-    finally:
-        sys.modules.pop("deny_diff_alone", None)
+    assert module.load_corpus(GOLDEN_PATHS)
 
 
 def test_both_sides_are_measured_against_the_same_table(staged, monkeypatch):

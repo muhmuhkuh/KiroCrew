@@ -130,6 +130,23 @@ describe("createDisplayMediaHandler", () => {
     assert.deepEqual(granted, { video: screenSrc });
   });
 
+  it("grants loopback only to trusted requests that ask for audio", async () => {
+    const { handler } = countingHandler();
+    const request = { ...TRUSTED, audioRequested: true };
+    const trusted = createDisplayMediaHandler({
+      getSources: async () => [screenSrc],
+      isTrustedRequest: (candidate) => candidate === request,
+      platform: "win32",
+    });
+    let streams;
+    await trusted(request, (value) => { streams = value; });
+    assert.deepEqual(streams, { video: screenSrc, audio: "loopback" });
+    await handler(request, (value) => { streams = value; });
+    assert.deepEqual(streams, {});
+    await handler(TRUSTED, (value) => { streams = value; });
+    assert.deepEqual(streams, { video: screenSrc });
+  });
+
   it("denies and notifies on macOS when screen access is denied (without calling getSources)", async () => {
     let calledGetSources = false;
     let reason;

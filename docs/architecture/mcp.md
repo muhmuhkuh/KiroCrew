@@ -214,13 +214,6 @@ a verb a server spec DECLARES still survives.
 
 Ownership is judged by the entry's shape -- its name and provenance marker -- never by
 who wrote the file, so a plainly-named entry an agent appended reads as the owner's.
-
-On KAS the key has no slot, and the projection drops it from the server entry. The
-verbs `strip_ungoverned_auto_approve` keeps for the kiro-cli route travel instead as
-`@server/tool` entries in the `allowedTools` input the `permissions` block is derived
-from (`acp/kas_auto_approve.py`), so they meet the same per-entry ceiling and
-PreToolUse-hook withholding as any other grant. A verb that is not one literal tool
-name prompts.
 `~/.kiro/settings/mcp.json` is therefore on the write-protected tier of the file-tool
 floor: an agent's file-edit tools cannot write it. The shell route is not fenced by
 that floor; [governance.md](../system-specs/modules/governance.md#self-protection-the-keystone)
@@ -1592,7 +1585,7 @@ Containment for app agents has three layers:
 |-------|-----------|----------------|
 | Agent config | `managedToolPolicy` renders as `disabledTools`; a `neutralize` entry re-declares a server with every tool disabled and does not add it to `tools` | Written at registration, no network |
 | kiro-cli | Reads `disabledTools` and filters before the model sees the list | In-process, no network |
-| MCP server | `GET /api/session-tool-policy` returns the calling session's `managedToolPolicy.exclude`, and the server filters `tools/list` and `tools/call`. A spec that sets `managedToolPolicy.honourToolRefs: true` and grants kirocrew-core only through `@kirocrew-core/<tool>` refs also gets `include: {"kirocrew-core": [...]}`: kirocrew-core lists only those tools and refuses any other call (`rejected_not_included`). Each server named in `managedToolPolicy.excludeServers` is answered as an empty include entry (`include: {"<server>": []}`), overriding any per-tool entry: that server lists nothing and refuses every call; a present `excludeServers` that is not a list of server names makes the policy unreadable. A malformed `include` is `unresolved` like a malformed `exclude`. When that read fails the policy is `unresolved`: `tools/call` refuses with an audited error, `tools/list` still lists everything | Gateway round-trip |
+| MCP server | `GET /api/session-tool-policy` returns the calling session's `managedToolPolicy.exclude`, and the server filters `tools/list` and `tools/call`. A spec that sets `managedToolPolicy.honourToolRefs: true` and grants kirocrew-core only through `@kirocrew-core/<tool>` refs also gets `include: {"kirocrew-core": [...]}`: kirocrew-core lists only those tools and refuses any other call (`rejected_not_included`). A malformed `include` is `unresolved` like a malformed `exclude`. When that read fails the policy is `unresolved`: `tools/call` refuses with an audited error, `tools/list` still lists everything | Gateway round-trip |
 
 Which session that third layer asks for is resolved by `mcp_shared._policy_session_key`
 in the same order the strict resolver uses — the gateway's per-call caller, then the
@@ -1636,10 +1629,13 @@ inside the server's own process and is not a boundary against the app; what it m
 not do is let a Kiro Crew server out, so a handler whose code location cannot be read
 keeps the policy.
 
-`tools/call` fails **closed** on the four reasons in `_UNRESOLVED_REFUSES_CALL`
-(`mcp_shared_policy.py`): `policy_unreadable`, `identity_unattested`, `identity_unattestable`
-and `resolution_failed`. Each means "an operator exclusion may exist and this process
-could not read it". `policy_unreadable` is the gateway's `409`
+`tools/call` fails **closed** on the five reasons in `_UNRESOLVED_REFUSES_CALL`
+(`mcp_shared_policy.py`): `policy_unreadable`, `identity_unattested`,
+`identity_unattestable`, `resolution_failed` and `gateway_locked`. The first
+four mean an operator exclusion may exist whose policy this process could not
+read. `gateway_locked` is different: an enterprise gateway's login gate is
+closed. It is not a caller policy decision, is not cached, and a later read can
+proceed after the gate reopens. `policy_unreadable` is the gateway's `409`
 whose body carries `"code": "policy_unreadable"`: a spec for this session exists and its
 policy could not be determined. `identity_unattested` is the gateway's `409` whose body
 carries `"code": "member_identity_unavailable"`: the gateway could not establish the
@@ -1806,13 +1802,13 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py` + `mcp_cron_*.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
 | `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_core_parts/` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py` + `mcp_dashboard_*.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `session_move_to_column`, `chat_session_pin`, `chat_session_pin_move`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_retry`, `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_set_color`, `session_close`, `session_revive`, `session_history_list`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_handoff`, `session_release`, `session_read_message`, `session_summary` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py` + `mcp_dashboard_*.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `session_move_to_column`, `chat_session_pin`, `chat_session_pin_move`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_retry`, `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_close`, `session_revive`, `session_history_list`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_handoff`, `session_release`, `session_read_message`, `session_summary` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_rebuild`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates`, `dashboard_fields`, `dashboard_types`, `dashboard_write`, `dashboard_templates`, `dashboard_preview`, `dashboard_apply`, `dashboard_rollback`, `dashboard_snapshot` |
 | `kirocrew-guide` | `kirocrew mcp-guide` (`mcp_guide.py`) | `guide_list_actions`, `guide_start`, `guide_status`, `guide_cancel`, `list_change_kinds`, `find_setting`, `get_member_capabilities`, `diagnose_settings`, `propose_change`, `get_change_status`, `search_docs`, `find_ui` |
-| `kirocrew-mate` | `kirocrew mcp-mate` (`mcp_mate.py`) | `update_self`, `set_model`, `set_approval_mode`, `find_capabilities`, `request_capabilities`, `goal_read`, `set_goal`, `set_key_results`, `key_result_progress`, `save_goal_report`, `save_notes` |
+| `kirocrew-mate` | `kirocrew mcp-mate` (`mcp_mate.py`) | `update_self`, `set_model`, `set_approval_mode`, `find_capabilities`, `request_capabilities`, `goal_read`, `set_goal`, `set_key_results`, `set_check_ins`, `key_result_progress`, `save_goal_report`, `offer_dashboard_page`, `save_notes` |
 
 `kirocrew-guide` is a platform capability: it is always emitted (not `opt_in`),
 so the default `kirocrew` template, every mate built from it, the worker
@@ -1903,25 +1899,27 @@ report or monthly review under `Crewmates/<name>/Reports`, as `markdown` or as
 notification linking it. `save_notes` replaces the crewmate's own briefing
 (`members/<slug>/briefing.md`, its `[CURRENT ASSIGNMENT]` section) through
 `/api/member/self/notes` (`member_notes.write_member_notes`, the read side's
-pinned, no-follow open), under the same admission as the goal writes. These goal operations are deliberately
-NOT in `_USER_TURN_OPERATIONS`: the check-in turns of
-`dashboard/goal_reminder.py` are gateway-authored hidden turns in the
-mate's own thread, and recording readings and filing reports is what they
-are for. Every other admission check below still applies. Three card asks
-are admitted without a turn the user sent: any turn in the mate's own
-pinned thread (a check-in, a sub-agent's result coming back, the goal-setup
-nudge of `dashboard/goal_setup.py`) may call `set_goal`, `set_key_results` and
+pinned, no-follow open). Goal operations, `save_notes` and `find_capabilities`
+are admitted on any turn in the mate's own pinned thread. The Daily Goal
+Reminder's check-in turns are gateway-authored hidden turns in that thread, and
+recording readings and filing reports is what they are for. All universal
+admission checks below still apply. Three card asks have a narrower exception
+to the usual user-origin requirement: any turn in the mate's own pinned thread
+(a check-in, a sub-agent's result coming back, or the goal-setup nudge of
+`dashboard/goal_setup.py`) may call `set_goal`, `set_key_results` and
 `set_check_ins`. `_resolve_agent_caller(..., own_goal=True)` (passed only by
-`member.propose_self`) admits such a turn when the slot is a mate DM thread
-and marks the request `REQ_OWN_GOAL_TURN`; a channel turn is still refused. The
-route then refuses every other request (`model`, `approval_mode`,
-`capabilities`) with `not_user_turn`. Each is a card: nothing changes until the
-user presses it, so the mate may raise its own goal, milestones and
-check-ins whenever its work calls for it.
+`member.propose_self`) admits these calls when the slot is a mate DM thread and
+marks the request `REQ_OWN_GOAL_TURN`; a channel turn is still refused. Other
+card asks, including `set_model`, `set_approval_mode` and
+`request_capabilities`, still require a user-origin dashboard turn. `offer_dashboard_page`
+is a one-time card offer, called only when the mate's turn includes the gateway's
+permission to offer a page; it writes nothing until the user accepts.
 The workspace, memory store, member id, key and template are not the
 mate's to change or to ask for.
-Its guide and card tools, and every `kirocrew-mate` tool, work only for a turn
-the user sent from the dashboard. The gateway's admission
+Most guide/card operations and member-changing tools require a user-origin
+dashboard turn. The own-thread exceptions above apply only to the goal/check-in
+card asks and the goal, notes and capability operations described above; they
+are not a general exemption. The gateway's admission
 (`dashboard.handlers.guide._resolve_agent_caller`, shared by the card and member
 routes) first requires the session key the call names to be attested by
 the transport (`member_memory_auth.session_key_is_attested`: the socket peer, or the
@@ -2202,9 +2200,7 @@ innermost middleware, active only on `change_card_catalog.HOOKED_ROUTES`) refuse
 any caller that is not the dashboard owner (internal-secret, app and agent callers
 included), requires method, path and canonical body to equal the step (a
 `user` fill such as a secret's value is never read or stored; a `step` fill must
-equal what an earlier step's real response returned, and one marked `in: path`
-replaces its placeholder segment in the path only with a plain identifier,
-`change_card_catalog.PATH_FILL_VALUE`), re-reads the state before
+equal what an earlier step's real response returned), re-reads the state before
 the first write (`409 changed_since_preview`; `changed_since_apply` for undo),
 runs the handler unchanged and records the step only from its own 2xx. A card
 applies once; undo restores the state before the change, and is refused once the
@@ -2513,54 +2509,6 @@ answers `tools/list` from):
   applies it. `status` is restricted to `done` (forward progress only — no
   clear/dismiss), and the gateway admits only that one path for internal-secret
   callers, never the app's state-mutating routes
-
-### Server instructions travel with the server
-
-A Kiro Crew server can describe its own tools in its MCP `instructions`, the
-`initialize` result field the spec calls a hint the client MAY add to the system
-prompt. `mcp_shared.run_mcp_stdio_loop(..., instructions=...)` returns the text, and
-`kiro_crew/mcp_instructions.py` holds it, one entry per server in `BY_SERVER`:
-`kirocrew-cron`, `kirocrew-guide`, `kirocrew-dashboard` (session control) and
-`kirocrew-computer`. Text in `config/prompt.md` reaches only the default-named
-agents, whatever they mount; as instructions it reaches every agent that mounts
-the server, on every harness, and nothing reaches an agent that does not. The harness places it
-in its own system prompt, so it is not part of what a compaction drops and Kiro
-Crew re-injects.
-
-The prompt keeps only what a server cannot say about itself: that an expected
-server is missing. Today that is the Computer Use pointer, the slot a closed spec
-gate resolves to.
-
-Each text opens with a one-line summary of at most `MAX_SUMMARY_CHARS` (250) and
-stays within `MAX_INSTRUCTIONS_CHARS` (4,096), measured 2026-10-27 (#24859):
-
-| Harness | Where the text lands | Limit |
-|---|---|---|
-| KAS | system prompt, under `MCP SERVER INSTRUCTIONS (untrusted ...)` | not seen |
-| Claude Code | system message `# MCP Server Instructions` | 4,096 chars, then `… [truncated]` |
-| Codex | the tool namespace's description | not seen |
-| opencode | system prompt `<mcp_instructions>` | not seen |
-| goose | system prompt `### Instructions` | not seen |
-| DeepSeek Harness | system prompt `### MCP server: <name>` | 32,768 bytes, over it `session/new` fails |
-| pi | nowhere for a `direct` server (only the first line, for `deferred`/`codemode`) | 250 chars |
-| kiro-cli, v2 engine (`acp` without `--agent-engine v3`) | nowhere | — |
-
-The v2 engine is deprecated and gets no fallback: a session on it, including one a
-KAS default or member backend degrades to (`apply_kas_cli_floor`), runs without these
-servers' usage text. That is the maintainer's recorded decision on #24869.
-
-So pi is handed the text by Crew: `pi_mcp_handoff_payload` seals the entries of the
-servers the session mounts beside the servers themselves, and the pi gate extension
-appends them to each run's system prompt in `before_agent_start`, skipping a server
-pi's own `mcp.json` shadows. Text that is a rule rather than a tool's usage stays in
-the prompt: KAS frames instructions as untrusted hints that cannot override the
-agent's own rules.
-
-A pooled backend's `initialize` result is cached and replayed to every later stub
-(`backend_handshake._deliver_cached_initialize`), `instructions` included, and a
-respawned backend's result replaces the cache. Pinned by
-`test_pooled_stubs_get_the_backends_instructions_after_a_respawn_too` and
-`test_mcp_instructions.py`.
 
 ### A `kirocrew-core` tool has two halves
 
@@ -3822,11 +3770,7 @@ servers defer like any other when the spawn runs the pinned kiro-cli install or 
 `kiro-cli-chat`, and both are >= 2.27.0. For any other executable (a pod bundle, a `kiro-cli`
 found on `PATH`), below that floor, or when the version is unknown, Crew keeps its
 servers resident to avoid the thinking-signature
-"tools list differs" rejection that bricks a session. KAS ignores the toggle and the
-thresholds and defers every MCP tool not on its `toolSearch.neverDefer` list, so for an
-agent whose `tools` grants no `tool_search` Crew sends that list with each of the
-agent's MCP tools as `<server>::<tool>`, expanding `@server` grants from the tool names
-it already holds; a server it holds none for stays deferred. A deferred tool costs a name
+"tools list differs" rejection that bricks a session. A deferred tool costs a name
 plus a description rather than a full JSON schema; it is smaller, not zero, and it
 scales with the tool count. An operator's `ASBX_KIRO_MANDATORY_MCPS` value
 (comma-separated server names) in the gateway's environment always wins, including

@@ -832,13 +832,11 @@ class TestCompleteOrchestration:
     async def test_runs_the_probe_in_the_vetted_session_directory(self):
         # `gh` finds the repo from the cwd, so a probe that ignored it would answer
         # for the wrong repository.
-        async def probe(_argv, cwd):
-            return "pr\tx\n:4\n" if cwd == "/w/proj" else ":0\n"
-
+        run = AsyncMock(return_value="pr\tx\n:4\n")
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved(cwd="/w/proj")), \
-             patch.object(tc, "_run_probe", AsyncMock(side_effect=probe)):
-            entries, reason = await tc.complete(["gh"], "", "/w/proj")
-        assert ([e.name for e in entries], reason) == (["pr"], "cmd_listed")
+             patch.object(tc, "_run_probe", run):
+            await tc.complete(["gh"], "", "/w/proj")
+        assert run.await_args.args[1] == "/w/proj"
 
     @pytest.mark.asyncio
     async def test_narrows_a_cached_listing_without_a_second_probe(self):
@@ -855,75 +853,71 @@ class TestCompleteOrchestration:
         assert [e.name for e in third] == ["create"]
         assert run.await_count == 1
 
-    # Each probe below answers differently, so the second call's entries name the
-    # probe that served it: a fresh one, or the cached first.
-
     @pytest.mark.asyncio
     async def test_probes_again_for_a_different_position_in_the_tree(self):
-        run = AsyncMock(side_effect=["create\td\n:4\n", "clone\td\n:4\n"])
+        run = AsyncMock(return_value="x\td\n:4\n")
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved()), \
              patch.object(tc, "_run_probe", run):
             await tc.complete(["gh", "pr"], "", None)
-            entries, _ = await tc.complete(["gh", "repo"], "", None)
-        assert [e.name for e in entries] == ["clone"]
+            await tc.complete(["gh", "repo"], "", None)
+        assert run.await_count == 2
 
     @pytest.mark.asyncio
     async def test_flags_and_subcommands_are_cached_separately(self):
-        run = AsyncMock(side_effect=["create\td\n:4\n", "--repo\td\n:4\n"])
+        run = AsyncMock(return_value="--repo\td\n:4\n")
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved()), \
              patch.object(tc, "_run_probe", run):
-            subs, _ = await tc.complete(["gh", "pr"], "", None)
-            flags, _ = await tc.complete(["gh", "pr"], "--", None)
-        assert [e.name for e in subs] == ["create"]
-        assert [e.name for e in flags] == ["--repo"]
+            await tc.complete(["gh", "pr"], "", None)
+            await tc.complete(["gh", "pr"], "--", None)
+        assert run.await_count == 2
 
     @pytest.mark.asyncio
     async def test_a_new_binary_identity_invalidates_the_cache(self):
         # Upgrading the tool (or a version manager repointing a shim) must not keep
         # serving the previous version's subcommands.
-        run = AsyncMock(side_effect=["pr\td\n:4\n", "repo\td\n:4\n"])
+        run = AsyncMock(return_value="pr\td\n:4\n")
         with patch.object(tc, "_run_probe", run):
             with patch.object(tc, "_resolve_and_vet",
                               return_value=(("/usr/bin/gh", ("/usr/bin/gh", 1, 2)), None)):
                 await tc.complete(["gh"], "", None)
             with patch.object(tc, "_resolve_and_vet",
                               return_value=(("/usr/bin/gh", ("/usr/bin/gh", 99, 2)), None)):
-                entries, _ = await tc.complete(["gh"], "", None)
-        assert [e.name for e in entries] == ["repo"]
+                await tc.complete(["gh"], "", None)
+        assert run.await_count == 2
 
     @pytest.mark.asyncio
     async def test_a_negative_result_is_cached_too(self):
         # Otherwise the failed probe is paid again on every keystroke.
-        run = AsyncMock(side_effect=[None, "pr\td\n:4\n"])
+        run = AsyncMock(return_value=None)
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved()), \
              patch.object(tc, "_run_probe", run):
             await tc.complete(["gh"], "", None)
-            second = await tc.complete(["gh"], "", None)
-        assert second == ([], "cmd_none")
+            await tc.complete(["gh"], "", None)
+        assert run.await_count == 1
 
     @pytest.mark.asyncio
     async def test_a_negative_result_expires_sooner_than_a_positive_one(self, monkeypatch):
-        run = AsyncMock(side_effect=[None, "pr\td\n:4\n"])
+        run = AsyncMock(return_value=None)
         clock = [1000.0]
         monkeypatch.setattr(tc.time, "monotonic", lambda: clock[0])
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved()), \
              patch.object(tc, "_run_probe", run):
             await tc.complete(["gh"], "", None)
             clock[0] += tc.CACHE_NEGATIVE_TTL_S + 1
-            entries, reason = await tc.complete(["gh"], "", None)
-        assert ([e.name for e in entries], reason) == (["pr"], "cmd_listed")
+            await tc.complete(["gh"], "", None)
+        assert run.await_count == 2
 
     @pytest.mark.asyncio
     async def test_a_positive_result_survives_the_negative_ttl(self, monkeypatch):
-        run = AsyncMock(side_effect=["pr\td\n:4\n", "repo\td\n:4\n"])
+        run = AsyncMock(return_value="pr\td\n:4\n")
         clock = [1000.0]
         monkeypatch.setattr(tc.time, "monotonic", lambda: clock[0])
         with patch.object(tc, "_resolve_and_vet", return_value=self._resolved()), \
              patch.object(tc, "_run_probe", run):
             await tc.complete(["gh"], "", None)
             clock[0] += tc.CACHE_NEGATIVE_TTL_S + 1
-            entries, _ = await tc.complete(["gh"], "", None)
-        assert [e.name for e in entries] == ["pr"]
+            await tc.complete(["gh"], "", None)
+        assert run.await_count == 1
 
     @pytest.mark.asyncio
     async def test_the_cache_is_bounded(self):

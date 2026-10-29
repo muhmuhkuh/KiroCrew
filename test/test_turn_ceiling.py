@@ -942,7 +942,7 @@ EXEMPT = {
     "dashboard/chat_turn/turn_entry.py": (
         "dashboard turns are driven by a human watching and clicking through them"
     ),
-    "slack/gateway_runtime/nudge_channel_fire.py": (
+    "slack/gateway.py": (
         "generates nudge turns rather than receiving them, and dispatches each "
         "through a channel's own gated dispatcher inside "
         "turn_ceiling.generated_turn, which is where the exemption is decided"

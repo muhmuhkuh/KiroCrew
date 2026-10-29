@@ -536,6 +536,9 @@ class TestTheCapabilityIsNotAnnounced:
             "_kiro/hooks/executeHook. See agent-host-contract.md."
         )
 
+    def test_the_settings_channel_is_still_open(self):
+        assert KAS_CLIENT_CAPABILITIES["_meta"]["kiro"]["settings"] == {}
+
     def test_the_harness_declares_the_same_meta(self):
         assert "hooks" not in KasHarness().client_capabilities["_meta"]["kiro"]
 
@@ -1086,6 +1089,30 @@ class TestExecuteHookReviewFixes:
 
         monkeypatch.setattr(kas_wire, "sel", lambda: _Sel())
         return records
+
+    @pytest.mark.asyncio
+    async def test_refused_event_is_audited_without_approving_or_spawning(
+        self, store: ScriptHookStore, governance_permits, audited, monkeypatch
+    ):
+        created = store.create({"name": "a", "event": "Stop", "command": "echo a"})
+        set_global_hook_store(store)
+        monkeypatch.setattr(hooks_mod, "run_script_hook", _must_not_run)
+        asked: list[tuple[str, str]] = []
+
+        def _deny(session_key: str, event: str) -> str | None:
+            asked.append((session_key, event))
+            return "hook event refused by the security policy"
+
+        monkeypatch.setattr("kiro_crew.hook_event_governance.event_refusal", _deny)
+        handle = _FakeHandle(session_key="slot:event")
+        _list_for(handle, trigger="agentStop")
+
+        await _execute(handle, {"hookId": f"crew:script:{created.id}"})
+
+        assert asked == [("slot:event", "Stop")]
+        assert len(handle._runtime.errors) == 1
+        assert "hook event refused" in handle._runtime.errors[0][2]
+        assert [row["outcome"] for row in audited] == ["refused"]
 
     @pytest.mark.asyncio
     async def test_an_allowed_run_is_audited_before_and_after_it_spawns(

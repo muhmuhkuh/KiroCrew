@@ -90,6 +90,13 @@ def _text(resp: web.Response) -> str:
 
 
 class TestConsolidateEndpoint(_Base):
+    def setUp(self):
+        super().setUp()
+        # Mocked dispatch handles must not survive into another test's real tasks.
+        tasks = patch.object(routes, "_TASKS", set[asyncio.Task]())
+        tasks.start()
+        self.addCleanup(tasks.stop)
+
     async def test_refuses_when_nothing_is_staged(self):
         resp = await routes._handle_consolidate(
             _FakeRequest({"namespace": "default"}))  # type: ignore[arg-type]

@@ -70,7 +70,6 @@ import {
   LinkOverrideCtx,
   LinkUnfurlCtx,
   MdSourceCtx,
-  MdBlockStartCtx,
   ParagraphNoticeSlotCtx,
   PathActionCtx,
   PathProbeCtx,
@@ -893,9 +892,7 @@ const MarkdownBlock = memo(function MarkdownBlock({ content, sourcePos, startLin
       </ReactMarkdown>
     </MdSourceCtx.Provider>
   )
-  const body = sourcePos
-    ? <div data-block-start={startLine ?? 1}><MdBlockStartCtx.Provider value={startLine ?? 1}>{md}</MdBlockStartCtx.Provider></div>
-    : md
+  const body = sourcePos ? <div data-block-start={startLine ?? 1}>{md}</div> : md
   // The provider carries no DOM node, so sourcepos / lightbox scoping upstream
   // is unaffected. It is the only way MdAnchor / MdParagraph — which react-markdown
   // instantiates deep inside its own tree — can see the gate.

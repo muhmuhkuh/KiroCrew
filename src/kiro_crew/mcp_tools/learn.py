@@ -16,7 +16,6 @@ every existing patch site.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Callable
 from typing import Any
@@ -225,16 +224,6 @@ def schemas() -> list[dict[str, Any]]:
                             "scope='workspace'."
                         ),
                     },
-                    "keep_one": {
-                        "type": "boolean",
-                        "description": (
-                            "Optional, default false. Remove only the extra "
-                            "copies: of the matching lessons, those with the "
-                            "same stored rule, NOT clause, tier and scope are collapsed to the "
-                            "oldest one. Different lessons are never removed "
-                            "in this mode, so use it to clean up duplicates."
-                        ),
-                    },
                 },
                 "required": ["query"],
             },
@@ -286,8 +275,9 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
         return f"Error: {_gov_mem}"
     # A stale client still holding the old advertised schema can send
     # scope="workspace". Silently forcing that to "global" would take a correction
-    # meant for one workspace and inject it into EVERY session -- worse than a
-    # tier that is inert and reaches no prompt at all. So a legacy scope asking for anything
+    # meant for one workspace and inject it into EVERY session -- the exact harm
+    # this change exists to end, and worse than the old behaviour, where the tier
+    # was inert and reached no prompt at all. So a legacy scope asking for anything
     # narrower than global is REFUSED, with the replacement named. Refusing loses
     # nothing that ever worked, and it tells the caller instead of widening silently.
     _legacy_scope = args.get("scope")
@@ -440,21 +430,6 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
             f"{lost}"
         )
     if outcome == "deduped":
-        # The stored lesson that claimed the write, when the gateway names it. A
-        # string check rather than trust: this crosses HTTP, and an older gateway
-        # sends no ``winner`` at all, which keeps the learn_list recovery below.
-        raw_winner = d.get("winner")
-        winner = raw_winner.strip() if isinstance(raw_winner, str) else ""
-        # ``winner_repo_scope`` is the delete selector for the winner's row: ``""``
-        # for a global row, the fragment for a scoped one, and null when the route
-        # withheld it. Only a string can be forwarded to learn_remove; without one a
-        # delete would reach every scope, so the reply keeps the learn_list path.
-        raw_winner_scope = d.get("winner_repo_scope")
-        selector = raw_winner_scope if isinstance(raw_winner_scope, str) else None
-        winner_line = ""
-        if winner:
-            winner_where = f" (applies only in {selector})" if selector else ""
-            winner_line = f"\nThe stored lesson that covers it{winner_where}: {winner}"
         # ``rule`` is the SUBMITTED text, not the stored lesson that claimed the
         # write. The old wording put it directly after "an existing stored lesson
         # already covers it", which reads as a quote OF that stored lesson -- so a
@@ -473,26 +448,14 @@ def learn_add(name: str, args: dict[str, Any]) -> str:
                 f"higher authority (set by the user, or imported at higher "
                 f"confidence) already covers it, and that stored lesson stays "
                 f"in effect. The text below is what was DROPPED -- it is NOT the "
-                f"stored lesson: {rule}{winner_line}\n"
+                f"stored lesson: {rule}\n"
                 "Only the user can replace their own lesson; do not remove it on "
                 "their behalf."
                 f"{lost}"
             )
-        if winner and selector is not None:
-            # ``json.dumps`` renders the selector as a literal the model can pass
-            # back unchanged, including the empty string that names a global row.
-            return (
-                f"Lesson was NOT saved{detail}. The text below is what was DROPPED -- "
-                f"it is NOT the stored lesson: {rule}{winner_line}\n"
-                "That stored lesson stays in effect. If this was meant to correct or "
-                "replace it, call learn_remove with that stored text as query and "
-                f"repo_scope={json.dumps(selector)} so only that scope is touched, then "
-                "add this again; otherwise the outdated lesson keeps applying."
-                f"{lost}"
-            )
         return (
             f"Lesson was NOT saved{detail}. The text below is what was DROPPED -- it "
-            f"is NOT the stored lesson: {rule}{winner_line}\n"
+            f"is NOT the stored lesson: {rule}\n"
             "An existing stored lesson already covers it, and that existing lesson "
             "stays in effect. If this was meant to correct or replace a stale lesson, "
             "run learn_list to find the stored wording -- it shows the newest window "
@@ -732,10 +695,6 @@ def learn_remove(name: str, args: dict[str, Any]) -> str:
     for key, value in (("scope", tier_scope), ("workspace", workspace)):
         if isinstance(value, str) and value:
             payload[key] = value
-    # Forwarded only when set, so a call without it sends today's body.
-    keep_one = args.get("keep_one") is True
-    if keep_one:
-        payload["keep_one"] = True
     d = mcp_core._delete("/api/lessons", payload)
     err_val = d.get("error")
     if err_val:
@@ -766,11 +725,7 @@ def learn_remove(name: str, args: dict[str, Any]) -> str:
     # removal would tell a remove-then-re-add consolidation its old lesson is
     # gone while it is still injected. A reply without the key reads as removed.
     if d.get("ok") is False:
-        if keep_one:
-            return f"No lessons were removed: no extra copies match: {query}"
         return f"No lessons were removed: nothing matches: {query}"
-    if keep_one:
-        return f"Removed extra copies of lessons matching: {query} (one of each kept)"
     return f"Removed lessons matching: {query}"
 
 

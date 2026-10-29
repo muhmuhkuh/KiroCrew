@@ -194,7 +194,7 @@ class TestFileIndexRegistry:
         root = os.path.realpath(str(tmp_path))
         await reg.acquire(root)
         assert reg.get(root) is not None
-        # Same release call api_chat_slot_delete makes.
+        # Simulate what api_chat_slot_delete now does
         await reg.release(root)
         assert reg.get(root) is None
 

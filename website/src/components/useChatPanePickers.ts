@@ -25,7 +25,6 @@ import { api } from '../api/client'
 import { displayModel, modelChipMarker } from '../lib/model'
 import { useSettingsDefaultModel } from '../hooks/useSettingsDefaultModel'
 import { i18nT } from '../i18n/t'
-import { slotRowByKey } from '../store/slotIndex'
 
 /**
  * `ChatPane`'s agent and model pickers, bound to the pane's own slot through
@@ -53,7 +52,7 @@ export function useChatPanePickerModels({ slotKey, paneSlot, provider, dispatch,
   const agentsRefreshTrigger = useAppSelector((s) => s.dashboard.refreshTrigger ?? 0)
   // This pane takes no project prop, so read THIS slot's project from the store:
   // it scopes which project-local agents exist, so a project change must refetch.
-  const paneProject = useAppSelector((s) => slotRowByKey(s.dashboard.slots, slotKey)?.project || undefined)
+  const paneProject = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey)?.project || undefined)
   const { agents: installedAgents, choices: catalogChoices, defaultAgent } = useAgents(agentsRefreshTrigger, slotKey, paneProject)
   // The picker lists every catalog row (a member and a template of one name
   // are two rows). A roster source that exposes only the folded list -- one
@@ -77,7 +76,8 @@ export function useChatPanePickerModels({ slotKey, paneSlot, provider, dispatch,
   // The pop-up lists the full catalog (a same-name member and template are
   // two rows); every other reader of the roster keeps the name-folded list.
   const agentDD = useFilteredDropdown(agentChoices)
-  const effectiveModels = useAvailableModels()
+  const chatBackend = paneSlot?.acp_backend ?? undefined
+  const effectiveModels = useAvailableModels({ backend: chatBackend })
   const selectionCapabilitiesQ = useQuery({
     queryKey: ['slot-selection-capabilities', slotKey],
     queryFn: () => api.chatSlotSelectionCapabilities(slotKey),
@@ -131,7 +131,9 @@ export function useChatPanePickerModels({ slotKey, paneSlot, provider, dispatch,
   // a cached list served while /api/models fails is stale and cannot disprove
   // entitlement — and is subscribed to, since it can flip while the served list
   // stays identical.
-  const _modelsDegraded = useModelsDegraded(provider.id)
+  const _modelsDegraded = useModelsDegraded(
+    chatBackend === undefined ? provider.id : `${provider.id}:${chatBackend}`,
+  )
   const displayModels = codexPairModels
     ? filterInteractiveModels(availableModels, [], [], true)
     : availableModels

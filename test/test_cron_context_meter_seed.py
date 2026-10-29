@@ -13,7 +13,6 @@ slot with no resident provider and get the stale reading the run recorded.
 
 from __future__ import annotations
 
-import json
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -125,56 +124,63 @@ def test_no_reading_when_accessor_raises():
 # ── inject wiring: route through the single writer ─────────────────────────
 
 
-def _meter_frames(state) -> list[dict]:
-    """The context-meter frames queued for the cron tab's live readers."""
-    frames = state.get_slot("cron-abc123").drain()
-    return [json.loads(f["content"]) for f in frames if f["cls"] == "context_usage"]
-
-
-def test_inject_records_reading_via_single_writer(tmp_path):
-    state = _make_state(tmp_path)
+def test_inject_records_reading_via_single_writer():
+    state = MagicMock()
+    slot = MagicMock()
+    slot.key = "cron-abc123"
+    slot.linked_session_key = "cron:abc123"
+    slot.messages = []
+    state.get_or_create_slot.return_value = slot
+    state.conversation_log = None
 
     _inject(
         state, _make_job(), "result",
         context_reading={"pct": 61.2, "used_tokens": 122400, "window_tokens": 200000},
     )
 
-    assert _meter_frames(state) == [
-        {"slot": "cron-abc123", "pct": 61.2, "used_tokens": 122400, "window_tokens": 200000}
-    ]
-    snapshot = state._context_snapshots["cron-abc123"]
-    assert (snapshot["pct"], snapshot["used_tokens"], snapshot["window_tokens"]) == (
-        61.2,
-        122400,
-        200000,
+    state.broadcast_context_usage.assert_called_once_with(
+        "cron-abc123",
+        {"slot": "cron-abc123", "pct": 61.2,
+         "used_tokens": 122400, "window_tokens": 200000},
     )
 
 
-def test_inject_pct_only_reading_signals_reset(tmp_path):
+def test_inject_pct_only_reading_signals_reset():
     # A bare {slot, pct} frame would leave stale token counts beside a fresh
     # percentage in the frontend's independent slices — reset moves them together.
-    state = _make_state(tmp_path)
+    state = MagicMock()
+    slot = MagicMock()
+    slot.key = "cron-abc123"
+    slot.linked_session_key = "cron:abc123"
+    slot.messages = []
+    state.get_or_create_slot.return_value = slot
+    state.conversation_log = None
 
-    _inject(state, _make_job(), "result", context_reading={"pct": 33.0})
+    _inject(
+        state, _make_job(), "result", context_reading={"pct": 33.0}
+    )
 
-    assert _meter_frames(state) == [{"slot": "cron-abc123", "pct": 33.0, "reset": True}]
+    state.broadcast_context_usage.assert_called_once_with(
+        "cron-abc123", {"slot": "cron-abc123", "pct": 33.0, "reset": True}
+    )
 
 
-def test_inject_without_reading_records_nothing(tmp_path):
+def test_inject_without_reading_records_nothing():
     # The to-chat replay path (no client in hand) must not clobber whatever
     # snapshot an earlier run stored.
-    state = _make_state(tmp_path)
-    _inject(state, _make_job(), "first", context_reading={"pct": 40.0})
-    _meter_frames(state)
-    before = dict(state._context_snapshots["cron-abc123"])
+    state = MagicMock()
+    slot = MagicMock()
+    slot.key = "cron-abc123"
+    slot.linked_session_key = "cron:abc123"
+    slot.messages = []
+    state.get_or_create_slot.return_value = slot
+    state.conversation_log = None
 
     _inject(state, _make_job(), "result")
 
-    assert _meter_frames(state) == []
-    assert state._context_snapshots["cron-abc123"] == before
+    state.broadcast_context_usage.assert_not_called()
     # The result itself is still delivered; only the meter frame is skipped.
-    contents = [m["content"] for m in state.get_slot("cron-abc123").messages]
-    assert any(c.endswith("result") for c in contents)
+    assert any(c.args[1].endswith("result") for c in slot.append.call_args_list)
 
 
 # ── end to end: the reported bug ────────────────────────────────────────────

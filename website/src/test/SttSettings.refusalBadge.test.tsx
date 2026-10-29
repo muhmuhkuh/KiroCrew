@@ -110,10 +110,9 @@ describe('Status badge for an installed-but-refused recogniser', () => {
 
   it('the load-crashed reason names the product and the real remedy', async () => {
     mountRefused('stt_load_crashed')
-    const line = await screen.findByText(/last attempt to load the speech model crashed/)
-    expect(line.textContent).toContain('until the voice packages are reinstalled')
-    expect(line.textContent).toContain('Provider menu below')
-    expect(line.textContent).not.toContain('gateway')
+    const line = await screen.findByText(/The last attempt to load the speech model stopped the gateway/)
+    expect(line.textContent).toContain('Turn speech-to-text off above')
+    expect(line.textContent).toContain('reinstall the voice packages')
     expect(line.textContent).not.toContain('{{productName}}')
   })
 })

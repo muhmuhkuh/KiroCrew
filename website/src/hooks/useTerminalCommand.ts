@@ -142,9 +142,7 @@ export function useTerminalCommand(options: Options) {
       awaitingDock.current = null
       if (settled) return
       if (!ownsDock()) { finish(false); return }
-      // Names its chat, so the gateway refuses a local shell if that chat now
-      // runs on a Session Environment (another window may have bound it).
-      const sessionId = addTab(snapshot.project || undefined, snapshot.slotId || undefined)
+      const sessionId = addTab(snapshot.project || undefined)
       if (!sessionId) { finish(false, 'limit'); return }
       unsubscribe = onTerminalReady(
         sessionId,

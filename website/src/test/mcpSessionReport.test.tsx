@@ -180,9 +180,9 @@ describe('McpToolsPanel session report', () => {
     }
   })
 
-  it('carries no footnote explaining where the list comes from', () => {
+  it('names where each half of the view comes from', () => {
     render(<McpToolsPanel {...base} sessionReport={report({ ready: ['kirocrew-core'] })} />)
-    expect(screen.queryByText(/this agent's configuration/)).toBeNull()
+    expect(screen.getByText(/this agent's configuration/)).toBeInTheDocument()
   })
 
   it('surfaces a server the session started that the list does not show', () => {

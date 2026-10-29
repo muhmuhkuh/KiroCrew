@@ -62,8 +62,6 @@ A candidate qualifies only if **all three** hold:
    green via `gh`; always set `repo` to `owner/name` — without it `gh` resolves
    the PR number against whatever checkout the evaluator runs in, which can be
    another repository's PR, and outside a checkout it cannot be evaluated),
-   `pr_merged` (a PR has merged, also via `gh`, with `repo` required: an open
-   PR reads `pending`, one closed without merging reads `fail`),
    `file` (a path existing), or `human_approval` (the user accepts it —
    legitimate for design reviews and go/no-go gates, but never
    machine-evaluated). **There is deliberately no "run this command" kind**, so
@@ -234,10 +232,8 @@ cycle; an unbound running worker is neither visible nor recoverable.
 | `select_crew` names a specialist crew that fits | that crew |
 
 `depth` is computed when a child first opens its ledger (its first `goal` or
-`create`) and capped at 2 by default (the operator's `work_ledger.max_depth`
-setting raises it; `work_ledger_read` reports the value in force as `max_depth`),
-so at the default you may dispatch a conductor and its own workers may not
-conduct. A `depth_exceeded` error means the item has to be
+`create`) and capped at 2, so you may dispatch a conductor and its own
+workers may not conduct. A `depth_exceeded` error means the item has to be
 flattened into leaves, not retried.
 
 A specialist crew that does not mount `@kirocrew-work` cannot report to the
@@ -610,10 +606,8 @@ So the worker contract applies to you on top of everything in this skill:
   parent's record across a dispatch relationship, so it prompts. Reporting at
   round boundaries keeps that to a handful of approvals per goal.
 
-Depth is capped at 2 by default (`work_ledger.max_depth`), so your own children
-may be workers only unless `work_ledger_read` shows a larger `max_depth` than
-your `depth` plus one — a `depth_exceeded` on a child's first `goal` or `create`
-means flatten, not retry.
+Depth is capped at 2, so your own children may be workers only — a
+`depth_exceeded` on a child's first `goal` or `create` means flatten, not retry.
 
 ## Stop conditions
 
@@ -811,8 +805,7 @@ what the composer renders:
   and `patrol_budget.py`; every call is
   audit-logged and every call prompts. The evaluator accepts **no command, argv
   array, or shell string from a spec** — it builds every argv it runs from a
-  fixed template, so `pr_checks` becomes `gh pr checks <n>`, `pr_merged`
-  becomes `gh pr view <n> --repo <owner/name> --json state`, and nothing else
+  fixed template, so `pr_checks` becomes `gh pr checks <n>` and nothing else
   executes. That is deliberate and load-bearing: this script is invoked as an
   approved wrapper, so a spec that could name a command would turn it into a
   general way to run one, and Kiro Crew's denied-command floor cannot see inside

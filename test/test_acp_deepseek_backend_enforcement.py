@@ -524,9 +524,8 @@ def test_registering_an_unverified_harness_as_selectable_is_refused(monkeypatch)
 
     The guard outlives its original subject. deepseek was the harness that needed
     it -- KNOWN, so a governance rule could deny it, and unrouted, so it must not
-    reach the switch -- and now that its routing is VERIFIED there is no KNOWN id
-    left that is UNVERIFIED (``test_no_known_backend_is_unverified``). So the
-    refusal is exercised by making this same id unrouted again, which keeps the
+    reach the switch. Vibe remains explicitly UNVERIFIED and unselectable; the
+    refusal is also exercised by making deepseek unrouted again, which keeps the
     guard covered for the next harness onboarded in that state rather than
     deleting it with the condition that motivated it.
     """
@@ -596,24 +595,18 @@ def test_a_routed_harness_still_registers() -> None:
         sdk_backends._selectable.update(selectable_before)
 
 
-def test_no_known_backend_is_unverified() -> None:
-    """The audit the refusal rests on, kept as a test so it cannot go quietly stale.
+def test_only_onboarded_vibe_is_unverified() -> None:
+    """Vibe stays known but unselectable until its routing is verified."""
+    from kiro_crew.acp_backends import ACP_BACKEND_VIBE
 
-    deepseek was the one member of this set, and this change empties it. If a
-    harness ever resolves to ``UNVERIFIED`` again -- including by being absent from
-    the routing table, which ``routing_for`` answers ``UNVERIFIED`` for -- the
-    refusal above starts applying to it. That may be right, but it must be noticed
-    rather than discovered when an edition's registration begins failing.
-    """
     unverified = {b for b in ACP_BACKENDS_KNOWN if routing_for(b) is Routing.UNVERIFIED}
-    assert unverified == set()
+    assert unverified == {ACP_BACKEND_VIBE}
     # Every known id is named EXPLICITLY, so none of them is unverified merely by
     # omission.
     from kiro_crew.acp_backends import ACP_BACKEND_ROUTING
 
     assert set(ACP_BACKEND_ROUTING) >= ACP_BACKENDS_KNOWN
-    # And the shipped baseline now carries this harness, which is the point of the
-    # change: every KNOWN harness is selectable because every one of them is routed.
+    # DeepSeek is verified and selectable; Vibe remains outside the baseline.
     assert ACP_BACKEND_DEEPSEEK in set(BASELINE_SELECTABLE_BACKENDS)
 
 

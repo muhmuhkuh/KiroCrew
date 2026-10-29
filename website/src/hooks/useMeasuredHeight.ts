@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-const rectHeight = (node: HTMLElement) => node.getBoundingClientRect().height
-
 /**
  * The rendered height of an element, measured rather than predicted.
  *
@@ -39,14 +37,8 @@ const rectHeight = (node: HTMLElement) => node.getBoundingClientRect().height
  * the observer dead after the first render and the height frozen at its mount
  * value (the list dock stayed at its search-row height while an error notice
  * grew it). The effect therefore re-attaches to the node it still holds.
- *
- * `measure` defaults to the rect height. A caller inside a scaling ancestor
- * (a dialog's zoom-in) passes `offsetHeight`, which ignores transforms: a
- * transform ending fires no `ResizeObserver` entry, so a scaled read sticks.
  */
-export function useMeasuredHeight<T extends HTMLElement>(
-  measure: (node: T) => number = rectHeight,
-): [(node: T | null) => void, number] {
+export function useMeasuredHeight<T extends HTMLElement>(): [(node: T | null) => void, number] {
   const [height, setHeight] = useState(0)
   const nodeRef = useRef<T | null>(null)
   const observerRef = useRef<ResizeObserver | null>(null)
@@ -55,12 +47,12 @@ export function useMeasuredHeight<T extends HTMLElement>(
     if (typeof ResizeObserver === 'undefined') return
     const observer = new ResizeObserver(entries => {
       for (const entry of entries) {
-        setHeight(measure(entry.target as T))
+        setHeight(entry.target.getBoundingClientRect().height)
       }
     })
     observer.observe(node)
     observerRef.current = observer
-  }, [measure])
+  }, [])
 
   const measuredRef = useCallback((node: T | null) => {
     observerRef.current?.disconnect()
@@ -70,9 +62,9 @@ export function useMeasuredHeight<T extends HTMLElement>(
       setHeight(0)
       return
     }
-    setHeight(measure(node))
+    setHeight(node.getBoundingClientRect().height)
     observe(node)
-  }, [observe, measure])
+  }, [observe])
 
   useEffect(() => {
     if (nodeRef.current && !observerRef.current) observe(nodeRef.current)

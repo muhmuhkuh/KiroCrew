@@ -752,10 +752,6 @@ def _client(ack_fails: bool = False) -> MagicMock:
     return client
 
 
-def _acked_envelopes(client: MagicMock) -> list[str]:
-    return [c.args[0].envelope_id for c in client.send_socket_mode_response.await_args_list]
-
-
 class TestOnEventDispatch:
     @pytest.mark.asyncio
     async def test_ack_failure_short_circuits(self):
@@ -814,7 +810,7 @@ class TestOnEventDispatch:
         with patch("kiro_crew.slack.events._route_message", new_callable=AsyncMock) as route:
             await on_event(client, _req("hello"))
         route.assert_not_called()
-        assert _acked_envelopes(client) == ["env-1"]
+        client.send_socket_mode_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_member_joined_channel_routed_to_prompt(self):
@@ -862,7 +858,7 @@ class TestOnEventDispatch:
         with patch("kiro_crew.slack.events._publish_home_tab", new_callable=AsyncMock) as publish:
             await on_event(client, _req("events_api", payload))
         publish.assert_not_called()
-        assert _acked_envelopes(client) == ["env-1"]
+        client.send_socket_mode_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_non_message_event_ignored(self):
@@ -873,7 +869,7 @@ class TestOnEventDispatch:
         with patch("kiro_crew.slack.events._route_message", new_callable=AsyncMock) as route:
             await on_event(client, _req("events_api", payload))
         route.assert_not_called()
-        assert _acked_envelopes(client) == ["env-1"]
+        client.send_socket_mode_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_message_deleted_is_delegated(self):
@@ -895,7 +891,7 @@ class TestOnEventDispatch:
         with patch("kiro_crew.slack.events._route_message", new_callable=AsyncMock) as route:
             await on_event(client, _req("events_api", {"event": event}))
         route.assert_not_called()
-        assert _acked_envelopes(client) == ["env-1"]
+        client.send_socket_mode_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_envelope_team_id_overrides_event_team(self):
@@ -1076,7 +1072,7 @@ class TestOnEventDispatch:
             with patch("kiro_crew.slack.events._route_message", new_callable=AsyncMock) as route:
                 await on_event(client, _req("events_api", {"event": event}))
         route.assert_not_called()
-        assert _acked_envelopes(client) == ["env-1"]
+        client.send_socket_mode_response.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_human_message_routed_without_trusted_flag(self):

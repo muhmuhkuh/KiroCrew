@@ -84,8 +84,8 @@ wherever a conductor runs, rather than discovering the refusal from a worker tha
 cannot report.
 
 **The acceptance condition is named before dispatch, not after.** It is one of
-four kinds: `pr_checks` (a pull request's checks are all green), `pr_merged` (a
-pull request has merged), `file` (a path exists), or `human_approval` (you accept it — legitimate for a design review,
+three kinds: `pr_checks` (a pull request's checks are all green), `file` (a path
+exists), or `human_approval` (you accept it — legitimate for a design review,
 and never machine-evaluated). There is deliberately no "run this command" kind,
 so "the tests pass" is expressed as `pr_checks` on the pull request that carries
 the work, and CI's verdict is the one that counts.
@@ -106,15 +106,8 @@ the 32 most recently closed items whole and only counts older closed ones, so it
 bounded by what is open, not by history. Those counts (the conductor header's
 `created_total`, and "N of M items accepted" in a crew's status) still cover every
 item the board ever created. A conductor may dispatch a
-conductor only once by default — depth is capped at 2, so a second-level
-conductor's own children are workers. An operator who runs a deeper
-organization raises the cap with `work_ledger.max_depth` (2 to 10); `work_ledger_read`
-reports the cap in force as `max_depth`, and a `depth_exceeded` refusal names
-the setting. Lowering the cap does not close ledgers that are already open: it
-refuses new ledgers and new items at the levels it removes. A bound lead's or
-conductor's `work_report` waits on an approval prompt unless the agent's allowed
-tools include `@kirocrew-work/work_report`, so a deeper run that nobody watches
-needs that entry for the parent to wake on its own. A worker holds one open item at a time.
+conductor only once — depth is capped at 2, so a second-level conductor's own
+children are workers. A worker holds one open item at a time.
 
 ## Other refusals
 

@@ -149,6 +149,7 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
                 ("handlers/members_thread_turns.py", "_turn_ends_within"),
                 # The agent route's transaction; the in-turn /agent command shares it.
                 ("chat_api/agent_switch.py", "switch_slot_agent"),
+                ("chat_handlers.py", "api_chat_slot_backend"),
                 ("chat_api/turn_stop.py", "api_chat_slot_interrupt"),
                 ("chat_api/slot_model.py", "api_chat_slot_model"),
                 ("chat_api/slot_note.py", "api_chat_slot_note"),
@@ -256,7 +257,6 @@ def test_running_and_turn_running_slot_readers_are_enumerated() -> None:
     assert publishers == {
         # A crewmate's first-open greeting: a gateway-authored turn, started the
         # way api_send_message starts one (spawn_guarded_turn, then slot.task).
-        # The Daily Goal Reminder's hidden turn shares the same publisher.
         ("mate_welcome.py", "dispatch_hidden_turn"),
         ("chat_api/chat_send.py", "api_chat"),
         ("chat_regenerate.py", "api_chat_slot_edit_resend"),

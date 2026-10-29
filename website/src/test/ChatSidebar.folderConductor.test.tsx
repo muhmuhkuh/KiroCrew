@@ -266,9 +266,9 @@ beforeEach(() => {
   // time; pinning it to the fixture instant keeps fixture-time and render-time
   // identical, so no row drifts past the stale cutoff between the two reads.
   // Real timers stay in place, so `settle`'s `findByText` retry still runs.
-  vi.spyOn(Date, 'now').mockReturnValue(NOW * 1000)
+  vi.setSystemTime(NOW * 1000)
 })
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks() })
 
 describe('the folder menu item', () => {
   it('names the FOLDER, and says what the chat it opens is to it', async () => {

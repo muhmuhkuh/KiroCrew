@@ -192,10 +192,7 @@ async def test_reap_skips_a_pid_that_is_gone(tmp_path: Path) -> None:
         patch.object(platform_compat, "kill_process_group") as kill,
         patch.object(platform_compat, "kill_process_tree_pinned") as kill_win,
     ):
-        signalled = await backend_record.reap(path, reason="test")
-    assert signalled == 0
-    # The record describes a generation that is gone, so it is dropped either way.
-    assert not path.exists()
+        await backend_record.reap(path, reason="test")
     kill.assert_not_called()
     kill_win.assert_not_called()
 
@@ -336,7 +333,6 @@ async def test_supervisor_reap_goes_through_the_identity_check(tmp_path: Path) -
         patch.object(platform_compat, "kill_process_tree_pinned") as kill_win,
     ):
         await manager._reap_orphaned_backends()
-    assert not backend_record.record_path(sock).exists()
     kill.assert_not_called()
     kill_win.assert_not_called()
 

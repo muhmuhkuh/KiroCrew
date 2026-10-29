@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import ast
 import errno
-import importlib
 import logging
 import os
 from pathlib import Path
@@ -148,8 +147,7 @@ _REFUSES_INSTEAD_OF_DEGRADING = "refusing unaudited delegation"
 
 
 def _sel_failure_handlers(*, critical_only: bool) -> dict[str, ast.ExceptHandler]:
-    """SEL-failure ``except`` handlers in ``sandbox.py`` and the owners carved out of it,
-    keyed by message text.
+    """SEL-failure ``except`` handlers in ``sandbox.py``, keyed by message text.
 
     ``critical_only`` keeps those whose audit write passes ``critical=True``.
     Those are the writes ``sel.log`` performs SYNCHRONOUSLY and raises on; the
@@ -158,9 +156,7 @@ def _sel_failure_handlers(*, critical_only: bool) -> dict[str, ast.ExceptHandler
     """
     # encoding pinned: the module carries non-ASCII prose and the Windows locale
     # codec (cp1252) cannot decode it.
-    # The module and the owners carved out of it.
-    modules = (sandbox_mod, *map(importlib.import_module, sandbox_mod._CARVED_OWNERS))
-    source = "\n".join(Path(m.__file__).read_text(encoding="utf-8") for m in modules)
+    source = Path(sandbox_mod.__file__).read_text(encoding="utf-8")
     found: dict[str, ast.ExceptHandler] = {}
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Try):

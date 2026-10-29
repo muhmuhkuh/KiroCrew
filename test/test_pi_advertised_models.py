@@ -29,6 +29,7 @@ def _cold_advertised_cache(monkeypatch):
 def _request(*providers):
     state = SimpleNamespace(sessions=SimpleNamespace(active_providers=lambda: list(providers)))
     request = MagicMock()
+    request.query = {}
     request.app = {"state": state}
     return request
 

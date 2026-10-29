@@ -749,13 +749,8 @@ def redact_exfiltration_urls_with_records(
     extra_exempt_hosts: frozenset[str] = frozenset(),
     removed_out: list[tuple[str, str]] | None = None,
     exempt_hosts: frozenset[str] | None = None,
-    _ordered_out: list[bool] | None = None,
 ) -> tuple[str, list[str], list[dict]]:
     """Redact suspicious URLs and, in the SAME pass, describe each one.
-
-    ``_ordered_out``, when given, is set ``[False]`` when a blocked address was
-    rewritten inside a longer one, so it has no placeholder of its own and the
-    records do not pair with the placeholders by order.
 
     ``removed_out``, when given, receives ``(address, placeholder)`` for every
     address the pass replaced (memory only: never store, log or send it).
@@ -792,9 +787,7 @@ def redact_exfiltration_urls_with_records(
     A URL string appearing more than once yields ONE record, in first-appearance
     order. There is deliberately no positional index: the placeholder carries
     only the domain, so two URLs on one domain redact to byte-identical text and
-    a position could pair one link's path with another's. Only
-    :func:`restore_allowed_links` pairs by order, and only when the counts and
-    a read-back prove each placeholder stood for one whole recorded address.
+    a position could pair one link's path with another's.
     """
     # The warnings come from the same loop, under the same exempt hosts, so a
     # link on a host the reader allowed is neither redacted nor reported. A
@@ -879,10 +872,6 @@ def redact_exfiltration_urls_with_records(
     # rewrite the longer one's head, so the longer one's own replace finds nothing
     # and its token-bearing tail stays in the text.
     for matched in sorted(blocked, key=len, reverse=True):
-        if _ordered_out is not None and matched in seen and matched not in result:
-            # A longer replace rewrote this URL inside itself, so its record has
-            # no placeholder of its own and breaks pairing by order.
-            _ordered_out[:] = [False]
         result = result.replace(matched, blocked[matched])
     if overflow:
         logger.info(
@@ -935,23 +924,23 @@ _PLACEHOLDER_RE = re.compile(re.escape(EXFILTRATION_REDACTION_TAG_PREFIX) + r"([
 
 
 def restore_allowed_links(
-    text: str, records: list[dict], hosts: frozenset[str], *, ordered: bool = False
+    text: str, records: list[dict], hosts: frozenset[str]
 ) -> tuple[str, list[dict]]:
     """Put back the address of each blocked link whose host the reader allowed.
 
     Every saved message carries each blocked link as a placeholder, allowed host
-    or not, and its records keep the full address. A host in ``hosts`` is
-    restored only when every record for it keeps its address (``url`` set)
-    under a rule an allowed host relaxes, and the text holds exactly one
-    placeholder per record for it. A placeholder names only its host, so they
-    pair by order: records are in first-appearance order and a repeated address
-    yields one record, so equal counts mean the n-th placeholder is the n-th
-    record; different addresses pair only when ``ordered`` vouches for that
-    order (an older row may not hold it). Any mismatch (an echoed placeholder,
-    a repeat, a dropped record) leaves all of that host's placeholders, as does
-    an address that is not the whole URL match starting where it lands (it
-    stood for part of, or inside, another link). Returns the text and the
-    records left.
+    or not, and its records keep the full address. For each placeholder
+    whose record is kept (``url`` set), was blocked only by a rule an allowed
+    host relaxes, and names a host in ``hosts``, the placeholder becomes the
+    address again and the record is dropped, so the reply shows the link it
+    was written with. A placeholder carries only its host, so it cannot say
+    which of several addresses on that host it stood for: a host is restored
+    only when every record for it keeps the same address, and otherwise its
+    placeholders stay. It is also restored only when the text holds exactly one
+    placeholder per record for it, so a placeholder with no record behind it
+    (one the model echoed in prose, or one whose record was dropped) never
+    becomes a link to an address that did not stand there. Returns the text and
+    the records left.
     """
     if not hosts or not records or EXFILTRATION_REDACTION_TAG_PREFIX not in text:
         return text, records
@@ -959,45 +948,54 @@ def restore_allowed_links(
     for i, rec in enumerate(records):
         by_domain.setdefault(str(rec.get("domain", "")).lower(), []).append(i)
     matches = list(_PLACEHOLDER_RE.finditer(text))
-    count: dict[str, int] = {}
+    placeholders: dict[str, int] = {}
     for m in matches:
-        count[m.group(1).lower()] = count.get(m.group(1).lower(), 0) + 1
-    domains = {
-        d
-        for d, ix in by_domain.items()
-        if d in hosts
-        and count.get(d, 0) == len(ix)
-        and (ordered or len({records[i].get("url") for i in ix}) == 1)
-        and all(
-            records[i].get("rule") in ALLOWABLE_BLOCKED_LINK_RULES
-            and isinstance(records[i].get("url"), str)
-            and records[i]["url"]
-            for i in ix
-        )
-    }
-    # Dropping a host changes what follows another host's address, so the
-    # read-back runs again until no host fails it; the set only shrinks.
+        placeholders[m.group(1).lower()] = placeholders.get(m.group(1).lower(), 0) + 1
+    address: dict[str, str] = {}
+    for domain, indexes in by_domain.items():
+        if domain not in hosts:
+            continue
+        urls = {records[i].get("url") for i in indexes}
+        rules_ok = all(records[i].get("rule") in ALLOWABLE_BLOCKED_LINK_RULES for i in indexes)
+        url = next(iter(urls)) if len(urls) == 1 else None
+        if (
+            rules_ok
+            and isinstance(url, str)
+            and url
+            and placeholders.get(domain, 0) == len(indexes)
+        ):
+            address[domain] = url
+    if not address:
+        return text, records
+
+    # A placeholder may have been embedded in another URL or followed by text
+    # that changes the link. Restore only when the resulting URL starts at the
+    # placeholder's exact position and is the complete URL match there. If one
+    # host fails, rebuild offsets with that host left untouched before checking
+    # the remaining hosts.
+    domains = set(address)
     while domains:
         parts: list[str] = []
         placed: list[tuple[str, int, str]] = []
-        taken: dict[str, int] = {}
         last = size = 0
-        for m in (m for m in matches if m.group(1).lower() in domains):
-            d = m.group(1).lower()
-            url = str(records[by_domain[d][taken.setdefault(d, 0)]]["url"])
-            taken[d] += 1
-            parts += [text[last : m.start()], url]
-            size += m.start() - last
-            placed.append((d, size, url))
+        for match in matches:
+            domain = match.group(1).lower()
+            if domain not in domains:
+                continue
+            url = address[domain]
+            prefix = text[last : match.start()]
+            parts.extend((prefix, url))
+            size += len(prefix)
+            placed.append((domain, size, url))
             size += len(url)
-            last = m.end()
+            last = match.end()
         out = "".join(parts) + text[last:]
-        starts = {r.start(): r.group(0) for r in _URL_RE.finditer(out)}
-        failed = {d for d, at, url in placed if starts.get(at) != url}
+        urls_at_start = {match.start(): match.group(0) for match in _URL_RE.finditer(out)}
+        failed = {domain for domain, start, url in placed if urls_at_start.get(start) != url}
         if not failed:
-            restored = {i for d in domains for i in by_domain[d]}
-            return out, [r for i, r in enumerate(records) if i not in restored]
-        domains -= failed
+            restored = {i for domain in domains for i in by_domain[domain]}
+            return out, [record for i, record in enumerate(records) if i not in restored]
+        domains.difference_update(failed)
     return text, records
 
 

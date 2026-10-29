@@ -1,14 +1,20 @@
-"""Validate a GitHub repo URL, clone it with push DISABLED, enumerate its branches.
+"""Validate a GitHub or GitLab repo URL, clone it with push DISABLED, enumerate its branches.
 
 This is the front door of a run: the user names a repository here, and the
 push-disable performed at clone time is the app's #1 safety control — the spine
 refuses to run against a clone whose push remote is live.
 
 Ported from the upstream module, GitHub-only: the internal-host allowlist entry,
-the internal SSH URL construction, and the CloudFarm code path are removed. Only
-`github.com` is accepted, and the clone URL is rebuilt from validated
-owner/repo components (never raw user text) so it is safe as a single git argv
-element.
+the internal SSH URL construction, and the CloudFarm code path are removed.
+Today the app accepts `github.com` and GitLab instances (`gitlab.com` or any
+host on the operator's `dashboard.gitlab_hosts` allowlist). The provider is
+derived from the validated URL, and every clone URL is rebuilt from validated
+components (never raw user text) so it is safe as a single git argv element.
+
+For GitLab the security-critical URL parsing and host allowlist are reused from
+``issue_radar``'s battle-tested ``gitlab_client`` (HTTPS-only, no userinfo,
+SSRF-guarded, nested-group namespaces) instead of re-deriving a second parser
+in this module.
 """
 
 from __future__ import annotations
@@ -63,8 +69,15 @@ def _git_cwd(repo: Path | str) -> str:
     return str(Path(repo).absolute())
 
 
-#: Allowlist, never a denylist (defense in depth for SSRF). GitHub only.
+#: Allowlist, never a denylist (defense in depth for SSRF). GitHub only; GitLab
+#: hosts use the operator's allowlist in :func:`_parse_gitlab_url`.
 _ALLOWED_HOSTS = frozenset({"github.com", "www.github.com"})
+
+#: GitLab hosts always reachable. Self-managed instances are accepted only when
+#: listed in the operator's ``dashboard.gitlab_hosts`` allowlist — the same
+#: source ``issue_radar``'s GitLab client validates against, so both apps agree
+#: on which instance a credential-bearing CLI may be pointed at.
+_GITLAB_PUBLIC_HOSTS = frozenset({"gitlab.com", "www.gitlab.com"})
 
 #: https://github.com/<owner>/<repo>[.git][/...]
 _GITHUB_RE = re.compile(
@@ -72,6 +85,53 @@ _GITHUB_RE = re.compile(
     r"/(?P<repo>[A-Za-z0-9._-]{1,100}?)(?:\.git)?(?:/.*)?$"
 )
 _MAX_URL_LEN = 400
+
+
+def _gitlab_hosts() -> frozenset[str]:
+    """gitlab.com ∪ the operator's ``dashboard.gitlab_hosts`` allowlist.
+
+    A broken or missing config yields just the public hosts — the parser then
+    refuses every self-managed instance rather than widening access (fail
+    closed), mirroring ``gitlab_client.allowed_hosts()`` semantics. Returns a
+    set even when the GitLab client cannot be imported, so egress validation
+    (``_is_allowed_remote``) never widens on an import failure either.
+    """
+    try:
+        from kiro_crew.apps.builtins.issue_radar.backend.gitlab_client import (
+            allowed_hosts as _gl_allowed_hosts,
+        )
+
+        configured = frozenset(_gl_allowed_hosts())
+    except Exception:  # noqa: BLE001 - broken config denies, never widens
+        configured = frozenset()
+    return _GITLAB_PUBLIC_HOSTS | configured
+
+
+def _parse_gitlab_url(url: str) -> tuple[str, str, str, str] | None:
+    """Parse a GitLab project URL → ``(host, namespace, project, clone_url)``.
+
+    Returns ``None`` (never raises) when ``url`` is not a GitLab project URL or
+    the GitLab parser is unavailable — the caller refuses rather than widening
+    access. Reuses ``issue_radar.gitlab_client.parse_gitlab_repo_url``, the
+    battle-tested strict parser: HTTPS-only, no userinfo, host allowlisted
+    (gitlab.com ∪ dashboard.gitlab_hosts), nested-group namespaces, `/-/` page
+    markers stripped, reserved segments refused, SSRF-guarded. A second,
+    differently-behaved parser here would be a security hole; this module only
+    turns the parsed identity into a clone URL.
+    """
+    try:
+        from kiro_crew.apps.builtins.issue_radar.backend.gitlab_client import (
+            RepoUrlError,
+            parse_gitlab_repo_url,
+        )
+    except Exception:  # noqa: BLE001 - unavailable parser → no GitLab URLs
+        return None
+    try:
+        host, namespace, project = parse_gitlab_repo_url(url, allowed_hosts=_gitlab_hosts())
+    except (RepoUrlError, ValueError):
+        return None
+    return host, namespace, project, f"https://{host}/{namespace}/{project}.git"
+
 
 #: The cross-cutting push-disable sentinel — matches the spine's isolation check.
 DISABLED_NO_PUSH = "DISABLED_NO_PUSH"
@@ -152,7 +212,8 @@ class IsolationProbeError(RuntimeError):
 
 
 #: Signatures only the namespace-sandbox launcher emits on stderr, matched
-#: STRUCTURALLY so repository-influenced text cannot satisfy them: a repo may legally be NAMED
+#: STRUCTURALLY so repository-influenced text cannot satisfy them (raised by
+#: the Opus review of this branch): a repo may legally be NAMED
 #: ``kirocrew_sandbox_x`` (``_GITHUB_RE`` admits ``_``), which puts that
 #: substring into the clone PATH that git echoes on path-printing fatals — so
 #: the script-filename marker only counts inside a real Python traceback frame
@@ -461,7 +522,8 @@ def _retire_unsafe_clone(repo: Path) -> Path | None:
 #: ``apps/auto-improvement/data/`` would sit beneath a directory an agent CAN rename, taking
 #: the mount with it. At the top level the only ancestors are the data home and ``$HOME``,
 #: the residual every other fenced leaf already stands on. This mirrors
-#: ``aws_control.storage.STAGING_DIR_LEAF``, top-level for exactly this reason.
+#: ``aws_control.storage.STAGING_DIR_LEAF``, top-level for exactly this reason. Raised by the
+#: GPT review of this branch.
 _QUARANTINE_DIR_LEAF = "quarantined-clones"
 
 
@@ -628,9 +690,16 @@ def _repository_is_isolated(repo: Path) -> bool:
 class CloneSpec:
     """The validated, derived clone target, built only from validated components."""
 
-    display: str  # human label: owner/repo
+    display: str  # human label: owner/repo or namespace/project
     clone_url: str  # the https URL git clones FROM
     dir_name: str  # local dir name under scratch
+    #: Which code host this target is: ``"github"`` or ``"gitlab"``. Derived at
+    #: validation time from the URL host, persisted at setup, and read by every
+    #: downstream consumer (profile dispatch, PR-recipe factory, frontend links).
+    provider: str = "github"
+    #: The resolved code-host hostname (``github.com`` or the GitLab instance,
+    #: incl. host:port for a non-default self-managed port).
+    host: str = "github.com"
 
 
 def _gh_prefers_ssh() -> bool:
@@ -686,42 +755,70 @@ def _host_is_blocked(host: str) -> bool:
 
 
 def validate_target_url(url: str) -> tuple[CloneSpec | None, str]:
-    """Validate a user-supplied GitHub URL. Returns ``(CloneSpec, "")`` or
-    ``(None, reason)``. Pure validation — the only I/O is a read-only DNS resolve."""
+    """Validate a user-supplied GitHub or GitLab URL. Returns ``(CloneSpec, "")``
+    or ``(None, reason)``. Pure validation — the only I/O is a read-only DNS
+    resolve.
+
+    Provider dispatch: ``github.com``/``www.github.com`` take the strict GitHub
+    path below; any other host is handed to the GitLab parser, which itself
+    enforces the host allowlist (gitlab.com ∪ dashboard.gitlab_hosts).
+    """
     if not isinstance(url, str) or not url.strip():
-        return None, "Enter a GitHub repository URL."
+        return None, "Enter a GitHub or GitLab repository URL."
     url = url.strip()
     if len(url) > _MAX_URL_LEN:
         return None, "URL is too long."
 
     parsed = urlparse(url)
     if parsed.scheme != "https":
-        return None, "Only https:// GitHub URLs are supported."
+        return None, "Only https:// repository URLs are supported."
     host = (parsed.hostname or "").lower()
-    if host not in _ALLOWED_HOSTS:
-        return None, f"Only github.com URLs are supported. Got host: {host or '<none>'}"
-    if _host_is_blocked(host):
-        return None, "URL host is not allowed (blocked address)."
 
-    match = _GITHUB_RE.match(url)
-    if not match:
-        return None, "URL did not match a github.com/<owner>/<repo> URL."
-    owner, repo = match.group("owner"), match.group("repo")
-    # Clone over whichever transport is actually authenticated. HTTPS is the
-    # natural default, but a PRIVATE repo needs credentials — and on a host where
-    # git's credential helper points elsewhere and ``gh`` is configured for SSH
-    # (observed here: the HTTPS clone died with "could not read Username"), only
-    # SSH authenticates. The owner/repo still come from the validated match, so
-    # the transport swap cannot retarget the clone.
-    if _gh_prefers_ssh():
-        clone_url = f"git@github.com:{owner}/{repo}.git"
-    else:
-        clone_url = f"https://github.com/{owner}/{repo}.git"
+    if host in _ALLOWED_HOSTS:
+        if _host_is_blocked(host):
+            return None, "URL host is not allowed (blocked address)."
+        match = _GITHUB_RE.match(url)
+        if not match:
+            return None, "URL did not match a GitHub or GitLab repository URL."
+        owner, repo = match.group("owner"), match.group("repo")
+        # Clone over whichever transport is actually authenticated. HTTPS is the
+        # natural default, but a PRIVATE repo needs credentials — and on a host where
+        # git's credential helper points elsewhere and ``gh`` is configured for SSH
+        # (observed here: the HTTPS clone died with "could not read Username"), only
+        # SSH authenticates. The owner/repo still come from the validated match, so
+        # the transport swap cannot retarget the clone.
+        if _gh_prefers_ssh():
+            clone_url = f"git@github.com:{owner}/{repo}.git"
+        else:
+            clone_url = f"https://github.com/{owner}/{repo}.git"
+        return (
+            CloneSpec(
+                display=f"{owner}/{repo}",
+                clone_url=clone_url,
+                dir_name=f"{owner}--{repo}",
+                provider="github",
+                host="github.com",
+            ),
+            "",
+        )
+
+    # Not GitHub — the GitLab parser decides whether this host is allowed.
+    parsed_gl = _parse_gitlab_url(url)
+    if parsed_gl is None:
+        return (
+            None,
+            f"Only GitHub or allowlisted GitLab URLs are supported. Got host: {host or '<none>'}",
+        )
+    gl_host, namespace, project, clone_url = parsed_gl
+    if _host_is_blocked(gl_host):
+        return None, "URL host is not allowed (blocked address)."
     return (
         CloneSpec(
-            display=f"{owner}/{repo}",
+            display=f"{namespace}/{project}",
             clone_url=clone_url,
-            dir_name=f"{owner}--{repo}",
+            dir_name=f"{namespace.replace('/', '--')}--{project}",
+            provider="gitlab",
+            host=gl_host,
         ),
         "",
     )
@@ -950,14 +1047,21 @@ def list_clone_branches(clone: Path, *, timeout_s: int = 30) -> tuple[list[str],
     return ordered, ""
 
 
-#: Network hosts this app may push to. Mirrors the host `validate_target_url` accepts for the
-#: SETUP url, applied to the STORED value and expressed over both shapes `setup_safe_clone`
-#: can persist (https and scp-like ssh). Kept as a set so a GitHub Enterprise host can be
-#: added in one place if this app ever supports one.
+#: Network hosts this app may push to (GitHub). Mirrors the host
+#: `validate_target_url` accepts for the SETUP url, applied to the STORED value
+#: and expressed over both shapes `setup_safe_clone` can persist (https and
+#: scp-like ssh). GitLab hosts (gitlab.com ∪ dashboard.gitlab_hosts) are added
+#: at call time via :func:`_gitlab_hosts`, so a self-managed instance removed
+#: from the allowlist stops being a push target immediately.
 _ALLOWED_REMOTE_HOSTS = frozenset({"github.com"})
 
 #: A Windows drive-absolute path (`C:\x` or `C:/x`), which git on Windows reads as local.
 _WINDOWS_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/].*\S")
+
+
+def _remote_hosts() -> frozenset[str]:
+    """The union push-host allowlist: github.com ∪ gitlab hosts."""
+    return _ALLOWED_REMOTE_HOSTS | _gitlab_hosts()
 
 
 def _is_allowed_remote(url: str) -> bool:
@@ -986,7 +1090,7 @@ def _is_allowed_remote(url: str) -> bool:
     if raw.startswith("git@"):
         # scp-like syntax: git@HOST:owner/repo(.git)
         host, sep, path = raw[len("git@") :].partition(":")
-        return bool(sep) and host.lower() in _ALLOWED_REMOTE_HOSTS and bool(path.strip("/"))
+        return bool(sep) and host.lower() in _remote_hosts() and bool(path.strip("/"))
     if IS_WINDOWS and _WINDOWS_DRIVE_PATH.match(raw):
         # `C:\work\repo.git`: urlparse reads the drive letter as a one-letter scheme, but git
         # on Windows treats a drive prefix as a local path. Windows-only on purpose: git on
@@ -1000,7 +1104,7 @@ def _is_allowed_remote(url: str) -> bool:
         # http:// (cleartext), git://, ftp://, … are never our push transport.
         return False
     # `hostname` strips any userinfo (`x-access-token:TOK@host`) and port.
-    return (parsed.hostname or "").lower() in _ALLOWED_REMOTE_HOSTS and bool(parsed.path.strip("/"))
+    return (parsed.hostname or "").lower() in _remote_hosts() and bool(parsed.path.strip("/"))
 
 
 def _remote_slug(url: str) -> str:
@@ -1026,10 +1130,14 @@ def _remote_slug(url: str) -> str:
     parts = [p for p in path.strip("/").split("/") if p]
     if len(parts) < 2:
         return ""
-    owner, repo = parts[0], parts[1]
+    # All-but-last segments are the namespace; the last is the project. This is
+    # the same rule for GitHub (owner/repo, 2 segments) and GitLab nested groups
+    # (group/subgroup/project), so identity pinning works for both without a
+    # provider branch.
+    *namespace, repo = parts
     if repo.endswith(".git"):
         repo = repo[: -len(".git")]
-    return f"{owner.lower()}/{repo.lower()}"
+    return "/".join(p.lower() for p in namespace) + "/" + repo.lower()
 
 
 def resolve_origin_url(config: dict) -> str:
@@ -1066,7 +1174,7 @@ def resolve_origin_url(config: dict) -> str:
         # form whenever `gh` prefers it, and refusing that would degrade every ssh install
         # to queue-only. A LOCAL path has no slug and stays allowed — it cannot exfiltrate.
         # Fail closed: when the two disagree, or `target_url` is missing/invalid so there is
-        # nothing to pin against, there is no push target.
+        # nothing to pin against, there is no push target. Raised by the GPT review.
         direct_slug = _remote_slug(direct)
         if direct_slug:
             pinned = str((config or {}).get("target_url") or "").strip()
@@ -1198,6 +1306,7 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
         # via `require_pinned` — exactly like the other host-side helpers, through the ONE
         # shared config. Was re-declaring the `-c` pair inline, which both missed the
         # attribute vector and re-introduced the per-call-site drift the shared module removed.
+        # Raised by the Opus 5 review.
         require_pinned(clone)
         where = _git_cwd(clone)
         return subprocess.run(
@@ -1242,8 +1351,8 @@ def checkout_branch(clone: Path, branch: str, *, timeout_s: int = 120) -> tuple[
     # while the operator believes it is working on the one they configured. No network is
     # needed to fix it: the ref is already in the clone.
     #
-    # Same root cause as the one-click-commit fetch in `commit.py`: code inside a
-    # deliberately push-disabled clone cannot
+    # Raised by the GPT review of this branch; same root cause as the one-click-commit
+    # fetch bug (`commit.py`) — code inside a deliberately push-disabled clone cannot
     # reach the remote for READS either.
     remote_ref = f"origin/{bare}"
     if _run("rev-parse", "--verify", "--quiet", remote_ref, tmo=30).returncode == 0:
@@ -1273,4 +1382,6 @@ def _ok(spec: CloneSpec, dest: Path, *, reused: bool) -> dict:
         # The real remote, for the trusted publishers only. Kept in config rather than in
         # the clone so agent-run Bash inside the clone cannot discover it from git.
         "origin_url": spec.clone_url,
+        "provider": spec.provider,
+        "host": spec.host,
     }

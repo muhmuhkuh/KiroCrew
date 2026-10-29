@@ -18,12 +18,12 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers import agents
 from kiro_crew.kiro_prerequisite import KiroPrerequisiteService
 
@@ -51,13 +51,11 @@ def _reset_catalog_cache():
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
-    agents._catalog_cache.failure = None
     yield
     _drain_catalog_task()
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
-    agents._catalog_cache.failure = None
 
 
 async def _no_audit(**kwargs: Any) -> None:
@@ -81,11 +79,12 @@ def _kiro_request(tmp_path: Path):
     # No live providers in app["state"]: _entitled_kiro_models fails open and
     # returns the catalog unchanged, so these tests pin the fetch/cache path only.
     request.app = {"kiro_prerequisite_service": service}
+    request.query = {}
     return request
 
 
-def _kiro_cfg() -> SimpleNamespace:
-    return SimpleNamespace(agent=SimpleNamespace(provider="kiro"))
+def _kiro_cfg() -> KiroCrewConfig:
+    return KiroCrewConfig()
 
 
 def _body(resp) -> object:

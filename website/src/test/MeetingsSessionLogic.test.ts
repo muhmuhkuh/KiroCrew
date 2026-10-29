@@ -823,7 +823,7 @@ describe('STT error frame is terminal — no reconnect loop', () => {
     // the stop() branch never fires, and buffered PCM is flushed into the notes.
 
     // Hook must export connecting
-    expect(TranscriptionSource).toContain('connecting, halted, start, stop, supported: transcriptionSupported')
+    expect(TranscriptionSource).toContain('connecting, halted, start, stop, meetingAudio, supported: transcriptionSupported')
     // connecting is set to true just before await readyPromise
     expect(TranscriptionSource).toContain('setConnecting(true)')
     // connecting is cleared once the stream is live, after the ready gate

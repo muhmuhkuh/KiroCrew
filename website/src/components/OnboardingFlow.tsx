@@ -15,7 +15,6 @@ import OnboardingChapterShell, { OnboardingShellContext } from './OnboardingChap
 import { api } from '../api/client'
 import { capRoleOther, clampRoleOther } from '../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../lib/profileOptions'
-import { safeGetItem, safeRemoveItem, safeSetItem } from '../utils/safeStorage'
 
 import { i18nT } from '../i18n/t'
 import { useDocumentImeLatch, useImeGuard } from '../hooks/useImeGuard'
@@ -94,26 +93,6 @@ const POP_BODY_KEY: Record<string, string> = {
 // popovers. Popovers 3-4 show "Next"; popover 5 is the last step of first-run,
 // so it shows "Done", drops its Skip, and finishes the flow.
 const LAST_STEP = 5
-
-/**
- * The step a first-run tour has reached, kept in the browser so a reload
- * resumes it. `mc-onboarded` is written only when the tour ends, so without
- * this a reload anywhere in steps 2-5 reopened the flow at step 1 and the user
- * met "Pick your look" again on every reload until they reached "Done".
- * Removed when the flow ends; ignored once `mc-onboarded` is set, so a
- * `/onboarding` replay never resumes a stale step.
- */
-const TOUR_STEP_KEY = 'mc-onboarding-step'
-
-function alreadyOnboarded(): boolean {
-  return safeGetItem('mc-onboarded') !== null
-}
-
-function resumedStep(): number {
-  if (alreadyOnboarded()) return 1
-  const saved = Number(safeGetItem(TOUR_STEP_KEY))
-  return Number.isInteger(saved) && saved >= 1 && saved <= LAST_STEP ? saved : 1
-}
 
 // Step-2 profile options. Values are the slugs accepted by the
 // dashboard.user_role / dashboard.user_technical_level enums in the config
@@ -231,7 +210,7 @@ export default function OnboardingFlow({
     setTheme: setModePref,
   } = useTheme()
   const [open, setOpen] = useState(initialOpen)
-  const [step, setStep] = useState(() => (initialOpen ? resumedStep() : 1))
+  const [step, setStep] = useState(1)
   const [coords, setCoords] = useState<{ left: number; top: number } | null>(null)
   // The focus trap queries the dialog element. Inside a persistent shell host
   // the dialog is host-owned, so use its ref; standalone we own it locally.
@@ -241,9 +220,6 @@ export default function OnboardingFlow({
   // Which dialog step already received its initial focus (see the trap effect).
   // Reset on close so reopening focuses again.
   const initialFocusKeyRef = useRef('')
-  // True while this open came from first run (`initialOpen`), false for a
-  // `/onboarding` replay: only first run saves its step for a reload.
-  const firstRunTour = useRef(false)
   // Shared IME latch for the modal-step Tab trap below (steps 1-2 only, like
   // the trap itself): a Tab that lands during an IME composition (or its
   // post-`compositionend` window) is choosing a candidate, not leaving the
@@ -361,19 +337,13 @@ export default function OnboardingFlow({
       profileTouched.current = false
       skipDiscardArmed.current = false
       initialFocusKeyRef.current = ''
-      firstRunTour.current = true
       setProfileSaveError(false)
-      setStep(resumedStep())
+      setStep(1)
       setOpen(true)
     } else {
       setOpen(false)
     }
   }, [initialOpen])
-
-  // Remember the first-run step so a reload resumes it (see TOUR_STEP_KEY).
-  useEffect(() => {
-    if (open && firstRunTour.current && !alreadyOnboarded()) safeSetItem(TOUR_STEP_KEY, String(step))
-  }, [open, step])
 
   // Manual re-trigger via the `/onboarding` slash command.
   useEffect(() => {
@@ -381,7 +351,6 @@ export default function OnboardingFlow({
       profileTouched.current = false
       skipDiscardArmed.current = false
       initialFocusKeyRef.current = ''
-      firstRunTour.current = false
       setProfileSaveError(false)
       setStep(1)
       setOpen(true)
@@ -414,7 +383,6 @@ export default function OnboardingFlow({
       }
     }
     setOpen(false)
-    safeRemoveItem(TOUR_STEP_KEY)
     if (skipped && onSkipAll) onSkipAll()
     else onComplete()
   }, [persistProfile, onComplete, onSkipAll])
@@ -674,19 +642,15 @@ export default function OnboardingFlow({
     // Freeze all inputs while a save is in flight: changing a chip after Next
     // snapshots the PATCH payload would advance the flow with a stale value
     // persisted (GPT round-3 finding). The freeze is brief (loopback PATCH).
-    // Single-choice chips: a second click on the selected chip keeps it. On a
-    // replay the saved answer is preselected, and a click meant to confirm it
-    // must not save an empty answer. Clearing an answer is done in
-    // Settings > General.
     const pickRole = (v: string) => {
       if (savingProfile) return
       profileTouched.current = true
-      setRole(v)
+      setRole(r => (r === v ? '' : v))
     }
     const pickTech = (v: string) => {
       if (savingProfile) return
       profileTouched.current = true
-      setTechLevel(v)
+      setTechLevel(t => (t === v ? '' : v))
     }
     return (
       <OnboardingChapterShell

@@ -42,12 +42,6 @@ from kiro_crew.wakatime.service import resolve_api_key, resolve_base_url
 
 logger = logging.getLogger(__name__)
 
-#: Strong references to in-flight send tasks. The event loop holds tasks only
-#: weakly, so a fire-and-forget task nothing else references can be collected
-#: mid-send and its heartbeat silently lost.
-_pending: set[asyncio.Task[None]] = set()
-
-
 #: Tool names that count as coding activity. A read-only tool (grep, fs_read)
 #: is not, on its own, coding: the turn only produces a heartbeat when it
 #: mutated the workspace or ran a command. Mirrors the filesystem-write and
@@ -213,13 +207,6 @@ def _make_heartbeat(
     return hb
 
 
-def _schedule_send(heartbeat: dict[str, Any]) -> None:
-    """Schedule one ``send_heartbeat`` task and keep it alive until it finishes."""
-    task = asyncio.get_running_loop().create_task(send_heartbeat(heartbeat))
-    task.add_done_callback(_pending.discard)
-    _pending.add(task)
-
-
 def note_coding_activity(
     project: str | None,
     *,
@@ -245,7 +232,8 @@ def note_coding_activity(
             ai_output_tokens=int(ai_output_tokens or 0),
             ai_line_changes=int(ai_line_changes or 0),
         )
-        _schedule_send(heartbeat)
+        loop = asyncio.get_running_loop()
+        loop.create_task(send_heartbeat(heartbeat))
     except Exception:
         # Producing a heartbeat must never disturb the turn that produced it.
         logger.debug("wakatime: note_coding_activity failed", exc_info=True)
@@ -274,7 +262,8 @@ def note_coding_cadence(project: str | None) -> None:
     """
     try:
         heartbeat = _make_heartbeat(project)
-        _schedule_send(heartbeat)
+        loop = asyncio.get_running_loop()
+        loop.create_task(send_heartbeat(heartbeat))
     except Exception:
         # Producing a heartbeat must never disturb the turn that produced it.
         logger.debug("wakatime: note_coding_cadence failed", exc_info=True)

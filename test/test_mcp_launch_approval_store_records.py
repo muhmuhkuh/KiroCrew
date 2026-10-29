@@ -197,12 +197,7 @@ def test_restore_keeps_a_reapproval_that_lands_after_revoke(tmp_path):
 
 
 @pytest.mark.parametrize("vendor", ["creds-agent", "local-creds-agent-mcp"])
-def test_a_recorded_approval_never_lets_a_credential_vendor_spawn(vendor):
-    """An approval recorded before the vendors joined ``UNPOOLABLE_SERVERS`` must
-    not let gatewayd spawn one: its shared backend would run outside every chat
-    sandbox. Both gateway-side checks refuse it -- the target filter that builds
-    gatewayd's env and the per-spawn ``admits_launch`` -- while the same approval
-    shape still admits an ordinary server, so the refusal is the denylist's."""
+def test_recorded_approval_cannot_pool_a_credential_vendor(vendor):
     from kiro_crew.mcp_gateway.hashing import hash_command
 
     mod = _approval_module()
@@ -211,8 +206,9 @@ def test_a_recorded_approval_never_lets_a_credential_vendor_spawn(vendor):
     command_hash = hash_command(_APPROVED_CMD, [])
     approvals = mod.LaunchApprovals()
     stem = mod.target_stem(vendor)
-    for approved in (stem, "SRV"):
-        approvals.approved_pairs[approved] = {mod.launch_pair(command_hash, env_hash)}
+    pair = mod.launch_pair(command_hash, env_hash)
+    approvals.approved_pairs[stem] = {pair}
+    approvals.approved_pairs["SRV"] = {pair}
 
     kept, dropped = mod.filter_target_env(
         {
@@ -223,8 +219,6 @@ def test_a_recorded_approval_never_lets_a_credential_vendor_spawn(vendor):
     )
     assert list(kept) == ["KIROCREW_MCP_TARGET_SRV"]
     assert dropped == [stem]
-    # Not a refusal the person can approve away: nothing is waiting on them.
     assert stem not in approvals.refused
-
     assert approvals.admits_launch("SRV", command_hash, env_hash)
     assert not approvals.admits_launch(stem, command_hash, env_hash)

@@ -544,8 +544,8 @@ class TestConcurrentWritesCannotRestoreAStaleCeiling(unittest.TestCase):
         published: list[tuple] = []
         real_publish = policy_store.publish_through_auth_store_staging
 
-        def _observe_each_publish(path, content, **kwargs):
-            real_publish(path, content, **kwargs)
+        def _observe_each_publish(path, content):
+            real_publish(path, content)
             # Read the FILE, not `content`: what a reader can see is whatever is at
             # `policy_path()` once the rename has landed, which is the state under test.
             data = json.loads(policy_store.policy_path().read_text(encoding="utf-8"))

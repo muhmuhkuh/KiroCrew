@@ -33,11 +33,10 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from auto_improvement_member_helpers import MEMBER_BUDGET_SECS
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, EVENT_TEXT_CHUNK
 from kiro_crew.apps.builtins.auto_improvement import profiles as profiles_mod
-from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup, crew, deps
+from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup, crew
 from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
 from kiro_crew.apps.builtins.auto_improvement.backend import store
 from kiro_crew.apps.builtins.auto_improvement.spine import agent_discovery as discovery_mod
@@ -184,12 +183,6 @@ def _no_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", _refuse)
     monkeypatch.setattr(subprocess, "Popen", _refuse)
     monkeypatch.setattr(subprocess, "check_output", _refuse)
-
-
-@pytest.fixture(autouse=True)
-def _gate_has_pytest(_floor_monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the pytest preflight probe, the one spawn every start and calibration makes."""
-    _floor_monkeypatch.setattr(deps, "gate_pytest_problem", lambda: "")
 
 
 @pytest.fixture(autouse=True)
@@ -674,33 +667,23 @@ class TestScoutShellCapability:
             driver.clone = tmp_path
             driver.log = logging.getLogger(__name__)
             driver._build_test_pre_push_clean = Mock(return_value=(False, "review unavailable"))
-            verdict = await await_until(
-                asyncio.ensure_future(
-                    asyncio.to_thread(
-                        driver._prepush_review_clean, target="feature", base_ref="main"
-                    )
-                ),
-                what="the pre-push review",
+            verdict = await asyncio.wait_for(
+                asyncio.to_thread(driver._prepush_review_clean, target="feature", base_ref="main"),
+                timeout=WAIT_S,
             )
             assert verdict == (True, "prepush_review clean")
             driver._build_test_pre_push_clean.assert_not_called()
             provider.approve_tool.assert_awaited_once_with("git-diff")
             provider.reject_tool.assert_not_awaited()
         else:
-            # The discovery budget is a lost-run guard, not the property: the member
-            # assignment before the provider is reached is config and sqlite work
-            # that takes tens of seconds on a loaded Windows shard. A budget near
-            # that work ends discovery before the git request is ever judged.
-            surfaces = await await_until(
-                asyncio.ensure_future(
-                    asyncio.to_thread(
-                        discovery_mod.discover_surfaces_via_agent,
-                        runner,
-                        clone=tmp_path,
-                        timeout_s=MEMBER_BUDGET_SECS,
-                    )
+            surfaces = await asyncio.wait_for(
+                asyncio.to_thread(
+                    discovery_mod.discover_surfaces_via_agent,
+                    runner,
+                    clone=tmp_path,
+                    timeout_s=5,
                 ),
-                what="agent discovery",
+                timeout=WAIT_S,
             )
             assert surfaces == []
             provider.reject_tool.assert_awaited_once_with("git-diff")

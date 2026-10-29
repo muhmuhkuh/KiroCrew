@@ -255,7 +255,8 @@ export default function BroadcastPanel({ slots: rowSlots, folders, tags, agents,
         </Btn>
       </div>
 
-      <div className="text-[11px] text-muted mb-1">{i18nT('pages.chatSidebar.broadcast_crewmates')}</div>
+      <div className="text-[11px] text-muted">{i18nT('pages.chatSidebar.broadcast_crewmates')}</div>
+      <div className="text-[11px] text-muted mb-1">{i18nT('pages.chatSidebar.broadcast_crewmates_hint')}</div>
       {/* One segmented control: three equal cells inside a shared border, so
           the row never grows past the panel and a long label truncates
           instead of wrapping onto a second line. */}

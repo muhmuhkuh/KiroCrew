@@ -146,7 +146,7 @@ def parse_gitlab_repo_url(
 
 def project_path(owner: str, repo: str) -> str:
     """Encode a namespace/project as GitLab's single ``:id`` parameter."""
-    return quote(f"{owner}/{repo}", safe="")
+    return quote("/".join(part for part in (owner, repo) if part), safe="")
 
 
 def validate_group_path(path: str) -> str:

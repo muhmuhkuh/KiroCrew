@@ -582,7 +582,7 @@ def test_only_the_handover_drain_opts_out_of_the_fence() -> None:
         source = path.read_text(encoding="utf-8")
         hits.extend([path.name] * source.count(flag))
 
-    assert hits == ["handover_drain.py"], f"the fence exemption gained a call site: {hits}"
+    assert hits == ["chat_handlers.py"], f"the fence exemption gained a call site: {hits}"
 
     source = _handler_source()
     lines = source.splitlines()

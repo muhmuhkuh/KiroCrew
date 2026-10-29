@@ -43,15 +43,17 @@ export function useComposerStopKey({ isRunning, onStop, anyPickerOpenRef, voiceR
   hasApproval: boolean
   /** The approval-mode nudge is up: Escape hides it for the session. */
   approvalNudgeActive: boolean
-  /** A prompt optimize is in flight: Escape cancels it, as its Cancel button does. */
-  optimizingRef?: React.RefObject<boolean>
+  /** A prompt rewrite is in flight in this composer. */
+  optimizingRef?: { current: boolean }
+  /** Cancels that rewrite; Escape gives it precedence over stopping the turn. */
   onCancelOptimize?: () => void
 }): StopTurnOnEscape {
   return useCallback((e: StopKeyEvent, { native, composing }: StopKeyContext): boolean => {
     // Leave Escape alone when an IME composition owns the key (Escape cancels
-    // the candidate window, never the turn). The caller computes `composing`
-    // from its own latch, which also catches the post-`compositionend` WebKit
-    // keydown (keyCode 229, isComposing already false).
+    // the candidate window, never the turn), when there is no turn to stop, or
+    // when this surface has no stop. The caller computes `composing` from its
+    // own latch, which also catches the post-`compositionend` WebKit keydown
+    // (keyCode 229, isComposing already false).
     if (composing) return false
     // This same keydown already stopped voice read-back (the capture-phase
     // stop-speaking shortcut). The press was for the speech: stopping the turn
@@ -74,8 +76,8 @@ export function useComposerStopKey({ isRunning, onStop, anyPickerOpenRef, voiceR
     // probe so the two gates cannot drift (escapeOwners.ts documents exactly
     // which surfaces count and why).
     if (anotherEscapeOwnerIsOpen()) return false
-    // An in-flight prompt optimize comes next: Escape cancels it the way its
-    // Cancel button does, and this press stops nothing else.
+    // Prompt optimization owns Escape before the running turn. Cancelling it
+    // restores an editable draft; stopping here would lose that deliberate action.
     if (optimizingRef?.current && onCancelOptimize) {
       e.preventDefault()
       onCancelOptimize()

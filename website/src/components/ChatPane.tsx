@@ -8,6 +8,7 @@ import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptVersioner } from '../chat-core/transcript/transcriptVersion'
 import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from '../pages/chat/composerDockMetrics'
 import ChatInput from './ChatInput'
+import ChatBackendSelect from './ChatBackendSelect'
 import { busySteerFlag } from './chat-input/busySend'
 import { filterCrewmateChat, withQueuedAsBubbles } from './chat/crewmateBubbles'
 import { AWAITING_REPLY_ACTIVITY, useCrewmateAwaitingReply } from './chat/useCrewmateAwaitingReply'
@@ -23,13 +24,11 @@ import PendingQuestionCard from './PendingQuestionCard'
 import QueueStack, { SubagentDeliveryProgress, splitPaneMessages } from './QueueStack'
 import SubagentProgressBar from '../pages/chat/SubagentProgressBar'
 import ChatFooter from '../pages/chat/ChatFooter'
-import { useEnvironmentStartLabel, useSlotRunsHere } from './sessionEnvironmentHooks'
 import PinnedPrompt from '../pages/chat/PinnedPrompt'
 import SessionTitleControl from '../pages/chat/SessionTitleControl'
 import { pinCandidateKey, usePinnedPrompt } from '../pages/chat/usePinnedPrompt'
 import { useJevAutoSend } from '../pages/chat/useJevAutoSend'
 import type { DisplayItem } from '../pages/chat/types'
-import { viewSubagentSlots } from '../lib/subagentReplayScope'
 import { useSlotActivity } from '../pages/members/useSlotActivity'
 import { agentOrDefaultLabel } from '../utils/agentLabel'
 import { sessionMemoryTag } from '../lib/agentMemorySource'
@@ -69,8 +68,6 @@ import { useChatPaneSend } from './useChatPaneSend'
 import { useChatPaneStop, useChatPaneRunSync } from './useChatPaneTurnControl'
 import { useChatPaneContinue } from './useChatPaneContinue'
 import { useChatPaneRenderers, ChatPaneAboveRows } from './ChatPaneTranscript'
-import { slotRowByKey } from '../store/slotIndex'
-import { useMarkTranscriptShown } from '../hooks/useAckCronNotesInView'
 
 export type { PaneLeading } from './ChatPaneProps'
 
@@ -100,7 +97,6 @@ export default function ChatPane({
   frameless,
   topInset = 0,
   followContentWidth,
-  pushToTalk = false,
   hideEmptyHint,
   openSideChat,
   leading,
@@ -155,8 +151,6 @@ export default function ChatPane({
   }, [pinItemsRef, updatePinnedPrompt])
   // A different session starts collapsed with nothing pinned.
   useEffect(() => { setPinned(null); setPinExpanded(false) }, [slotKey, setPinned, setPinExpanded])
-  // This pane draws the slot's subagent cards, so the gateway's durable replay is asked for it.
-  useEffect(() => (slotKey ? viewSubagentSlots([slotKey]) : undefined), [slotKey])
   const getDisplayItems = useCallback(() => pinItemsRef.current, [pinItemsRef])
   // Which slot's authoritative page has landed in the store. A live frame can
   // put a partial transcript in `slotMessages` before this fetch resolves; the
@@ -190,8 +184,7 @@ export default function ChatPane({
   // Prefer the warm's value: this pane's own query is staleTime:Infinity, so its
   // has_more freezes at mount while a later bounded warm can truncate the cache.
   const warmHasMore = useAppSelector((s) => s.chat.slotPaneHasMore?.[slotKey])
-  const paneSlot = useAppSelector((s) => slotRowByKey(s.dashboard.slots, slotKey))
-  const paneRunsHere = useSlotRunsHere(paneSlot && paneSlot.executor !== 'remote' ? paneSlot.key : null)
+  const paneSlot = useAppSelector((s) => s.dashboard.slots.find((x) => x.key === slotKey))
   // A stop is under way on this pane's turn: the stream state's own `stopping`
   // phase, or a Stop pressed from another tab that reaches this pane only as
   // the slots frame's `stopping` flag. This is the footer's and composer's
@@ -233,17 +226,15 @@ export default function ChatPane({
   // P3-b). Its Voice atom is what gives the pane a microphone: the pane wires no
   // voice props, only the two things the atom cannot know — the endpointer's
   // auto-submit, and (through the root) that a pane's composer IS its slot's, so
-  // the atom's default on-screen predicate is exact. Push-to-talk only when the
-  // host says so (`pushToTalk`): the key binding is document-wide, so a
-  // split-view grid of panes must not arm it (ChatPage owns it there); the
-  // Members page's single DM pane does. The pane's steer-not-queue rule
-  // (#8852) stays on `canSteer` below until the Send atom exists.
+  // the atom's default on-screen predicate is exact. No push-to-talk here: that
+  // key binding is document-wide and ChatPage owns it (follow-up: focused-pane
+  // ownership). The pane's steer-not-queue rule (#8852) stays on `canSteer`
+  // below until the Send atom exists.
   const composerRef = useRef<ComposerHandle>(null)
   const autoSubmitRef = useRef<(() => void) | null>(null)
   const composerVoiceOptions = useMemo<ComposerVoiceOptions>(() => ({
     onAutoSubmit: () => { autoSubmitRef.current?.() },
-    pushToTalk,
-  }), [pushToTalk])
+  }), [])
   // Shared composer-busy rule (chatSlice.selectComposerBusy): main turn
   // streaming OR sub-agents running (dual signal). Drives the queue affordance
   // and skips the optimistic user bubble (the backend returns a "queued"
@@ -253,7 +244,7 @@ export default function ChatPane({
   // history key (dashboard:<slot>); strip the prefix to match the bare slot key.
   const parentKey = paneSlot?.forked_from ? paneSlot.forked_from.replace(/^dashboard:/, '') : null
   const parentSlot = useAppSelector((s) =>
-    parentKey ? slotRowByKey(s.dashboard.slots, parentKey) : undefined,
+    parentKey ? s.dashboard.slots.find((x) => x.key === parentKey) : undefined,
   )
   // An untitled parent reads "Untitled session", never its slot key; the tag's
   // hover keeps the key so two untitled parents stay tellable apart. A parent
@@ -308,10 +299,6 @@ export default function ChatPane({
     () => (crewmate ? filterCrewmateChat(withQueuedAsBubbles(allMessages, queuedMessages)) : paneMessages),
     [crewmate, allMessages, paneMessages, queuedMessages],
   )
-  // This pane shows the chat's transcript once it has rows; a bell note for a
-  // cron run is read against that, and a closed pane drops out (#23564).
-  // The scroller is what the on-screen backstop probes.
-  useMarkTranscriptShown(slotKey, messages.length > 0, () => scrollerRef.current)
   // The host's greeting is drawn while it is still the newest word: a reply
   // landing after it (a patrol / wake turn keeps it up) takes it down.
   const greetingShown = useCrewmateGreetingShown(!!crewmate && !!crewmateGreeting, messages)
@@ -357,10 +344,6 @@ export default function ChatPane({
   // The host declares the conversation surface; only the gateway decides
   // how to prioritize the human's message on the validated member DM.
   const composerBusyMode = crewmate ? 'responsive' : busyMode
-  // A reply on record means this session's environment connected before, so a
-  // later engine restart is a reconnect, not setup (see useEnvironmentStartLabel).
-  const paneHasReplied = useMemo(() => paneMessages.some(m => m.role === 'assistant'), [paneMessages])
-  const paneEnvironmentStart = useEnvironmentStartLabel(slotKey, !!paneSlot?.running, paneHasReplied)
   // The unfiltered rows, handed to the row set for the one read that must see
   // what the filter dropped (the steer-chip decision reads the policy-block
   // inject row). `undefined` for an ordinary chat, so its renderer set does not
@@ -558,7 +541,7 @@ export default function ChatPane({
   })
   const { recoverInto: recoverQuoteInto } = messageQuote
 
-  const { stopError, stopErrorDetail, dismissStopError, paneStopState, onStop } = useChatPaneStop({ slotKey, busy: composerBusy, paneSlot, dispatch })
+  const { stopError, dismissStopError, paneStopState, onStop } = useChatPaneStop({ slotKey, busy: composerBusy, paneSlot, dispatch })
   // The endpointer auto-submit (handed to the Voice atom above) is an Enter
   // press: the composer's default busy decision with this pane's own composer
   // inputs (never the flipped chord), so it steers where Send would steer.
@@ -871,7 +854,6 @@ export default function ChatPane({
                 )
                 : (
                   <ChatFooter
-                    statusLabel={paneEnvironmentStart}
                     running={running || !!paneSlot?.running || preparing}
                     stopping={stopUnderWay}
                     state={streamState}
@@ -1009,9 +991,7 @@ export default function ChatPane({
           variant="inline"
           className="mx-4 mt-2"
           testId="chat-pane-stop-error"
-          title={stopErrorDetail ? stopError : undefined}
-          message={stopErrorDetail || stopError}
-          messagePlacement="below"
+          message={stopError}
           onDismiss={dismissStopError}
         />
         {/* No hand-off: the composer draft is untouched by a refused Resume.
@@ -1051,15 +1031,12 @@ export default function ChatPane({
           voice={composerVoiceOptions}
           pastes={composerPastes}
         >
+        <ChatBackendSelect slot={paneSlot} />
         <ComposerInput
           value={input}
           onChange={handleUserInput}
           onSend={doSend}
-          // A chat bound to a Session Environment runs in its workspace, so a `!`
-          // command would land on this machine instead: refused like a remote
-          // crew's, and held while that placement is still unread.
-          terminalCommands={!paneSlot ? 'pending' : paneSlot.executor === 'remote' || paneRunsHere === false ? 'remote'
-            : paneRunsHere === undefined ? 'pending' : 'local'}
+          terminalCommands={!paneSlot ? 'pending' : paneSlot.executor === 'remote' ? 'remote' : 'local'}
           hiddenCommands={paneHiddenCommands}
           isRunning={composerBusy}
           onStop={onStop}
@@ -1086,7 +1063,6 @@ export default function ChatPane({
           jevAutoAvailable={jevAutoConsented && running}
           busyMode={composerBusyMode}
           autoFocusKey={slotKey}
-          environmentSlot={slotKey}
           agentName={paneAgentName}
           // The chip shows the inherited-default marker; `agentName` stays the
           // raw resolved alias for the skills query and switch title. Uses the

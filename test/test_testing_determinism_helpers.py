@@ -1765,6 +1765,7 @@ class TestTheSuiteFloors:
 
         stub = launch_approval.launch_approved
         assert stub("anything") is True
+        # nosemgrep: kirocrew.test-bare-monkeypatch-undo -- undo survival is the behavior under test
         monkeypatch.undo()  # flake-ok: the subject is how far a test's own undo reaches
         assert launch_approval.launch_approved is stub
 

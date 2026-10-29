@@ -287,7 +287,7 @@ class PlatformContext:
     # ── boot-layer extension points ──
     providers: "ProviderRegistry"
     publish: "PublishRegistry"
-    # ``run_first_run_setup`` is wired (slack/gateway_runtime/service_boot.py); ``managed_mcp_servers``
+    # ``run_first_run_setup`` is wired (slack/gateway.py); ``managed_mcp_servers``
     # is [RESERVED] — see RESERVED_METHODS.
     agent_runtime: "AgentRuntime"
     agent_executable: "AgentExecutableResolver"
@@ -1141,10 +1141,13 @@ def binary_content_is_flagged(raw: bytes) -> bool:
 
     Four gates guard the ``file_send`` delivery path -- the MCP tool before any
     byte is copied, ``POST /api/outbox/notify``, ``GET /api/outbox/{filename}``,
-    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. The
-    owner gets their own file unscanned; a non-owner outbox download and the upload
-    legs scan, and they must agree on what counts as flagged content, or one
-    file's verdict splits across two delivery legs. Agreement is why
+    and the ``_gate_upload_file`` shared by the Slack and channel upload legs. All
+    four must agree on what counts as flagged content, for two different reasons.
+    The three owner-facing gates each read the one durable grant
+    :mod:`kiro_crew.file_delivery_consent` records, so a disagreement among them
+    turns that grant into "delivered, card rendered, download refused". The upload
+    legs read no grant at all and refuse regardless, so a disagreement there
+    splits one file's verdict across two delivery legs instead. Agreement is why
     this lives here as one function rather than as the same three lines written
     out four times.
 

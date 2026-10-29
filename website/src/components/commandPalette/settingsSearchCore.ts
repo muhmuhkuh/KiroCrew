@@ -34,11 +34,10 @@
  *     in its description/keywords/tab.
  */
 import { fuzzyMatch } from '../../utils/fuzzyMatch'
-import { PREVIEW_SESSION_ENVIRONMENTS, readPreviewFlag } from '../../utils/previewFlags'
 import { i18nT } from '../../i18n/t'
 import { SETTINGS_KEYWORDS } from './settingsKeywords'
 import { settingsTabLabel } from './settingsTabLabel'
-import { settingHelpText, type SettingEntry } from './settingsTypes'
+import type { SettingEntry } from './settingsTypes'
 
 export interface SettingEntryScore {
   /** Comparable score (same scale as fuzzyMatch). Higher is better. */
@@ -161,10 +160,6 @@ export function settingEntryOffered(
   entry: SettingEntry,
   governance: SettingsSearchGovernance,
 ): boolean {
-  // By tab too: a row with no configKey (the default picker) still opens that tab.
-  if (entry.tab === 'session-environments' || entry.configKey?.startsWith('session_environments.')) {
-    return readPreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
-  }
   if (entry.id === FEATURE_TIPS_SETTING_ID) return governance.tipsEnabled
   if (entry.id === GATEWAY_AUTO_UPDATE_SETTING_ID) return governance.updateSwitches.gateway
   if (entry.id === APP_AUTO_DOWNLOAD_SETTING_ID) return governance.updateSwitches.app
@@ -243,10 +238,7 @@ export function scoreSettingEntry(
   // scattered subsequence. See the module comment.
   const q = query.trim().toLowerCase()
   const parts: string[] = []
-  // Tip and on-row help together, as one part: both are words the row
-  // explains itself with, wherever they render.
-  const help = settingHelpText(entry)
-  if (help) parts.push(help)
+  if (entry.description) parts.push(entry.description)
   if (kws) parts.push(...kws)
   if (opts.includeTab !== false) {
     parts.push(entry.tab)

@@ -24,10 +24,7 @@
  * too. This extension reads and opens it once at load,
  * registers each server with pi's built-in MCP support, and refuses any call to
  * a Kiro Crew server name that pi resolved to a different server: a same-named
- * entry in pi's own `mcp.json` outranks an extension's registration. The file
- * also carries those servers' MCP instructions, which pi does not put in the
- * prompt for a directly declared server, so this extension appends them to the
- * system prompt of each run.
+ * entry in pi's own `mcp.json` outranks an extension's registration.
  *
  * And it carries a user's mid-turn message (a steer) into the running turn. pi-acp
  * has no steer verb, so the host writes each steer as its own file in the same
@@ -299,14 +296,8 @@ function serverKey(server: string): string {
   return server.replace(/-/g, "_");
 }
 
-/** What the host handed this session: its servers and their MCP instructions. */
-interface McpHandoff {
-  servers: Record<string, Record<string, unknown>>;
-  instructions: Record<string, string>;
-}
-
-/** The servers (and their instructions) the host handed this session, or null when it handed none. */
-function readMcpHandoff(): McpHandoff | null {
+/** The servers the host handed this session, or null when it handed none. */
+function readMcpHandoff(): Record<string, Record<string, unknown>> | null {
   const path = process.env[MCP_HANDOFF_ENV];
   if (!path) return null;
   let raw: string;
@@ -339,30 +330,7 @@ function readMcpHandoff(): McpHandoff | null {
   if (!opened || typeof opened !== "object") return null;
   const servers = (opened as Record<string, unknown>).servers;
   if (!servers || typeof servers !== "object" || Array.isArray(servers)) return null;
-  const instructions: Record<string, string> = {};
-  const given = (opened as Record<string, unknown>).instructions;
-  if (given && typeof given === "object" && !Array.isArray(given)) {
-    for (const [name, text] of Object.entries(given)) {
-      if (typeof text === "string" && text && name in servers) instructions[name] = text;
-    }
-  }
-  return { servers: servers as Record<string, Record<string, unknown>>, instructions };
-}
-
-// Heads the section this extension adds to pi's system prompt. pi lists a server's
-// MCP instructions only for servers it does not declare directly, and Kiro Crew
-// declares its own directly, so the extension carries them in itself.
-const MCP_INSTRUCTIONS_HEADING = "# MCP Server Instructions";
-// Marks the section as this extension's own, so the once-guard below never
-// mistakes an agent prompt that happens to carry the heading for it.
-const MCP_INSTRUCTIONS_SENTINEL = "<!-- kiro-crew:mcp-instructions -->";
-
-/** The system-prompt section for *instructions* of the servers not in *shadowed*, or "". */
-function mcpInstructionsSection(instructions: Record<string, string>, shadowed: Set<string>): string {
-  const parts = Object.entries(instructions)
-    .filter(([name]) => !shadowed.has(name))
-    .map(([name, text]) => `## ${name}\n${text}`);
-  return parts.length === 0 ? "" : `${MCP_INSTRUCTIONS_SENTINEL}\n${MCP_INSTRUCTIONS_HEADING}\n\n${parts.join("\n\n")}`;
+  return servers as Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -401,7 +369,7 @@ export default function (pi: ExtensionAPI) {
   // Kiro Crew server names whose tools this session must not run.
   const shadowed = new Set<string>();
   const handoff = readMcpHandoff();
-  for (const [name, config] of Object.entries(handoff?.servers ?? {})) {
+  for (const [name, config] of Object.entries(handoff ?? {})) {
     crewServers.set(name, mcpToolPrefix(name));
     try {
       pi.registerMcpServer(name, config as never);
@@ -419,7 +387,7 @@ export default function (pi: ExtensionAPI) {
     const fileKeys = fileConfiguredServerKeys(ctx.cwd);
     for (const name of crewServers.keys()) {
       const mine = registered.get(name);
-      const expected = JSON.stringify(handoff?.servers[name] ?? null);
+      const expected = JSON.stringify(handoff?.[name] ?? null);
       if (!mine || JSON.stringify(mine.config) !== expected) shadowed.add(name);
       if (fileKeys === null || fileKeys.has(serverKey(name))) shadowed.add(name);
     }
@@ -431,14 +399,6 @@ export default function (pi: ExtensionAPI) {
         "warning",
       );
     }
-  });
-
-  // Each run's system prompt gets the instructions of the Kiro Crew servers this
-  // session mounted, once: a prompt that already carries the section is left alone.
-  pi.on("before_agent_start", async (event) => {
-    const section = mcpInstructionsSection(handoff?.instructions ?? {}, shadowed);
-    if (!section || event.systemPrompt.includes(MCP_INSTRUCTIONS_SENTINEL)) return;
-    return { systemPrompt: `${event.systemPrompt}\n\n${section}` };
   });
 
   pi.registerCommand(PROBE_COMMAND, {

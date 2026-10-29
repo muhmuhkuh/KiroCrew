@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 
 from kiro_crew.crew_log.entry_types import (
-    CUSTOM_FOLD_NAME,
     DASHBOARD_FOLD_NAME,
     GOAL_FOLD_NAME,
     MISTAKES_FOLD_NAME,
@@ -112,7 +111,6 @@ SLOT_PROJECTION_NAMES: Final[tuple[str, ...]] = (
     WORKSTREAMS_FOLD_NAME,
     GOAL_FOLD_NAME,
     WAITING_FOLD_NAME,
-    CUSTOM_FOLD_NAME,
     WORKERS_FOLD_NAME,
 )
 

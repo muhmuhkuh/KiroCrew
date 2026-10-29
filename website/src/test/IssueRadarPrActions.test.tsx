@@ -1489,11 +1489,11 @@ describe('bulk selection is scoped to the full repo identity', () => {
     // which these tests mock out.
     const src = await import('node:fs').then((fs) =>
       fs.readFileSync('src/apps/issue-radar/context.tsx', 'utf8'))
-    const effect = src.slice(src.indexOf('useEffect(() => { setCheckedPulls(new Set()) }'))
-      .slice(0, 400)
-    expect(effect).toContain('scopeKey')
+    const effect = src.match(/useEffect\(\(\) => \{\s*setCheckedPulls\(new Set\(\)\);\s*\},\s*\[([\s\S]*?)\]\)/)
+    expect(effect, 'selection-reset effect exists').not.toBeNull()
+    expect(effect?.[1]).toContain('scopeKey')
     // The bare pair must not be the key: it is what let the selection survive.
-    expect(effect).not.toMatch(/\[\s*owner,\s*repo\s*,/)
+    expect(effect?.[1]).not.toMatch(/\bowner\s*,\s*repo\b/)
   })
 })
 

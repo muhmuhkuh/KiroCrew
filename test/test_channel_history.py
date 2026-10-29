@@ -194,6 +194,7 @@ class TestObservePersistence:
 
     def test_load_observe_restores_history(self, tmp_path):
         """set_observe loads persisted history from disk."""
+        # Write some history to disk
         path = tmp_path / "C1.jsonl"
         now = time.time()
         entries = [

@@ -499,7 +499,8 @@ class TestInstallApparmorProfileAttachesToTheLauncher:
         SKIP rather than forward None: ``_substitutable_by_others`` reads None
         as "check against the calling process's uid", which under ``sudo`` is
         root — a root-owned shared launcher would then pass the ownership
-        check and the userns grant would extend to every account on the host."""
+        check and the userns grant would extend to every account on the host
+        (GPT review finding on this PR)."""
         from kiro_crew.service import apparmor as aa
         from kiro_crew.service import linux as svc_linux
 

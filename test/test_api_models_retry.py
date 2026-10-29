@@ -55,13 +55,11 @@ def _reset_catalog_cache():
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
-    agents._catalog_cache.failure = None
     yield
     _drain_catalog_task()
     agents._catalog_cache.models = None
     agents._catalog_cache.fetched_at = 0.0
     agents._catalog_cache.task = None
-    agents._catalog_cache.failure = None
 
 
 async def _no_audit(**kwargs: Any) -> None:
@@ -95,6 +93,7 @@ def _kiro_request(tmp_path: Path) -> MagicMock:
     )
     request = MagicMock()
     request.app = {"kiro_prerequisite_service": service}
+    request.query = {}
     return request
 
 
@@ -118,7 +117,7 @@ async def _raise_timeout(awaitable, timeout):
     raise asyncio.TimeoutError
 
 
-def _body(resp) -> object:
+def _body(resp) -> Any:
     return json.loads(resp.body)
 
 
@@ -307,6 +306,7 @@ def test_successful_list_launches_resolved_binary_in_place(tmp_path, monkeypatch
 
     assert resp.status == 200
     # Position, not argv[0]: a sandbox/cgroup wrapper may precede the binary.
+    assert spawn.await_args is not None
     argv = list(spawn.await_args.args)
     assert resolved in argv, argv
     assert not any("kiro-cli-snapshots" in str(a) for a in argv), argv
@@ -478,9 +478,11 @@ def test_configured_sandbox_mode_is_the_tier_the_chat_path_uses():
 
 def test_configured_sandbox_mode_fails_secure_when_config_unreadable(caplog):
     """An unreadable config must not become a way to obtain a LOOSER tier."""
-    with patch("kiro_crew.config.loader.KiroCrewConfig.load", side_effect=OSError("boom")):
-        with caplog.at_level(logging.WARNING, logger=sandbox.logger.name):
-            assert sandbox.configured_sandbox_mode() == sandbox._SANDBOX_MODE_FALLBACK
+    with (
+        patch("kiro_crew.config.loader.KiroCrewConfig.load", side_effect=OSError("boom")),
+        caplog.at_level(logging.WARNING, logger=sandbox.logger.name),
+    ):
+        assert sandbox.configured_sandbox_mode() == sandbox._SANDBOX_MODE_FALLBACK
     # Never silently: the substituted tier is announced.
     assert any(r.levelno == logging.WARNING for r in caplog.records), caplog.text
 
@@ -503,13 +505,19 @@ def test_sandbox_refusal_is_reported_with_a_machine_readable_code(tmp_path, capl
 
     with (
         patch.object(agents.KiroCrewConfig, "load", return_value=_kiro_cfg()),
-        patch("kiro_crew.acp.client._resolve_kiro_bin_for_spawn", return_value="/usr/bin/kiro-cli"),
+        patch(
+            "kiro_crew.acp.client._resolve_kiro_bin_for_spawn",
+            return_value="/usr/bin/kiro-cli",
+        ),
         patch("kiro_crew.env.augmented_path", lambda p: p),
-        patch("kiro_crew.dashboard.handlers.agents.configured_sandbox_mode", lambda: "auto"),
+        patch(
+            "kiro_crew.dashboard.handlers.agents.configured_sandbox_mode",
+            lambda: "auto",
+        ),
         patch("kiro_crew.dashboard.handlers.agents.wrap_argv", _refuse),
+        caplog.at_level(logging.WARNING, logger=agents.logger.name),
     ):
-        with caplog.at_level(logging.WARNING, logger=agents.logger.name):
-            resp = _run(agents.api_models(_kiro_request(tmp_path)))
+        resp = _run(agents.api_models(_kiro_request(tmp_path)))
 
     # 503, not 4xx: the "degraded, keep the last-good list" client contract is
     # what stops the picker caching an empty result.

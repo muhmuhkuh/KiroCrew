@@ -488,7 +488,6 @@ async def _api_request(
     timeout: int,
     build: Callable[[], dict[str, Any]],
     destination: str = "",
-    recheck_destination: bool = True,
 ) -> DiscordApiResult:
     """Shared REST ladder. ``build`` supplies the per-ATTEMPT body kwargs.
 
@@ -508,14 +507,6 @@ async def _api_request(
     auth = {"Authorization": f"Bot {self._token}"}
     route = _route_key(method, path)
     exempt = _is_global_limit_exempt(path)
-    # ``recheck_destination=False`` is for ONE kind of caller: an admission
-    # lookup whose subject is, by construction, not yet on any roster
-    # (``thread_origin``). Re-reading the roster after a wait would refuse the
-    # very lookup that decides admission, so its caller re-reads both rosters
-    # itself once the answer arrives. It keeps the pacing; every other route,
-    # GETs included, is re-judged after each wait.
-    recheck_path = path if recheck_destination else ""
-    recheck_hint = destination if recheck_destination else ""
     rate_limited = 0
     transient = 0
     # The attempt that follows a 429 has already served that back-off, so it
@@ -527,7 +518,7 @@ async def _api_request(
             return _failed(DISCORD_BLOCKED, detail="invalid-request breaker open")
         if not served_backoff:
             if await self._await_capacity(route, exempt=exempt) > 0:
-                permission = await self._destination_still_permitted(recheck_path, recheck_hint)
+                permission = await self._destination_still_permitted(path, destination)
                 if not permission.permitted:
                     return _failed(DISCORD_BLOCKED, detail=permission.detail)
         served_backoff = False
@@ -572,7 +563,7 @@ async def _api_request(
                             delay,
                         )
                         return _failed(DISCORD_TRANSIENT, status=429, detail="rate limited")
-                    permission = await self._wait_then_revalidate(recheck_path, delay, recheck_hint)
+                    permission = await self._wait_then_revalidate(path, delay, destination)
                     if not permission.permitted:
                         return _failed(DISCORD_BLOCKED, detail=permission.detail)
                     served_backoff = True
@@ -597,9 +588,7 @@ async def _api_request(
                         resp.status,
                         backoff,
                     )
-                    permission = await self._wait_then_revalidate(
-                        recheck_path, backoff, recheck_hint
-                    )
+                    permission = await self._wait_then_revalidate(path, backoff, destination)
                     if not permission.permitted:
                         return _failed(DISCORD_BLOCKED, detail=permission.detail)
                     continue
@@ -631,7 +620,7 @@ async def _api_request(
             if transient > _TRANSIENT_RETRIES:
                 return _failed(DISCORD_TRANSIENT, detail=type(exc).__name__)
             permission = await self._wait_then_revalidate(
-                recheck_path, _TRANSIENT_BACKOFF_SECS * transient, recheck_hint
+                path, _TRANSIENT_BACKOFF_SECS * transient, destination
             )
             if not permission.permitted:
                 return _failed(DISCORD_BLOCKED, detail=permission.detail)

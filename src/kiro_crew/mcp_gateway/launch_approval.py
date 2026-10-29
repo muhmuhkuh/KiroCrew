@@ -468,10 +468,8 @@ class LaunchApprovals:
     def admits_launch(self, stem: str, command_hash: str, derived_env_hash: str) -> bool:
         """Whether one exact command/effective-environment pair was approved.
 
-        A never-pooled server (a credential vendor) is refused whatever its
-        recorded approval: this is the check ``gatewayd`` runs before it spawns
-        a shared backend, so an approval written before the name was listed
-        cannot let it run outside every chat sandbox.
+        A credential vendor is refused regardless of a prior approval: this is
+        the daemon's last check before spawning a shared backend.
         """
         if stem in _unpoolable_stems():
             return False
@@ -1344,18 +1342,14 @@ def filter_target_env(
     """
     kept: dict[str, str] = {}
     dropped: set[str] = set()
-    # A never-pooled server is dropped whatever its approval says: an approval
-    # or sidecar written before the name was listed must not let gatewayd spawn
-    # it outside every chat sandbox. Not recorded as a refusal: nothing is
-    # waiting on the person to approve it.
-    denied = _unpoolable_stems()
     never: set[str] = set()
+    unpoolable = _unpoolable_stems()
     for key, spec in target_env.items():
         stem = target_env_stem(key)
         if stem is None:
             kept[key] = spec
             continue
-        if stem in denied:
+        if stem in unpoolable:
             never.add(stem)
             continue
         try:
@@ -1384,17 +1378,13 @@ def filter_target_env(
 
 
 def _unpoolable_stems() -> frozenset[str]:
-    """Target stems of the servers the rewriter never pools.
-
-    Imported lazily: the rewriter imports this module, so a module-level import
-    would be a cycle.
-    """
+    """Target stems for servers that must never run as shared backends."""
     from kiro_crew.mcp_gateway import rewriter_spec
     from kiro_crew.mcp_utils import mcp_server_alias
 
     names = rewriter_spec.UNPOOLABLE_SERVERS
-    return frozenset(target_stem(n) for n in names) | frozenset(
-        target_stem(mcp_server_alias(n)) for n in names
+    return frozenset(target_stem(name) for name in names) | frozenset(
+        target_stem(mcp_server_alias(name)) for name in names
     )
 
 

@@ -3,7 +3,7 @@ import { createElement } from 'react'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { api } from '../api/client'
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import { effortToCarry, filterInteractiveModels, legacyCodexEffort, normalizeHiddenModels, shouldSeparateModelEffort, switchGroupedModel, useModelPickerConfigured, useModelPickerHiddenModelsQuery } from '../hooks/useInteractiveModels'
@@ -21,40 +21,6 @@ describe('interactive model visibility', () => {
     expect(filterInteractiveModels(next, hidden).map(model => model.name)).toEqual(['auto', 'model-a', 'new-model'])
     expect(filterInteractiveModels([...next, MODELS[2]], hidden).map(model => model.name)).toEqual(['auto', 'model-a', 'new-model'])
     expect(filterInteractiveModels([...next, MODELS[2]], hidden, ['model-b']).map(model => model.name)).toContain('model-b')
-  })
-
-  it('keeps a model hidden after a harness switch respells its id', () => {
-    // Hidden under the kiro backend's id; the Claude Code backend lists the
-    // same model by its bare wire id, its prefixed wire id or its registry key.
-    const hidden = ['claude-opus-4.7']
-    for (const spelling of ['claude-opus-4-7[1m]', 'global.anthropic.claude-opus-4-7[1m]', 'opus-4.7-1m']) {
-      const models = [{ name: 'auto' }, { name: spelling }, { name: 'model-a' }]
-      expect(filterInteractiveModels(models, hidden).map(model => model.name)).toEqual(['auto', 'model-a'])
-    }
-  })
-
-  it('matches a bare family alias only by itself', () => {
-    // Claude Code's `opus` is its newest Opus, while the registry folds the
-    // alias to Opus 4.8 (1M). Hiding one must not hide the other.
-    const models = [{ name: 'auto' }, { name: 'opus' }, { name: 'claude-opus-4.8' }, { name: 'claude-opus-4-8[1m]' }, { name: 'claude-opus-5.5' }]
-    expect(filterInteractiveModels(models, ['opus']).map(model => model.name))
-      .toEqual(['auto', 'claude-opus-4.8', 'claude-opus-4-8[1m]', 'claude-opus-5.5'])
-    expect(filterInteractiveModels(models, ['claude-opus-4.8']).map(model => model.name))
-      .toEqual(['auto', 'opus', 'claude-opus-5.5'])
-    expect(filterInteractiveModels(models, ['Opus']).map(model => model.name)).not.toContain('opus')
-  })
-
-  it('keeps distinct registry models distinct when matching hidden ids', () => {
-    // `claude-opus-4-8` (200K) and `claude-opus-4.8` (1M) are different models.
-    const models = [{ name: 'auto' }, { name: 'claude-opus-4-8' }, { name: 'claude-opus-4.8' }]
-    expect(filterInteractiveModels(models, ['claude-opus-4.8']).map(model => model.name)).toEqual(['auto', 'claude-opus-4-8'])
-  })
-
-  it('keeps a hidden active model visible when the harness spells it differently', () => {
-    // The session pinned `claude-opus-4.8`; Claude Code lists it as `claude-opus-4-8[1m]`.
-    const models = [{ name: 'auto' }, { name: 'claude-opus-4-8[1m]' }, { name: 'model-a' }]
-    expect(filterInteractiveModels(models, ['claude-opus-4.8'], ['claude-opus-4.8']).map(model => model.name))
-      .toEqual(['auto', 'claude-opus-4-8[1m]', 'model-a'])
   })
 
   it('hides the first-use row while loading and follows only the server acknowledgement', async () => {
@@ -133,26 +99,6 @@ describe('interactive model visibility', () => {
       { name: 'gpt-6-astra', description: 'Frontier reasoning', rateMultiplier: undefined },
       { name: 'gpt-6-sol', description: '', rateMultiplier: undefined },
     ])
-  })
-
-  it('does not give a grouped row one variant display name', () => {
-    const models = [
-      { name: 'openai.gpt-6-astra[high]', displayName: 'GPT-6 Astra (high)' },
-      { name: 'openai.gpt-6-astra[max]', displayName: 'GPT-6 Astra (max)' },
-    ]
-    const [row] = filterInteractiveModels(models, [], [], true)
-    expect(row.name).toBe('openai.gpt-6-astra')
-    expect(row.displayName).toBeUndefined()
-  })
-
-  it('keeps the base display name when the base row is advertised', () => {
-    const models = [
-      { name: 'openai.gpt-6-astra[high]', displayName: 'GPT-6 Astra (high)' },
-      { name: 'openai.gpt-6-astra', displayName: 'GPT-6 Astra' },
-    ]
-    const [row] = filterInteractiveModels(models, [], [], true)
-    expect(row.name).toBe('openai.gpt-6-astra')
-    expect(row.displayName).toBe('GPT-6 Astra')
   })
 
   it('separates effort only when the capability response says IDs encode effort', () => {
@@ -301,44 +247,23 @@ describe('interactive model visibility', () => {
     expect(normalizeHiddenModels([' model-a ', 'model-a', '', 'auto', 3])).toEqual(['model-a'])
   })
 
-  it('is wired only into ChatPage and ChatPane consumers', () => {
+  it('is wired only into the ChatPage and ChatPane picker modules', () => {
     const root = resolve(process.cwd(), 'src')
-    // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
-    const ownerDir = resolve(root, 'pages/chat/page')
-    const chatPage = [
-      readFileSync(resolve(root, 'pages/ChatPage.tsx'), 'utf8'),
-      ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(resolve(ownerDir, f), 'utf8')),
-      ...readdirSync(resolve(root, 'pages')).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => readFileSync(resolve(root, 'pages', f), 'utf8')),
-    ].join('\n')
-    const chatPane = ['components/useChatPanePickers.ts', 'components/ChatPanePickerMenus.tsx']
-      .map(rel => readFileSync(resolve(root, rel), 'utf8')).join('\n')
-    // The sidebar, whose bulk model switch lives in pages/chat-sidebar/bulkModelSwitch.tsx:
-    // the shell joined with every owner it composes.
-    const sidebarFiles = [resolve(root, 'pages/ChatSidebar.tsx')]
-    const walk = (dir: string) => {
-      for (const name of readdirSync(dir).sort()) {
-        const p = resolve(dir, name)
-        if (statSync(p).isDirectory()) walk(p)
-        else if (/\.(ts|tsx)$/.test(name) && !/\.test\./.test(name)) sidebarFiles.push(p)
-      }
-    }
-    walk(resolve(root, 'pages/chat-sidebar'))
-    const bulkSwitcher = sidebarFiles.map(f => readFileSync(f, 'utf8')).join('\n')
-    // Settings ▸ Chat is a facade over sibling owners: read them as one text.
-    const settings = [
-      'ChatPanel.tsx', 'ChatPanelLinkPatternsEditor.tsx', 'chatPanelOptions.ts',
-      'useChatPanelDashboard.ts', 'useChatPanelModels.ts', 'useChatPanelTypedFields.ts',
-    ].map(file => readFileSync(resolve(root, 'pages/settings', file), 'utf8')).join('\n')
-    expect(chatPage).toContain('const availableModels = effectiveModels')
-    expect(chatPage).toContain('useFilteredDropdown(modelPickerModels)')
-    expect(chatPage).toContain('filterInteractiveModels(effectiveModels')
-    expect(chatPage).toContain('modelVisibilityError={hiddenModelsQ.isError}')
-    expect(chatPage).toContain('onRetryModelVisibility={() => hiddenModelsQ.refetch()}')
-    expect(chatPane).toContain('const availableModels = effectiveModels')
-    expect(chatPane).toContain('useFilteredDropdown(modelPickerModels)')
-    expect(chatPane).toContain('filterInteractiveModels(effectiveModels')
-    expect(chatPane).toContain('{hiddenModelsQ.isError && (')
-    expect(chatPane).toContain('onClick={() => hiddenModelsQ.refetch()}')
+    const sessionPicks = readFileSync(resolve(root, 'pages/chat/page/sessionPicks.ts'), 'utf8')
+    const composerDock = readFileSync(resolve(root, 'pages/chat/page/ComposerDockView.tsx'), 'utf8')
+    const chatPanePickers = readFileSync(resolve(root, 'components/useChatPanePickers.ts'), 'utf8')
+    const chatPane = readFileSync(resolve(root, 'components/ChatPane.tsx'), 'utf8')
+    const bulkSwitcher = readFileSync(resolve(root, 'pages/ChatSidebar.tsx'), 'utf8')
+    const settings = readFileSync(resolve(root, 'pages/settings/ChatPanel.tsx'), 'utf8')
+    expect(sessionPicks).toContain('const availableModels = effectiveModels')
+    expect(sessionPicks).toContain('useFilteredDropdown(modelPickerModels)')
+    expect(sessionPicks).toContain('filterInteractiveModels(effectiveModels')
+    expect(composerDock).toContain('modelVisibilityError={hiddenModelsQ.isError}')
+    expect(composerDock).toContain('onRetryModelVisibility={() => hiddenModelsQ.refetch()}')
+    expect(chatPanePickers).toContain('useModelPickerHiddenModelsQuery()')
+    expect(chatPanePickers).toContain('filterInteractiveModels(effectiveModels')
+    expect(chatPanePickers).toContain('useFilteredDropdown(modelPickerModels)')
+    expect(chatPane).toContain('useChatPanePickerModels({ slotKey, paneSlot, provider, dispatch, dashCfg })')
     expect(bulkSwitcher).not.toContain('filterInteractiveModels(')
     expect(settings).not.toContain('filterInteractiveModels(')
   })

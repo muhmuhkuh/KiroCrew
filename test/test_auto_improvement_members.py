@@ -12,7 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from auto_improvement_member_helpers import MEMBER_BUDGET_SECS, MemberDeadline
 
 from conftest import make_dir_link, requires_symlinks
 from kiro_crew.acp.types import PROVIDER_LABEL_KAS
@@ -32,21 +31,25 @@ from kiro_crew.platform.governance import parse_policy
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.security.exfil import EXFILTRATION_REDACTION_TAG_PREFIX
 from kiro_crew.security.redaction import REDACTED_CREDENTIAL_TAG
-from kiro_crew.testing.wait import async_wait_until
+
+#: How long these tests let one member assignment run, and how long they wait for
+#: it. Both are LOST-RUN guards: no test that uses them is about how long an
+#: assignment takes (the deadline tests pass ``timeout_s`` themselves). The work is
+#: config loads, sqlite commits and fsyncs, ~0.3s on a quiet host and 18-31s per
+#: test call on a Windows CI shard whose four workers ran this file together, so a
+#: budget sized near the work measures the runner's disk instead of the property.
+#: The wait plus a slow ``ensure_team`` stays under ``--timeout=120``, so a run that
+#: is really stuck fails at this wait, by name, rather than taking its worker down.
+_MEMBER_BUDGET_SECS = 45
+_MEMBER_WAIT_SECS = 60
 
 
-async def _run_member(runner, prompt, deadline=None, **kwargs):
-    """Run one assignment off the loop and wait for it under ``deadline``.
-
-    Every wait on member work in this file runs in the time left on one
-    :class:`MemberDeadline` per test, so waits never stack past ``--timeout`` and a
-    hang fails by name. A test or helper that waits more than once passes one
-    deadline to every wait. (The deadline test moves the runner's own clock instead.)
-    """
-    deadline = deadline or MemberDeadline()
-    kwargs.setdefault("timeout_s", deadline.budget())
-    work = asyncio.ensure_future(asyncio.to_thread(runner.run, prompt, **kwargs))
-    return await deadline.wait(work, f"the {prompt!r} assignment")
+async def _run_member(runner, prompt, **kwargs):
+    """Run one assignment off the loop, bounded only against a lost run."""
+    return await asyncio.wait_for(
+        asyncio.to_thread(runner.run, prompt, timeout_s=_MEMBER_BUDGET_SECS, **kwargs),
+        timeout=_MEMBER_WAIT_SECS,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -267,9 +270,12 @@ async def test_member_essentials_are_built_for_the_spawned_harness(tmp_path, fac
     runtime = crew.GatewayRuntime(sessions, context, asyncio.get_running_loop())
     runner = CrewRunner(runtime, identities).for_role("implementation")
 
-    result = await _run_member(runner, "Inspect candidate", cwd=str(tmp_path))
+    result = await asyncio.wait_for(
+        asyncio.to_thread(runner.run, "Inspect candidate", cwd=str(tmp_path), timeout_s=5),
+        timeout=10,
+    )
 
-    assert result.ok, result.error
+    assert result.ok
     assert [call["provider_type"] for call in context.calls] == [harness]
     assert "context_provider" not in context.calls[0]
 
@@ -383,7 +389,6 @@ async def test_member_result_redactor_failure_withholds_output_and_releases(tmp_
 @pytest.mark.asyncio
 @pytest.mark.parametrize("author", [agent_runner.author_bug_fix, agent_runner.author_perf_fix])
 async def test_authors_retain_completed_edits_after_member_deadline(author, tmp_path, monkeypatch):
-    deadline = MemberDeadline()
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     await asyncio.to_thread(
@@ -416,9 +421,7 @@ async def test_authors_retain_completed_edits_after_member_deadline(author, tmp_
             await asyncio.to_thread(source.write_text, completed_edit, encoding="utf-8")
             written.set()
             try:
-                # Only the runner's deadline ends this wait; the test's lost-run
-                # bound on ``running`` catches a runner that never cancels it.
-                await asyncio.Future()
+                await asyncio.wait_for(asyncio.Event().wait(), timeout=10)
             except asyncio.CancelledError:
                 provider_cancelled.set()
                 raise
@@ -435,31 +438,37 @@ async def test_authors_retain_completed_edits_after_member_deadline(author, tmp_
     running = asyncio.create_task(
         asyncio.to_thread(author, runner, candidate=candidate, worktree=worktree)
     )
-    async with deadline.settles(running, "the stopped author", stop=stopped.set):
-        await deadline.wait(written, "the provider's completed edit")
+    try:
+        await asyncio.wait_for(written.wait(), timeout=5)
         expired.set()
-        assert await deadline.wait(running, "the author after its deadline")
+        assert await asyncio.wait_for(asyncio.shield(running), timeout=10)
         assert provider_cancelled.is_set()
         assert await asyncio.to_thread(source.read_text, encoding="utf-8") == completed_edit
         key = sessions.acquired[0][0]
         assert sessions.released == sessions.removed == [key]
         assert sessions.providers[0].shutdowns == 1
+    finally:
+        stopped.set()
+        await asyncio.wait_for(asyncio.shield(running), timeout=10)
 
 
 @pytest.mark.asyncio
 async def test_stages_use_distinct_owned_sessions_and_shared_budget(tmp_path):
-    deadline = MemberDeadline()
     identities = await asyncio.to_thread(crew.ensure_team)
     sessions = Sessions()
     context = Context()
     runtime = crew.GatewayRuntime(sessions, context, asyncio.get_running_loop())
     runner = CrewRunner(runtime, identities)
-    scout = await _run_member(runner, "Find a bug", deadline, cwd=str(tmp_path))
-    engineer = await _run_member(
-        runner.for_role("implementation"),
-        f"Implement this candidate: {scout.text}",
-        deadline,
-        cwd=str(tmp_path),
+    scout = await asyncio.wait_for(
+        asyncio.to_thread(runner.run, "Find a bug", cwd=str(tmp_path)), timeout=10
+    )
+    engineer = await asyncio.wait_for(
+        asyncio.to_thread(
+            runner.for_role("implementation").run,
+            f"Implement this candidate: {scout.text}",
+            cwd=str(tmp_path),
+        ),
+        timeout=10,
     )
     assert scout.ok and engineer.ok
     assert runner.total_cost_usd() == 0.5
@@ -484,7 +493,6 @@ async def test_stages_use_distinct_owned_sessions_and_shared_budget(tmp_path):
 
 @pytest.mark.asyncio
 async def test_assignments_build_real_context_from_only_their_private_store(tmp_path, monkeypatch):
-    deadline = MemberDeadline(assignments=3)
     from kiro_crew import context as context_module
     from kiro_crew.context import ContextBuilder
     from kiro_crew.learn import LessonStore
@@ -529,8 +537,11 @@ async def test_assignments_build_real_context_from_only_their_private_store(tmp_
             crew.GatewayRuntime(sessions, context, asyncio.get_running_loop()), identities
         )
         for role in ("discovery", "implementation", "discovery"):
-            result = await _run_member(
-                runner.for_role(role), "Work on the assigned candidate", deadline, cwd=str(tmp_path)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    runner.for_role(role).run, "Work on the assigned candidate", cwd=str(tmp_path)
+                ),
+                timeout=15,
             )
             assert result.ok, result.error
             prompt = sessions.providers[-1].prompts[0]
@@ -546,7 +557,6 @@ async def test_assignments_build_real_context_from_only_their_private_store(tmp_
 
 @pytest.mark.asyncio
 async def test_stop_cancels_a_silent_provider_and_releases_session():
-    deadline = MemberDeadline()
     identities = await asyncio.to_thread(crew.ensure_team)
     entered = threading.Event()
     stopped = threading.Event()
@@ -556,22 +566,19 @@ async def test_stop_cancels_a_silent_provider_and_releases_session():
         identities,
         stop_check=stopped.is_set,
     )
-    running = asyncio.create_task(
-        asyncio.to_thread(runner.run, "Wait", timeout_s=deadline.budget())
-    )
-    async with deadline.settles(running, "the stopped assignment", stop=stopped.set):
-        await async_wait_until(
-            entered.is_set,
-            timeout=deadline.remaining(),
-            describe=lambda: f"provider not entered; {sessions.acquired=}",
-        )
+    running = asyncio.create_task(asyncio.to_thread(runner.run, "Wait", timeout_s=10))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
         stopped.set()
-        result = await deadline.wait(running, "the stopped assignment")
+        result = await asyncio.wait_for(running, timeout=5)
         assert not result.ok
         assert "stopped by request" in result.error
         assert sessions.released == sessions.removed
         assert len(sessions.removed) == 1
         assert sessions.providers[0].shutdowns == 1
+    finally:
+        stopped.set()
+        await asyncio.wait_for(running, timeout=5)
 
 
 @pytest.mark.parametrize(
@@ -646,7 +653,9 @@ async def test_native_permission_without_kind_uses_same_call_only(
     runner = CrewRunner(
         crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop()), identities
     ).for_role("implementation")
-    result = await _run_member(runner, "Fix the candidate", allowed_tools=allowed)
+    result = await asyncio.wait_for(
+        asyncio.to_thread(runner.run, "Fix the candidate", allowed_tools=allowed), timeout=10
+    )
     assert result.ok
     assert sessions.providers[0].approved == (["request-1"] if approved else [])
     assert sessions.providers[0].rejected == ([] if approved else ["request-1"])
@@ -1099,12 +1108,8 @@ class _GovernedProvider(Provider):
         self.rejected.append(rid)
 
 
-async def _run_governed_assignment(identities, monkeypatch, *, denied_agent, deadline):
-    """Run one discovery assignment under a gate that denies only ``denied_agent``.
-
-    The caller's ``deadline`` covers every assignment in its test, so two calls share
-    one lost-run bound.
-    """
+async def _run_governed_assignment(identities, monkeypatch, *, denied_agent):
+    """Run one discovery assignment under a gate that denies only ``denied_agent``."""
     judged = []
 
     def gate(ev, *, session_key, agent, tool_kind=None):
@@ -1116,14 +1121,13 @@ async def _run_governed_assignment(identities, monkeypatch, *, denied_agent, dea
     runner = CrewRunner(
         crew.GatewayRuntime(sessions, Context(), asyncio.get_running_loop()), identities
     ).for_role("discovery")
-    result = await _run_member(runner, "Read the notes", deadline)
+    result = await asyncio.wait_for(asyncio.to_thread(runner.run, "Read the notes"), timeout=10)
     assert result.ok
     return judged, sessions
 
 
 @pytest.mark.asyncio
 async def test_renamed_member_is_governed_under_its_alias_not_its_template(tmp_path, monkeypatch):
-    deadline = MemberDeadline()
     identities = await asyncio.to_thread(crew.ensure_team)
     template = crew.ROLES["discovery"].template
 
@@ -1135,7 +1139,7 @@ async def test_renamed_member_is_governed_under_its_alias_not_its_template(tmp_p
 
     # A profile that denies the ALIAS refuses the request even though the template is allowed.
     judged, sessions = await _run_governed_assignment(
-        identities, monkeypatch, denied_agent="my-scout", deadline=deadline
+        identities, monkeypatch, denied_agent="my-scout"
     )
     assert judged == ["my-scout"]
     assert sessions.providers[0].rejected == ["request-1"]
@@ -1146,7 +1150,7 @@ async def test_renamed_member_is_governed_under_its_alias_not_its_template(tmp_p
 
     # A profile that denies only the TEMPLATE does not reach a renamed member.
     judged, sessions = await _run_governed_assignment(
-        identities, monkeypatch, denied_agent=template, deadline=deadline
+        identities, monkeypatch, denied_agent=template
     )
     assert judged == ["my-scout"]
     assert sessions.providers[0].approved == ["request-1"]
@@ -1155,18 +1159,17 @@ async def test_renamed_member_is_governed_under_its_alias_not_its_template(tmp_p
 
 @pytest.mark.asyncio
 async def test_unrenamed_member_governance_is_unchanged(monkeypatch):
-    deadline = MemberDeadline()
     identities = await asyncio.to_thread(crew.ensure_team)
     template = crew.ROLES["discovery"].template
 
     judged, sessions = await _run_governed_assignment(
-        identities, monkeypatch, denied_agent=template, deadline=deadline
+        identities, monkeypatch, denied_agent=template
     )
     assert judged == [template]
     assert sessions.providers[0].rejected == ["request-1"]
 
     judged, sessions = await _run_governed_assignment(
-        identities, monkeypatch, denied_agent="some-other-member", deadline=deadline
+        identities, monkeypatch, denied_agent="some-other-member"
     )
     assert judged == [template]
     assert sessions.providers[0].approved == ["request-1"]
@@ -1191,7 +1194,7 @@ async def test_session_runner_default_governs_under_its_agent_name(monkeypatch):
         session_key="s1",
         cwd=None,
         append_system=None,
-        timeout_s=MEMBER_BUDGET_SECS,
+        timeout_s=5,
         t0=time.monotonic(),
     )
     assert result.ok

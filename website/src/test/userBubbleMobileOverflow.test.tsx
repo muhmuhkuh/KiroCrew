@@ -19,7 +19,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import React from 'react'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import userEvent from '@testing-library/user-event'
@@ -27,20 +27,14 @@ import UserMessage from '../pages/chat/UserMessage'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const src = (rel: string) => readFileSync(resolve(HERE, '..', rel), 'utf8')
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the ChatPage row reads the page and those owners.
-const chatPageSource = () => [
-  src('pages/ChatPage.tsx'),
-  ...readdirSync(resolve(HERE, '..', 'pages/chat/page')).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => src(`pages/chat/page/${f}`)),
-  ...readdirSync(resolve(HERE, '..', 'pages')).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => src(`pages/${f}`)),
-].join('\n')
 
 /** Any arbitrary-value width cap in pixels: `max-w-[550px]`, `max-w-[min(550px,100%)]`, … */
 const PIXEL_CAP = /max-w-\[[^\]]*\d+px[^\]]*\]/
 
 /** Both hosts render the same UserMessage inside the same wrapper pair. */
 const HOSTS = [
-  ['ChatPage.tsx', chatPageSource],
-  ['app-sdk/ChatMessageList.tsx', () => src('app-sdk/ChatMessageList.tsx')],
+  ['ChatPage transcript rendering', 'pages/chat/page/transcriptRendering.tsx'],
+  ['app-sdk/ChatMessageList.tsx', 'app-sdk/ChatMessageList.tsx'],
 ] as const
 
 function renderBubble(props: Partial<React.ComponentProps<typeof UserMessage>> = {}) {
@@ -101,8 +95,8 @@ describe('user bubble stays inside a phone viewport', () => {
     expect(wrapper.className).not.toMatch(PIXEL_CAP)
   })
 
-  it.each(HOSTS)('%s caps the transcript row wrapper it shares with the bubble', (_label, read) => {
-    const text = read()
+  it.each(HOSTS)('%s caps the transcript row wrapper it shares with the bubble', (_label, rel) => {
+    const text = src(rel)
     const wrappers = text.match(/flex flex-col gap-0\.5 min-w-0 overflow-hidden[^`'"]*/g) ?? []
     expect(wrappers.length).toBeGreaterThan(0)
     for (const w of wrappers) expect(w).toContain('max-w-full')

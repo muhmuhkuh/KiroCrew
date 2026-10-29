@@ -6,13 +6,6 @@
 
 import { withDeadline } from '../../lib/withDeadline'
 import type { ClientTransport } from './transport'
-import type {
-  RemoteDirListing,
-  RemoteFileContent,
-  SessionEnvironmentsCheck,
-  SessionEnvironmentWorkspace,
-  SlotEnvironment,
-} from '../client'
 
 /** Deadline for `api.slashCommands`. Same value as the `$`-menu's
  *  `SKILLS_TIMEOUT_MS` (`./skills`), for the same reason and against the same
@@ -38,9 +31,9 @@ export interface FollowDefaultCount {
   titles: string[]
 }
 
-export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fetch }: ClientTransport) {
+export function createChatSlotSettingsEndpoints({ post, j, jfetch: fetch }: ClientTransport) {
   const selection = {
-    models: () => fetch('/api/models').then(j),
+    models: (backend?: string) => fetch('/api/models' + (backend !== undefined ? '?backend=' + encodeURIComponent(backend) : '')).then(j),
     chatSlotSelectionCapabilities: (slot: string) =>
       fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/selection-capabilities').then(j) as Promise<{
         known: boolean
@@ -68,6 +61,8 @@ export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fet
         ...(kind ? { agent_kind: kind } : {}),
         ...(opts?.announce ? { announce: true } : {}),
       }).then(j) as Promise<{ ok?: boolean; agent?: string; agent_kind?: 'member' | 'template' | ''; workspace?: string }>,
+    chatSlotBackend: (slot: string, acp_backend: string | null) =>
+      post('/api/chat/slots/' + encodeURIComponent(slot) + '/backend', { acp_backend }).then(j) as Promise<{ ok?: boolean; acp_backend?: string | null; model?: string }>,
     /** `deferred: true` when a response was running: the pick is committed and
      *  applies from the next message; the running reply keeps its model. */
     chatSlotModel: (slot: string, model: string) =>
@@ -102,34 +97,6 @@ export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fet
       post('/api/chat/slots/follow-default', { digest }).then(j) as Promise<{ ok: boolean; changed: number }>,
     chatSlotReasoningEffort: (slot: string, reasoning_effort: string) =>
       post('/api/chat/slots/' + encodeURIComponent(slot) + '/reasoning-effort', { reasoning_effort }).then(j) as Promise<{ ok?: boolean; reasoning_effort?: string; model?: string; deferred?: boolean }>,
-    /** Which Session Environment this slot's session runs on (`profile: null` =
-     *  this machine) plus the configured profiles to choose from. Owner-only. */
-    chatSlotEnvironment: (slot: string) =>
-      get('/api/chat/slots/' + encodeURIComponent(slot) + '/environment').then(j) as Promise<SlotEnvironment>,
-    /** Read-only view of a REMOTE session's workspace: list a directory or read a
-     *  file, relative to the profile's working directory. Owner-only. */
-    chatSlotEnvironmentList: (slot: string, path: string) =>
-      get('/api/chat/slots/' + encodeURIComponent(slot) + '/environment/browse?op=list&path=' + encodeURIComponent(path)).then(j) as Promise<RemoteDirListing>,
-    chatSlotEnvironmentRead: (slot: string, path: string) =>
-      get('/api/chat/slots/' + encodeURIComponent(slot) + '/environment/browse?op=read&path=' + encodeURIComponent(path)).then(j) as Promise<RemoteFileContent>,
-    /** Read-only readiness check: Coder sign-in and each profile's template. */
-    sessionEnvironmentsCheck: () =>
-      post('/api/session-environments/check').then(j) as Promise<SessionEnvironmentsCheck>,
-    sessionEnvironmentsWorkspaces: () =>
-      get('/api/session-environments/workspaces').then(j) as Promise<{ workspaces: SessionEnvironmentWorkspace[] }>,
-    /** Templates the saved Coder deployment offers; `error` when unreadable. Owner-only. */
-    sessionEnvironmentsTemplates: () =>
-      get('/api/session-environments/templates').then(j) as Promise<{ templates: string[]; error?: string }>,
-    /** Save a remote file. `expected` is the text the editor opened; a file that
-     *  changed since answers 409 `file_changed` instead of being overwritten.
-     *  `workdir` is the profile's working folder the edit was made under; once the
-     *  profile points elsewhere the save answers 409 `root_changed`. */
-    chatSlotEnvironmentWrite: (slot: string, path: string, content: string, expected?: string, workdir?: string) =>
-      put('/api/chat/slots/' + encodeURIComponent(slot) + '/environment/file', { path, content, ...(expected !== undefined ? { expected } : {}), ...(workdir !== undefined ? { workdir } : {}) }).then(j) as Promise<{ ok: boolean; path: string }>,
-    /** Bind (or, with `null`, unbind) the slot's session to a profile. Applies at
-     *  the session's next start; an idle runtime is reset so it cannot linger. */
-    setChatSlotEnvironment: (slot: string, profile: string | null) =>
-      put('/api/chat/slots/' + encodeURIComponent(slot) + '/environment', { profile }).then(j) as Promise<{ profile: string | null; applies: string }>,
     chatSlotWorkspace: (slot: string, workspace: string) =>
       post('/api/chat/slots/' + encodeURIComponent(slot) + '/workspace', { workspace }).then(j),
     // Relaunch the slot's agent process in place (fresh agent spec, env, and MCP

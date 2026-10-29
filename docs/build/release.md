@@ -213,15 +213,6 @@ code.
      version prefix, which is also why a hotfix rebuild of an older tag keeps
      working after upstream releases. See [desktop-app](desktop-app.md) "Bundled
      kiro-cli".
-   - *Installer tool pins*: the source installers download mise
-     (`scripts/lib/pinned-mise.sh`) and the AWS CLI and Session Manager plugin
-     (`packaging/pins/aws-tools.env`) at pinned versions and refuse a sha256
-     mismatch. Compare each pin with upstream and bump the stale ones: pick a
-     release at least 7 days old, record each artifact's sha256 (mise: its
-     release `SHASUMS256.txt`; AWS: two downloads that match), keep
-     `AWSCLI_VERSION` equal to the crew runtime Dockerfile's, and run
-     `test/test_installer_tool_pins.py`. The procedure is in each file's header. A
-     stale pin is not a failure; the pinned artifacts stay downloadable.
 2. **Cut the RC — verify content, not PR status.** On the target commit confirm:
    `github-release` has an `if:`; `CHANGELOG.md` line 5 is `## [X.Y.Z]` with zero
    non-bare-release `##` headings; no `### Contributors` (the GitHub Release
@@ -1109,7 +1100,6 @@ The consequences to know:
 - **The "you are running prerelease bytes" note still keys on the stamp**
   (`stampedChannel`), not on the followed channel, because that statement is
   about the bytes and stays literally true on a promoted stable install.
-- **An enterprise build has no opt-in.** It follows `stable`, the minimal set of the `updates.channel` control (RFC crew-enterprise-edition, D3), whatever the preference says. `runtime/update/policy-channel.js` reads the baked edition, `resolveChannel()` lets that channel replace the preference, About shows the channel read-only with the "Locked by policy" badge, and `update:set-channel` refuses with `locked_by_policy`. A build that cannot follow the required channel (a nightly install) gets no update lane (`disabled: "policy-channel"`); About names the required channel and links that channel's build. An oss build is unchanged.
 
 The specific to Kiro Crew part is install ordering: the app supervises a bundled
 Python gateway child, so before `quitAndInstall` the client stops it gracefully
@@ -1382,16 +1372,7 @@ rather than replacing them — so the published body is always
 for one to appear.
 
 - **Remove the generated commit list.** `generate_release_notes: true` appends a
-  `## What's Changed` line per pull request since the previous tag. The step
-  names that tag itself (`scripts/release_previous_tag.py`): the previous
-  stable tag for a stable release, and the previous prerelease of the same
-  `X.Y.Z` line for a prerelease, or the previous stable for the first one.
-  It reads tags with `scripts/check_feed_advance.py::parse_version`, and if
-  listing tags or choosing one fails, GitHub chooses as before. A prerelease
-  tag whose run failed and published no page still counts as a base (#25077).
-  GitHub's own choice is the newest ancestor release tag, and since each
-  release is tagged on its own release branch that is a tag from the project's
-  first weeks. A stable list can still be long: on v0.5.0 it was
+  `## What's Changed` line per commit since the previous tag. On v0.5.0 that was
   **746 lines for 922 commits** — 65% of the body, and it pushed the whole thing
   to 125,219 characters, past GitHub's 125,000-character ceiling, so the body was
   published truncated mid-word. The page already links "N commits to main since

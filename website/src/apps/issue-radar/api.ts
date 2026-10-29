@@ -99,12 +99,12 @@ export type {
 } from './apiCrewTypes'
 
 export const issueRadarApi = {
-  connect: async (url: string): Promise<ConnectResponse> => {
+  connect: async (url: string, repo?: string): Promise<ConnectResponse> => {
     const r = await fetch(`${API}/connect`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, ...(repo ? { repo } : {}) }),
     })
     if (!r.ok) throw new Error(await parseErrorBody(r))
     return r.json()

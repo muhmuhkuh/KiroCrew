@@ -269,6 +269,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                         onMouseDown={e => e.stopPropagation()}
                         onKeyDown={e => e.stopPropagation()}
                       >
+                        <div className="px-1 pb-1 text-[11px] text-muted">{i18nT('pages.chatSidebar.within')}</div>
                         <div className="flex flex-wrap gap-1 px-1 mb-2">
                           {RECENT_WINDOW_PRESETS.map(preset => (
                             <DurationChip
@@ -339,6 +340,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                       return (
                         <Fragment key={filterDef.key}>
                           <DropdownMenuItem
+                            title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                             onSelect={e => { e.preventDefault(); toggleFilter('recent') }}
                           >
                             {rowBody}
@@ -360,6 +362,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                     return (
                       <DropdownMenuSub key={filterDef.key}>
                         <DropdownMenuSubTrigger
+                          title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                           onClick={() => toggleFilter('recent')}
                           onKeyDown={e => {
                             if (e.key === 'Enter' || e.key === ' ') {
@@ -382,6 +385,7 @@ export function renderSearchDock(shell: SidebarScope): { field: React.ReactNode;
                   const showRow = (
                     <DropdownMenuItem
                       key={filterDef.key}
+                      title={i18nT(FILTER_DESCRIPTION_KEY[filterDef.key])}
                       // Keep the menu open so multiple filters can be toggled.
                       onSelect={e => { e.preventDefault(); toggleFilter(filterDef.key) }}
                       className={canHide ? 'flex-1 min-w-0' : undefined}

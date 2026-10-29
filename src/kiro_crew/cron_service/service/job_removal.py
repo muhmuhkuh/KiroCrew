@@ -513,18 +513,8 @@ def remove_jobs_sync(
     return removed, missing
 
 
-def _remove_jobs_by_owner_locked(
-    self: CronService,
-    owner_prefix: str,
-    *,
-    keep: Callable[[CronJob], bool] | None = None,
-) -> list[str]:
+def _remove_jobs_by_owner_locked(self: CronService, owner_prefix: str) -> list[str]:
     """Select AND remove every job owned by ``owner_prefix`` under ONE lock.
-
-    A job for which ``keep(job)`` is true is left in place: same id, same run
-    history, same enabled state. ``keep`` is called inside the lock on the
-    reloaded jobs, so it judges the same snapshot the removal acts on; it must
-    not touch the store.
 
     Sync core of :meth:`remove_jobs_by_owner` — lock/reload/select/mutate/
     save only, no timer work (so it is safe in an executor thread;
@@ -554,11 +544,7 @@ def _remove_jobs_by_owner_locked(
     removed: list[str] = []
     with self._file_lock():
         self._sync_for_write()
-        removed = [
-            j.id
-            for j in self._jobs
-            if getattr(j, "created_by", "") == owner_prefix and not (keep is not None and keep(j))
-        ]
+        removed = [j.id for j in self._jobs if getattr(j, "created_by", "") == owner_prefix]
         if removed:
             targets = set(removed)
             self._bump_grant_epochs_for(targets)
@@ -581,15 +567,9 @@ def _remove_jobs_by_owner_locked(
     return removed
 
 
-async def remove_jobs_by_owner(
-    self: CronService,
-    owner_prefix: str,
-    *,
-    keep: Callable[[CronJob], bool] | None = None,
-) -> list[str]:
+async def remove_jobs_by_owner(self: CronService, owner_prefix: str) -> list[str]:
     """Remove every job owned by ``owner_prefix`` under ONE lock, off-loop.
 
-    Jobs ``keep`` accepts are kept (see :meth:`_remove_jobs_by_owner_locked`).
     Selects and removes in a SINGLE :meth:`_remove_jobs_by_owner_locked`
     lock/reload/select/save transaction — the owner scan runs against the
     in-lock reloaded on-disk state, so a job another process created for
@@ -599,7 +579,7 @@ async def remove_jobs_by_owner(
     worker thread; only ``_arm_timer`` runs back on the loop, and only when
     something was actually removed. Returns the removed ids.
     """
-    removed = await asyncio.to_thread(self._remove_jobs_by_owner_locked, owner_prefix, keep=keep)
+    removed = await asyncio.to_thread(self._remove_jobs_by_owner_locked, owner_prefix)
     if removed:
         self._arm_timer()
     return removed

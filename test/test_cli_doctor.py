@@ -999,11 +999,11 @@ class TestSelectedBackendProjectionRow:
         asserts -- but it IS the state an operator gets told about, so the set is
         pinned by name and a new one is a deliberate change to this assertion.
 
-        No backend ships as one: pi, whose adapter drops the ``session/new`` array,
-        receives Crew's servers through its gate extension instead and is declared
-        ``broker-only`` like deepseek. The case that follows pins that pi's row is
-        therefore silent.
+        Vibe is onboarding-only and declares no channel; it is not selectable.
+        Pi receives Crew's servers through its gate extension and is declared
+        ``broker-only`` like deepseek, so its row remains silent.
         """
+        from kiro_crew.acp_backends import ACP_BACKEND_VIBE, BASELINE_SELECTABLE_BACKENDS
         from kiro_crew.providers.mirrors import PROJECTIONS, ProjectionKind
 
         gaps = {
@@ -1011,7 +1011,8 @@ class TestSelectedBackendProjectionRow:
             for backend, declared in PROJECTIONS.items()
             if declared.kind is ProjectionKind.NO_CHANNEL
         }
-        assert gaps == set(), f"no-channel backends shipping: {sorted(gaps)}"
+        assert gaps == {ACP_BACKEND_VIBE}, f"no-channel backends shipping: {sorted(gaps)}"
+        assert gaps.isdisjoint(BASELINE_SELECTABLE_BACKENDS)
 
     def test_the_real_pi_declaration_prints_no_channel_row(self, capsys):
         """Read off the SHIPPED declaration: pi's servers arrive, so nothing is said."""

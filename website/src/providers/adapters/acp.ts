@@ -68,10 +68,11 @@ interface CachedModels {
  *  expired (older than the TTL), or unusable. Fully guarded: SSR (no
  *  localStorage), disabled storage, quota, and corrupt JSON all degrade to null
  *  so the caller falls through to auto-only. */
-function readCachedModels(): ModelInfo[] | null {
+function readCachedModels(backend?: string): ModelInfo[] | null {
   try {
     if (typeof localStorage === 'undefined') return null
-    const raw = localStorage.getItem(MODELS_CACHE_KEY)
+    const key = backend === undefined ? MODELS_CACHE_KEY : `${MODELS_CACHE_KEY}:${backend}`
+    const raw = localStorage.getItem(key)
     if (!raw) return null
     const parsed = JSON.parse(raw) as CachedModels
     if (!parsed || typeof parsed.ts !== 'number' || !Array.isArray(parsed.models)) return null
@@ -117,11 +118,12 @@ export function clearCachedModels(): void {
 
 /** Persist a live model list with a timestamp. Best-effort — storage errors
  *  (quota, disabled, SSR) are swallowed so caching never breaks the picker. */
-function writeCachedModels(models: ModelInfo[]): void {
+function writeCachedModels(models: ModelInfo[], backend?: string): void {
   try {
     if (typeof localStorage === 'undefined') return
     const payload: CachedModels = { ts: Date.now(), models }
-    localStorage.setItem(MODELS_CACHE_KEY, JSON.stringify(payload))
+    const key = backend === undefined ? MODELS_CACHE_KEY : `${MODELS_CACHE_KEY}:${backend}`
+    localStorage.setItem(key, JSON.stringify(payload))
   } catch {
     /* quota exceeded / storage disabled — non-fatal */
   }
@@ -165,10 +167,6 @@ interface RawPlugin {
 /** Raw model entry from /api/models. */
 interface RawModel {
   model_name: string
-  /** The backend's own human label for the model (advertised by the harness for
-   *  an advertised-selection backend). Optional: a gateway predating the field
-   *  omits it, and the render site falls back to `model_name`. */
-  display_name?: string
   description?: string
   /** Backend-resolved context window. Two spellings because the endpoint has two
    *  branches: the kiro path returns `kiro-cli --list-models` rows verbatim
@@ -406,14 +404,15 @@ export class AcpAdapter implements ProviderAdapter {
     return { ok: false as const, error: 'plugin update is not supported' }
   }
 
-  async fetchAvailableModels(): Promise<ModelInfo[]> {
+  async fetchAvailableModels(backend?: string): Promise<ModelInfo[]> {
+    const healthKey = backend === undefined ? this.id : `${this.id}:${backend}`
     try {
-      const models = await api.models()
+      const models = await api.models(backend)
       if (!Array.isArray(models) || models.length === 0) {
         // Empty/non-array success: NOT a live list — keep polling, serve the
         // last-good live list if we have one, else auto-only.
-        markModelsDegraded(this.id, true)
-        return readCachedModels() ?? this._defaultModels()
+        markModelsDegraded(healthKey, true)
+        return readCachedModels(backend) ?? this._defaultModels()
       }
       const result = models.map((m: RawModel) => {
         // Prefer the backend's resolved window over the bundled snapshot: the
@@ -425,34 +424,22 @@ export class AcpAdapter implements ProviderAdapter {
         learnWindow(m.model_name, reported)
         return {
           name: m.model_name,
-          // The backend's native label, kept only when it is a REAL name (not
-          // the id-fallback the gateway fills in when a harness advertised no
-          // name). The auto row keeps its catalog label. The render site falls
-          // back to `name` when this is absent.
-          displayName:
-            m.model_name !== 'auto' && m.display_name && m.display_name !== m.model_name
-              ? m.display_name
-              : undefined,
           description: m.description || '',
           contextWindow: reported || MODEL_TOKENS[m.model_name] || DEFAULT_CONTEXT,
           rateMultiplier: rowMultiplier(m),
         }
       })
-      writeCachedModels(result) // remember this good live list for next hiccup
-      markModelsDegraded(this.id, false) // live success → self-heal can stop polling
+      writeCachedModels(result, backend) // remember this good live list for next hiccup
+      markModelsDegraded(healthKey, false) // live success → self-heal can stop polling
       return result
     } catch (err) {
       // Transient backend failure (503 / network): NOT live — keep polling.
       // Serve the last-good live list if we have one, else auto-only. Never
       // surface canonical registry keys — the ACP CLI rejects them (-32603).
-      // Read the refusal code HERE, where the error is formed, so an expired /
-      // signed-out kiro-cli login (503 `kiro_prerequisite_required`) can raise
-      // the one actionable sign-in banner instead of the generic config-load
-      // failure. Any other cause clears the auth flag — only this code means a
-      // sign-in wall.
-      markModelsDegraded(this.id, true)
-      markModelsAuthRequired(this.id, apiErrorCode(err) === 'kiro_prerequisite_required')
-      return readCachedModels() ?? this._defaultModels()
+      // Only the prerequisite refusal means this backend needs sign-in.
+      markModelsDegraded(healthKey, true)
+      markModelsAuthRequired(healthKey, apiErrorCode(err) === 'kiro_prerequisite_required')
+      return readCachedModels(backend) ?? this._defaultModels()
     }
   }
 

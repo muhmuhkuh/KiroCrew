@@ -590,6 +590,7 @@ class TestRelayWsCredentialStripping:
                 pass
 
             def recv(self, n):
+                # Return a valid 101 handshake.
                 return b"HTTP/1.1 101 Switching\r\nUpgrade: websocket\r\n\r\n"
 
             def close(self):

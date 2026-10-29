@@ -105,11 +105,7 @@ jobs:
   # ==========================================================================
   generate:
     name: Security Scope Review (generate)
-    # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
-    # "Larger runners for the review lanes and CodeQL" in
-    # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     # No `checks:` scope and no WRITE anywhere: this job holds the Bedrock
     # credential and prompt-injection is its live risk, so it must not be able to
@@ -822,11 +818,7 @@ jobs:
   validate:
     name: Security Scope Review (validate)
     needs: generate
-    # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
-    # "Larger runners for the review lanes and CodeQL" in
-    # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       actions: read
@@ -1205,7 +1197,6 @@ jobs:
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.head_repository.full_name != github.repository
     strategy:
-      max-parallel: 4
       # Every leg reports. One platform's regression is not evidence about
       # another's, so a fail-fast cancel would hide the rows an operator on the
       # cancelled runner is the only one who can see.
@@ -1422,11 +1413,7 @@ jobs:
     # scores blanks and the check-run is posted with no PR in its external id --
     # an id readiness can never match, on a lane that is supposed to block.
     needs: [generate, validate, adjudicate]
-    # `kirocrew-runners` larger-runner group, targeted by GROUP not label; see
-    # "Larger runners for the review lanes and CodeQL" in
-    # docs/ci/ci-and-reviews.md.
-    runs-on:
-      group: kirocrew-runners
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     # The only job with write scope, and the only one that never materializes or
     # runs code from either PR tree: it downloads artifacts and posts. The one
@@ -1991,7 +1978,7 @@ jobs:
           [ -z "${PR:-}" ] && { echo "no PR resolved; skipping comment"; exit 0; }
           MARKER="<!-- security-scope-review -->"
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
+          # lane; test_ai_review_workflows.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
@@ -2431,7 +2418,7 @@ jobs:
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
+          # byte-identically in every review lane; test_ai_review_workflows.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {

@@ -1,65 +1,109 @@
-"""A sign-out in one process stops a login pending in another from re-filling the vault.
-
-The gateway's in-memory epoch covers its own pending logins. ``kirocrew kas logout``
-runs in a shell, in a second process, with a second ``KasLoginService`` over the same
-vault; its sign-out must still stop a dashboard login that was pending in the gateway
-from persisting once the user approves the code. The store carries a sign-out
-generation every sign-out bumps; a login snapshots it when it begins and compares it
-before it writes. These tests drive two services over one store, the way the two
-processes do, and also pin the two sibling fixes the same round brought: a refresh
-keeps the token's recorded claims, and a refresh-rejected slot reads as signed out.
-"""
+"""A sign-out in another process fences an already-pending KAS login."""
 
 from __future__ import annotations
 
+import asyncio
+import errno
+import multiprocessing
+import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
-from kiro_crew.auth.refresh import ensure_fresh
+import kiro_crew.auth.store as store_module
+import kiro_crew.platform_compat as platform_compat
 from kiro_crew.auth.service import KasLoginService
-from kiro_crew.auth.store import KasToken, TokenStore
-from kiro_crew.auth.whoami import START_URL_EXTRA_KEY, resolve_signed_in
+from kiro_crew.auth.store import TokenStore, TokenStoreError
+from kiro_crew.platform_compat import file_lock, open_lock_file
+from kiro_crew.testing.wait import async_wait_until, await_until, default_timeout
 
 
-class _FakeResp:
-    def __init__(self, status: int, payload):
-        self.status = status
-        self._payload = payload
+class _Response:
+    def __init__(self, payload):
+        self.status = 200
+        self.payload = payload
 
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *a):
+    async def __aexit__(self, *_args):
         return False
 
-    async def json(self, *, content_type: str | None = "application/json"):
-        return self._payload
+    async def json(self, *, content_type="application/json"):
+        return self.payload
 
     async def text(self):
-        return str(self._payload)
+        return str(self.payload)
 
 
-class _FakeSession:
-    def __init__(self, responses):
-        self._responses = list(responses)
+class _Session:
+    def __init__(self, payloads):
+        self.responses = [_Response(payload) for payload in payloads]
+        self.closed = False
 
-    def post(self, url, *, json=None, data=None, headers=None):  # noqa: A002
-        return self._responses.pop(0)
-
-    @property
-    def closed(self):
-        return False
+    def post(self, *_args, **_kwargs):
+        return self.responses.pop(0)
 
     async def close(self):
-        return None
+        self.closed = True
+
+
+_AUTHORIZED = {
+    "status": "authorized",
+    "accessToken": "at-test",
+    "refreshToken": "rt-test",
+    "expiresIn": 3600,
+    "profileArn": "arn:aws:kiro:us-east-1:1:profile/p1",
+}
+
+
+def _hold_signout_lock(directory: str, acquired, holder_inside, release) -> None:
+    store = TokenStore(Path(directory))
+
+    def _hold() -> None:
+        holder_inside.set()
+        acquired.set()
+        try:
+            release.wait()
+        finally:
+            holder_inside.clear()
+
+    store.with_signout_lock(_hold)
+
+
+def _guard_action(
+    action,
+    holder_inside,
+    action_entered,
+    action_while_held,
+):
+    """Return an action that fails if another process still holds the lock."""
+
+    def _guarded_action():
+        if holder_inside.is_set():
+            action_while_held.set()
+            raise AssertionError("sign-out action ran while another process held the lock")
+        action_entered.set()
+        return action()
+
+    return _guarded_action
+
+
+def _signout_lock_is_held(path: Path) -> bool:
+    with open_lock_file(path, create=False) as fd:
+        try:
+            with file_lock(fd, wait=False):
+                return False
+        except BlockingIOError:
+            return True
 
 
 def _device_auth():
     from kiro_crew.auth.login import device
 
     return device.DeviceAuthorization(
-        device_code="dc-1",
+        device_code="dc-test",
         user_code="WXYZ-1234",
         verification_uri="https://app.kiro.dev/device",
         verification_uri_complete="https://app.kiro.dev/device?user_code=WXYZ-1234",
@@ -68,189 +112,258 @@ def _device_auth():
     )
 
 
-async def _begin_social(service: KasLoginService, monkeypatch) -> str:
+def _patch_device_start(monkeypatch):
     from kiro_crew.auth.login import device
 
-    async def _fake_initiate(provider, *, session):
+    async def _initiate(_provider, *, session):
         return _device_auth()
 
-    monkeypatch.setattr(device, "initiate_device_authorization", _fake_initiate)
-    return (await service.begin_device("google"))["login_id"]
-
-
-_AUTHORIZED = {
-    "status": "authorized",
-    "accessToken": "at-1",
-    "refreshToken": "rt-1",
-    "expiresIn": 3600,
-    "profileArn": "arn:aws:kiro:us-east-1:1:profile/p1",
-}
+    monkeypatch.setattr(device, "initiate_device_authorization", _initiate)
 
 
 @pytest.mark.asyncio
-async def test_a_sign_out_in_another_process_stops_a_pending_login_from_persisting(
+async def test_signout_in_a_second_service_rejects_late_poll_then_allows_new_login(
     tmp_path, monkeypatch
 ):
     store = TokenStore(tmp_path)
-    gateway = KasLoginService(store, session=_FakeSession([_FakeResp(200, _AUTHORIZED)]))
-    shell = KasLoginService(TokenStore(tmp_path))
+    gateway = KasLoginService(store, session=_Session([_AUTHORIZED, _AUTHORIZED]))
+    other_process = KasLoginService(TokenStore(tmp_path))
+    _patch_device_start(monkeypatch)
     try:
-        login_id = await _begin_social(gateway, monkeypatch)
-        # The shell signs out while the dashboard's code is still awaiting approval.
-        store.save(
-            KasToken(
-                access_token="old",
-                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
-                provider="BuilderId",
-                identity="builder_id",
-            )
-        )
-        await shell.logout("builder_id")
+        pending = await gateway.begin_device("google")
+        await other_process.logout("social")
+        late = await gateway.poll_device(pending["login_id"])
+        assert late == {"status": "error", "code": "signed_out_during_login"}
         assert store.resolve() is None
-        # The user approves the code; the gateway's poll must not re-fill the vault.
-        result = await gateway.poll_device(login_id)
+
+        fresh = await gateway.begin_device("google")
+        accepted = await gateway.poll_device(fresh["login_id"])
+        assert accepted["status"] == "authorized"
+        assert store.resolve() is not None
     finally:
         await gateway.close()
-        await shell.close()
-    assert result == {"status": "error", "code": "signed_out_during_login"}
-    assert store.resolve() is None
-    # Terminal for that login: it is gone from the pending table.
-    from kiro_crew.auth.service import UnknownLoginError
-
-    with pytest.raises(UnknownLoginError):
-        await gateway.poll_device(login_id)
+        await other_process.close()
 
 
 @pytest.mark.asyncio
-async def test_a_login_with_no_sign_out_in_between_persists(tmp_path, monkeypatch):
-    store = TokenStore(tmp_path)
-    gateway = KasLoginService(store, session=_FakeSession([_FakeResp(200, _AUTHORIZED)]))
-    try:
-        login_id = await _begin_social(gateway, monkeypatch)
-        result = await gateway.poll_device(login_id)
-    finally:
-        await gateway.close()
-    assert result["status"] == "authorized"
-    saved = store.resolve()
-    assert saved is not None and saved.identity == "social"
-
-
-def test_every_sign_out_moves_the_generation_and_an_absent_marker_reads_empty(tmp_path):
-    store = TokenStore(tmp_path)
-    assert store.signout_generation() == ""
-    store.bump_signout_generation()
-    first = store.signout_generation()
-    assert first
-    store.bump_signout_generation()
-    assert store.signout_generation() not in ("", first)
-
-
-@pytest.mark.asyncio
-async def test_a_refresh_keeps_the_recorded_start_url(tmp_path):
-    store = TokenStore(tmp_path)
-    stale = KasToken(
-        access_token="old",
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=10),
-        provider="Enterprise",
-        identity="identity_center",
-        refresh_token="rt",
-        profile_arn="arn:aws:kiro:eu-west-1:1:profile/p1",
-        region="eu-west-1",
-        client_id="cid",
-        client_secret="csec",
-        extra={START_URL_EXTRA_KEY: "https://acme.awsapps.com/start"},
-    )
-    store.save(stale)
-    out = await ensure_fresh(
-        store,
-        stale,
-        session=_FakeSession([_FakeResp(200, {"accessToken": "new", "expiresIn": 3600})]),
-    )
-    assert out.access_token == "new"
-    assert out.extra[START_URL_EXTRA_KEY] == "https://acme.awsapps.com/start"
-    reread = store.resolve()
-    assert (
-        reread is not None and reread.extra[START_URL_EXTRA_KEY] == "https://acme.awsapps.com/start"
-    )
-
-
-def test_a_refresh_rejected_slot_reads_as_signed_out(tmp_path):
-    store = TokenStore(tmp_path)
-    token = KasToken(
-        access_token="atk",
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-        provider="Enterprise",
-        identity="identity_center",
-        refresh_token="rt",
-        profile_arn="arn:aws:kiro:us-east-1:1:profile/p1",
-    )
-    store.save(token)
-    assert token.is_usable()  # a refresh token keeps the spawn predicate true
-    assert resolve_signed_in(store) is not None
-    store.mark_refresh_rejected("identity_center")
-    # Doctor and the card call this "sign-in expired"; so does the shell verb.
-    assert resolve_signed_in(store) is None
-
-
-def test_a_sign_out_whose_fence_cannot_be_written_reports_failure(tmp_path, monkeypatch):
-    """The marker is the cross-process fence; a sign-out must not publish success
-    while a pending approval elsewhere could still re-fill the vault."""
-    import asyncio
-
-    from kiro_crew.auth.store import TokenStoreError
-
-    store = TokenStore(tmp_path)
-    store.save(
-        KasToken(
-            access_token="atk",
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            provider="BuilderId",
-            identity="builder_id",
-        )
-    )
-
-    # A marker path under a FILE: the write fails with NotADirectoryError on every
-    # platform, with no permission bits to depend on.
-    blocker = tmp_path / "blocker"
-    blocker.write_text("x", encoding="utf-8")
-    monkeypatch.setattr(store, "_signout_generation_path", lambda: blocker / "signed-out")
-    with pytest.raises(TokenStoreError, match="sign-out generation"):
-        asyncio.run(KasLoginService(store).logout("builder_id"))
-
-
-@pytest.mark.asyncio
-async def test_a_loopback_login_that_fails_leaves_no_generation_row(tmp_path, monkeypatch):
-    """Every per-login table is keyed by one id and must leave together: a row left
-    in ``_signout_gen`` after the entry drops out of ``_pending`` is never swept."""
-    import asyncio
-
-    from kiro_crew.auth.login import portal
-    from kiro_crew.auth.service import _PendingLoopbackLogin
-    from kiro_crew.auth.store import SocialProvider
-
+async def test_signout_lock_failure_is_reported(tmp_path, monkeypatch):
     store = TokenStore(tmp_path)
     service = KasLoginService(store)
 
-    async def _fail() -> KasToken:
-        raise portal.PortalTimeoutError("nobody came back")
+    def _lock_failure(_action):
+        raise TokenStoreError("could not take the sign-out lock")
 
-    task = asyncio.ensure_future(_fail())
-    try:
-        await task
-    except portal.PortalTimeoutError:
-        pass
-    entry = _PendingLoopbackLogin(
-        task=task,
-        provider=SocialProvider.GOOGLE,
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=300),
+    monkeypatch.setattr(store, "with_signout_lock", _lock_failure)
+    with pytest.raises(TokenStoreError, match="sign-out lock"):
+        await service.logout("social")
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_logout_waits_for_a_signout_lock_held_by_another_process(tmp_path, monkeypatch):
+    context = multiprocessing.get_context("spawn")
+    acquired = context.Event()
+    holder_inside = context.Event()
+    release = context.Event()
+    holder = context.Process(
+        target=_hold_signout_lock,
+        args=(str(tmp_path), acquired, holder_inside, release),
     )
-    service._pending["lid-x"] = entry
-    service._signout_gen["lid-x"] = ""
+    store = TokenStore(tmp_path)
+    service = KasLoginService(store)
+    original_lock = store.with_signout_lock
+    original_acquire = store_module.acquire_lock
+    original_release = store_module.release_lock
+    lock_path = store.signout_lock_path()
+    lock_attempted = threading.Event()
+    collision_observed = threading.Event()
+    lock_acquired = threading.Event()
+    lock_acquired_while_held = threading.Event()
+    observed_acquire_fd = [None]
+    action_entered = threading.Event()
+    action_while_held = threading.Event()
+    no_op_lock_attempted = threading.Event()
+    no_op_continue = threading.Event()
+    no_op_action_entered = threading.Event()
+    no_op_action_while_held = threading.Event()
+    no_op_logout = None
+    logout = None
+    holder_started = False
+
+    def _no_op_acquire(_fd, *, exclusive=True):
+        no_op_lock_attempted.set()
+        if not no_op_continue.wait(default_timeout()):
+            raise AssertionError("no-op lock continuation was not released")
+        return None
+
+    def _no_op_release(_fd):
+        return None
+
+    def _guard_with(action, action_entered_event, action_while_held_event):
+        return original_lock(
+            _guard_action(
+                action,
+                holder_inside,
+                action_entered_event,
+                action_while_held_event,
+            )
+        )
+
+    def _guarded_no_op_lock(action):
+        return _guard_with(action, no_op_action_entered, no_op_action_while_held)
+
+    def _guarded_lock(action):
+        return _guard_with(action, action_entered, action_while_held)
+
+    def _observed_acquire(fd, *, exclusive=True):
+        observed_acquire_fd[0] = fd
+        lock_attempted.set()
+        result = original_acquire(fd, exclusive=exclusive)
+        if holder_inside.is_set():
+            lock_acquired_while_held.set()
+        lock_acquired.set()
+        return result
+
+    monkeypatch.setattr(store, "with_signout_lock", _guarded_no_op_lock)
     try:
-        result = await service.poll_device("lid-x")
+        holder.start()
+        holder_started = True
+        await async_wait_until(
+            lambda: acquired.is_set() or holder.exitcode is not None,
+            off_loop=True,
+            describe=lambda: f"holder exitcode={holder.exitcode}",
+        )
+        assert acquired.is_set(), "child exited without acquiring the sign-out lock"
+        assert holder_inside.is_set()
+
+        # Force the no-op service call to resume from its acquire point only after
+        # the child owns the actual file lock. Keep that holder in place until the
+        # service action itself proves the no-op would enter the critical section.
+        monkeypatch.setattr(store_module, "acquire_lock", _no_op_acquire)
+        monkeypatch.setattr(store_module, "release_lock", _no_op_release)
+        no_op_logout = asyncio.create_task(service.logout("social"))
+        await async_wait_until(
+            lambda: no_op_lock_attempted.is_set() or no_op_logout.done(),
+            describe=lambda: (
+                f"no_op_lock_attempted={no_op_lock_attempted.is_set()}, "
+                f"logout_done={no_op_logout.done()}"
+            ),
+        )
+        assert no_op_lock_attempted.is_set(), "no-op service path did not reach acquire"
+        no_op_continue.set()
+        await async_wait_until(
+            lambda: no_op_action_while_held.is_set() or no_op_logout.done(),
+            describe=lambda: (
+                f"action_while_held={no_op_action_while_held.is_set()}, "
+                f"logout_done={no_op_logout.done()}"
+            ),
+        )
+        assert no_op_action_while_held.is_set(), (
+            "service action did not reject a no-op lock while another process held it"
+        )
+        assert not no_op_action_entered.is_set()
+        try:
+            await await_until(
+                no_op_logout,
+                what="no-op service path rejecting an unlocked critical section",
+            )
+        except AssertionError as exc:
+            assert "another process held the lock" in str(exc)
+        else:
+            pytest.fail("the service path proceeded with a no-op process lock")
+
+        monkeypatch.setattr(store_module, "acquire_lock", original_acquire)
+        monkeypatch.setattr(store_module, "release_lock", original_release)
+        monkeypatch.setattr(store, "with_signout_lock", _guarded_lock)
+        action_while_held.clear()
+
+        # Observe contention from the OS lock attempt made by original_acquire.
+        # A Python-level signal before calling it would let cleanup release the
+        # child between that signal and the actual lock operation.
+        if platform_compat.IS_POSIX:
+            original_flock = platform_compat.fcntl.flock
+
+            def _observed_flock(fd, operation):
+                try:
+                    return original_flock(fd, operation)
+                except BlockingIOError:
+                    if (
+                        fd == observed_acquire_fd[0]
+                        and operation & platform_compat.fcntl.LOCK_NB
+                        and holder_inside.is_set()
+                    ):
+                        collision_observed.set()
+                    raise
+
+            monkeypatch.setattr(platform_compat.fcntl, "flock", _observed_flock)
+        else:
+            original_msvcrt_locking = platform_compat.msvcrt.locking
+            busy_errnos = (errno.EACCES, getattr(errno, "EDEADLOCK", errno.EDEADLK))
+
+            def _observed_msvcrt_locking(fd, mode, count):
+                try:
+                    return original_msvcrt_locking(fd, mode, count)
+                except OSError as exc:
+                    if (
+                        fd == observed_acquire_fd[0]
+                        and mode == platform_compat.msvcrt.LK_NBLCK
+                        and count == 1
+                        and exc.errno in busy_errnos
+                        and holder_inside.is_set()
+                    ):
+                        collision_observed.set()
+                    raise
+
+            monkeypatch.setattr(platform_compat.msvcrt, "locking", _observed_msvcrt_locking)
+
+        monkeypatch.setattr(store_module, "acquire_lock", _observed_acquire)
+        logout = asyncio.create_task(service.logout("social"))
+        await async_wait_until(
+            lambda: collision_observed.is_set() or logout.done(),
+            describe=lambda: (
+                f"lock_attempted={lock_attempted.is_set()}, "
+                f"collision_observed={collision_observed.is_set()}, "
+                f"logout_done={logout.done()}"
+            ),
+        )
+        assert lock_attempted.is_set(), "logout completed without reaching the process lock"
+        assert collision_observed.is_set(), (
+            "service acquire did not observe the child's held file lock before release"
+        )
+        assert holder_inside.is_set()
     finally:
-        await service.close()
-    assert result["code"] == "loopback_timeout"
-    assert "lid-x" not in service._pending
-    assert "lid-x" not in service._signout_gen
-    assert "lid-x" not in service._replaces
+        release.set()
+        no_op_continue.set()
+        try:
+            if no_op_logout is not None and not no_op_logout.done():
+                try:
+                    await await_until(
+                        no_op_logout,
+                        what="no-op service path after test-controlled continuation",
+                    )
+                except AssertionError:
+                    pass
+            if logout is not None:
+                await await_until(logout, what="logout after the process lock is released")
+        finally:
+            try:
+                await service.close()
+            finally:
+                if holder_started:
+                    await asyncio.to_thread(holder.join, default_timeout())
+                    if holder.is_alive():
+                        holder.terminate()
+                        await asyncio.to_thread(holder.join, default_timeout())
+                    if holder.is_alive():
+                        holder.kill()
+                        await asyncio.to_thread(holder.join, default_timeout())
+                    assert not holder.is_alive(), (
+                        "lock-holder process survived bounded terminate and kill joins"
+                    )
+    assert holder.exitcode == 0
+    assert lock_acquired.is_set()
+    assert not lock_acquired_while_held.is_set(), (
+        "service acquire returned while another process still held the lock"
+    )
+    assert action_entered.is_set()
+    assert not action_while_held.is_set()

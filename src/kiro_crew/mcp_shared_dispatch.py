@@ -177,7 +177,6 @@ def _run_stdio_dispatch_loop(
     advertise_caller_identity: bool = False,
     error_prefix_is_error: bool = False,
     reports_inflight: bool = False,
-    instructions: str = "",
 ) -> bool:
     """Read/dispatch body of :func:`run_mcp_stdio_loop`.
 
@@ -587,7 +586,7 @@ def _run_stdio_dispatch_loop(
                 # gatewayd injects the per-call ``_meta.kirocrew.caller`` block
                 # only into a backend that advertised this capability, and
                 # nothing declines to POOL one that did not (see
-                # ``rewriter.UNPOOLABLE_SERVERS``, which lists only credential vendors and documents
+                # ``rewriter.UNPOOLABLE_SERVERS``, which is empty and documents
                 # exactly that). So NOT advertising does not buy a per-session
                 # spawn -- it buys a shared process whose dispatch-loop caller
                 # slot never receives gateway-authored metadata, which is how a
@@ -602,14 +601,14 @@ def _run_stdio_dispatch_loop(
             if _experimental:
                 _caps["experimental"] = _experimental
             _client_wants_inflight = _sends_inflight and _declares_inflight_capability(params)
-            _init_result: dict[str, Any] = {
-                "protocolVersion": "2024-11-05",
-                "capabilities": _caps,
-                "serverInfo": {"name": server_name, "version": server_version},
-            }
-            if instructions:
-                _init_result["instructions"] = instructions
-            respond(req_id, _init_result)
+            respond(
+                req_id,
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": _caps,
+                    "serverInfo": {"name": server_name, "version": server_version},
+                },
+            )
         elif method == "notifications/initialized":
             pass
         elif method == "notifications/cancelled":
@@ -903,28 +902,19 @@ def _run_stdio_dispatch_loop(
             ):
                 # The agent's spec grants this server tool by tool and opted in
                 # to having those refs honoured; a tool it did not name is not
-                # this agent's, listed or not. An EMPTY include is a server the
-                # spec withholds whole (``managedToolPolicy.excludeServers``).
-                _whole = not _included
+                # this agent's, listed or not.
                 sel().log_tool_invocation(
                     session_key=_policy_session,
                     source="mcp",
                     tool_name=tool_name,
                     tool_kind=server_name,
                     outcome="rejected_not_included",
-                    error=(
-                        "managedToolPolicy.excludeServers"
-                        if _whole
-                        else "managedToolPolicy.honourToolRefs"
-                    ),
+                    error="managedToolPolicy.honourToolRefs",
                 )
                 respond(
                     req_id,
                     _tool_response(
                         f"Error: tool '{tool_name}' is not available for this agent: its "
-                        f"spec withholds every {server_name} tool"
-                        if _whole
-                        else f"Error: tool '{tool_name}' is not available for this agent: its "
                         f"spec grants {server_name} only through @{server_name}/<tool> refs "
                         f"and does not name this one"
                     ),

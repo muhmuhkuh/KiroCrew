@@ -11,7 +11,6 @@ import { findReport } from '../utils/errorReport'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
 import { DropdownMenuSub, DropdownMenuSubTrigger, DropdownMenuSubContent, DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent, ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
-import { slotRowByKey } from '../store/slotIndex'
 
 type SourceLink = NonNullable<ChatSlot['source_links']>[number]
 const unlinkKey = (slotKey: string) => ['unlink-source-link', slotKey]
@@ -91,7 +90,7 @@ export default function SourceLinksSubmenu({ slotKey, variant }: {
   const errorId = useId()
   const connected = useConnected()
   const store = useAppStore()
-  const slot = useAppSelector(s => slotRowByKey(s.dashboard.slots, slotKey))
+  const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const links = slot?.source_links ?? []
   const total = slot?.source_links_total
   // Stable identity of the session CURRENTLY behind ``slotKey``. It must change

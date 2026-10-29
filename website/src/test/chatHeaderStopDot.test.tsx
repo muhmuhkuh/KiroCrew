@@ -152,7 +152,7 @@ describe('ChatPane header status dot — #20397', () => {
     await killing.findByTestId('chat-pane-status-caption')
     const killingCaption = killing.getByTestId('chat-pane-status-caption')
     expect(killingCaption).toHaveClass('text-danger')
-    expect(killingCaption.textContent).toMatch(/Force stopping/)
+    expect(killingCaption.textContent).toMatch(/Killing/)
   })
 
   it('an idle pane with a stale slots-frame stopping flag shows no red dot and no caption', async () => {

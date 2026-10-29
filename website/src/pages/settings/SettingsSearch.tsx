@@ -102,7 +102,7 @@ export default function SettingsSearch() {
 
   // Shared Arrow/Enter/Escape handling. Escape closes the dropdown only —
   // focus never leaves the input, so the user can keep typing.
-  const { selected, setSelected, itemRefs, hoverSelect } = useListKeyboardNav({
+  const { selected, setSelected, itemRefs } = useListKeyboardNav({
     open,
     count: results.length,
     wrap: true,
@@ -198,7 +198,7 @@ export default function SettingsSearch() {
               tabIndex={-1}
               ref={el => { itemRefs.current[i] = el }}
               className={`px-3 py-2 cursor-pointer transition-colors ${i === selected ? 'bg-accent-subtle' : 'hover:bg-bg-hover'}`}
-              onMouseMove={e => hoverSelect(i, e)}
+              onMouseEnter={() => setSelected(i)}
               onMouseDown={e => { e.preventDefault(); activate(m) }}
             >
               <div className={`text-[13px] font-medium text-text-strong ${inNav ? 'break-words' : 'truncate'}`}>{m.label}</div>

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import logging
 import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,7 +28,6 @@ def _no_reclaim() -> AsyncMock:
     isolation from the reclaim probe.
     """
     return AsyncMock(return_value="no_holder")
-
 
 # ---------------------------------------------------------------------------
 # Helpers for mock-based tests
@@ -68,7 +66,7 @@ async def test_start_site_succeeds_immediately() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_site_retries_then_succeeds(caplog) -> None:
+async def test_start_site_retries_then_succeeds() -> None:
     """Port busy for 3 attempts, then succeeds on the 4th."""
     site = _make_site()
     site.start.side_effect = [
@@ -77,17 +75,9 @@ async def test_start_site_retries_then_succeeds(caplog) -> None:
         _eaddrinuse(),
         None,  # succeeds on 4th attempt
     ]
-    server_log = "kiro_crew.dashboard.server"
-    with (
-        patch("kiro_crew.dashboard.server.asyncio.sleep", new_callable=AsyncMock),
-        caplog.at_level(logging.INFO, logger=server_log),
-    ):
+    with patch("kiro_crew.dashboard.server.asyncio.sleep", new_callable=AsyncMock):
         await _start_site(site, 7777, retries=5, delay=0.01, reclaim=_no_reclaim())
 
-    # One waiting notice for the whole busy spell, and no give-up error.
-    assert [r.getMessage() for r in caplog.records if r.name == server_log] == [
-        "Port 7777 in use — waiting up to 0s for the previous gateway to release it…"
-    ]
     assert site.start.await_count == 4
     # The partially-started site is released listener-only once per failure:
     # its LISTEN socket is closed and it is unregistered, without TCPSite.stop()

@@ -62,7 +62,7 @@ hooks, the disable path has to spell it out.
 | POST | `/calibrate` | owner | prove the ruler (Phase 1) before any improvement cycle |
 | GET | `/progress` | enabled | the cumulative-best staircase for the chart |
 | GET | `/events` | enabled | server-sent live run events |
-| GET | `/deps` | enabled | external tool availability (git / gh / pytest in the gate interpreter / ruff) |
+| GET | `/deps` | enabled | external tool availability (git / gh / ruff) |
 | POST | `/deps/install` | owner | install the optional linter |
 | POST | `/draft-pr/{fp}` | owner | draft a PR from an already-queued change |
 | GET | `/profiles` | enabled | every captured profiler frame tree |
@@ -521,7 +521,7 @@ widened to `$HOME`: the interpreter's own stdlib can live there — hiding `~/.l
 `import platform`.
 
 **What remains open**: arbitrary same-user files elsewhere (`~/notes.txt`) are still writable.
-Kiro Crew's own home is sealed per leaf (`sandbox_leaves.py` marks each crew-home leaf hidden,
+Kiro Crew's own home is sealed per leaf (`sandbox.py` marks each crew-home leaf hidden,
 read-only or visible), but `kiro_crew.sandbox` has no general write confinement for arbitrary
 same-user files, and adding one changes the shared sandbox for every caller. Failing closed at
 `profile._run` until then would disable the entire bug track (no test could run at all).

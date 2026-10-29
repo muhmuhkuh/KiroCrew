@@ -824,24 +824,38 @@ def test_projection_lock_covers_alias_publication_and_pruning(native_tree, monke
 def test_concurrent_threads_of_one_process_queue_instead_of_timing_out(tmp_path, monkeypatch):
     """N starts in ONE gateway must not each race the file lock on its own clock.
 
-    Each holder keeps the lock 0.15 s and the file-lock ceiling is 0.3 s, so
-    eight threads racing the file lock directly exceed it; queued in-process,
-    each one's file-lock wait is near zero.
+    The first holder releases only after all eight threads have reached the
+    in-process queue, so contention is established without a wall-clock delay.
     """
     monkeypatch.setattr(projection, "_PROJECTION_LOCK_TIMEOUT_SECS", 0.3)
     directory = tmp_path / "agents"
     failures: list[BaseException] = []
     start = threading.Barrier(8)
+    local = projection._in_process_projection_lock(directory)
+    attempted = 0
+    count_lock = threading.Lock()
+    all_attempted = threading.Event()
+
+    class ObservedLock:
+        def acquire(self, *, timeout):
+            nonlocal attempted
+            with count_lock:
+                attempted += 1
+                if attempted == 8:
+                    all_attempted.set()
+            return local.acquire(timeout=timeout)
+
+        def release(self):
+            local.release()
+
+    monkeypatch.setattr(projection, "_in_process_projection_lock", lambda _dir: ObservedLock())
 
     def hold() -> None:
-        # flake-ok: the eight holders meet at the barrier so they contend at once; each join below is bounded at 30 s
-        start.wait()
         try:
+            start.wait(timeout=30)
             with projection._projection_alias_lock(directory):
-                # flake-ok: the 0.15 s hold is the subject; eight holders queued in-process stay under the 0.3 s file-lock ceiling
-                # nosemgrep: kirocrew.test-sleep-as-barrier -- the hold time under the lock is the subject, not a barrier
-                time.sleep(0.15)
-        except OSError as exc:
+                assert all_attempted.wait(timeout=30), "threads never reached the local queue"
+        except BaseException as exc:
             failures.append(exc)
 
     threads = [threading.Thread(target=hold) for _ in range(8)]

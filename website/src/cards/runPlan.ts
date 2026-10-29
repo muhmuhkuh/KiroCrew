@@ -45,9 +45,8 @@ export function fillBody(step: CardPlanStep, inputs: Record<string, string>, res
   if (!step.fill?.length || !step.body || typeof step.body !== 'object') return step.body
   const out = { ...(step.body as Record<string, unknown>) }
   for (const f of step.fill) {
-    if (f.source === 'step' && f.in === 'path') continue
     if (f.source === 'user') out[f.field] = inputs[f.field] ?? ''
-    else {
+    else if (f.in !== 'path') {
       const res = responses[f.step]
       out[f.field] = res && typeof res === 'object' ? (res as Record<string, unknown>)[f.key] : undefined
     }
@@ -55,22 +54,24 @@ export function fillBody(step: CardPlanStep, inputs: Record<string, string>, res
   return out
 }
 
-/** A `{{stepN.key}}` token in a planned path: a wire spelling, never copy. */
-const STEP_PLACEHOLDER = /\{\{step(\d+)\.([A-Za-z0-9_]+)\}\}/g
-
-/**
- * The path a step is sent to: the planned path with each `in: 'path'` fill's
- * `{{stepN.key}}` placeholder replaced by that earlier step's response value,
- * encoded as one segment. The gateway checks the value is what that step returned.
- */
+/** Resolve declared earlier-step fills in the URL, encoding each as one segment. */
 export function fillPath(step: CardPlanStep, responses: unknown[]): string {
   let path = step.path
   for (const f of step.fill ?? []) {
     if (f.source !== 'step' || f.in !== 'path') continue
-    const res = responses[f.step]
-    const value = res && typeof res === 'object' ? (res as Record<string, unknown>)[f.key] : undefined
-    const filled = encodeURIComponent(typeof value === 'string' ? value : '')
-    path = path.replace(STEP_PLACEHOLDER, (token, n: string, key: string) => (Number(n) === f.step && key === f.key ? filled : token))
+    const response = responses[f.step]
+    if (!response || typeof response !== 'object' || !Object.prototype.hasOwnProperty.call(response, f.key)) {
+      throw new Error('Missing earlier response field "' + f.key + '" for path fill "' + f.field + '".')
+    }
+    const value = (response as Record<string, unknown>)[f.key]
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      throw new Error('Path fill "' + f.field + '" must be a string or number.')
+    }
+    const placeholder = '{{step' + f.step + '.' + f.key + '}}'
+    if (!path.includes(placeholder)) {
+      throw new Error('Path fill "' + f.field + '" has no placeholder in the planned path.')
+    }
+    path = path.replaceAll(placeholder, encodeURIComponent(String(value)))
   }
   return path
 }
@@ -88,7 +89,8 @@ export async function runCardPlan(card: Card, op: CardOp, opts: RunOptions = {})
     for (;;) {
       let response: unknown
       try {
-        response = await sendCardStep(card, op, i, { ...step, path: fillPath(step, responses) }, fillBody(step, inputs, responses))
+        const filledStep = { ...step, path: fillPath(step, responses) }
+        response = await sendCardStep(card, op, i, filledStep, fillBody(step, inputs, responses))
       } catch (error) {
         return { ok: false, step: i, error }
       }

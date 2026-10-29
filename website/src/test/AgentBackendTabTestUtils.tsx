@@ -59,7 +59,6 @@ export function probeRow(
     installed: string
     missing_components: string[]
     install_command: string
-    found_version: string
     restart_required: boolean
     auth: { sign_in_remedy: string; signs_in_separately: boolean }
     capabilities: {

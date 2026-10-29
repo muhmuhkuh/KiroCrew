@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { sortSkills } from '../pages/overview/skillSort'
 import type { Skill } from '../types'
@@ -25,7 +25,7 @@ vi.mock('../components/SkillDirectoryBrowser', () => ({
 
 import SkillsTab from '../pages/overview/SkillsTab'
 
-const NOW_S = Math.floor(Date.now() / 1000)
+const NOW_S = 1_791_091_200
 
 const skill = (key: string, deliveries: number | null, lastUsedAgoS: number | null): Skill => ({
   key,
@@ -58,7 +58,10 @@ function mount(skills: Skill[]) {
 const rowOrder = () =>
   screen.getAllByRole('button', { name: /^Select / }).map(r => r.getAttribute('aria-label')?.replace('Select ', ''))
 
+afterEach(() => vi.useRealTimers())
+
 beforeEach(() => {
+  vi.setSystemTime(NOW_S * 1000)
   Object.values(mockApi).forEach(m => m.mockReset())
   mockApi.skill.mockResolvedValue({ name: 'x', content: '---\nname: x\n---\nbody' })
   mockApi.skillsPending.mockResolvedValue({ skills: [] })

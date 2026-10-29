@@ -13,7 +13,7 @@ import {
 
 const EMPTY_QUERY: RosterQuery = { search: '', starredOnly: false, source: 'all', status: new Set(), sort: 'recent' }
 
-const IDLE: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false, goal: false }
+const IDLE: MemberSignals = { running: false, needsYou: false, unread: false, patrolling: false }
 const SIGNALS: Record<string, MemberSignals> = {
   conductor: { ...IDLE, running: true, patrolling: true },
   kirocrew: { ...IDLE, needsYou: true },
@@ -98,20 +98,18 @@ describe('narrowRoster', () => {
   })
 })
 
-/** A roster as a real host serves it. `has_dm_message` is the DM thread holding
- *  a message, whoever sent it; `dashboard_created` is a crewmate the person
- *  created (source kirocrew AND a member id), listed even with an empty chat;
- *  `has_user_dm_message` is the reserved `default` row's own, stricter signal. */
+/** A roster as a real host serves it. A deliberate dashboard-created row is
+ *  visible even before its greeting lands. The reserved default uses the
+ *  user-only marker when the gateway provides it. */
 const NO = { dashboard_created: false, has_dm_message: false }
 const MIXED = [
-  // The reserved default member, no message the person sent -> hidden.
+  // The reserved default: no user-sent message -> hidden.
   { name: 'default', ...NO, has_user_dm_message: false, source: 'builtin' },
   // Dashboard-created, greeting never landed, but starred: listed.
   { name: 'radar', display_name: 'Issue Radar', ...NO, dashboard_created: true, source: 'kirocrew', starred: true },
   // Dashboard-created AND a message in the thread: listed.
   { name: 'oncall', dashboard_created: true, has_dm_message: true, source: 'kirocrew' },
-  // Created by the person (on the page, or by approving Mate's card), chat
-  // never opened, not starred -> listed: the person asked for it.
+  // Deliberately dashboard-created; greeting never landed, still listed.
   { name: 'fresh', ...NO, dashboard_created: true, source: 'kirocrew' },
   // Legacy kirocrew row: no member id, no message -> hidden.
   { name: 'legacy-aim', ...NO, source: 'kirocrew' },
@@ -134,38 +132,19 @@ describe('listedByDefault / rosterShows', () => {
     expect(listedByDefault(byName('radar'))).toBe(true)
     expect(listedByDefault(byName('older-gateway'))).toBe(true)
   })
-  it('hides an empty thread on every auto-generated row: default, app, sync, legacy', () => {
-    for (const n of ['default', 'app-bot', 'pkg-tool', 'legacy-aim']) expect(listedByDefault(byName(n))).toBe(false)
-  })
-  it('lists a crewmate the person created even while its chat is empty and never opened', () => {
+  it('lists an empty dashboard-created row and hides empty app, sync and legacy rows', () => {
     expect(listedByDefault(byName('fresh'))).toBe(true)
-    // The same empty thread on a row the person did not create stays hidden.
-    expect(listedByDefault({ ...byName('fresh'), dashboard_created: false })).toBe(false)
+    for (const n of ['app-bot', 'pkg-tool', 'legacy-aim']) expect(listedByDefault(byName(n))).toBe(false)
   })
-  it('lists the reserved default member only once the person sent it a message', () => {
-    const base = { name: 'default', source: 'builtin', dashboard_created: false }
-    // A gateway welcome, a scheduled run or a relay filled the thread: still hidden.
-    expect(listedByDefault({ ...base, has_dm_message: true, has_user_dm_message: false })).toBe(false)
-    expect(listedByDefault({ ...base, has_dm_message: false, has_user_dm_message: false })).toBe(false)
-    expect(listedByDefault({ ...base, has_dm_message: true, has_user_dm_message: true })).toBe(true)
-    // Even a row that looks person-created never lists default by that alone.
-    expect(listedByDefault({ ...base, source: 'kirocrew', dashboard_created: true, has_dm_message: false, has_user_dm_message: false })).toBe(false)
-    // Starring it is the person's own mark.
-    expect(listedByDefault({ ...base, has_dm_message: false, has_user_dm_message: false, starred: true })).toBe(true)
-    // An older gateway sends no has_user_dm_message: its has_dm_message rule stands.
-    expect(listedByDefault({ ...base, has_dm_message: true })).toBe(true)
-  })
-  it('an upgraded roster whose default thread holds only gateway rows lists only Mate', () => {
-    const upgraded = [
-      { name: 'default', source: 'builtin', has_dm_message: true, has_user_dm_message: false },
-      { name: 'mate', ...NO, source: 'builtin' },
-      { name: 'kirocrew-conductor', ...NO, source: 'builtin' },
-    ]
-    expect(names(rosterPopulation(upgraded, EMPTY_QUERY))).toEqual(['mate'])
+  it('uses the user-only marker for default and falls back for older gateways', () => {
+    const defaultRow = byName('default')
+    expect(listedByDefault({ ...defaultRow, has_dm_message: true, has_user_dm_message: false })).toBe(false)
+    expect(listedByDefault({ ...defaultRow, has_dm_message: true, has_user_dm_message: true })).toBe(true)
+    expect(listedByDefault({ ...defaultRow, has_dm_message: true, has_user_dm_message: undefined })).toBe(true)
   })
   it('lists Mate, the first mate, from the start; a fresh roster shows Mate and not the default mate', () => {
     const fresh = [
-      { name: 'default', ...NO, has_user_dm_message: false, source: 'builtin' },
+      { name: 'default', ...NO, source: 'builtin' },
       { name: 'mate', ...NO, source: 'builtin' },
     ]
     expect(names(rosterPopulation(fresh, EMPTY_QUERY))).toEqual(['mate'])

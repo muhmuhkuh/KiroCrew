@@ -219,14 +219,7 @@ def test_a_collapsed_tool_call_id_records_no_credential_source() -> None:
 
     from kiro_crew.dashboard import chat_runner
 
-    source = "\n".join(
-        turn_file.read_text(encoding="utf-8")
-        for turn_file in [
-            *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-            Path(chat_runner.__file__),
-        ]
-        if turn_file.name != "__init__.py"
-    )
+    source = Path(chat_runner.__file__).read_text(encoding="utf-8")
     assert "if event.tool_output_credentials and _tcid_identifies:" in source
     assert "if event.tool_output_credentials:\n" not in source
 

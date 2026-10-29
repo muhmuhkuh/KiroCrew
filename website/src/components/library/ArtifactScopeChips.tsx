@@ -7,7 +7,6 @@ import { useAppSelector } from '../../store'
 import type { ChatFolder } from '../../types'
 import { i18nT } from '../../i18n/t'
 import type { ReactNode } from 'react'
-import { slotRowByKey } from '../../store/slotIndex'
 
 /** The query parameters that narrow the library to a chat's involvement. */
 export type ArtifactChatScopeParam = 'touched_by' | 'chat_folder'
@@ -31,7 +30,7 @@ export default function ArtifactScopeChips({ touchedBy, chatFolder, onClear, ask
   askAgent?: boolean
 }) {
   const chatTitle = useAppSelector(
-    s => (touchedBy ? slotRowByKey(s.dashboard.slots, touchedBy)?.title || '' : ''),
+    s => (touchedBy ? s.dashboard.slots.find(x => x.key === touchedBy)?.title || '' : ''),
   )
   // The sidebar's own folder cache; fetched only when a folder scope needs a name.
   const { data: chatFolders, error: chatFoldersError } = useQuery<ChatFolder[]>({

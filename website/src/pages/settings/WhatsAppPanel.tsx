@@ -270,12 +270,10 @@ function GroupRow({
     if (next !== group.rules) onChange({ ...group, rules: next })
   }
   const commitCooldown = () => {
-    const raw = cooldown.trim()
-    const next = Math.max(0, Math.floor(Number(raw)))
+    const next = Math.max(0, Math.floor(Number(cooldown)))
     // A field emptied or filled with text is not a zero cooldown, zero means
     // "no rate limit at all", which is the opposite of a cautious default.
-    // `Number('')` is 0, so the empty case needs its own check.
-    if (raw === '' || !Number.isFinite(next)) {
+    if (!Number.isFinite(next)) {
       setCooldown(String(group.cooldown_s))
       return
     }

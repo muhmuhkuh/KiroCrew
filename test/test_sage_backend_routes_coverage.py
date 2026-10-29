@@ -350,12 +350,12 @@ class TestRunHeadline(_SageRoutesBase):
                 side_effect=self.mod.adapters.AdapterError("nope")):
             headline = self.mod._run_headline(
                 {"changes": ["https://github.com/acme/repo/pull/oops"]})
-        self.assertEqual(headline, "acme/repo/pull/oops")
+        self.assertEqual(headline, "https://github.com/acme/repo/pull/oops")
 
     def test_multi_change_run_without_repo_is_a_bare_count(self):
         self.assertEqual(
-            self.mod._run_headline({"changes": ["a", "b", "c"]}), "3 PRs")
-        self.assertEqual(self.mod._run_headline({}), "0 PRs")
+            self.mod._run_headline({"changes": ["a", "b", "c"]}), "3 changes")
+        self.assertEqual(self.mod._run_headline({}), "0 changes")
 
 
 class TestNotifyFinished(_SageRoutesBase):

@@ -70,6 +70,7 @@ from typing import Any, Mapping
 from kiro_crew.acp import session_mcp
 from kiro_crew.acp.session_mcp import CONTROL_PLANE_SERVERS, session_mcp_projection
 from kiro_crew.acp_backends import ACP_BACKEND_CODEX
+from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
 from kiro_crew.members import MEMBER_DISPATCH_SERVER
 from kiro_crew.providers.mirrors.base import (
     AgentConfigMirror,
@@ -88,6 +89,28 @@ from kiro_crew.providers.mirrors.identity import (
 logger = logging.getLogger(__name__)
 
 _D = Disposition
+
+
+def _work_ledger_server_name() -> str:
+    """Return the canonical Work-Ledger server name without an import cycle."""
+    from kiro_crew.mcp_work import SERVER_NAME
+
+    return SERVER_NAME
+
+
+def _stub_has_session_identity(element: Mapping[str, Any], session_token: str) -> bool:
+    """Check that a pooled stub carries exactly this ACP session's token."""
+    if not session_token:
+        return False
+    raw_env = element.get("env")
+    if not isinstance(raw_env, list):
+        return False
+    tokens = [
+        pair.get("value")
+        for pair in raw_env
+        if isinstance(pair, Mapping) and pair.get("name") == STUB_SESSION_TOKEN_ENV
+    ]
+    return tokens == [session_token]
 
 #: The transport every ACP agent MUST support, so it needs no advertisement. An
 #: element with no ``type`` at all is this one: ACP v1 spells ``McpServer`` as
@@ -360,6 +383,8 @@ def codex_projection(
         stub_server_names=stub_server_names,
         work_dir=work_dir,  # type: ignore[arg-type]
     )
+    identity_bound = _identity_bound_crew_servers()
+    work_ledger_server = _work_ledger_server_name()
     withheld = codex_withheld_servers(projection.restricted)
     kept: list[dict[str, Any]] = []
     for element in projection.servers:
@@ -391,16 +416,23 @@ def codex_projection(
         if not isinstance(stub, Mapping):
             continue
         name = stub.get("name")
-        # A dashboard stub is produced by the gateway rewriter, which rebuilds
-        # managed launches and verifies each caller. Keep the spec restrictions.
-        if name in withheld and not (
+        work_ledger_stub = (
+            name == work_ledger_server
+            and name in identity_bound
+            and name not in projection.restricted
+            and _stub_has_session_identity(stub, session_token)
+        )
+        dashboard_stub = (
             name == MEMBER_DISPATCH_SERVER
             and name not in projection.restricted
             and name not in projection.disabled_servers
+        )
+        if (name == work_ledger_server and not work_ledger_stub) or (
+            name in withheld and not dashboard_stub and not work_ledger_stub
         ):
             logger.warning(
-                "codex session MCP: withholding pooled stub %r -- the projection withheld "
-                "the server it wraps, and a stub re-adds it unrestricted",
+                "Codex-Sitzungs-MCP: Pool-Stub %r wird gesperrt; die Projektion hat "
+                "den eingeschränkten Server gesperrt oder dem Work-Stub fehlt das Token dieser Sitzung",
                 name,
             )
             continue

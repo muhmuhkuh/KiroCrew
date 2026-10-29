@@ -177,9 +177,7 @@ describe('context-usage readout', () => {
     )
   }
   const readout = () => screen.getByRole('button', { name: /context usage/i })
-  // The popover has no heading of its own; its "Remaining" row is only in the
-  // DOM while it is open.
-  const popoverShown = () => screen.queryByText('Remaining') !== null
+  const popoverShown = () => screen.queryByText(/Context window/i) !== null
 
   it('opens on the press, stays open through the release, and a second press closes it', async () => {
     render(<Host />)

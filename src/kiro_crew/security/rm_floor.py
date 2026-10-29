@@ -151,8 +151,8 @@ def _segments(command: str, track: bool = True) -> "list[str]":
 def _rm_wipe_targets(command: str) -> "set[str]":
     """The targets (``root`` / ``home``) a recursive-force ``rm`` in *command* wipes."""
     kinds: set[str] = set()
-    # read with and without ``${…}`` tracking: the untracked reading is the
-    # base one, so tracking can only add refusals
+    # Read with and without ``${…}`` tracking: the untracked reading is the base
+    # one, so tracking can only add refusals.
     for segment in [*_segments(command), *_segments(command, track=False)]:
         words = _shell._shell_tokens(segment)
         while words:
@@ -169,14 +169,14 @@ def _rm_wipe_targets(command: str) -> "set[str]":
                     words = words[1:]
                 continue
             if _SUBST in words[0]:
-                # a substitution in command position may expand to nothing
+                # A substitution in command position may expand to nothing.
                 bare = words[0].replace(_SUBST, "")
                 words = [bare, *words[1:]] if bare else words[1:]
                 continue
             bare = _PARAM_RE.sub("", words[0])
             if bare != words[0] and _shell._program_basename(words[0]) != "rm":
                 # ``${x}rm`` runs ``rm`` when ``x`` is unset; a word already read
-                # as ``rm`` keeps that reading, so this only adds refusals
+                # as ``rm`` keeps that reading, so this only adds refusals.
                 words = [bare, *words[1:]] if bare else words[1:]
                 continue
             break

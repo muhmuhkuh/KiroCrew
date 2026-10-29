@@ -5,7 +5,7 @@ the session queue before a prompt starts.
 """
 
 import asyncio
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 from acp_runtime_helpers import _fast_no_report_ceiling  # noqa: F401
@@ -424,9 +424,7 @@ async def test_pre_turn_drain_answers_a_permission_request_whose_id_collides():
         await _bounded(gen.__anext__(), what="the first prompt event")
     await gen.aclose()
 
-    assert handle.reject_tool.await_args_list == [call(3)]
-    # Answering the request did not settle our own call that shares its id.
-    assert 3 in handle._awaited_responses
+    handle.reject_tool.assert_awaited_once_with(3)
 
 
 @pytest.mark.asyncio

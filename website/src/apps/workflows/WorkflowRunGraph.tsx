@@ -29,7 +29,6 @@ import {
   Square,
   XCircle,
 } from 'lucide-react'
-import { sliceCodePoints } from '../../components/CommentOverlay'
 import { sanitizeLlmOutput } from '../../utils/sanitize'
 import { fmtElapsed } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
@@ -166,11 +165,9 @@ const WorkflowRunGraph = memo(function WorkflowRunGraph({
 
       <ol className="flex flex-col">
         {graph.phases.map((phase, idx) => {
-          const title = sliceCodePoints(
-            sanitizeLlmOutput(phase.title || i18nT('apps.workflows.workflowsRuns.unknown')),
-            0,
-            MAX_TITLE,
-          )
+          const title = sanitizeLlmOutput(
+            phase.title || i18nT('apps.workflows.workflowsRuns.unknown'),
+          ).slice(0, MAX_TITLE)
           return (
             <li key={`${phase.title}#${idx}`} className="flex flex-col">
               <div
@@ -208,7 +205,7 @@ const WorkflowRunGraph = memo(function WorkflowRunGraph({
                       const label =
                         node.state === 'unknown'
                           ? node.label
-                          : sliceCodePoints(sanitizeLlmOutput(node.label), 0, MAX_LABEL)
+                          : sanitizeLlmOutput(node.label).slice(0, MAX_LABEL)
                       return (
                         <div
                           key={node.id}

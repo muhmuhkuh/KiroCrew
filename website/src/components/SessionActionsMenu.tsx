@@ -25,7 +25,6 @@ import { useChatPopouts } from '../hooks/useChatPopouts'
 
 import { uiLocation } from '../uiLocations/uiLocation'
 import { i18nT } from '../i18n/t'
-import { slotRowByKey } from '../store/slotIndex'
 export interface SessionActionsMenuProps {
   /** Chooses the Radix primitive family; must match the enclosing menu. */
   variant: 'dropdown' | 'context'
@@ -162,7 +161,7 @@ export default function SessionActionsMenu({
   // its behaviour). `unread` comes from dashboard.unreadSlots — the same source
   // toggleRead reads — and pin/folder/colour from the slot itself.
   const isUnread = useAppSelector(s => s.dashboard.unreadSlots.includes(slotKey))
-  const slot = useAppSelector(s => slotRowByKey(s.dashboard.slots, slotKey))
+  const slot = useAppSelector(s => s.dashboard.slots.find(x => x.key === slotKey))
   const isPinned = !!slot?.pinned
   const isMutesOpened = !!slot?.mutes_opened
   const isMuted = !!slot?.muted

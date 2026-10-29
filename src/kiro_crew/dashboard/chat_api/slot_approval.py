@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 
 if TYPE_CHECKING:
-    import time
-
     from kiro_crew.dashboard.chat_handlers import (
         _SLOT_SCOPED_TRUST_MODES,
         DashboardState,
@@ -41,6 +39,7 @@ if TYPE_CHECKING:
         sel,
         session_grant,
         slot_not_found,
+        time,
         yolo_policy_permits,
     )
 

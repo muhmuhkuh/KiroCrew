@@ -526,8 +526,8 @@ class TestRecordsReachTheDisplayPath:
         from kiro_crew.dashboard import chat_runner
 
         src = inspect.getsource(chat_runner._flush_segment)
-        assert "_redact_segment( slot, assistant_text," in " ".join(src.split())
-        assert "_segment_row_meta( slot, blocked_links, redactions," in " ".join(src.split())
+        assert "_redact_segment(slot, assistant_text)" in src
+        assert "_segment_row_meta(slot, blocked_links, redactions)" in src
         helper = inspect.getsource(chat_runner._redact_segment_text)
         assert "redact_exfiltration_urls_with_records(" in helper
         assert "redact_credentials_with_records(" in helper
@@ -536,18 +536,11 @@ class TestRecordsReachTheDisplayPath:
         # Same guard for the recovery path: a stopped or failed turn persists its
         # partial text through this nested helper, and a two-tuple redactor there
         # would store only the placeholder, losing a wrongly blocked link for good.
-        from pathlib import Path
+        import inspect
 
         from kiro_crew.dashboard import chat_runner
 
-        lines = "\n".join(
-            turn_file.read_text(encoding="utf-8")
-            for turn_file in [
-                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-                Path(chat_runner.__file__),
-            ]
-            if turn_file.name != "__init__.py"
-        ).splitlines()
+        lines = inspect.getsource(chat_runner).splitlines()
         start = next(i for i, ln in enumerate(lines) if "def _persist_partial_reply(" in ln)
         indent = len(lines[start]) - len(lines[start].lstrip())
         body = []
@@ -556,8 +549,8 @@ class TestRecordsReachTheDisplayPath:
                 break
             body.append(ln)
         src = "\n".join(body)
-        assert "_redact_segment( slot, turn.assistant_text," in " ".join(src.split())
-        assert "_segment_row_meta( slot, _blocked, _redactions," in " ".join(src.split())
+        assert "_redact_segment(slot, turn.assistant_text)" in src
+        assert "_segment_row_meta(slot, _blocked, _redactions)" in src
         assert "redact_exfiltration_urls(" not in src
 
 

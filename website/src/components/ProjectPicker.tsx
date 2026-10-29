@@ -4,7 +4,6 @@ import { OverlayPortal } from './overlayRoot'
 import { FolderOpen, FolderSearch, ChevronRight, ChevronLeft, Clock, Search, Star } from 'lucide-react'
 import { api } from '../api/client'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
-import { usePointerMotion } from '../hooks/usePointerMotion'
 import ErrorNotice from './ErrorNotice'
 import { reportForError, type ErrorReport } from '../utils/errorReport'
 import { endsWithSeparator, isWindowsPath, lastSegment, parentIsDriveList, pathSeparator, stripTrailingSeparator } from '../utils/browsePath'
@@ -57,7 +56,7 @@ const DRIVES_FAILED_KEYS: Record<SearchErrorCause, string> = {
 }
 // Only two arms have copy of their own: the recents endpoint answers any read error
 // with 200 `{"dirs": []}` and never a coded body (`api_recent_projects` in
-// chat_api/project_lists.py), so `denied` / `root_missing` cannot be produced for it -- a 403
+// chat_handlers.py), so `denied` / `root_missing` cannot be produced for it -- a 403
 // carrying `authRequired` classifies as `failed` -- and both take the generic copy
 // rather than keys no request can reach.
 const RECENT_FAILED_KEYS: Record<SearchErrorCause, string> = {
@@ -627,9 +626,6 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   // Reset the Browse highlight whenever the visible list changes (tab switch,
   // drill into a new dir, or filter edit).
   useEffect(() => { setBrowseSel(0) }, [tab, input, browsePath])
-  // Browse keeps its own selection, so it asks the shared motion check directly:
-  // hover moves the highlight only on real pointer motion (see usePointerMotion).
-  const browsePointerMoved = usePointerMotion(open && tab === 'browse')
 
   // Auto-drill on a typed trailing separator. Without this, typing "/foo/bar/"
   // only filters the *current* directory's children by the last segment — the
@@ -845,7 +841,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                   tabIndex={-1}
                   ref={el => { favoriteNav.itemRefs.current[i] = el }}
                   className={`w-full text-left pl-3 pr-9 py-2 flex items-center gap-2 cursor-pointer transition-colors ${i === favoriteNav.selected ? 'bg-bg-hover' : 'hover:bg-bg-hover'}`}
-                  onMouseMove={e => favoriteNav.hoverSelect(i, e)}
+                  onMouseEnter={() => favoriteNav.setSelected(i)}
                   onMouseDown={e => { e.preventDefault(); select(d) }}
                 >
                   <FolderOpen size={12} className="text-accent shrink-0" />
@@ -920,7 +916,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                   tabIndex={-1}
                   ref={el => { recentNav.itemRefs.current[i] = el }}
                   className={`w-full text-left pl-3 pr-9 py-2 flex items-center gap-2 cursor-pointer transition-colors ${i === recentNav.selected ? 'bg-bg-hover' : 'hover:bg-bg-hover'}`}
-                  onMouseMove={e => recentNav.hoverSelect(i, e)}
+                  onMouseEnter={() => recentNav.setSelected(i)}
                   onMouseDown={e => { e.preventDefault(); select(d) }}
                 >
                   <FolderOpen size={12} className="text-accent shrink-0" />
@@ -1066,7 +1062,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                 tabIndex={-1}
                 ref={el => { browseItemRefs.current[i] = el }}
                 className={`w-full text-left px-3 py-1.5 flex items-center gap-2 cursor-pointer transition-colors ${i === browseSel ? 'bg-bg-hover' : 'hover:bg-bg-hover'}`}
-                onMouseMove={e => { if (browsePointerMoved(e)) setBrowseSel(i) }}
+                onMouseEnter={() => setBrowseSel(i)}
                 onClick={() => browse(d.path)}
               >
                 <FolderOpen size={12} className="text-accent shrink-0" />

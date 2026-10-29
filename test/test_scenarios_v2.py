@@ -78,6 +78,7 @@ class TestScenarioMultiStepCodeTask:
         run.task_id = "rest_api_task"
         run.work_dir = str(repo)
 
+        # Init — should create worktree
         await git_coord.init_workspace(run)
         assert run.worktree_path != ""
         assert Path(run.work_dir).exists()
@@ -433,6 +434,7 @@ class TestScenarioConcurrentTasks:
         assert len(run1.commit_hashes) == 1
         assert len(run2.commit_hashes) == 1
 
+        # Cleanup both
         await git_coord.finalize(run1)
         await git_coord.finalize(run2)
 
@@ -508,6 +510,7 @@ class TestScenarioEdgeCases:
 
         await git_coord.init_workspace(run)
 
+        # Write a binary file
         (Path(run.work_dir) / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
         sha = await git_coord.commit_step(run, Step(index=1, title="Add image", description="d"))
         assert sha != ""
@@ -557,6 +560,7 @@ class TestScenarioEdgeCases:
 
         await git_coord.init_workspace(run)
 
+        # Create then delete
         f = Path(run.work_dir) / "temp.py"
         f.write_text("temporary")
         await git_coord.commit_step(run, Step(index=1, title="Create temp", description="d"))

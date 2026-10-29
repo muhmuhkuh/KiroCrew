@@ -233,42 +233,25 @@ async def _check_console_script(self: GatewayOrchestrator) -> None:
     checkout to reinstall from.
     """
     proj = os.environ.get("KIROCREW_PROJECT_DIR", "")
-    if not proj:
+    if not proj or self._is_brazil_install(proj):
         return
-    dep_sync_file = dep_sync.__file__
-
-    def _probe() -> tuple[Path, Path, str | None] | None:
-        # Every stat and read here is against the checkout, which can sit on a
-        # network mount, and this runs at gateway startup -- so the whole probe
-        # runs in a thread rather than on the loop that serves every session.
-        if self._is_brazil_install(proj):
-            return None
-        method_file = Path(proj) / ".install-method"
-        if not (
-            method_file.is_file()
-            and method_file.read_text(encoding="utf-8", errors="replace").strip() == "pip"
-        ):
-            return None
-        # The venv interpreter under the project, platform-aware (Scripts on
-        # Windows, bin on POSIX), shared with dep_sync's ownership exception.
-        venv_py = dep_sync.project_venv_python(Path(proj))
-        script = dep_sync.console_script_path(venv_py)
-        if script.exists() and os.access(script, os.X_OK):
-            return None
-        resolved = str(Path(dep_sync_file).resolve()) if dep_sync_file is not None else None
-        return venv_py, script, resolved
-
-    probed = await asyncio.to_thread(_probe)
-    if probed is None:
+    method_file = Path(proj) / ".install-method"
+    if not (method_file.is_file() and method_file.read_text().strip() == "pip"):
         return
-    venv_py, script, dep_sync_path = probed
+    # The venv interpreter under the project, platform-aware (Scripts on
+    # Windows, bin on POSIX), shared with dep_sync's ownership exception.
+    venv_py = dep_sync.project_venv_python(Path(proj))
+    script = dep_sync.console_script_path(venv_py)
+    if script.exists() and os.access(script, os.X_OK):
+        return
 
     logger.warning("kirocrew console script missing/not executable at %s — reinstalling", script)
     print("👻 Repairing kirocrew install (console script missing)…")
     # Run the stdlib-only module by absolute file path: the target venv may
     # not currently contain an importable kiro_crew package. A dedicated
     # child session lets cancellation own pip and its build descendants.
-    if dep_sync_path is None:
+    dep_sync_file = dep_sync.__file__
+    if dep_sync_file is None:
         raise RuntimeError("dep_sync module has no source path")
     # Route through the sandbox chokepoint: this child EXECUTES
     # ``venv_py`` (dep_sync probes the target interpreter via
@@ -289,7 +272,7 @@ async def _check_console_script(self: GatewayOrchestrator) -> None:
     try:
         argv, env, cleanup = await sandboxed_spawn_argv_async(
             platform_compat.isolated_python_argv(
-                dep_sync_path,
+                str(Path(dep_sync_file).resolve()),
                 "--repair-missing-package",
                 str(proj),
                 str(venv_py),

@@ -14,20 +14,20 @@
 import AzureDevopsLogo from '../../../components/icons/AzureDevopsLogo'
 import GithubLogo from '../../../components/icons/GithubLogo'
 import GitlabLogo from '../../../components/icons/GitlabLogo'
+import JiraLogo from '../../../components/icons/JiraLogo'
 import { i18nT } from '../../../i18n/t'
 import { type RepoRef } from '../api'
 import { providerKeyOf, providerTerms } from '../lib/links'
 
 /** Brand mark per provider id.
  *
- * A lookup rather than a ternary: `isGitlab ? GitlabLogo : GithubLogo` has two
- * arms, so a third provider silently renders under the GitHub mark — the exact
- * class of bug this component exists to prevent, just moved one provider along.
- * A record keyed by provider id fails to compile when a provider has no mark. */
+ * A lookup rather than a ternary: a provider that is missing here fails loudly at
+ * compile time instead of silently rendering under the GitHub mark. */
 const LOGO_BY_PROVIDER = {
   github: GithubLogo,
   gitlab: GitlabLogo,
   azure: AzureDevopsLogo,
+  jira: JiraLogo,
 } as const
 
 /** The provider's brand mark for `repoRef`.

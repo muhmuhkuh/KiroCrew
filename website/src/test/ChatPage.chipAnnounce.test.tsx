@@ -42,8 +42,8 @@ vi.mock('../api/client', () => ({
     fileSearch: vi.fn().mockResolvedValue({
       root: '/repo',
       results: [
-        { path: '/repo/src/main.ts', name: 'main.ts', size: 10, mtime: Math.floor(Date.now() / 1000) - 60, kind: 'file' },
-        { path: '/repo/src/helper.ts', name: 'helper.ts', size: 10, mtime: Math.floor(Date.now() / 1000) - 60, kind: 'file' },
+        { path: '/repo/src/main.ts', name: 'main.ts', size: 10, mtime: 1_791_091_140, kind: 'file' },
+        { path: '/repo/src/helper.ts', name: 'helper.ts', size: 10, mtime: 1_791_091_140, kind: 'file' },
       ],
     }),
   },

@@ -280,7 +280,9 @@ class TestEveryGatewayHardExitFlushesTheAuditQueue:
                 if node is fn:
                     self.generic_visit(node)
 
-            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                if node is fn:
+                    self.generic_visit(node)
 
             def visit_Attribute(self, node):
                 nonlocal found
@@ -311,7 +313,9 @@ class TestEveryGatewayHardExitFlushesTheAuditQueue:
                 if node is fn:
                     self.generic_visit(node)
 
-            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                if node is fn:
+                    self.generic_visit(node)
 
             def visit_Name(self, node):
                 names.add(node.id)
@@ -443,7 +447,9 @@ class TestSelFlushPrecedesGatewayLogDrain:
                 if node is fn:
                     self.generic_visit(node)
 
-            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                if node is fn:
+                    self.generic_visit(node)
 
             def visit_Name(self, node):
                 if node.id in names:

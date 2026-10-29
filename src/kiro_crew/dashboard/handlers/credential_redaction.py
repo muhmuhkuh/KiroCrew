@@ -8,7 +8,8 @@ Why owner-gated rather than merely authenticated: the switch turns off the
 credential pass in the owner's dashboard file viewer, the one surface it
 governs. A Slack-allow-listed non-owner running ``!dashboard`` authenticates
 with ``app == ""`` and ``sub != owner_id``, so plain token auth admits them; the
-owner predicate does not.
+owner predicate does not. Same shape as the flagged-file delivery consent
+handler, and for the same reason.
 
 Known limit, stated rather than papered over: the owner gate is an IDENTITY
 check, not a proof that a human clicked. An agent driving the owner's

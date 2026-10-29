@@ -126,7 +126,7 @@ class TestTheEffortChannel:
             if level in advertised:
                 assert effort_config_option_value(ACP_BACKEND_PI, level) == level
 
-    def test_no_harness_has_a_fold(self) -> None:
+    def test_no_harness_has_an_unconditional_fold(self) -> None:
         """A row is an exception; every backend without one writes Crew's own spelling."""
         for backend in ACP_BACKENDS_KNOWN:
             for level in EFFORT_LEVELS:
@@ -302,8 +302,9 @@ class TestTheEffortControlIsReachableOnThisHarness:
     def test_a_level_the_harness_never_advertised_is_still_dropped(self, tmp_path) -> None:
         """The advertised list is a filter, not a bypass.
 
-        The example is a level with neither an advertised match nor a row in
-        ``EFFORT_CONFIG_OPTION_VALUES``; ``TestMaxFollowsTheModel`` pins ``max``.
+        The example has neither an advertised match nor an unconditional row in
+        ``EFFORT_CONFIG_OPTION_VALUES``; ``TestMaxFollowsTheModel`` pins the
+        separate advertised-aware fallback for ``max``.
         """
         provider = _pi_provider(tmp_path)
         provider._effort_per_model = {PI_MODEL: "gargantuan"}
@@ -408,12 +409,7 @@ class TestAPersistedLevelSurvivesAColdStart:
 
 
 class TestMaxFollowsTheModel:
-    """pi offers ``max`` per model, so the advertised list decides, as on deepseek.
-
-    Applied as ``max`` where the session offers it. Where it does not but offers
-    ``xhigh``, a saved ``max`` runs at ``xhigh``, as it did before pi 1.3.0 offered
-    ``max``. Every other level the model lacks stays hidden.
-    """
+    """pi offers ``max`` per model, so the advertised list decides, as on deepseek."""
 
     def _max_provider(self, tmp_path):
         return _pi_provider(tmp_path, options=[_thought_level(_pi_effort_frames()[1])])
@@ -432,11 +428,6 @@ class TestMaxFollowsTheModel:
         assert provider._resolve_effort() == "max"
 
     def test_a_saved_max_runs_at_xhigh_where_the_model_tops_out_there(self, tmp_path) -> None:
-        """The capture without ``max`` tops out at ``xhigh``; a saved ``max`` lands there.
-
-        Without the fold the level is dropped: the session runs pi's default while
-        the slot still records ``max``.
-        """
         provider = _pi_provider(tmp_path)
         provider._effort_per_model = {PI_MODEL: "max"}
 
@@ -461,7 +452,6 @@ class TestMaxFollowsTheModel:
         provider._client.set_config_option.assert_awaited_once_with("thought_level", "xhigh")
 
     def test_max_is_hidden_where_neither_max_nor_xhigh_is_offered(self, tmp_path) -> None:
-        """The fold needs its target advertised; otherwise ``max`` stays hidden."""
         options = [
             {
                 "id": "thought_level",
@@ -477,7 +467,6 @@ class TestMaxFollowsTheModel:
         assert provider._resolve_effort() is None
 
     def test_only_max_folds_and_only_when_absent(self) -> None:
-        """Pinned on the resolver: the fold is one row, taken only on absence."""
         without_max = ["off", "minimal", "low", "medium", "high", "xhigh"]
 
         assert effort_config_option_value(ACP_BACKEND_PI, "max", without_max) == "xhigh"
@@ -498,14 +487,12 @@ class TestMaxFollowsTheModel:
         provider._client.set_config_option.assert_awaited_once_with("thought_level", "max")
 
     def test_a_level_that_folds_to_nothing_advertised_is_still_dropped(self, tmp_path) -> None:
-        """The fold is not a bypass: a level with no row and no advertised match goes."""
         provider = _pi_provider(tmp_path)
         provider._effort_per_model = {PI_MODEL: "colossal"}
 
         assert provider._resolve_effort() is None
 
     def test_the_resolution_hands_the_fold_in_rather_than_applying_it_after(self) -> None:
-        """Order is the property, so it is pinned at the seam rather than inferred."""
         from kiro_crew.providers import acp as provider_module
 
         body = inspect.getsource(provider_module.AcpProvider._resolve_effort)
@@ -514,7 +501,6 @@ class TestMaxFollowsTheModel:
         assert "effort_config_option_value, self._client.backend, advertised=advertised" in body
 
     def test_the_shared_resolver_folds_before_it_checks(self) -> None:
-        """Directly, on the resolver: a fold applied after the check cannot pass this."""
         from kiro_crew.effort import resolve_effort_for_model
 
         fold = {"max": "xhigh"}.get
@@ -575,7 +561,7 @@ class TestThePushNeverNeedsARefusal:
         return [lvl for lvl in reversed(EFFORT_LEVELS[: start + 1]) if lvl in advertised]
 
     def test_every_crew_level_emits_only_values_pi_advertised(self) -> None:
-        """Crew's whole ladder, including the level this model does not have."""
+        """Crew's whole ladder, including the two levels pi does not have."""
         from kiro_crew.effort import EFFORT_LEVELS
 
         advertised = {o["value"] for o in _pi_thought_level_option()["options"]}

@@ -1125,10 +1125,8 @@ class RuntimeReconciler:
                     # slice and in no record, but it is not an agent runtime, so it
                     # leaves the population HERE rather than at a later condition:
                     # excluded before the list is built it is never counted in
-                    # ``unowned_alive`` and never reaches ``_why_not_yet``, so it
-                    # writes none of the withheld-reason audit rows ``hold`` records.
-                    # It never reached the gate either way: ``_why_not_yet`` withholds
-                    # a non-harness pid before ``_authorize`` is asked.
+                    # ``unowned_alive``, never reaches ``_why_not_yet``, and never
+                    # collects a gate allow or a kill attribution naming it.
                     #
                     # BOTH tests, because the marker describes a TREE and the argv
                     # test is per process. A harness can carry the marker two ways:
@@ -1144,8 +1142,7 @@ class RuntimeReconciler:
                     # So the population that leaves here is exactly the population
                     # ``_why_not_yet`` would withhold by name anyway: the kill arm's
                     # behaviour is unchanged, and what changes is that these pids
-                    # stop being counted in ``unowned_alive`` and stop writing
-                    # withheld-reason audit rows every pass. Both
+                    # stop being counted, gated and attributed every pass. Both
                     # error directions land on that same pre-existing behaviour -- a
                     # wider basename set excludes FEWER pids, and a tool named like
                     # a harness is not excluded at all.

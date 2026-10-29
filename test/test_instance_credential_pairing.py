@@ -412,14 +412,7 @@ class TestListenerKeyedCredentialFile:
         import ast
         from pathlib import Path as _Path
 
-        src = (
-            _Path(__file__).resolve().parent.parent
-            / "src"
-            / "kiro_crew"
-            / "slack"
-            / "gateway_runtime"
-            / "exit_path.py"
-        )
+        src = _Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "slack" / "gateway.py"
         tree = ast.parse(src.read_text(encoding="utf-8"))
         worker = [
             fn

@@ -173,13 +173,15 @@ def build_agent_fn(
                 key = memory_scope.worker_key(f"named:{session}")
             await memory_scope.prepare(context_builder, key)
 
-        provider, is_new, _resumed = await sessions.get_or_create(
-            key,
-            agent=opts.get("agent") or default_agent,
-            model=opts.get("model") or default_model,
-            cwd=step_cwd or cwd,
-            extra_env=extra_env,
-        )
+        factory_kwargs = {
+            "agent": opts.get("agent") or default_agent,
+            "model": opts.get("model") or default_model,
+            "cwd": step_cwd or cwd,
+            "extra_env": extra_env,
+        }
+        if opts.get("backend") is not None:
+            factory_kwargs["acp_backend_override"] = opts["backend"]
+        provider, is_new, _resumed = await sessions.get_or_create(key, **factory_kwargs)
         # Wall clock for THIS agent turn only (not the whole workflow run):
         # acp leaves TurnUsage.duration_ms at 0, so without this the row's
         # duration_ms is a literal 0. Started after get_or_create so session

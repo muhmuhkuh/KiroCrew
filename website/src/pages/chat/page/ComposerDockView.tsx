@@ -43,6 +43,7 @@ import ProjectPicker from '../../../components/ProjectPicker'
 import { ProjectAwsProfileSection } from '../../../components/ProjectAwsProfile'
 import ModelEffortDropdown from '../../../components/ModelEffortDropdown'
 import ChatInput from '../../../components/ChatInput'
+import ChatBackendSelect from '../../../components/ChatBackendSelect'
 import { useStableCallbackProps } from '../useStableCallbackProps'
 import SessionControlHost from '../../../components/SessionControlHost'
 import ErrorNotice from '../../../components/ErrorNotice'
@@ -60,7 +61,6 @@ import WorkflowProgressBar from '../WorkflowProgressBar'
 import { tryQuickSend } from '../../../lib/quickSend'
 import { i18nT } from '../../../i18n/t'
 import { fmtDateFields } from '../../../i18n/format'
-import { useSlotRunsHere } from '../../../components/sessionEnvironmentHooks'
 
 /**
  * The main composer, with its callback props held at stable identities. This
@@ -276,8 +276,6 @@ export default function ComposerDockView({
   queuePendingIds, steer, stopTurn, systemDeliveryCount, handleEditLastRequest, composerOptimizing, handleOptimizingChange, memorySwitching, showComposerMemoryChip, switchMemoryMode, composerAbove,
   composerSessionControls,
 }: ComposerDockViewProps) {
-  // A chat on a Session Environment runs in its workspace; see ChatPane.
-  const runsHere = useSlotRunsHere(currentSlot && currentSlot.executor !== 'remote' ? currentSlot.key : null)
   return (
     <>
             {/* Composer dock. Floats over the bottom of the transcript scroller
@@ -461,6 +459,7 @@ export default function ComposerDockView({
                 voice={composerVoiceOptions}
                 pastes={pasteSlice}
               >
+              <ChatBackendSelect slot={currentSlot} />
               <StableChatInput
               aboveComposer={composerAbove}
               // No `value`: ChatInput reads the text from the root's `draft` store.
@@ -469,9 +468,7 @@ export default function ComposerDockView({
               // seed -- so it is the signal that arms the prefill hint's expiry.
               onChange={composerUserEdit}
               onSend={() => send()}
-              terminalCommands={activeSlot && !currentSlot ? 'pending'
-                : currentSlot?.executor === 'remote' || runsHere === false ? 'remote'
-                  : currentSlot && runsHere === undefined ? 'pending' : 'local'}
+              terminalCommands={activeSlot && !currentSlot ? 'pending' : currentSlot?.executor === 'remote' ? 'remote' : 'local'}
               canSteer={composerBusy}
               onSteer={steer}
               // AND a turn actually running. `composerBusy` is also true when only
@@ -579,7 +576,6 @@ export default function ComposerDockView({
               contextWindowTokens={contextTokens?.window || provider.getContextWindow(shownModel)}
               showContextPct={chatConfig.showContextPct}
               showContextTokens={chatConfig.showContextTokens}
-              environmentSlot={activeSlot}
               isRunning={composerBusy}
               projectLocked={projectLocked}
               /* Composed with `interrupted`, matching the ErrorCard gate above.

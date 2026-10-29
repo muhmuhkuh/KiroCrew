@@ -68,11 +68,9 @@ removes:
   disabled-when-empty and queue-while-running rules.
 - `toolDetails` reaches `ChatMessageList`'s `toolDetails` prop and the render
   context, so built-in tool rows draw `ToolCallPill` with `expandable={false}`:
-  no toggle, and an open panel closes and stays closed when the key is removed.
-  A host `renderTool` row is its own.
+  no toggle, and an open panel closes. A host `renderTool` row is its own.
 - `header`, `queue` and `followUps` gate their strips; the sent message, the
-  queue and the options themselves are unchanged. The sub-agent delivery
-  progress line renders inside the queue strip, so `queue` hides it too.
+  queue and the options themselves are unchanged.
 
 No key grants a capability, and voice stays off. `ChatEmbed.hide.test.tsx`
 checks each key both ways and compiles the union against an unknown key.
@@ -292,19 +290,12 @@ the import map and from every vendor stub, which is what the boundary rests on.
 
 ## Embedded chat file deliveries
 
-Every surface that draws a `file` row decides with one parser,
-`parseFileRecord` in `website/src/lib/fileRecord.ts`: the SDK's default `file`
-renderer, ChatPage's override and the crew window's sent-file row all call it.
-It accepts a JSON record with a non-empty string `filename`. Optional
-`content_type` and `description` fields must be strings when present, and
-`size` must be a number. Omitted optional fields remain valid; other fields are
-dropped. Anything else (invalid JSON, `null`, a non-object, a missing or empty
-`filename`, malformed metadata) is rejected, so malformed metadata never
-reaches `FileCard`. The surfaces differ only in what they draw: the crew window
-names the peer's file in a line of text rather than a card, and for a rejected
-record the SDK default and the crew window draw nothing, while ChatPage passes
-the row to its `renderUnparsedFile` option, which the single-chat page fills
-with its conversational bubble so the raw text stays visible.
+The SDK's default `file` renderer draws the shared `FileCard` for a JSON
+record with a non-empty string `filename`. Optional `content_type` and
+`description` fields must be strings when present, and `size` must be a
+number. Invalid records draw nothing; malformed metadata never reaches the
+card. Omitted optional fields remain valid. ChatPage's renderer override
+retains its separate fallback behavior.
 
 ## Host-mediated chat launch and cron toggles
 
@@ -1868,7 +1859,7 @@ per socket at ONE chokepoint — `DashboardState._send_ws_all` →
 (`broadcast_ws` and the `_broadcast` `_type` translation) and the
 subagent-subscriber fan-out funnel through it. An event absent from the module's
 tables is DENIED, so a new event name is a silent loss of function for apps until
-it is classified — `test_ws_event_scoping_frames.py` fails the build on an unclassified
+it is classified — `test_ws_event_scoping.py` fails the build on an unclassified
 broadcast name rather than letting it reach production.
 
 Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
@@ -1993,31 +1984,15 @@ stale entry serves the previous value while refreshing.
 because iterating a string yields its characters (`"*"` → the wildcard, and
 `"/api/chat"` → the prefix `"/"`, which matches every path).
 
-**`permissions.mcpTools` scopes the app's own agents.** When it is non-empty,
-`bridges_agents._register_agents` → `_enforce_declared_mcp_tools` adds every
-host-managed tool the app did not declare (judged by
-`permissions.check_tool_permission`) to each app agent's `managedToolPolicy.exclude`,
-unioned with any exclude the agent spec authored. The managed-tool universe is each
-managed server's unconditional declaration (`mcp_discovery_managed.managed_tool_names_for_policy`),
-so a tool hidden behind a runtime enable is excluded before the enable flips. A managed
-server whose declaration cannot be read has no names to exclude, so it fails closed: it
-is written to `managedToolPolicy.excludeServers` instead, which the session-tool-policy
-endpoint answers as an empty `include` entry for that server, so the server lists and
-runs none of its tools for the agent (a declared one included) until a later
-materialization reads it. Materialization reruns on gateway start (the boot resource
-reconcile calls `register_app` for every enabled app), on enabling or updating the app, when
-the app's backend comes up healthy and its MCP server is registered, and on
-`refresh_app_agents` (an MCP reach-policy change or a health-scrub reconcile); restarting
-the gateway or re-enabling the app recovers a server withheld after a transient read failure. Each written app agent whose spec carries a derived restriction
-is recorded with one bounded SEL event (`operation=app_mcp_tools_restricted`,
-`source=app_agent_materialization`) naming the app, the agent, the count and first twenty
-excluded tool names, and any servers withheld whole; an unrestricted app records none. Only
-sessions on the app's agents are scoped: a cron with no `agent:` runs on the host default
-agent unrestricted, the app's own MCP server tools and base built-ins are never excluded,
-`skill_search` (the path an app agent's own skills are served through) is never derived
-into the exclusion, a malformed authored `managedToolPolicy`, `exclude` or
-`excludeServers` is left as written so the session gate keeps refusing it as
-`policy_unreadable`, and an empty or absent list leaves the app unrestricted.
+**`permissions.mcpTools` scopes the app's own agents.** A non-empty list adds
+undeclared host-managed tools to `managedToolPolicy.exclude`, unioned with the
+agent's authored exclusions. Tool names come from each managed server's
+unconditional declaration, including feature-gated tools; if a declaration
+cannot be read, that server is withheld whole through `excludeServers`. The
+session policy answers a withheld server with an empty include list. Empty
+`mcpTools` remains unrestricted; app-owned MCP servers and base built-ins are
+not filtered. This scopes sessions on the app's agents and does not sandbox
+in-process app code. Malformed authored policy remains unreadable and denied.
 
 **User-session control is explicit.** App-token calls that send messages to
 existing local user-owned sessions, choose generated response options, approve
@@ -2463,8 +2438,8 @@ resolution), `dashboard/state_parts/slots_push.py` (`_send_ws_all`, `_ws_client_
 (`_granted_list`), `apps/manifest_names.py` (`RESERVED_APP_PATH_SEGMENTS`), `dashboard/slot_ownership.py`
 (`slot_ownership_middleware`, `SLOT_ROUTE_POLICIES`, `deny_app_slot_access`,
 `app_reserved_key_reason`, `transcript_acquisition_reason`, `app_holds_gateway_key`),
-`dashboard/chat_api/app_admission.py` (`_app_slot_acquisition_denial`,
-`_app_resume_refusal`), `dashboard/chat_api/resume.py` (`resume_slot_from_history`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+`dashboard/chat_handlers.py` (`_app_slot_acquisition_denial`,
+`_app_resume_refusal`, `resume_slot_from_history`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../architecture/app-platform-trust-model.md](../../architecture/app-platform-trust-model.md).
@@ -3886,11 +3861,7 @@ worker threads. The per-directory `asyncio.Lock` from `_turn_lock` is the only l
 held across an await. The app's tests reach every module through one facade,
 `tests/routes_facade.py`, which patches each module that binds a name, so every
 shared name must be one object. `test_orchestration_composition_contract.py` pins
-that, the import order, the one-hop facade, and the lock order end to end. The
-route tests are split by the behaviour they pin into `test_routes_<topic>.py` files
-beside `test_routes.py`, which keeps the route contract. They share state
-redirection, the autouse live-state guard and the client builders in
-`tests/routes_helpers.py`, and a new route test goes in the part for its behaviour.
+that, the import order, the one-hop facade, and the lock order end to end.
 
 Writers: `apps/builtins/spec_builder/backend/handlers.py`, `runtime.py`,
 `decisions.py`, `orchestration/`; `apps/builtins/spec_builder/tests/routes_facade.py`

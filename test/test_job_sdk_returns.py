@@ -110,7 +110,8 @@ class TestCoroutineRunnerIsRefusedAtRegistration:
 
         ``inspect`` reports the INSTANCE as an ordinary object, so
         ``iscoroutinefunction(instance)`` is False while invoking it still returns
-        a coroutine, which is why the check goes through ``__call__`` too.
+        a coroutine. Two reviewers found this gap in the first version of the
+        guard, which is why the check goes through ``__call__`` too.
         """
 
         class AsyncRunner:

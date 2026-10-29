@@ -449,7 +449,7 @@ def run(args, input=None, env=None, raw=False, timeout=None, stall=None):
     replaced with the specified command list — no PATH/shell wrappers or
     environment-variable indirection needed.  Otherwise git is resolved via
     shutil.which so PATH-injected wrappers (including .bat/.cmd on Windows)
-    are found without shell=True.
+    are found without invoking a shell.
     """
     bound = GIT_TIMEOUT_S if timeout is None and stall is None else timeout
     res = run_child(_git_argv(args), child_env(extra=env), bound, input=input, stall=stall)

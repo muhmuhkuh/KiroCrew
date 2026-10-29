@@ -48,6 +48,12 @@ if TYPE_CHECKING:
     )
 
 
+def _resolve_project_directory(project: str) -> tuple[str, bool]:
+    """Resolve and check a project path off the event loop."""
+    resolved = os.path.realpath(os.path.expanduser(project))
+    return resolved, os.path.isdir(resolved)
+
+
 async def api_chat_slot_reload(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/reload -- relaunch the slot's agent process.
 
@@ -611,8 +617,10 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     if project:
-        project = os.path.realpath(os.path.expanduser(project))
-        if not os.path.isdir(project):
+        project, is_directory = await asyncio.to_thread(_resolve_project_directory, project)
+        if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_project"):
+            return _slot_not_found()
+        if not is_directory:
             return web.json_response({"error": "Not a directory"}, status=400)
         if is_sensitive_path(project):
             sel().log_api_access(
@@ -654,18 +662,10 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     # reset stays DEFERRED via the flag (the killpg constraint below), so no
     # reset is awaited while holding the lock beyond what the other switch
     # handlers already hold.
-    #
-    # Two locks, in the order documented at _slot_switch_session_lock:
-    # slot._lock, then the session lock. The session lock is the one a turn's
-    # dispatch in chat_runner._run_chat holds while it captures its binding
-    # (slot.project included) and registers its session. Without it a pick
-    # made in the first moments of a reply lands inside that window, and the
-    # turn's _require_current_binding check fails the message just sent with
-    # "conversation binding changed during preparation". Under it the pick
-    # waits until the turn has registered (the dispatch releases the lock
-    # there, never holding it across the turn), so the running reply keeps
-    # its captured project and the pick applies from the next turn via the
-    # deferred reset below.
+    # Match the other switch routes' lock order: slot lock first, then the
+    # session lock keyed from the binding read while the slot lock is held.
+    # The latter serializes this pick with a turn that has captured its
+    # project but has not registered its session yet.
     async with contextlib.AsyncExitStack() as _stack:
         await _stack.enter_async_context(slot._lock)
         if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_project"):
@@ -681,11 +681,7 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
         # action cannot disagree. session_directive_apply's set_project path
         # already resolves the flag the same way.
         session_key = effective_session_key(slot)
-        # Keyed on the value resolved just above, so the lock provably guards
-        # the session this request acts on (see _slot_switch_session_lock).
         await _stack.enter_async_context(_slot_switch_session_lock(session_key))
-        # Second lock-acquisition await, second re-check: a same-name recreate
-        # lands during this wait just as easily as during the first.
         if _slot_replaced_while_queued(state, slot, name, request, "chat.slot_project"):
             return _slot_not_found()
         # App isolation on the SESSION, not just the slot (the cancel routes'

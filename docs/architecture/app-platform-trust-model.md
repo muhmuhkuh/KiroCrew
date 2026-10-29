@@ -16,15 +16,12 @@ When an app's executable surfaces are **admitted** and enabled, its in-process b
 The `AppContext` capability permissions (`permissions.cron`,
 `permissions.events`, `permissions.spawn`, `permissions.storage`, and
 `permissions.jobs`) gate only which SDK objects `context.py` populates.
-A non-empty `permissions.mcpTools` scopes the app's OWN agents: when they are
-materialized, every host-managed (`kirocrew-*`) tool the app did not declare is
-added to the agent spec's `managedToolPolicy.exclude`, which the managed servers
-enforce per session. A managed server whose tool names cannot be read is withheld
-whole (`managedToolPolicy.excludeServers`) rather than left reachable. It covers sessions running on the app's agents (including
-its crons that name one) and nothing else: a cron with no `agent:` runs on the
-host default agent unscoped, the app's own MCP server tools and base built-ins
-are untouched, and an empty list leaves the app unrestricted. It is a tool-surface
-scope, not a process boundary. Neither mechanism restricts imports, filesystem, network, or
+When non-empty, `permissions.mcpTools` scopes the app's own agents: materialized
+agents exclude undeclared host-managed tools through `managedToolPolicy`, and
+withhold a managed server whole when its tool declaration cannot be read. Empty
+`mcpTools` remains unrestricted; app-owned MCP servers and base built-ins remain
+available. This is a session tool-surface boundary, not a sandbox for app Python.
+Neither mechanism restricts imports, filesystem, network, or
 subprocess use by the loaded module. There is currently **no process-level
 sandbox** around in-process app code (hooks and route handlers). An app's
 separate backend process is launched under the OS sandbox's `standard` mode

@@ -892,13 +892,7 @@ class TestTheCallSitesAreWired:
         the omission this pins. It also pins the ORDER: the report clear runs first,
         and a guard that ran before it would have its row erased.
         """
-        import sys
-
-        lines = [
-            line
-            for name in (client_mod.__name__, *client_mod._CLIENT_OWNERS)
-            for line in inspect.getsource(sys.modules[name]).splitlines()
-        ]
+        lines = inspect.getsource(client_mod).splitlines()
         handoffs = [i for i, ln in enumerate(lines) if "self._begin_session_report(" in ln]
         assert len(handoffs) == 3, "a session-establishment handoff was added or removed"
         for i in handoffs:
@@ -1056,13 +1050,8 @@ class TestTheRuntimeCallSitesAreWired:
         monkeypatch.setattr(runtime_mod, "warn_unresolved_server_refs", _boom)
         rt = AcpRuntime(work_dir="/tmp", acp_backend=ACP_BACKEND_CODEX, expect_mcp_reports=False)
         handle = MagicMock()
-        spec = {"tools": ["@x"]}
-        wire: list[dict] = [{"name": "kirocrew-core"}]
-        assert rt._guard_unresolved_mcp_refs(handle, spec, "kirocrew", wire) is None
-        # Silence, and the session's inputs are left exactly as they were.
-        assert handle.mcp_session_report.return_value.record_unresolved_refs.call_count == 0
-        assert spec == {"tools": ["@x"]}
-        assert wire == [{"name": "kirocrew-core"}]
+        rt._guard_unresolved_mcp_refs(handle, {"tools": ["@x"]}, "kirocrew", [])  # must not raise
+        handle.mcp_session_report.return_value.record_unresolved_refs.assert_not_called()
 
     def test_the_runtime_guard_is_synchronous_and_reads_no_disk(self):
         """H13: the guard adds no suspension point to any host's session start.
@@ -1146,10 +1135,11 @@ class TestTheRuntimeCallSitesAreWired:
 class TestTheSpawnHopCarriesTheSnapshot:
     """The warm rides in the hop ``_spawn`` already had, and adds no await.
 
-    An added ``await asyncio.to_thread`` on the Kiro construction path would be
-    a new suspension point in service of a diagnostic (harness-parity H13).
-    Folding the snapshot into the pre-existing ``mkdir`` hop means no added await
-    exists -- which is only true while nothing re-adds one, hence the structural
+    The reviewer finding that produced this shape was specific: an added
+    ``await asyncio.to_thread`` on the Kiro construction path is a new suspension
+    point in service of a diagnostic (harness-parity H13). Folding the snapshot
+    into the pre-existing ``mkdir`` hop answers it by making the added await not
+    exist -- which is only true while nothing re-adds one, hence the structural
     pin below.
     """
 

@@ -1,5 +1,5 @@
 import { act, render } from '@testing-library/react'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import React from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
@@ -50,20 +50,6 @@ vi.mock('../pages/chat/TranscriptScrollShell', async importOriginal => {
 import VirtualTranscript from '../chat-core/transcript/VirtualTranscript'
 import { HeightCache } from '../hooks/virtualizer/HeightCache'
 import { gcOrphanedStorage, gcSessionStorage } from '../utils/storageGc'
-
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-function chatPageSource(): string {
-  const pages = join(__dirname, '../pages')
-  const owners = join(pages, 'chat', 'page')
-  return [
-    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
-    ...readdirSync(owners).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => readFileSync(join(owners, f), 'utf8')),
-    ...readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => readFileSync(join(pages, f), 'utf8')),
-  ].join('\n')
-}
 
 class FakeResizeObserver {
   static instance: FakeResizeObserver | undefined
@@ -131,10 +117,12 @@ it.each([
 })
 
 it('keeps the main chat host uncapped at initialization and resize', () => {
-  const source = chatPageSource()
+  const source = readFileSync(join(__dirname, '../pages/ChatPage.tsx'), 'utf8')
   expect(source).toContain('widthBucket: scrollerWidthBucket, canMeasure, bindScroller } = useTranscriptWidth()')
-  expect(source).toContain('onScrollerElement={bindScroller}')
-  expect(source).toMatch(/heightScopeKey:.*\n\s+canMeasure,/)
+  const transcriptView = readFileSync(join(__dirname, '../pages/chat/page/ChatTranscriptView.tsx'), 'utf8')
+  expect(transcriptView).toContain('onScrollerElement={bindScroller}')
+  const paging = readFileSync(join(__dirname, '../pages/chat/page/transcriptPaging.ts'), 'utf8')
+  expect(paging).toMatch(/heightScopeKey:.*\n\s+canMeasure,/)
   const shell = readFileSync(join(__dirname, '../pages/chat/TranscriptScrollShell.tsx'), 'utf8')
   expect(shell).toContain("bucketWidth(typeof window !== 'undefined' ? window.innerWidth : 944)")
   expect(shell).toContain('setWidthBucket(bucketWidth(scroller.clientWidth))')
@@ -157,7 +145,7 @@ type Host = typeof HOSTS[number]
  *  template is read from source to avoid mounting the whole dashboard. */
 function productionScope(host: Host, slot: string): string {
   if (host !== 'ChatPage') return sharedScope(host === 'VirtualTranscript' ? slot : `${host}:${slot}`)
-  const source = chatPageSource()
+  const source = readFileSync(join(__dirname, '../pages/chat/page/transcriptPaging.ts'), 'utf8')
   const template = /heightScopeKey: `\$\{activeSlot \?\? '__no_slot__'\}([^`]*)`/.exec(source)
   expect(template, 'ChatPage heightScopeKey template').not.toBeNull()
   return slot + template![1].replace('${scrollerWidthBucket}', '1216')

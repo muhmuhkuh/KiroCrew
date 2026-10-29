@@ -208,7 +208,7 @@ describe('hidden-until-hover controls stay reachable on touch', () => {
 
   it.each([
     ['pages/chat-sidebar/folderBlocks.tsx', 'absolute top-1/2 -translate-y-1/2 right-1.5 p-1 bg-card border border-border shadow-sm opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100'],
-    ['pages/chat-sidebar/folderBlocks.tsx', 'has-[[data-state=open]]:opacity-100'],
+    ['pages/chat-sidebar/SessionRow.tsx', 'has-[[data-state=open]]:opacity-100'],
     ['components/ui.tsx', "'opacity-0 group-hover:opacity-100 [@media(hover:none)]:opacity-100"],
     ['components/chat-input/FilePreviewStrip.tsx', 'group-hover/preview:opacity-100 [@media(hover:none)]:opacity-100'],
     ['components/notifications/NotificationCard.tsx', 'group-hover:opacity-50 [@media(hover:none)]:opacity-60'],

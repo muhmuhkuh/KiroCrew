@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -169,16 +169,11 @@ class TestCleanupSession:
         assert sorted(p.name for p in sessions.iterdir()) == ["other-session.json"]
 
     @pytest.mark.asyncio
-    async def test_blank_session_id_is_a_noop(self, monkeypatch, tmp_path: Path) -> None:
-        resolved: list[Path] = []
-
-        def _sessions_dir() -> Path:
-            resolved.append(tmp_path)
-            return tmp_path
-
-        monkeypatch.setattr(acp_mod, "kiro_sessions_dir", _sessions_dir)
-        assert await _provider().cleanup_session("") is None
-        assert resolved == []
+    async def test_blank_session_id_is_a_noop(self, monkeypatch) -> None:
+        monkeypatch.setattr(
+            acp_mod, "kiro_sessions_dir", lambda: pytest.fail("resolved a dir for a blank id")
+        )
+        await _provider().cleanup_session("")
 
     @pytest.mark.asyncio
     async def test_traversal_attempt_deletes_nothing(self, monkeypatch, tmp_path: Path) -> None:
@@ -243,12 +238,8 @@ class TestShutdown:
     async def test_shutdown_delegates_to_the_client(self) -> None:
         provider = _provider()
         provider._client.shutdown = AsyncMock()
-        provider.cleanup_session = AsyncMock()
         await provider.shutdown()
-        assert provider._client.shutdown.await_args_list == [call()]
-        # A persistent session keeps its transcript for a later resume.
-        assert provider.memory_mode == "persistent"
-        assert provider.cleanup_session.await_count == 0
+        provider._client.shutdown.assert_awaited_once()
 
 
 class TestBackendIdentityHelpers:

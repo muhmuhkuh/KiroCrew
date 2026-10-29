@@ -177,8 +177,7 @@ def _env_file_is_untouched_seed() -> bool:
     """
     try:
         return ENV_FILE_PATH.read_text(encoding="utf-8") == _ENV_FILE_TEMPLATE
-    except (OSError, UnicodeDecodeError):
-        # Not UTF-8 means an operator wrote it (our seed is ASCII): theirs to keep.
+    except OSError:
         return False
 
 

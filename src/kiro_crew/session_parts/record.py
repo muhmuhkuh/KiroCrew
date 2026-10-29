@@ -85,13 +85,12 @@ class _Session:
     # the caller's existing stale-provider path evicts it and cold starts. Default
     # False so every existing construction site is unaffected.
     retire_on_identity_change: bool = False
-    # The ``backend_override`` the session was cold-started with (``None``: the
-    # factory's default backend), and the caller's ``extra_env`` and
-    # ``reasoning_effort_override``. Carried by ``allocation_identity`` so a reset
-    # successor or a compaction restart starts on the same harness, env and effort.
+    # The two backend overrides, caller's ``extra_env`` and reasoning effort are
+    # carried by ``allocation_identity`` to a reset or compaction successor.
     # The env is the caller's own map: the successor's allocation applies the
     # ``aws.project_profiles`` binding again. It can hold secrets, so no ``repr``.
     backend_override: str | None = None
+    acp_backend_override: str | None = None
     extra_env: dict[str, str] | None = field(default=None, repr=False)
     reasoning_effort_override: str | None = None
     # The app launch copy kiro-cli was asked for in place of ``agent``

@@ -689,14 +689,7 @@ class TestPreToolUseHookBlockRecovery:
         change fixes -- the model stalls with no idea what it did wrong, while every
         other assertion still passes. One helper makes that omission unrepresentable.
         """
-        source = "\n".join(
-            turn_file.read_text(encoding="utf-8")
-            for turn_file in [
-                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-                Path(chat_runner.__file__),
-            ]
-            if turn_file.name != "__init__.py"
-        )
+        source = Path(chat_runner.__file__).read_text(encoding="utf-8")
         deny_branches = source.count("if _pre_tool_hooks_should_block(pre_hook_results):")
         helper_calls = source.count("await _reject_hook_blocked(")
 
@@ -1030,14 +1023,7 @@ class TestDenyRowTitleRedaction:
         passes. Rendering each deny shape in exactly one place (its helper)
         makes that omission unrepresentable.
         """
-        source = "\n".join(
-            turn_file.read_text(encoding="utf-8")
-            for turn_file in [
-                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
-                Path(chat_runner.__file__),
-            ]
-            if turn_file.name != "__init__.py"
-        )
+        source = Path(chat_runner.__file__).read_text(encoding="utf-8")
         assert source.count("🚫 {event.title}") == 0, (
             "a transcript row interpolates the raw model-authored title -- "
             "route the deny through _reject_invalid_tool/_reject_hook_error"

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from kiro_crew.dashboard import chat_handlers
 from kiro_crew.dashboard.chat import api_chat_slot_project
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
@@ -81,6 +83,30 @@ class TestChatSlotProject:
                 json={"project": "/nonexistent_xyz_123"},
             )
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_project_path_probes_run_off_event_loop(self, tmp_path, monkeypatch):
+        loop_thread = threading.get_ident()
+        probe_threads: list[int] = []
+        resolve_project = chat_handlers._resolve_project_directory
+
+        def _record_project_probe(project):
+            probe_threads.append(threading.get_ident())
+            return resolve_project(project)
+
+        monkeypatch.setattr(chat_handlers, "_resolve_project_directory", _record_project_probe)
+        slot = _ChatSlot("test")
+        state = _mock_state(slot)
+        with patch("kiro_crew.dashboard.chat_handlers._save_recent_project"):
+            async with TestClient(TestServer(_make_app(state))) as client:
+                resp = await client.post(
+                    "/api/chat/slots/test/project",
+                    json={"project": str(tmp_path)},
+                )
+                assert resp.status == 200
+
+        assert probe_threads
+        assert all(thread != loop_thread for thread in probe_threads)
 
     @pytest.mark.asyncio
     async def test_sensitive_path_returns_403(self, tmp_path):

@@ -93,17 +93,12 @@ BENIGN_APP_SPAWNS: frozenset[str] = frozenset(
         # Was keyed to `commit_finding` until the checkout+apply block was extracted here so
         # the draft-PR route could reuse it (the detector keys by the ENCLOSING function).
         "apps/builtins/auto_improvement/backend/commit.py::materialize_queued_diff",
-        "apps/builtins/auto_improvement/backend/deps.py::_gh_authenticated",
-        # `<running interpreter> -m pytest --version` from an empty temp dir: a literal
-        # argv, no repo or agent input, so no conftest can load. It asks whether the gate's
-        # own interpreter has pytest before a run starts.
-        "apps/builtins/auto_improvement/backend/deps.py::gate_pytest_problem",
-        # Its test fixture: `python -m venv --without-pip` into tmp_path, then that bare
-        # interpreter's `-c "import pytest"`. Literal argv, nothing agent-influenced; the
-        # bare venv is the fixture (an interpreter without pytest, like the desktop bundle).
-        "apps/builtins/auto_improvement/tests/test_gate_pytest_preflight.py::python_without_pytest",
+        # Fixed gh/glab auth-status probes; the provider chooses the binary.
+        "apps/builtins/auto_improvement/backend/deps.py::_cli_authenticated",
         "apps/builtins/auto_improvement/backend/deps.py::install_deps",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_gh",
+        # Fixed glab MR update with a validated URL and host-pinned environment.
+        "apps/builtins/auto_improvement/backend/pr_watchers.py::_gitlab_ready",
         "apps/builtins/auto_improvement/backend/pr_watchers.py::_git",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_gh_prefers_ssh",
         "apps/builtins/auto_improvement/profiles/github_repo/pr_recipe.py::_git",

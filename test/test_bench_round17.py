@@ -1,8 +1,8 @@
-"""The excluded population must be reported under its own reason.
+"""Round-17 review finding: the excluded population was reported under one wrong reason.
 
 ``retrieve_for_instance`` keeps only ``scorable_retrieval`` queries and that predicate
-already excludes the unanswerable ones, so counting ``unanswerable`` over the RESULTS is
-structurally always zero. The whole adversarial population would then appear under
+already excludes the unanswerable ones, so counting ``unanswerable`` over the RESULTS was
+structurally always zero. The whole adversarial population then appeared under
 ``skipped_unscorable``, whose summary line reads "with no resolvable gold" -- telling the
 reader that 446 LoCoMo records are broken when 9 are.
 """

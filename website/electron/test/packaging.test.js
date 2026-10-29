@@ -1103,6 +1103,14 @@ describe("macOS microphone entitlement (both signing lanes)", () => {
     assert.equal(pkg.build.mac.hardenedRuntime, true);
   });
 
+  it("declares the macOS system-audio recording purpose for meeting transcription", () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+    const usage = pkg.build.mac.extendInfo.NSAudioCaptureUsageDescription;
+    assert.equal(typeof usage, "string");
+    assert.match(usage, /meeting audio/i);
+    assert.match(usage, /transcription/i);
+  });
+
   it("ships real Info.plist usage-string copy, not just the key", () => {
     // The entitlement grants the capability; this string is what macOS SHOWS.
     // macOS rejects an EMPTY purpose string, so asserting only that the key

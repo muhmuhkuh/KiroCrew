@@ -548,17 +548,10 @@ def test_pre_governed_passthrough_schema_forces_regeneration(
     assert rewrite_counter["n"] == before + 2
 
 
-def test_a_kept_overlay_from_before_the_vendor_denylist_drops_the_vendor_stub(
+def test_a_schema_10_overlay_drops_a_credential_vendor_stub(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A schema 10 overlay can hold a stub for a credential vendor.
-
-    Before the vendors joined ``UNPOOLABLE_SERVERS`` an operator could list one
-    in ``stub_servers`` and the rewriter wrapped it. The denylist is not a
-    fingerprint input, so with every input unchanged a kept overlay would keep
-    that stub, and its shared backend would run outside every chat sandbox. The
-    schema bump is what rejects such an overlay on the next boot.
-    """
+    """The denylist is not fingerprint input, so schema 10 must be invalidated."""
     from mcp_gateway_rewriter_fingerprint_helpers import _CMD
 
     from kiro_crew.mcp_gateway import rewriter_spec
@@ -572,22 +565,18 @@ def test_a_kept_overlay_from_before_the_vendor_denylist_drops_the_vendor_stub(
         json.dumps({"name": "agent-0", "mcpServers": {"creds-agent": {"command": _CMD}}})
     )
     overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
-
-    def vendor_entry() -> dict[str, Any]:
-        return json.loads(overlay.read_text())["mcpServers"]["creds-agent"]
-
     stub_servers = frozenset({"creds-agent"})
+
     with monkeypatch.context() as patch:
-        # The pass as it ran before this change: schema 10, empty denylist.
         patch.setattr(rewriter, "_FINGERPRINT_SCHEMA", 10)
         patch.setattr(rewriter_spec, "UNPOOLABLE_SERVERS", frozenset())
         _rewrite(tmp_path, stub_servers=stub_servers)
-    assert vendor_entry().get(_WRAPPER_MARKER) is True  # pooled before
+    assert json.loads(overlay.read_text())["mcpServers"]["creds-agent"].get(_WRAPPER_MARKER)
 
-    # Same inputs, current schema and denylist: the overlay must be rebuilt.
     _rewrite(tmp_path, stub_servers=stub_servers)
-    assert _WRAPPER_MARKER not in vendor_entry()
-    assert vendor_entry()["command"] == _CMD
+    entry = json.loads(overlay.read_text())["mcpServers"]["creds-agent"]
+    assert _WRAPPER_MARKER not in entry
+    assert entry["command"] == _CMD
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows executable casing")

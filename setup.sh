@@ -20,9 +20,7 @@ else
 fi
 cd "$_kirocrew_dir" || return 1
 
-# ACP_NPM_PKG and acp_adapter_spec (the exact pinned version).
-# shellcheck source=scripts/lib/acp-adapter-pin.sh
-. "$_kirocrew_dir/scripts/lib/acp-adapter-pin.sh"
+ACP_NPM_PKG="@agentclientprotocol/claude-agent-acp"
 
 echo "👻 KiroCrew Setup"
 echo ""
@@ -159,15 +157,11 @@ echo "── Step 3: Agent Backends ──"
 if _check claude-agent-acp; then
     echo "  ✅ claude-agent-acp ($(which claude-agent-acp))"
 elif _check npm; then
-    if ! ACP_NPM_SPEC="$(acp_adapter_spec "$_kirocrew_dir")"; then
-        echo "  ⚠️  Could not read the pinned $ACP_NPM_PKG version (packaging/acp-adapters/package.json) — skipping"
+    echo "  → Installing $ACP_NPM_PKG via npm..."
+    if npm install -g "$ACP_NPM_PKG" >/dev/null 2>&1; then
+        echo "  ✅ claude-agent-acp installed"
     else
-        echo "  → Installing $ACP_NPM_SPEC via npm..."
-        if npm install -g "$ACP_NPM_SPEC" >/dev/null 2>&1; then
-            echo "  ✅ claude-agent-acp installed"
-        else
-            echo "  ⚠️  npm i -g $ACP_NPM_SPEC failed — install it manually before selecting this backend"
-        fi
+        echo "  ⚠️  npm i -g $ACP_NPM_PKG failed — install it manually before selecting this backend"
     fi
 else
     echo "  ⚠️  npm not found — install the optional agent backend later:"

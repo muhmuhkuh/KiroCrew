@@ -5,8 +5,8 @@
  * completion, composer uploads and screenshots.
  */
 
-import { COMPOSER_UPLOAD_PATH, uploadComposerFiles } from '../../utils/composerUpload'
-import { chatSlotParam } from '../../utils/fileReadUrl'
+import { i18nT } from '../../i18n/t'
+import { resizeImageForModel, type ResizeInfo } from '../../utils/resizeImage'
 import type { ClientTransport } from './transport'
 
 /** Response of POST /api/reveal. When the backend cannot drive a file manager
@@ -156,8 +156,7 @@ export function createFilesEndpoints({ post, put, del, j, jfetch: fetch, checkSe
 
   const fileOps = {
     pickFiles: () => post('/api/upload').then(j) as Promise<{ paths: string[] }>,
-    /** `slot` names the chat asking; the gateway refuses one that runs remotely. */
-    fileDiff: (path: string, slot?: string | null) => fetch('/api/file-diff?path=' + encodeURIComponent(path) + chatSlotParam(slot)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
+    fileDiff: (path: string) => fetch('/api/file-diff?path=' + encodeURIComponent(path)).then(j) as Promise<{ diff: string; original: string; status?: 'clean' | 'modified' | 'untracked' | 'not_git' | 'error' }>,
     /** Fuzzy file search for @-mention picker. `kind` distinguishes folder hits from files.
      *  `kinds` narrows the result set server-side — 'files' or 'dirs'; omitted returns both.
      *  Filtering server-side rather than dropping unwanted hits here matters because the
@@ -189,12 +188,27 @@ export function createFilesEndpoints({ post, put, del, j, jfetch: fetch, checkSe
      *  `signal` lets the composer abort an upload still in flight: the
      *  request dies client-side and the server unlinks its partials through
      *  the disconnect path the upload handler already has. */
-    uploadFiles: async (files: File[], signal?: AbortSignal) =>
-      uploadComposerFiles(files, async body => {
-        const res = await fetch(COMPOSER_UPLOAD_PATH, { method: 'POST', body, ...(signal ? { signal } : {}) })
-        checkSessionExpired(res)
-        return res
-      }),
+    uploadFiles: async (files: File[], signal?: AbortSignal) => {
+      // Downscale oversized images client-side so they fit the model's image
+      // limits before they ever reach the server (see resizeImage.ts).
+      const prepared = await Promise.all(files.map(f => resizeImageForModel(f)))
+      const resized = prepared.map(p => p.info).filter((i): i is ResizeInfo => i !== null)
+      const fd = new FormData()
+      prepared.forEach(p => fd.append('file', p.file))
+      const res = await fetch('/api/upload/file', { method: 'POST', body: fd, ...(signal ? { signal } : {}) })
+      checkSessionExpired(res)
+      let body: { paths?: unknown; error?: string }
+      try { body = await res.json() } catch { body = {} }
+      if (!res.ok) return { paths: [] as string[], error: body.error || res.statusText, resized, resizedByPath: {} as Record<string, ResizeInfo> }
+      if (!Array.isArray(body.paths)) return { paths: [] as string[], error: i18nT('api.client.unexpected_server_response'), resized, resizedByPath: {} as Record<string, ResizeInfo> }
+      // The server appends one path per multipart 'file' part in order, so
+      // paths[i] is prepared[i]'s stored location — zip them to key resize
+      // details by the exact server path the attachment chip renders from.
+      const paths = body.paths as string[]
+      const resizedByPath: Record<string, ResizeInfo> = {}
+      prepared.forEach((p, i) => { if (p.info && paths[i]) resizedByPath[paths[i]] = p.info })
+      return { ...(body as { paths: string[]; error?: string }), resized, resizedByPath }
+    },
     screenshot: () => post('/api/screenshot').then(j) as Promise<{ path: string }>,
   }
 

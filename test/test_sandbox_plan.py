@@ -256,15 +256,12 @@ def test_cc_masks_aws_on_both_backends_and_exposes_only_config() -> None:
     aws = {m.path: m for m in macos.masks}[f"{HOME}/.aws"]
     assert aws.exposed == (f"{HOME}/.aws/config",)
     assert not aws.cancelled
-    # strict hides .aws with no exception; standard does not touch it.
     assert _plan("strict", BACKEND_SEATBELT).masks[0].path == f"{HOME}/.aws"
     assert _plan("strict", BACKEND_SEATBELT).masks[0].exposed == ()
 
 
 def test_seatbelt_cc_profile_denies_aws_except_config() -> None:
-    """Everything under ~/.aws but ``config`` is unreadable in a macOS cc profile:
-    the credentials file, the SSO token cache and any link name inside it. The
-    exception is a ``literal``, so it opens one path and nothing beneath ``config``."""
+    """The literal exception opens only config, never credentials or SSO caches."""
     profile = sandbox_seatbelt.render_seatbelt_profile(_plan("cc", BACKEND_SEATBELT))
     aws = f"{HOME}/.aws"
     read_rule = (
@@ -274,12 +271,11 @@ def test_seatbelt_cc_profile_denies_aws_except_config() -> None:
     assert read_rule in profile.splitlines()
     assert f'(deny file-link (subpath "{aws}"))' in profile.splitlines()
     assert f'(deny file-read* (subpath "{aws}"))' not in profile
-    # The only exception under ~/.aws is config itself.
     assert profile.count("require-not") == 1
-    # A literal exception: nothing beneath a ``config`` directory or link name opens.
     assert f'(require-not (subpath "{aws}/config"))' not in profile
     for leaf in ("credentials", "sso/cache/abc123.json", "cli/cache/x.json", "config.bak"):
         assert f"{aws}/{leaf}" not in profile
+    assert _plan("strict", BACKEND_SEATBELT).masks[0].path == f"{HOME}/.aws"
 
 
 #: For each declared capability: the tier and request that exercise it, and a value it

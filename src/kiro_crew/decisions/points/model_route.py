@@ -781,7 +781,6 @@ async def routed_model(
             config=config,
             extra=extra,
             scopes=scopes,
-            unclipped=text,
         )
     except asyncio.CancelledError:
         raise

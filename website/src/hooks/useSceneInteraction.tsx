@@ -9,7 +9,6 @@ import type { AgentSource } from './useAgentSync'
 import { useImeGuard } from './useImeGuard'
 import { KIRO_GHOST_PIXELS } from './sceneText'
 import ErrorNotice from '../components/ErrorNotice'
-import { sliceCodePoints } from '../components/CommentOverlay'
 
 import { i18nT } from '../i18n/t'
 /** Minimal agent shape for hit-testing — all scene agent types satisfy this */
@@ -74,7 +73,7 @@ export function agentStatusLine(agent: SceneAgent): string {
 export function messagePreview(text: string, max = 64): string {
   const flat = text.replace(/\s+/g, ' ').trim()
   if (flat.length <= max) return flat
-  return sliceCodePoints(flat, 0, max - 1) + '…'
+  return flat.slice(0, max - 1) + '…'
 }
 
 const THREAD_VIEW_MESSAGES = 8
@@ -151,7 +150,7 @@ export function useSceneInteraction(
 
   const openChat = useCallback((agent: SceneAgent) => {
     const slotKey = agent.id.replace(/^slot-/, '')
-    dispatch(switchSlot({ key: slotKey, announceOnMissing: true, gesture: true }))
+    dispatch(switchSlot({ key: slotKey, announceOnMissing: true }))
     navigate('/chat')
   }, [dispatch, navigate])
 

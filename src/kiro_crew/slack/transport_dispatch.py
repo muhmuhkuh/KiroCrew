@@ -55,7 +55,6 @@ from kiro_crew.security import redact, redact_local_paths
 from kiro_crew.sel import sel
 from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.slack.channel_crew import resolve_channel_crew
-from kiro_crew.slack.channel_policy import channel_refusal
 from kiro_crew.slack.format import escape_mrkdwn
 from kiro_crew.slack.handler import (
     _get_default_agent,
@@ -375,9 +374,7 @@ async def handle_message_transport(
     # Inbound channels-governance gate (off-loop), same as native handle_message:
     # a ``channels`` policy that denies ``slack`` drops the message before any
     # processing. Default build (no policy) permits — behavior unchanged.
-    if not (
-        await channel_inbound_permitted("slack") and not channel_refusal(channel, caller=user_id)
-    ):
+    if not await channel_inbound_permitted("slack"):
         logger.info("slack inbound (transport) dropped: denied by channels governance policy")
         return
 

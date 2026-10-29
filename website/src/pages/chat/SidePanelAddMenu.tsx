@@ -53,26 +53,24 @@ export const NEW_MENU_LABEL_KEY: Record<ViewKind | 'terminal', string> = {
   pins: 'pages.chat.sidePanel.menu_pins',
 }
 
-/** `null` where the label already says it all (Git, Logs, Links, Pins, Issues,
- *  Files, Browser): the launcher renders no second line for those rows. */
-export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string | null> = {
+export const NEW_MENU_DESC_KEY: Record<ViewKind | 'terminal', string> = {
   'command-center': 'commandCenter.description',
   changes: 'pages.chat.sidePanel.menu_changes_desc',
-  issues: null,
-  files: null,
-  links: null,
+  issues: 'pages.chat.sidePanel.menu_issues_desc',
+  files: 'pages.chat.sidePanel.menu_files_desc',
+  links: 'pages.chat.sidePanel.menu_links_desc',
   artifacts: 'pages.chat.sidePanel.menu_artifacts_desc',
   subagents: 'pages.chat.sidePanel.menu_subagents_desc',
   workflows: 'pages.chat.sidePanel.menu_workflows_desc',
-  logs: null,
+  logs: 'pages.chat.sidePanel.menu_logs_desc',
   crewlog: 'pages.chat.sidePanel.menu_crewlog_desc',
   context: 'pages.chat.sidePanel.menu_context_desc',
   side: 'pages.chat.sidePanel.menu_side_desc',
-  browser: null,
+  browser: 'pages.chat.sidePanel.menu_browser_desc',
   terminal: 'pages.chat.sidePanel.menu_terminal_desc',
-  git: null,
+  git: 'pages.chat.sidePanel.menu_git_desc',
   summary: 'pages.chat.sidePanel.menu_summary_desc',
-  pins: null,
+  pins: 'pages.chat.sidePanel.menu_pins_desc',
 }
 
 /** Views offered by the + menu, in the three semantic groups the menu renders

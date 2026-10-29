@@ -350,10 +350,9 @@ class TestDrainNotifications:
         client._mcp_notifications = []
         client._read_message = AsyncMock(side_effect=AcpError("process died"))
 
-        assert await client._drain_notifications(duration=0.1) is None
+        await client._drain_notifications(duration=0.1)  # should not raise
         # The error ends the drain; it does not keep reading a dead process.
-        assert client._read_message.await_count == 1
-        assert client._mcp_notifications == []
+        client._read_message.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_captures_buffered_mcp_oauth_request(self, tmp_path):

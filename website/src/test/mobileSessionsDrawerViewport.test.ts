@@ -1,20 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { readdir, readFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-const read = (p: string) => readFile(join(__dirname, '..', p), 'utf8')
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so
-// the ChatPage pins read the page and those owners.
-const CHAT_PAGE = 'pages/ChatPage.tsx'
-const isSource = (f: string) => /\.tsx?$/.test(f) && !/\.test\./.test(f)
-const sourcesIn = async (dir: string, keep: (f: string) => boolean) =>
-  (await readdir(join(__dirname, '..', dir))).filter(keep).sort().map(f => `${dir}/${f}`)
-const chatPageAndOwners = async () => (await Promise.all([
-  CHAT_PAGE,
-  ...(await sourcesIn('pages/chat/page', isSource)),
-  ...(await sourcesIn('pages', f => /^useChatPage/.test(f) && isSource(f))),
-].map(read))).join('\n')
-const raw = (p: string) => (p === CHAT_PAGE ? chatPageAndOwners() : read(p))
+const raw = (p: string) => readFile(join(__dirname, '..', p), 'utf8')
 // Strip comments before matching. The rules below are explained in prose that
 // quotes the very class names and style keys being asserted against, so a
 // raw-text negative match (`fixed inset-0 z-[46]`) hits the comment that
@@ -35,19 +23,19 @@ const src = async (p: string) =>
 // the sibling geometry guards use, so a revert fails loudly.
 describe('mobile sessions drawer overlay', () => {
   it('consumes the shared visual-viewport hook', async () => {
-    const s = await src('pages/ChatPage.tsx')
+    const s = await src('pages/chat/page/pageEnvironment.ts')
     expect(s, 'expected the hook').toContain('useVisualViewport()')
   })
 
   it('derives the covered bottom band from the visual viewport', async () => {
-    const s = await src('pages/ChatPage.tsx')
+    const s = await src('pages/chat/page/pageEnvironment.ts')
     // Same expression SidePanelLayout uses, and clamped at 0 so a browser whose
     // visual and layout viewports agree contributes no inset at all.
     expect(s).toMatch(/Math\.max\(0, window\.innerHeight - vv\.offsetTop - vv\.height\)/)
   })
 
   it('insets the scrim to the visible band without restating inset-0', async () => {
-    const s = await src('pages/ChatPage.tsx')
+    const s = await src('pages/chat/page/SessionsSidebarChrome.tsx')
     // The class list is untouched — `inset-0` still spans the layout viewport, and
     // the margins pull both block edges in to what the user can actually see.
     expect(s).toMatch(/className="fixed inset-0 z-\[46\]/)
@@ -62,12 +50,12 @@ describe('mobile sessions drawer overlay', () => {
     // assertions into comparisons against `undefined`. Deliberately the RAW
     // source: a comment is exactly what this measures, so stripping comments
     // first would make the assertion unfailable.
-    const s = await raw('pages/ChatPage.tsx')
+    const s = await raw('pages/chat/page/SessionsSidebarChrome.tsx')
     expect(s).toMatch(/key="sessions-backdrop"[\s\S]{0,240}?z-\[46\]/)
   })
 
   it('insets the panel with visual-viewport margins, keeping its safe-area edges', async () => {
-    const s = await src('pages/ChatPage.tsx')
+    const s = await src('pages/chat/page/SessionsSidebarChrome.tsx')
     // Scoped to the sessions drawer's OverlayDrawer element, not the whole file:
     // OTHER mobile surfaces in pages/chat/page/ (the floating open-sessions button, the
     // right-side inline overlay) also carry `top-safe-offset-[42px]`, so a

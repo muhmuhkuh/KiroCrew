@@ -276,11 +276,9 @@ def _resolve_effort(self: AcpProvider) -> str | None:
     ``change_effort`` writes the override under the same recorded spelling
     this reads, so the override path matches by construction.
     """
-    # The fold the WRITE path takes, handed in so it runs BEFORE the
-    # advertised-list check rather than after it. ``change_effort`` admits any
-    # level the dynamic validation set knows, so a stored level a harness spells
-    # differently must be checked in that harness's spelling -- a filter that
-    # ran first would drop the very level the live push applied.
+    # Normalize against the same advertised list the WRITE path uses. A stored
+    # ``max`` therefore remains max where offered, folds only to an advertised
+    # ``xhigh``, and is filtered out where neither spelling exists.
     advertised = self._advertised_effort_levels()
     return resolve_effort_for_model(
         self._effort_model,

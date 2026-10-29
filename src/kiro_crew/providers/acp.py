@@ -44,13 +44,13 @@ from kiro_crew.acp.session_mcp import agent_spec_snapshot  # noqa: F401
 from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import (  # noqa: F401
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
@@ -562,9 +562,9 @@ class AcpProvider(LLMProvider):
         return self._client.backend == ACP_BACKEND_DEEPSEEK
 
     @property
-    def is_copilot_backend(self) -> bool:
-        """True when this ACP provider talks to GitHub Copilot CLI (vs kiro-cli)."""
-        return self._client.backend == ACP_BACKEND_COPILOT
+    def is_vibe_backend(self) -> bool:
+        """True when this ACP provider talks to Mistral Vibe (vs kiro-cli)."""
+        return self._client.backend == ACP_BACKEND_VIBE
 
     @property
     def is_kas_backend(self) -> bool:

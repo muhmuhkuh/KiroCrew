@@ -207,10 +207,11 @@ def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
     Shared by the reset successor and the compaction restart
     (``session_compaction._restart_held``) so the two cannot drift: agent,
     approval policy, cwd, bound channel, the model the allocation selected, the
-    crew member, the per-spawn backend, the ``extra_env`` and
+    crew member, the per-spawn and chat backend overrides, the ``extra_env`` and
     ``reasoning_effort_override`` the caller passed, and an app's launch copy.
     """
     backend = getattr(session, "backend_override", None)
+    chat_backend = getattr(session, "acp_backend_override", None)
     env = getattr(session, "extra_env", None)
     effort = getattr(session, "reasoning_effort_override", None)
     launch = getattr(session, "app_launch_agent", "")
@@ -224,6 +225,7 @@ def allocation_identity(owner: Any, key: str, session: Any) -> dict[str, Any]:
         # Each only when the session was started with one, so a session that
         # named none rebuilds with exactly the kwargs it always had.
         **({"backend_override": backend} if isinstance(backend, str) else {}),
+        **({"acp_backend_override": chat_backend} if isinstance(chat_backend, str) else {}),
         **({"extra_env": env} if env else {}),
         **({"reasoning_effort_override": effort} if effort else {}),
         # An app's launch copy (``apps.agent_launch``): the successor is asked for

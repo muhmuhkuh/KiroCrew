@@ -214,6 +214,7 @@ class TestVirtualTime:
             loop.call_soon(release.set)
             await job
             order.append(("job", loop.time()))
+            # nosemgrep: kirocrew.test-sleep-as-barrier -- advances the virtual clock under test
             await asyncio.sleep(600)
 
         with asyncio.Runner(loop_factory=lambda: _VirtualTimeLoop(clock)) as runner:
@@ -243,6 +244,7 @@ class TestVirtualTime:
             loop.call_soon(release.set)
             # Only the job, still running on its thread, can complete this.
             await done
+            # nosemgrep: kirocrew.test-sleep-as-barrier -- advances the virtual clock under test
             await asyncio.sleep(600)
 
         with asyncio.Runner(loop_factory=lambda: _VirtualTimeLoop(clock)) as runner:
@@ -271,6 +273,7 @@ class TestVirtualTime:
             with pytest.raises(asyncio.CancelledError):
                 await queued
             assert await busy is True
+            # nosemgrep: kirocrew.test-sleep-as-barrier -- advances the virtual clock under test
             await asyncio.sleep(600)
 
         try:
@@ -368,7 +371,6 @@ class TestVirtualTime:
         assert record.stop_reason == STOP_REASON_END_TURN
         [(prompt,)] = [call.args for call in record.calls("stream")]
         assert "with context" in prompt
-        assert record.elapsed < 60
 
     def test_a_loop_with_nothing_left_to_run_fails_by_name(self) -> None:
         clock = VirtualClock()

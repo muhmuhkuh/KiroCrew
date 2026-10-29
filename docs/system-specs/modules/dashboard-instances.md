@@ -15,20 +15,13 @@ The instance store is two modules and one route, each with one job:
 
 The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel_dashboard.py`, behind the `dashboard/handlers/agent_panel.py` facade, serves the `/api/agent-panel/dashboard/{fields,write,templates,preview,apply,rollback}` routes, `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
 
-An array or object field is emptied with `dashboard_write` `clear: true` and no
-`value`. The MCP server (`mcp_panel.py`) reads the field's declared type from the
-`/api/agent-panel/dashboard/fields` route, then posts `value: {}` for an object field
-and `value: []` for any other field, so the write route and its body schema
-(`DASHBOARD_WRITE_SCHEMA`) see an ordinary write and type-check it the same way; the
-tool's own argument schema is `DASHBOARD_WRITE_TOOL_SCHEMA`. The MCP server does not
-refuse a clear for the field's type or source: a string, number or boolean field, a
-fold-sourced field and an unknown field all reach the write route, which refuses them
-(`wrong_type`, `field_not_agentic`, `unknown_field`) and records each refusal in the
-mistake book. When the field list cannot be read, the server posts `value: []`, so
-emptying an array field does not depend on the fields route. The flag exists because
-an MCP client can drop an empty list, an empty object or a top-level null from a tool
-call's arguments before the server reads them, so `value: []` or `value: {}` arrives
-as no value at all and is refused as missing; a boolean arrives intact.
+An array field is emptied with `dashboard_write` `clear: true` and no `value`. The MCP
+server (`mcp_panel.py`) posts that as `value: []`, so the write route and its body
+schema (`DASHBOARD_WRITE_SCHEMA`) see an ordinary write and type-check it the same
+way; the tool's own argument schema is `DASHBOARD_WRITE_TOOL_SCHEMA`. The flag exists
+because an MCP client can drop an empty list, an empty object or a top-level null
+from a tool call's arguments before the server reads them, so `value: []` arrives as
+no value at all and is refused as missing; a boolean arrives intact.
 
 The sharing and snapshot modules are designed in the RFC and built behind the surface
 that calls each -- a chooser, an export button -- because a module with no caller is
@@ -117,7 +110,7 @@ stays in the crew log; nothing here deletes or migrates it.
 
 `stale` covers two cases with different sentences: the template moved ahead of the copy,
 and the template left the registry. Nothing is missing from the copy in either case --
-it still renders.
+it still renders -- which is exactly what the frame's stale band says.
 
 Each state carries a `state_reason`: one sentence a surface can show a person. The four
 words are what a client BRANCHES on; a client cannot branch on prose and a person cannot
@@ -461,60 +454,6 @@ is never read; only a `builtin` template may name a helper. The profile's Notes 
 shows the same text (`GET /api/members/{slug}/briefing` `upkeep`). Decision:
 `rfc-crewmate-dashboard-upkeep-skill.md`.
 
-
-## A field that does not resolve is the mate's to fix, and only the mate is told
-
-The Dashboard frame (`dashboard_frame.compose`) draws NO band about field values, in any
-state: no "Some numbers are older" line, no `data-dashboard-stale` attribute. A cell
-whose value did not resolve keeps the last value the page drew and is dimmed through
-`data-dashboard-missing`; a cell that never resolved stays empty and dimmed. `missing`
-wins over presence on every fill, because a patch carries the fields it did not move
-forward from the read before it: a cell named in the patch's `missing` is dimmed even
-though its old value is still in `window.kirocrew.fields`. The person
-cannot fix a binding, so telling them about one only teaches them to ignore the page.
-The read carries no `stale` key, and no shipped template draws a freshness or
-staleness message of its own: no badge from a read flag, no quiet band from a fold
-stamp, no live/"no new entry" indicator (`test_no_shipped_page_reads_stale` and
-`test_no_shipped_page_draws_its_own_staleness_band` pin it). A task's own "gone quiet"
-status on a row is the task's state, not the page's freshness, and stays; a read that cannot be
-serialized is sent as an empty one, and the page draws its own empty state.
-
-`DashboardFeed.read` names each FOLD field that did not resolve in `FieldRead.unresolved`,
-with one of three reasons: `fold_unseen` (the fold has produced no value), `path_missing`
-(the fold has a value with nothing at the field's path) and `older_value` (the fold has a
-value without the field, which resolved at an earlier read on this slot, so a page that
-drew it still shows the older number). A fold with no value on this read is always
-`fold_unseen`, even for a field that resolved before: the cell may only be cold (a unit
-rollover with no savepoint, an evicted cell, a prime still running), and the turn block
-must not tell the mate to rebind a working field. `older_value` is decided from a process-wide record of
-which fields resolved per slot (`dashboard_feed.remember_resolved`), because a tab is
-refilled from a fresh feed per request. It holds at most 256 slots and 256 names per
-slot, a read forgets every name the page in force no longer declares, and it is lost on
-a restart, which turns an older value into one of the other two reasons for the same
-binding. An agentic
-field never written is absent, not unresolved: it is in `missing` only, and its upkeep
-text already asks the mate to write it. A TREE-keyed fold has no bus scope, so the feed
-reports its fields unresolved and each reader that reads the tree
-(`LivePage._resolve_trees`, the turn block) takes them back out when they resolve.
-
-The mate hears about it in its `[DASHBOARD]` turn block. `build_member_section` passes the
-crew name to `turn_block`, which reads the page in force the way the tab does
-(`member_dashboard.read_fields`) and adds one line (`dashboard.unresolved` in
-`crewmate_prompts.json`) naming up to three fields with their reason and counting the
-rest, then saying what to do: check the folds with `dashboard_types`, then
-`dashboard_save` a page that binds a path that exists or drops the field, and
-`dashboard_apply` it. Only `path_missing` and `older_value` are named. `fold_unseen` is
-left out: a fold with no value yet is not a broken binding, and a fresh mate on its
-shipped page is in that state; once the fold has a value, a wrong path shows as
-`path_missing`. A `panel` field reads `fold_unseen` until the mate has published, since
-the empty record has none of a published record's paths. The line is absent when nothing
-fixable is left, so it leaves on the first turn after the fix. No read is made on a
-locked page or with `agent.crew_panel` off, where the mate cannot call the tools the line
-names. A V1 mate (no `member_id`) carries its member section only at session start,
-resume or re-injection, so on its WARM turns `turn_message` adds the line alone through
-`dashboard_agentic.unresolved_notice`, under the same gates and the desk gate; a V2 mate's
-essentials rebuild the whole section every turn; a read that fails adds nothing; and the apply reply, which builds the block
-without a crew name, makes no read.
 
 ## The preview link opens the Dashboard tab; the tab reads `?preview=1`
 

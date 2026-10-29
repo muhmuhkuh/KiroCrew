@@ -733,12 +733,11 @@ describe("window lifecycle tray-close wiring", () => {
   });
 
   it("routes the non-quit close through hideToTray, not a bare hide", () => {
-    // The close handler's hide branch, up to its `return`. The quit-on-close
-    // branch (closeAction "quit") is pinned in window-lifecycle.test.js.
+    // The close handler's non-quit branch, up to its `return`.
     const branch = WINDOW_LIFECYCLE_JS.match(
-      /mainWindow\.on\("close"[\s\S]*?hide: \(\) => \{([\s\S]*?)\n      \},/,
+      /mainWindow\.on\("close"[\s\S]*?if \(!isQuitting\(\)\) \{([\s\S]*?)return;/,
     );
-    assert.ok(branch, "could not locate the close handler's hide branch");
+    assert.ok(branch, "could not locate the close handler's non-quit branch");
     const body = branch[1];
     assert.match(body, /hideToTray\(mainWindow, \{/);
     assert.match(body, /transitionTarget: fullScreenWatch \? fullScreenWatch\.pending\(\) : null/);

@@ -69,10 +69,11 @@ Object.defineProperty(window, 'matchMedia', {
 import ChatSidebar from '../pages/ChatSidebar'
 
 const LONG = 'Investigate flaky Windows shard in backend tests after the sandbox refactor'
+const NOW = new Date('2026-06-15T12:00:00Z').getTime()
 // Recent activity: rows older than the stale-collapse threshold fold away.
 const SLOTS = Array.from({ length: 12 }, (_, i) => ({
   key: `k${i}`, title: `${LONG} ${i}`, messages: 1, running: false, mode: '', created: '', pinned: false,
-  last_ts: new Date(Date.now() - (i + 1) * 60_000).toISOString(), folder_id: null,
+  last_ts: new Date(NOW - (i + 1) * 60_000).toISOString(), folder_id: null,
 }))
 
 function renderSidebar({ fillsHost = false }: { fillsHost?: boolean } = {}) {
@@ -108,7 +109,11 @@ function renderSidebar({ fillsHost = false }: { fillsHost?: boolean } = {}) {
 const rect = (top: number, bottom: number, left: number, right: number) =>
   ({ top, bottom, left, right, width: right - left, height: bottom - top, x: left, y: top, toJSON: () => ({}) })
 
-beforeEach(() => { localStorage.clear() })
+beforeEach(() => {
+  localStorage.clear()
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(NOW)
+})
 afterEach(() => { vi.useRealTimers(); vi.clearAllMocks() })
 
 describe('chat sidebar scroll peek', () => {

@@ -154,8 +154,7 @@ _AWS_KEY_ANYCASE_RE = re.compile(
     # Prefixes come from the shared home; the BODY deliberately does not. This net
     # is mixed-case and boundary-bounded, so it is a different pattern from the
     # scrubber's uppercase-only one rather than another spelling of it.
-    f"(?<![A-Za-z0-9])(?:{AWS_KEY_ID_PREFIXES})"
-    r"[A-Za-z0-9]{16}(?![A-Za-z0-9])",
+    f"(?<![A-Za-z0-9])(?:{AWS_KEY_ID_PREFIXES})" r"[A-Za-z0-9]{16}(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -385,6 +384,7 @@ class SecurityEventLog:
 
     def _flush_with_retry(self, batch: list[SecurityEvent]) -> None:
         """Best-effort flush, retried with backoff; count a batch that is lost."""
+        exc: OSError | None = None
         for attempt in range(_WRITE_RETRIES + 1):
             exc = self._flush_batch(batch)
             if exc is None:
@@ -394,6 +394,8 @@ class SecurityEventLog:
             if permanent or attempt == _WRITE_RETRIES:
                 break
             _backoff_wait(min(_WRITE_BACKOFF_SECS * 2**attempt, _WRITE_BACKOFF_CAP_SECS))
+        if exc is None:
+            raise RuntimeError("SEL write retry loop made no attempt")
         self.dropped_events += len(batch)
         if not self._drop_streak:
             self._drop_streak = True
@@ -520,7 +522,9 @@ class SecurityEventLog:
                     except OSError as exc:
                         if raise_on_error:
                             raise
-                        logger.warning("SEL dir create failed for %d events", len(events), exc_info=True)
+                        logger.warning(
+                            "SEL dir create failed for %d events", len(events), exc_info=True
+                        )
                         return exc
                     # Close the live log first when it is already at the size cap, so
                     # this batch lands in a fresh segment, and keep the cross-process
@@ -558,9 +562,7 @@ class SecurityEventLog:
             # best-effort caller drops the batch with a warning.
             if raise_on_error:
                 raise
-            logger.warning(
-                "SEL chain lock unavailable for %d events", len(events), exc_info=True
-            )
+            logger.warning("SEL chain lock unavailable for %d events", len(events), exc_info=True)
             return exc
         if callback:
             for event in events:
@@ -768,8 +770,7 @@ class SecurityEventLog:
             # Critical writes never take this branch; they fail closed above.
             if _on_event_loop():
                 logger.warning(
-                    "SEL writer enqueue failed on the event loop; "
-                    "dropping non-critical event",
+                    "SEL writer enqueue failed on the event loop; " "dropping non-critical event",
                     exc_info=True,
                 )
                 return

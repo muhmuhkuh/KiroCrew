@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /**
@@ -16,33 +16,24 @@ import { join } from 'node:path'
  * `useMemo` body, an IIFE inside a 60-prop JSX element, and a renderer-entry
  * loop) with no seam to call.
  */
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-const PAGES_DIR = join(__dirname, '..', 'pages')
-const OWNER_DIR = join(PAGES_DIR, 'chat', 'page')
-const CHAT_PAGE = [
-  readFileSync(join(PAGES_DIR, 'ChatPage.tsx'), 'utf8'),
-  ...readdirSync(OWNER_DIR).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(join(OWNER_DIR, f), 'utf8')),
-  ...readdirSync(PAGES_DIR).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(join(PAGES_DIR, f), 'utf8')),
-].join('\n')
+const RENDERING = readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', 'transcriptRendering.tsx'), 'utf8')
+const ACTIONS = readFileSync(join(__dirname, '..', 'pages', 'chat', 'page', 'turnActions.ts'), 'utf8')
 const SDK_RENDERERS = readFileSync(join(__dirname, '..', 'app-sdk', 'messageRenderers.tsx'), 'utf8')
 
 describe('last-assistant scans skip system-notice rows', () => {
   it('lastTextIdx passes over notice rows', () => {
-    const i = CHAT_PAGE.indexOf('const lastTextIdx = useMemo(() => {')
+    const i = ACTIONS.indexOf('const lastTextIdx = useMemo(() => {')
     expect(i).toBeGreaterThan(-1)
-    const body = CHAT_PAGE.slice(i, CHAT_PAGE.indexOf('}, [messages])', i))
+    const body = ACTIONS.slice(i, ACTIONS.indexOf('}, [messages])', i))
     expect(body).toContain('!isSystemNoticeRow(messages[i])')
     // The invisible-row skip must survive alongside the new one.
     expect(body).toContain('!isHiddenInvisibleAssistantRow(messages[i])')
   })
 
   it('showFooter walk passes over notice rows', () => {
-    const i = CHAT_PAGE.indexOf('showFooter={(() => {')
+    const i = RENDERING.indexOf('showFooter={(() => {')
     expect(i).toBeGreaterThan(-1)
-    const pred = CHAT_PAGE.slice(i, CHAT_PAGE.indexOf('})()}', i))
+    const pred = RENDERING.slice(i, RENDERING.indexOf('})()}', i))
     expect(pred).toMatch(/if \(isSystemNoticeRow\(later\)\) continue/)
     // The skip decides "does a later row end the turn", so it must run BEFORE
     // the assistant/streaming check that returns false.
@@ -72,13 +63,13 @@ describe('last-assistant scans skip system-notice rows', () => {
     // handleRegenerate mirrors chat_regenerate.py's scan: both sides must
     // skip system notices or the variant stash captures the notice and the
     // real reply is silently dropped from variant history.
-    const i = CHAT_PAGE.indexOf('const handleRegenerate = useCallback(')
+    const i = ACTIONS.indexOf('const handleRegenerate = useCallback(')
     expect(i).toBeGreaterThan(-1)
-    const body = CHAT_PAGE.slice(i, CHAT_PAGE.indexOf('api.regenerateSlot', i))
+    const body = ACTIONS.slice(i, ACTIONS.indexOf('api.regenerateSlot', i))
     expect(body).toContain('if (isSystemNoticeRow(messages[i])) continue')
   })
 
   it('the shared predicate is imported from CompactionCard', () => {
-    expect(CHAT_PAGE).toContain("import { isSystemNoticeRow } from '../CompactionCard'")
+    expect(RENDERING).toMatch(/import\s*\{\s*isSystemNoticeRow\s*\}\s*from\s*['"][^'"]*CompactionCard['"]/) 
   })
 })

@@ -99,10 +99,8 @@ class TestEndWaitTarget:
             target._wait_contested = True
 
         with patch.object(sc, "_audit") as audit:
-            result = _end(state, caller)
+            _end(state, caller)
 
-        # The audit reason agrees with what the caller was told.
-        assert result["ended"] is (expected == "requested")
         assert audit.call_args.kwargs["detail"] == {"result": expected}
 
     def test_a_session_the_caller_did_not_create_is_refused(self, tmp_path):

@@ -124,7 +124,7 @@ export function useChatPageSessionController({
 }: UseChatPageSessionControllerArgs) {
   // Older-sessions history is fetched lazily, not on mount: the
   // sidebar's "Older sessions" section self-fetches when expanded (see
-  // chat-sidebar/HistoryPane.tsx's footer toggle -- the section starts collapsed and its open
+  // ChatSidebar's footer toggle -- the section starts collapsed and its open
   // state is not persisted, so it can never be open at mount), which leaves
   // the welcome-screen "Continue a previous chat?" suggestions as the only
   // consumer that can need the payload before that. They need it only once
@@ -205,10 +205,8 @@ export function useChatPageSessionController({
     if (opts?.background) return
     if (!connectedRef.current) return
     // Foreground open-in-tab is a user gesture on a session reference: the
-    // announced class. With `requestSeq` it is a create opening the session it
-    // just made when the server answered, not the user opening a chat, so it
-    // is not a `gesture` (#23564).
-    if (key !== activeSlotRef.current) dispatch(switchSlot({ key, announceOnMissing: true, ...(opts?.requestSeq !== undefined ? { requestSeq: opts.requestSeq } : { gesture: true }) }))
+    // announced class.
+    if (key !== activeSlotRef.current) dispatch(switchSlot({ key, announceOnMissing: true, ...(opts?.requestSeq !== undefined ? { requestSeq: opts.requestSeq } : {}) }))
     // Depends on the ONE member it calls, not on `sessionTabs` — that hook
     // returns a fresh object literal every render, so the whole object as a dep
     // makes this callback (and thus ChatSidebar's `onOpenSlotInNewTab`, and thus
@@ -237,7 +235,7 @@ export function useChatPageSessionController({
     if (key === activeSlotRef.current || !connectedRef.current) return
     // Tab-strip select is a user gesture on a session reference: the announced
     // class.
-    dispatch(switchSlot({ key, announceOnMissing: true, gesture: true }))
+    dispatch(switchSlot({ key, announceOnMissing: true }))
   }, [dispatch, activeSlotRef])
   const closeSessionTab = useCallback((key: string) => {
     const next = sessionTabs.closeTab(key)
@@ -887,7 +885,7 @@ export function useChatPageSessionController({
     // resumed since the notice appeared, and an open one is switched to.
     const open = filteredSlotsRef.current.some(s => s.key === match.key)
     if (match.stem && !open) void dispatch(resumeFromHistory({ key: match.stem, title: match.title }))
-    else dispatch(switchSlot({ key: match.key, announceOnMissing: true, gesture: true }))
+    else dispatch(switchSlot({ key: match.key, announceOnMissing: true }))
   }, [dispatch, filteredSlotsRef])
   useEffect(() => {
     if (embedded && !embedMode) return
@@ -1143,13 +1141,7 @@ export function useChatPageSessionController({
   // silently undo the link — clicking a session on the System page landed you
   // in whatever chat you had open before. The sid effect's own switchSlot
   // fetches, so nothing is lost by skipping here.
-  //
-  // Also skipped while a switch to that same session is still in flight (an
-  // open from the command palette on another page, which then navigates
-  // here): it already fetches, and a plain re-fetch would supersede it and
-  // drop its gesture flag, so a cron note would never read (#23564).
-  const switchInFlightKey = useAppSelector(s => (s.chat.slotSwitchRequestId !== null ? s.chat.slotSwitchTarget : null))
-  useEffect(() => { if (!deepLinkPendingRef.current && activeSlot && switchInFlightKey !== activeSlot && !newSessionRef.current && filteredSlotsRef.current.find(s => s.key === activeSlot)) dispatch(switchSlot(activeSlot)) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { if (!deepLinkPendingRef.current && activeSlot && !newSessionRef.current && filteredSlotsRef.current.find(s => s.key === activeSlot)) dispatch(switchSlot(activeSlot)) }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Clear activeSlot when it belongs to a different mode (page switch)
   useEffect(() => {

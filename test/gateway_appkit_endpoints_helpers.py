@@ -23,6 +23,7 @@ def app_env_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "kirocrew-home"
     home.mkdir()
     monkeypatch.setenv("KIROCREW_HOME", str(home))
+    # Create a test app
     app_dir = home / "apps" / "test-app"
     app_dir.mkdir(parents=True)
     manifest = {
@@ -33,6 +34,7 @@ def app_env_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "author": "tester",
     }
     (app_dir / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest))
+    # Create installed.json metadata
     installed = {
         "name": "test-app",
         "version": "1.0.0",

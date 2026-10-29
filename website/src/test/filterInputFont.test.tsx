@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import React from 'react'
@@ -33,20 +33,6 @@ import notificationsReducer from '../store/notificationsSlice'
  */
 
 const SRC = join(__dirname, '..')
-
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings),
-// so the pins read the page and those owners.
-function chatPageSource(): string {
-  const pages = join(SRC, 'pages')
-  const owners = join(pages, 'chat', 'page')
-  return [
-    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
-    ...readdirSync(owners).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => readFileSync(join(owners, f), 'utf8')),
-    ...readdirSync(pages).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort()
-      .map(f => readFileSync(join(pages, f), 'utf8')),
-  ].join('\n')
-}
 
 const baseProps = {
   anchorRect: { right: 400, top: 300 } as DOMRect,
@@ -94,7 +80,7 @@ describe('dropdown filter inputs follow the Font Family setting', () => {
 
   /**
    * The other five inputs live on surfaces too heavy to mount for a class
-   * assertion (ChatPage, AgentsPage) or behind a portal opened by a chain of
+   * assertion (ComposerDockView, AgentsPage) or behind a portal opened by a chain of
    * clicks (ChatPane's two dropdowns). They share one class shape, so the shape
    * itself is the invariant: it must never carry mono again.
    */
@@ -103,7 +89,7 @@ describe('dropdown filter inputs follow the Font Family setting', () => {
       'components/ModelEffortDropdown.tsx',
       'components/AgentSelector.tsx',
       'components/AgentSkillsEditor.tsx',
-      'pages/ChatPage.tsx',
+      'pages/chat/page/ComposerDockView.tsx',
     ]
     const offenders: string[] = []
     const uncovered: string[] = []
@@ -114,7 +100,7 @@ describe('dropdown filter inputs follow the Font Family setting', () => {
       // offenders while the input is still pinned to mono. Flattening also
       // makes the match a whole quoted run, so the assertion sees the complete
       // class list rather than one line of it.
-      const flat = (rel === 'pages/ChatPage.tsx' ? chatPageSource() : readFileSync(join(SRC, rel), 'utf8')).replace(/\s+/g, ' ')
+      const flat = readFileSync(join(SRC, rel), 'utf8').replace(/\s+/g, ' ')
       const runs = [...flat.matchAll(/["'`]([^"'`]*px-2 py-1 text-\[13px\][^"'`]*)["'`]/g)]
       // Per file, never summed. An aggregate floor sits exactly on the boundary
       // here (one match per file), so a refactor that inlines one filter box

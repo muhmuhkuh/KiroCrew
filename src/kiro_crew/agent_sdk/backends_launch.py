@@ -15,19 +15,19 @@ in ``VOCABULARY_PATHS``, which is what lets its ``ACP_BACKEND*`` names be define
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import FrozenSet, Mapping
 
 from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
 )
 
 # Backends carrying their OWN internal OS sandbox, which on macOS cannot nest
@@ -133,15 +133,6 @@ class SelfServedLaunch:
         return " ".join((self.binary, *self.acp_args)).strip()
 
 
-#: The one Copilot CLI release Crew's Copilot defences were measured against. The
-#: install hint pins it, so a new install lands on it rather than on whatever is newest,
-#: and a session on any other release is refused at the handshake (``acp.
-#: client_copilot._refuse_unverified_copilot_version``): several of those defences
-#: are lists read off this release's bundle and fail open on a release that adds an
-#: entry they do not know.
-#: Re-measure against a fresh capture before raising it.
-COPILOT_VERIFIED_VERSION = "1.0.100"
-
 #: Harness id -> the fixed facts of LAUNCHING it, for the harnesses whose own binary
 #: serves ACP.
 #:
@@ -203,29 +194,17 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
             "this binary is the host that boots the profile it lives in."
         ),
     ),
-    # ``--no-auto-update`` keeps the child on the binary that was installed: left
-    # on, Copilot CLI downloads a newer release into its own package cache and runs
-    # THAT on a later launch, which would move a session off the verified range
-    # with nothing on the install row saying so. ``--disable-builtin-mcps`` keeps
-    # its built-in GitHub MCP servers, which act with the operator's own GitHub
-    # credential and are not projected by Crew, out of the session;
-    # ``--disallow-temp-dir`` withdraws the access to the system temp directory it
-    # otherwise grants itself. Both measured on 1.0.100 to leave a session, its
-    # launch MCP mount and its permission requests working.
-    ACP_BACKEND_COPILOT: SelfServedLaunch(
-        label="GitHub Copilot CLI",
-        binary="copilot",
-        acp_args=(
-            "--acp",
-            "--stdio",
-            "--no-auto-update",
-            "--disable-builtin-mcps",
-            "--disallow-temp-dir",
-        ),
-        bin_env_var="COPILOT_BIN",
-        install_command=f"npm i -g @github/copilot@{COPILOT_VERIFIED_VERSION}",
+    ACP_BACKEND_VIBE: SelfServedLaunch(
+        label="Mistral Vibe",
+        binary="vibe-acp",
+        acp_args=(),
+        bin_env_var="VIBE_ACP_BIN",
+        install_command="pip install mistral-vibe",
         protocol_version=1,
-        missing_hint="No adapter package is needed: this harness serves ACP itself.",
+        missing_hint=(
+            "This is a Python package, not an npm adapter: install it with "
+            "pip or uv (uv tool install mistral-vibe)."
+        ),
     ),
 }
 
@@ -235,7 +214,7 @@ ACP_BACKEND_LAUNCH: Mapping[str, SelfServedLaunch] = {
 #: harness's argv a value the table already holds?", which only the spawn path, the
 #: install probe and the driver seams ask. Derived from the table's keys rather than
 #: written a second time, so the two cannot disagree.
-ACP_BACKENDS_SELF_SERVED_ACP: FrozenSet[str] = frozenset(ACP_BACKEND_LAUNCH)
+ACP_BACKENDS_SELF_SERVED_ACP: frozenset[str] = frozenset(ACP_BACKEND_LAUNCH)
 
 #: The argv0 basename each harness's child process runs as.
 #:

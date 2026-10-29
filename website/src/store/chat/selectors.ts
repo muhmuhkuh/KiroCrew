@@ -11,7 +11,6 @@ import type { InjectKind } from '../../pages/chat/RecoveryCard'
 import type { SlotState } from './state'
 import { safeKey } from './wire'
 import { selectSlotSubagentsActive } from './subagents'
-import { slotRowByKey } from '../slotIndex'
 
 /** Path B selectors: read a slot's messages / stream-state, falling back to the
  *  global active mirror when the slot IS the currently-active one. */
@@ -26,7 +25,7 @@ export const selectSlotMessages = (state: RootState, slot: string): ChatMessage[
  *  not its reply to the person reading. A structured monitor's wake runs before
  *  its row is written; until then the slot frame says so (`wake_starting`). */
 export const selectSlotTurnFromWake = (state: RootState, slot: string): boolean => {
-  if (slotRowByKey(state.dashboard.slots, slot)?.wake_starting) return true
+  if (state.dashboard.slots.find((sl) => sl.key === slot)?.wake_starting) return true
   const msgs = selectSlotMessages(state, slot)
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
@@ -93,7 +92,7 @@ export const selectComposerBusy = (state: RootState, slot: string | null): boole
   if (selectSlotStreamState(state, slot) !== 'idle') return true
   if (slot === state.chat.activeSlot && state.chat.slotRunning) return true
   if (selectSlotSubagentsActive(state, slot)) return true
-  const dashSlot = slotRowByKey(state.dashboard.slots, slot)
+  const dashSlot = state.dashboard.slots.find((sl) => sl.key === slot)
   return !!dashSlot?.subagents_running
 }
 
@@ -105,7 +104,7 @@ export const selectComposerBusy = (state: RootState, slot: string | null): boole
 export const selectProjectChipLocked = (state: RootState, slot: string | null): boolean => {
   if (!slot) return false
   if (selectSlotSubagentsActive(state, slot)) return true
-  const dashSlot = slotRowByKey(state.dashboard.slots, slot)
+  const dashSlot = state.dashboard.slots.find((sl) => sl.key === slot)
   return !!dashSlot?.subagents_running
 }
 
@@ -144,7 +143,7 @@ const CONTINUE_SCAN_SKIP = new Set(['queued', 'tool_call', 'tool_result', 'injec
 export const selectActiveSlotProject = (state: RootState): string | undefined => {
   const key = state.chat.activeSlot
   if (!key) return undefined
-  return slotRowByKey(state.dashboard.slots, key)?.project || undefined
+  return state.dashboard.slots.find((sl) => sl.key === key)?.project || undefined
 }
 
 /**
@@ -186,7 +185,7 @@ export const selectContinuable = (state: RootState, slot?: string | null): boole
   const c = state.chat
   const key = slot ?? c.activeSlot
   const other = key && key !== c.activeSlot ? key : null
-  const dashSlot = slotRowByKey(state.dashboard.slots, key)
+  const dashSlot = state.dashboard.slots.find((sl) => sl.key === key)
   if (other) {
     if (selectSlotStreamState(state, other) !== 'idle' || c.pendingTurnSlot === other || dashSlot?.running || dashSlot?.stopping) return false
   } else if (c.slotRunning || c.slotStopping || c.pendingTurnSlot) return false

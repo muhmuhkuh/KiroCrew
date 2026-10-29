@@ -161,9 +161,7 @@ describe('FilePickerMenu', () => {
     } as never)
     mount()
     const rows = await screen.findAllByRole('option')
-    // Hover selects only on real motion, so the pointer moves across the row.
-    fireEvent.mouseMove(rows[1], { clientX: 10, clientY: 30 })
-    fireEvent.mouseMove(rows[1], { clientX: 11, clientY: 30 })
+    fireEvent.mouseEnter(rows[1])
     await waitFor(() => expect(rows[1].getAttribute('aria-selected')).toBe('true'))
     expect(rows[0].getAttribute('aria-selected')).toBe('false')
   })

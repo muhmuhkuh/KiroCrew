@@ -135,6 +135,7 @@ class WorkflowContext(Protocol):
         phase: Optional[str] = None,
         schema: Optional[dict] = None,
         model: Optional[str] = None,
+        backend: Optional[str] = None,
         agent: Optional[str] = None,
         effort: Optional[str] = None,
         cwd: Optional[str] = None,

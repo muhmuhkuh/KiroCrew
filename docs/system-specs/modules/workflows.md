@@ -132,7 +132,7 @@ run_id`.
 ```python
 async def agent(
     self, prompt: str, *, label=None, phase=None, schema=None, model=None,
-    agent=None, effort=None, cwd=None, session=None, nudge=None,
+    backend=None, agent=None, effort=None, cwd=None, session=None, nudge=None,
 ) -> AgentResult
 ```
 
@@ -162,10 +162,13 @@ Semantics, from `runner._RunContext.agent`:
   `describe_agent_error` (type + message, redacted then truncated to
   `MAX_AGENT_ERROR_CHARS` = 500, no traceback).
 
-`label`, `phase`, `schema`, `model`, `agent`, `effort`, `cwd`, `session` and
-`nudge` are all passed to the injected `agent_fn` in one `opts` dict. The shipped
-adapters read `session`, `agent`, `model` and `cwd`; `label` and `phase` are
-consumed by the runner for the event stream; `schema` is consumed by the runner.
+`label`, `phase`, `schema`, `model`, `backend`, `agent`, `effort`, `cwd`, `session`
+and `nudge` are all passed to the injected `agent_fn` in one `opts` dict. The
+shipped adapters read `session`, `agent`, `model`, `backend` and `cwd`; `backend`
+selects a selectable ACP harness for that call, while `model` is resolved within
+that harness. Backend-pinned calls bypass the workflow warm pool because pool
+workers belong to the default harness. `label` and `phase` are consumed by the
+runner for the event stream; `schema` is consumed by the runner.
 
 > Open question: `effort` and the per-call `nudge` dict are part of the frozen
 > signature and reach `opts`, but neither shipped `agent_fn`
@@ -1165,6 +1168,8 @@ never spawns `kiro-cli` in tests. Two production adapters:
   Per-call `agent` / `model` / `cwd` overrides each get their **own** warm
   sub-pool, so a multi-specialist fan-out still gets warm reuse per specialist and
   a worker built for one identity never serves a call that asked for another.
+  Per-call `backend` overrides bypass pooling and use the requested selectable
+  harness, since pooled workers are bound to the run's default backend.
   Distinct identities are capped at `max_identities` (default 8); beyond that a
   call runs on a one-shot unpooled `wf-unpooled:{run_id}:{i}` session, so total
   live workers stay bounded at `(max_identities + 1) * max_workers`. Pool teardown

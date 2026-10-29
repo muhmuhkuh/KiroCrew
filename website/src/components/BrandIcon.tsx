@@ -1,7 +1,6 @@
 import type { CSSProperties } from 'react'
 import githubMarkUrl from '../assets/github-mark.svg'
 import discordMarkUrl from '../assets/discord-mark.svg'
-import coderMarkUrl from '../assets/coder-mark.svg'
 
 /**
  * Monochrome brand marks (GitHub, Discord, the Kiro ghost) tinted via CSS
@@ -60,10 +59,4 @@ export function GithubIcon({ size = 16 }: { size?: number }) {
 
 export function DiscordIcon({ size = 16 }: { size?: number }) {
   return <BrandGlyph url={discordMarkUrl} size={size} />
-}
-
-/** Coder wordmark-style mark. Monochrome, so it is masked and follows the
- * theme's currentColor in light and dark. The art is about 2.17:1 wide. */
-export function CoderIcon({ size = 16 }: { size?: number }) {
-  return <BrandGlyph url={coderMarkUrl} size={Math.round(size * 2.17)} height={size} />
 }

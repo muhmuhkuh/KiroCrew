@@ -29,7 +29,6 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -64,7 +63,6 @@ class TestCompactCapabilitySet:
                 ACP_BACKEND_GOOSE,
                 ACP_BACKEND_KAS,
                 ACP_BACKEND_PI,
-                ACP_BACKEND_COPILOT,
             }
         )
         # deepseek is the one known harness outside the set: its ACP surface carries
@@ -229,7 +227,9 @@ class TestDashboardManualCompactGate:
         state.sessions._sessions = {cr.effective_session_key(slot): SimpleNamespace(provider=stale)}
         state.sessions.get_provider = MagicMock(return_value=stale)
         state.sessions.is_provider_alive = AsyncMock(return_value=False)
-        _cfg = SimpleNamespace(agent=SimpleNamespace(provider="acp", acp_backend=""))
+        _cfg = SimpleNamespace(
+            agent=SimpleNamespace(provider="acp", acp_backend="", member_acp_backend="")
+        )
         with patch.object(cr.KiroCrewConfig, "load", staticmethod(lambda: _cfg)):
             await _run_chat(state, slot, "/compact")
 
@@ -300,7 +300,9 @@ class TestDashboardManualCompactGate:
         from kiro_crew.dashboard import chat_runner as cr
 
         _cfg = SimpleNamespace(
-            agent=SimpleNamespace(provider="acp", acp_backend=ACP_BACKEND_DEEPSEEK)
+            agent=SimpleNamespace(
+                provider="acp", acp_backend=ACP_BACKEND_DEEPSEEK, member_acp_backend=""
+            )
         )
         with patch.object(cr.KiroCrewConfig, "load", staticmethod(lambda: _cfg)):
             await _run_chat(state, slot, "/compact")

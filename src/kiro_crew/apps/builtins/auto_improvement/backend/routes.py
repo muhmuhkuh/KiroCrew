@@ -17,9 +17,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
@@ -28,7 +29,6 @@ from kiro_crew.apps.manager import app_lifecycle_lock, is_app_enabled
 from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
 from kiro_crew.security import redact
 
-from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
 from ..spine.push_policy import normalize_branch
 from . import (
     clone_setup,
@@ -72,6 +72,10 @@ _CONFIG_WRITABLE = frozenset(
         "bandCapMs",
         "forceBugSeeds",
         "autoDraftPr",
+        #: Display-only label for the GitLab namespace — neither this nor
+        #: ``githubUser`` decides where a push lands (``provider``/``host`` only
+        #: move through setup-clone).
+        "gitlabUser",
         # Opt-in: mark a fully-green DRAFT pull request ready-for-review. Safe to
         # expose because it can only ever flip a draft to ready — it never merges,
         # never enables auto-merge, and the gate (pr_watchers.auto_publish_gate) is
@@ -82,7 +86,8 @@ _CONFIG_WRITABLE = frozenset(
         # built from pull-request comment text an outsider can write, it runs with an
         # auto-approved shell, and the strict sandbox hides credential stores but does NOT
         # isolate the network. Auto-starting that from a READ meant the operator never had a
-        # consent moment. With this off, reading the list is read-only.
+        # consent moment. With this off, reading the list is read-only. Raised by the GPT
+        # review; the auto-start path was found while re-deriving D-105's own claim.
         "watcherAutoStart",
         # Opt-in: acknowledge the watcher's residual NETWORK-EGRESS risk before any watcher
         # agent is allowed to run. Default OFF, fail-closed. The watcher agent is UNATTENDED,
@@ -94,7 +99,7 @@ _CONFIG_WRITABLE = frozenset(
         # weaken the sandbox or silently accept that, `_make_runner` REFUSES to build a runner
         # unless this flag is set — the operator states, once and explicitly, that they point
         # watchers only at repositories whose PR comments they would be willing to execute.
-        # Same opt-in shape as `watcherAutoStart`.
+        # Same opt-in shape as `watcherAutoStart`. Raised by the GPT review.
         "watcherAcceptEgressRisk",
         # Explicit consent for unattended repository execution when the gateway's
         # effective sandbox is below strict and credential stores remain visible.
@@ -298,6 +303,7 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
     # it. Measured: flipping `branch` from `origin/main` to `origin/feature` moved the key from
     # `..._repoa__main` to `..._repoa__feature`. The calibrate path was already pinned to its
     # LAUNCHED config for this reason; this is the write side of the same hazard.
+    # Raised by the GPT review of this branch.
     if busy := await _refuse_while_running("changing config would move the run's workspace."):
         return busy
 
@@ -307,6 +313,7 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
     # `store.workspace_key()` reads config FRESH on every path lookup — so the ruler, results,
     # ledger and PR queue can end up in DIFFERENT workspaces within one run. Fourth handler to
     # need this pattern, so it reuses the same helper rather than hand-rolling a copy.
+    # Raised by the GPT review.
     def _apply() -> dict[str, Any] | None:
         with commit_mod.clone_lock():
             if _run_is_active():
@@ -333,12 +340,12 @@ async def _handle_put_config(request: web.Request) -> web.StreamResponse:
 
 
 async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
-    """Validate a GitHub URL, clone it push-disabled, and record it as the target.
+    """Validate a GitHub or GitLab URL, clone it push-disabled, record the target.
 
-    This is the ONLY path that may set ``clone``/``target_url`` in config —
-    ``PUT /config`` deliberately cannot, because these decide which repository
-    the agent is turned loose on. The clone itself is a blocking git subprocess,
-    so it runs off the event loop.
+    This is the ONLY path that may set ``clone``/``target_url`` (and, with them,
+    ``provider``/``host``) in config — ``PUT /config`` deliberately cannot,
+    because these decide which repository the agent is turned loose on. The
+    clone itself is a blocking git subprocess, so it runs off the event loop.
     """
     owner_denied = await require_owner_dashboard_request(request, "auto_improvement.setup_clone")
     if owner_denied is not None:
@@ -376,6 +383,13 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         # this setup path.
         current["origin_url"] = str(result.get("origin_url") or "")
         current["target_display"] = result["display"]
+        # The code host (github/gitlab) and instance host are derived from the
+        # validated URL at setup time and persisted here — NOT in
+        # ``_CONFIG_WRITABLE`` — because they decide which forge a push/PR targets.
+        # Every downstream consumer (profile dispatch, recipe factory, frontend
+        # link builder) reads these rather than re-guessing.
+        current["provider"] = str(result.get("provider") or "github")
+        current["host"] = str(result.get("host") or "")
         if retargeted:
             # A branch belongs to the repo it came from. Carrying it across a retarget
             # leaves config naming a branch that does not exist in the NEW clone — the
@@ -394,7 +408,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
     # persist — showed the new one. The run's artifacts then hang off a different
     # `workspace_key` than the UI displays. Run startup takes the same lock across its own
     # config-read → driver build, which is what makes the pair mutually exclusive; a lock
-    # held by one side alone serializes nothing.
+    # held by one side alone serializes nothing. Raised by the GPT review.
     def _clone_and_persist() -> tuple[dict, str, dict[str, Any] | None]:
         with commit_mod.clone_lock():
             # Re-check INSIDE the lock: the pre-lock guard above only proves no run was live
@@ -598,8 +612,9 @@ async def _handle_findings(_request: web.Request) -> web.StreamResponse:
         return collapsed
 
     # Redact: a ledger row's `note` is agent-authored prose (a gate reason, a discard
-    # explanation), so it is the same class of text the DETAIL endpoint already scans. Every
-    # reader of run evidence is redacted, not only the one in front of you.
+    # explanation), so it is the same class of text the DETAIL endpoint already scans. Found
+    # by sweeping every reader of run evidence after review caught the MCP surface — the
+    # four earlier fixes each treated their own path as the last one.
     rows = await asyncio.to_thread(_read)
     return web.json_response({"findings": _redact_tree(rows)})
 
@@ -696,7 +711,8 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
             # EVERY agent-authored text field is redacted, not just the diff. These are
             # the model's own prose about the defect ("the fix uses KEY=…"), rendered in
             # the operator's browser by FindingDetail — the same egress boundary the diff
-            # crosses, and the same class of text.
+            # crosses, and the same class of text. Raised by review of this branch: the
+            # first pass redacted the diff and the PR body and missed these.
             detail["candidate"] = {
                 "cand_id": proposal.get("cand_id") or "",
                 "signature": _redact_for_display(str(cand.get("signature") or "")),
@@ -764,8 +780,36 @@ async def _handle_finding_detail(request: web.Request) -> web.StreamResponse:
     # calls above are defense-in-depth, but the endpoint also returns blocks assembled
     # elsewhere — the `run` provenance meta, the gate tree — and a field added later would
     # leak the moment someone forgets one more `_redact_for_display`. The list endpoint
-    # already wraps its whole payload; this makes the two consistent.
+    # already wraps its whole payload; this makes the two consistent. Raised by the GPT
+    # review of this branch.
     return web.json_response({"finding": _redact_tree(detail)})
+
+
+def _recipe_for(config: dict, *, clone: str, pr_queue_dir: Path):
+    """Build the PR/MR recipe the draft path should use.
+
+    Picks the recipe by the persisted ``provider`` (github default) so the same
+    publish path drafts a GitHub PR or a GitLab MR without knowing which forge
+    the operator configured. The provider/host came from the validated setup
+    URL (Stage 2), never from free text here.
+    """
+    from ..profiles.github_repo.pr_recipe import GitHubPRRecipe
+    from ..profiles.gitlab_repo.pr_recipe import GitLabPRRecipe
+
+    provider = str((config or {}).get("provider") or "github").lower()
+    cls = GitLabPRRecipe if provider == "gitlab" else GitHubPRRecipe
+    user = str(
+        config.get("gitlabUser") if provider == "gitlab" else config.get("githubUser")
+    )
+    return cls(
+        user=user,
+        clone_path=Path(clone),
+        pr_queue_dir=pr_queue_dir,
+        base_ref=str(config.get("branch") or "origin/main"),
+        # From config, not the clone — see clone_setup._disable_push.
+        fetch_url=clone_setup.resolve_origin_url(config) or None,
+        host=str(config.get("host") or "") or None,
+    )
 
 
 async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
@@ -800,7 +844,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # then pushes whatever HEAD the interleaving left — reintroducing the metadata/content
     # mismatch the materialize step exists to prevent. Every other clone-mutating handler
     # (`/run`, `/calibrate`, `/findings/{fp}/commit`) already refuses; this one was the gap,
-    # introduced by the materialize fix itself.
+    # introduced by the materialize fix itself. Raised by the Opus 5 review of this branch.
     if busy := await _refuse_while_running(
         "drafting now would race the loop's own checkout/apply/push on this branch."
     ):
@@ -836,7 +880,8 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         # drafting an OLDER finding published whatever a LATER cycle left at HEAD. Measured
         # against a real bare repo: finding A's diff adds `FINDING_A`, and the branch pushed
         # for A contained `FINDING_B`. The loop path is safe because `_stage_winner` applies
-        # the winner first; this manual path needs its own step.
+        # the winner first; this manual path had no such step. Raised by the GPT review of
+        # this branch.
         diff_text = diff_path.read_text(encoding="utf-8")
         staged = commit_mod.materialize_queued_diff(
             clone=Path(clone),
@@ -855,14 +900,14 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         # COMMIT what was staged. `git apply --index` does not move `HEAD`, and
         # `_push_fix_branch` pushes `HEAD:refs/heads/<branch>` — so staging alone published
         # the BASE and the queued fix was absent from the pull request. Measured on a real
-        # bare repo: worktree `return 2`, pushed branch `return 1`.
+        # bare repo: worktree `return 2`, pushed branch `return 1`. Raised by the GPT review.
         # Everything after the commit must ROLL BACK on failure. Committing left the change
         # on the configured branch, and `clone_setup.checkout_branch` prefers an existing
         # local branch — so a draft that fails (no `gh`, no network, a refused push) would
         # leave the next run starting from an unfiled commit and treating the queued change
         # as already-landed baseline. Measured on a real bare repo: local `work` sat 1 commit
         # ahead of a remote it had never been pushed to. `commit_finding` already resets at
-        # each of its own failure points; this path had none.
+        # each of its own failure points; this path had none. Raised by the GPT review.
         base = str(staged.get("base") or "")
 
         def _rollback() -> None:
@@ -881,14 +926,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
                 ),
             }
 
-        recipe = GitHubPRRecipe(
-            user=str(config.get("githubUser") or ""),
-            clone_path=Path(clone),
-            pr_queue_dir=queue,
-            base_ref=str(config.get("branch") or "origin/main"),
-            # From config, not the clone — see clone_setup._disable_push.
-            fetch_url=clone_setup.resolve_origin_url(config) or None,
-        )
+        recipe = _recipe_for(config, clone=clone, pr_queue_dir=queue)
         try:
             ref = recipe.draft(
                 summary=summary,
@@ -948,7 +986,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # not around each step. The race is BETWEEN the steps: another operator-triggered mutation
     # doing `checkout -B` between our apply and our commit is what merges two findings into a
     # single commit (measured on a real bare repo). The run-status gate above only stops this
-    # racing the loop, not a second click.
+    # racing the loop, not a second click. Raised by the Opus 5 review of this branch.
     # RE-CHECK the run status INSIDE the lock, not just via the pre-lock `_refuse_while_running`
     # above. The two are not atomic: a request that passed the arrival check can then block on
     # `clone_lock` for the length of a driver build, and a run that starts in that window is now
@@ -956,7 +994,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     # mutation-races-the-loop bug the pre-lock guard is meant to stop, reached by waiting. This
     # is the same D-95/D-96 fix `PUT /config` and `POST /setup-clone` already carry; `_run_is_active`
     # exists precisely for this in-lock check (the async guard cannot be awaited here). A 409
-    # `run_in_progress` sentinel, distinguished from a real draft failure.
+    # `run_in_progress` sentinel, distinguished from a real draft failure. Raised by the GPT review.
     _RUN_STARTED = object()
 
     def _draft_serialized() -> dict[str, Any] | object:
@@ -984,7 +1022,7 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
             # `_draft()`'s failure dicts carry `error`; `detail` is kept as the
             # legacy fallback. Reading only `detail` serialized every failure —
             # including the sandbox-launcher diagnosis this route now surfaces —
-            # as an empty string.
+            # as an empty string. Raised by the GPT review of this branch.
             "error": _redact_for_display(str(result.get("error") or result.get("detail") or "")),
         },
         status=400,
@@ -1089,7 +1127,7 @@ async def _handle_watchers(request: web.Request) -> web.StreamResponse:
     # carries `target`/`title`/`lastNote`/`verdictReason`/`fixing`, all derived from model
     # output or from the pull request's own text, which the watcher ingests as untrusted input
     # by design. Measured: a `target` of `src/m.py::aws_secret_access_key=AKIA…` reached the
-    # browser verbatim.
+    # browser verbatim. Raised by the GPT review.
     return web.json_response(_redact_tree({"sessions": sessions, "reconcile": reconcile}))
 
 
@@ -1188,7 +1226,7 @@ async def _handle_profiles(_request: web.Request) -> web.StreamResponse:
     # function/module/file names captured from the TARGET repo's code, and a credential-shaped
     # identifier there (an `AKIA…`-shaped symbol, a token-shaped path segment) would otherwise
     # reach the dashboard unscanned. Same redactor the findings/session/progress routes use; the
-    # single-profile route below is wrapped for the same reason.
+    # single-profile route below is wrapped for the same reason. Raised by the GPT review.
     profiles = await asyncio.to_thread(profile_normalize.list_profiles)
     return web.json_response(_redact_tree({"profiles": profiles}))
 
@@ -1209,7 +1247,8 @@ async def _handle_profile(request: web.Request) -> web.StreamResponse:
         )
     # Scan the frame tree before it reaches the browser: its function/module/file names come
     # from the target repo's code, so a credential-shaped identifier would otherwise be served
-    # raw — the same egress boundary the findings/session responses close.
+    # raw — the same egress boundary the findings/session responses close. Raised by the GPT
+    # review.
     return web.json_response(_redact_tree({"profile": tree}))
 
 
@@ -1324,7 +1363,7 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # checkout/apply/commit sequences in one clone: the button can commit onto a tree the
     # loop is mid-edit on, or push a HEAD the loop just moved. Gate on the supervisor's
     # live status (RUNNING / CALIBRATING / STOPPING) so the operator's manual commit only
-    # runs when the loop is not touching the clone.
+    # runs when the loop is not touching the clone. Raised by the GPT review of this branch.
     if busy := await _refuse_while_running(
         "committing now would race the loop's own checkout/apply/push on this branch."
     ):
@@ -1336,6 +1375,7 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # would put the loop mid checkout/apply/push on this clone when `commit_finding` runs the
     # same sequence. `clone_lock` is a re-entrant RLock, so holding it here and letting
     # `commit_finding` re-enter it is safe and keeps the whole recheck-then-mutate atomic.
+    # Raised by the GPT review.
     _RUN_STARTED = object()
 
     def _commit() -> dict[str, Any] | object:
@@ -1374,7 +1414,7 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
     # hook printed — scrubbed at the source with `redact_via_context` so its bound can
     # never cut a credential mid-match. Latent while nothing rendered it; D-97 started
     # showing it at the finding row, which made it a live egress path to the browser, so
-    # this pass stays as the output-boundary backstop.
+    # this pass stays as the output-boundary backstop. Raised by the GPT review.
     return web.json_response(
         {"code": "request_failed", "error": _redact_for_display(str(result.get("error") or ""))},
         status=400,

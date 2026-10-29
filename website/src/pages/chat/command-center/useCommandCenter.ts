@@ -8,15 +8,11 @@ import { useAppDispatch, useAppSelector } from '../../../store'
 import { isAnsweredQuestionEnding, markQuestionSettled } from '../../../store/chatSlice'
 import { answersAsText, questionName } from '../../../utils/questionAnswers'
 import { restoreToComposer } from '../../../utils/composerRestore'
-import { viewSubagentSlots } from '../../../lib/subagentReplayScope'
 import type { SubagentActivity } from '../../../types'
 import { buildCommandCenter, effectiveApprovalMode, scopedSlots, slotKey, type PendingQuestion, type WorkItem } from './model'
 
 /** The work board as its route serves it: the folded value plus its revision. */
-// `published_revision` is the read's delta base: the revision of the gateway's last
-// work publish, read before the fold. Kept on the cached entry, because a pushed
-// `slot_fold` delta applies only on exactly that base (hooks/websocket/workDelta.ts).
-type WorkProjection = { value?: { items: WorkItem[]; omitted?: number }; revision?: number; published_revision?: number }
+type WorkProjection = { value?: { items: WorkItem[]; omitted?: number }; revision?: number }
 
 /** How often the panel re-reads the work board on its own.
  *
@@ -73,13 +69,6 @@ export function useCommandCenter(root: string | null, enabled = true, scope: 'ta
   const connected = useAppSelector(s => s.dashboard.connected)
   const fleet = scope === 'fleet'
   const scoped = useMemo(() => fleet ? slots : root ? scopedSlots(slots, root) : [], [slots, root, fleet])
-  // These slots' subagent runs are drawn here, finished ones included, so the
-  // gateway's durable replay is asked for them (it covers only named slots).
-  const scopedKeys = useMemo(() => scoped.map(s => s.key).join('\n'), [scoped])
-  useEffect(() => {
-    if (!enabled || !scopedKeys) return
-    return viewSubagentSlots(scopedKeys.split('\n'))
-  }, [enabled, scopedKeys])
   const canRead = enabled && (fleet || !!root && scoped.length > 0)
   // The app-wide policy is never-stale; a finite staleTime here made every
   // window focus re-read all of these. Frames and reconnect own freshness; a
@@ -192,8 +181,6 @@ export function useCommandCenter(root: string | null, enabled = true, scope: 'ta
     // let a high read revision reject newer pushes, dropping them silently until
     // the clock pull. The module's rule is "the ledger holds only revisions a
     // frame applied"; a read records none, so the next frame always applies.
-    // `published_revision` stays: it is comparable to a delta frame's base by
-    // construction, and is the base the next `slot_fold` delta applies on.
     queryFn: async (): Promise<WorkProjection> => {
       const { revision: _ignored, ...rest } = (await api.sessionWorkProjection(root!)) as WorkProjection
       return rest

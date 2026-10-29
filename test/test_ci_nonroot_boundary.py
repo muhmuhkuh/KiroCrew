@@ -99,7 +99,6 @@ def test_all_linux_shards_and_memory_heavy_jobs_use_large(jobs):
         assert jobs[name]["runs-on"] == _LARGE
     backend = jobs["backend-test"]
     assert backend["strategy"] == {
-        "max-parallel": "${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 8 || 4 }}",
         "fail-fast": False,
         "matrix": {"python-version": ["3.12"], "group": list(range(1, 9))},
     }

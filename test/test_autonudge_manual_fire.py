@@ -86,7 +86,7 @@ async def _run_armed_cycle(svc: AutoNudgeService, loop_id: str) -> None:
     """Await the timer task ``fire_now`` just armed, to completion.
 
     The suite's established shape (``await svc._timers[loop.id]`` in
-    ``test_autonudge_firing.py``). Captured by REFERENCE before any await, because the
+    ``test_autonudge.py``). Captured by REFERENCE before any await, because the
     gates inside ``_timer`` reach ``update``/``remove``, which pop the entry from
     ``_timers`` — reading the dict afterwards would raise KeyError on exactly
     the paths this file is here to test. Draining "until no tasks remain"
@@ -658,7 +658,7 @@ async def test_every_early_refusal_is_audited_as_denied(monkeypatch, sel_mock: M
 
 @pytest.mark.asyncio
 async def test_the_busy_refusal_is_audited_as_denied(monkeypatch, sel_mock: MagicMock) -> None:
-    """The busy guard specifically.
+    """The busy guard specifically -- it is the one a reviewer flagged.
 
     Kept separate from the loop above because it needs a slot in a distinct
     state rather than a distinct service, and because it is the refusal an

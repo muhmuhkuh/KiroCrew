@@ -102,10 +102,7 @@ class TestLivenessBound:
                 asyncio.run(method("Pkg"))
             else:
                 asyncio.run(method())
-            # sync_plugins first reads the drift set (a bounded read) so governance
-            # can ask about each package it would install.
-            prior = [CAPABILITY_READ_TIMEOUT] if op == "sync_plugins" else []
-            assert recorded == [*prior, expected], f"{op} not bounded at {expected}s"
+            assert recorded == [expected], f"{op} not bounded at {expected}s"
 
     def test_bounded_proxy_is_explicit_not_getattr(self):
         """The wrapper is an explicit proxy so a new Protocol op surfaces loudly.

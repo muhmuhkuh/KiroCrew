@@ -79,7 +79,8 @@ const FROZEN = new Date(2026, 5, 15, 12, 0, 0)
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
-  vi.useFakeTimers({ toFake: ['Date'], now: FROZEN })
+  vi.useFakeTimers({ toFake: ['Date'] })
+  vi.setSystemTime(FROZEN)
 })
 
 afterEach(() => {

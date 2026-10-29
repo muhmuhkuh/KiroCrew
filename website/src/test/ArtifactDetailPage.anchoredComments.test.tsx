@@ -17,9 +17,9 @@
  * real `Range` over the rendered body — the same object the production code reads.
  * Selecting opens the toolbar's type-first composer (the same box the file
  * viewer uses); its `onOpen` is where the page resolves the anchor.
- * The suite uses a MARKDOWN artifact because that is the kind that renders to a
- * DOM tree behind `previewRef`; text/json/svg render as a highlighted <pre> with
- * no preview ref, so a DOM selection there has nothing to map back to source.
+ * Markdown uses the real renderer; text uses a stable plaintext Pierre stand-in.
+ * This suite pins the page's selection-to-comment payload, not the lazy viewer's
+ * fallback swaps or its shadow-DOM highlighting.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, fireEvent, act, within } from '@testing-library/react'
@@ -32,6 +32,13 @@ import type { ReactNode } from 'react'
 import { MORE_ACTIONS, chooseMore, commentsShown, findMoreItem } from './artifactMoreMenu'
 
 vi.mock('../api/client')
+vi.mock('../pierre', async () => {
+  const actual = await vi.importActual<typeof import('../pierre')>('../pierre')
+  return {
+    ...actual,
+    PierreCode: ({ file }: { file: { contents: string } }) => <pre>{file.contents}</pre>,
+  }
+})
 vi.mock('../pages/ChatPage', () => ({
   default: () => <div data-testid="chat-page" />,
   PREFILL_STORAGE_KEY: 'kirocrew_prefill',

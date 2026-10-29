@@ -17,7 +17,6 @@ from typing import Any
 from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
-    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -25,6 +24,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CLIENT_META_SETTINGS,
@@ -70,7 +70,6 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
-    ACP_BACKENDS_STEER_RETRACT,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
@@ -82,10 +81,6 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     model_registry_namespace,
     overlay_project_scope,
     selectable_backends,
-)
-from kiro_crew.agent_sdk.backends import (  # noqa: F401 - re-exported for importers
-    escape_user_message_markup,
-    wrap_user_message,
 )
 
 # Declared per harness rather than listed as a capability set: whether a
@@ -143,11 +138,6 @@ EVENT_SUBAGENT_ACTIVITY = "subagent_activity"
 EVENT_STEER_QUEUED = "steer_queued"
 EVENT_STEER_CONSUMED = "steer_consumed"
 EVENT_STEER_CLEARED = "steer_cleared"
-#: kiro-cli dropped every steer it was still holding, unread, because
-#: ``_session/steer/clear`` asked it to (``AgentExecutionUserMessageCleared``).
-#: Not KAS's ``steering_cleared``, which arrives after a turn ends and names steers
-#: the turn already read (``EVENT_STEER_CLEARED``).
-EVENT_STEER_DROPPED = "steer_dropped"
 #: A typed :class:`StructuredStatus` from the EXECUTION LAYER (the versioned
 #: ``kirocrew/status`` extension on a routed ``session/update`` frame, or the
 #: watchdog's own post-stall classification). Never derived from model text —
@@ -188,12 +178,6 @@ MAX_STEERING_TEXT_CHARS = 64_000
 # (``SEND_ABORT_MS``), so an answer slower than this sends the steer down the
 # caller's queue path instead of leaving the request to time out.
 STEERING_ANSWER_WAIT_SECS = 8.0
-# kiro-cli's request to drop every steer it holds and has not yet handed to the
-# turn (``ACP_BACKENDS_STEER_RETRACT``), and how long its answer is waited for.
-# The answer comes from kiro-cli's request handler, not from the turn, so a
-# healthy session answers in milliseconds.
-METHOD_SESSION_STEER_CLEAR = "_session/steer/clear"
-STEER_CLEAR_ANSWER_WAIT_SECS = 5.0
 
 
 def steering_outcome(result: object) -> str:
@@ -422,7 +406,7 @@ PROVIDER_LABEL_OPENCODE = "opencode"
 PROVIDER_LABEL_PI = "pi"
 PROVIDER_LABEL_GOOSE = "goose"
 PROVIDER_LABEL_DEEPSEEK = "deepseek"
-PROVIDER_LABEL_COPILOT = "copilot"
+PROVIDER_LABEL_VIBE = "vibe"
 
 #: Backend id -> its label. The mapping is what ``provider_label`` resolves
 #: through, so a harness's label and the answer a session persists under are one
@@ -442,7 +426,7 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
     ACP_BACKEND_PI: PROVIDER_LABEL_PI,
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
     ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
-    ACP_BACKEND_COPILOT: PROVIDER_LABEL_COPILOT,
+    ACP_BACKEND_VIBE: PROVIDER_LABEL_VIBE,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
@@ -735,7 +719,7 @@ class JsonRpcMessage:
     fanout_no_owner: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "JsonRpcMessage":
+    def from_dict(cls, data: dict[str, Any]) -> JsonRpcMessage:
         """Build a JsonRpcMessage from a parsed JSON-RPC frame."""
         return cls(
             id=data.get("id"),
@@ -944,7 +928,7 @@ class AcpEvent:
     #: dashboard has one branch, and the structured fields travel alongside.
     #: ``None`` on every other terminal, including a plain ``end_turn`` whose
     #: metadata said nothing about a refusal.
-    refusal: "RefusalInfo | None" = None
+    refusal: RefusalInfo | None = None
     #: True when Kiro Crew fabricated this terminal event because the provider
     #: omitted its result frame. Consumers must not treat it as raw completion
     #: evidence even when compatibility requires ``stop_reason=end_turn``.
@@ -1150,7 +1134,7 @@ class AcpEvent:
     #: every other event. Populated ONLY by the execution layer — never from a
     #: text chunk — so a consumer may trust ``wait_reason`` without re-checking
     #: provenance.
-    status: "StructuredStatus | None" = None
+    status: StructuredStatus | None = None
 
     @property
     def shell_command(self) -> str | None:
@@ -1230,9 +1214,7 @@ class AcpEvent:
             return True
         if not self.shell_classified:
             return True
-        if self.is_shell and not self.shell_command:
-            return True
-        return False
+        return bool(self.is_shell and not self.shell_command)
 
     @property
     def child_mcp_identity_trusted(self) -> bool:
@@ -1405,7 +1387,7 @@ class AcpPromptStats:
     # PER-TURN like ``credits``.
     metered_calls: int = 0
 
-    def carry_over(self) -> "AcpPromptStats":
+    def carry_over(self) -> AcpPromptStats:
         """Return fresh per-turn stats carrying this turn's context state.
 
         Event/tool/credit counters are per-turn and start at zero; the context
@@ -1465,7 +1447,7 @@ class AcpPromptStats:
         """
         self.context_pct_unknown = False
 
-    def terminal_refusal(self, stop_reason: str) -> tuple[str, "RefusalInfo | None"]:
+    def terminal_refusal(self, stop_reason: str) -> tuple[str, RefusalInfo | None]:
         """Fold this turn's refusal evidence onto a terminal's stop reason.
 
         A structured refusal recorded from metadata wins: the terminal's own
@@ -1859,7 +1841,7 @@ class StructuredStatus:
         return self.phase == STATUS_PHASE_WAITING and bool(self.wait_reason)
 
     @classmethod
-    def from_meta(cls, meta: object) -> "tuple[StructuredStatus | None, str]":
+    def from_meta(cls, meta: object) -> tuple[StructuredStatus | None, str]:
         """Parse ``params._meta`` into a status, or explain why not.
 
         Returns ``(status, "")`` on success and ``(None, reason)`` otherwise.

@@ -92,6 +92,7 @@ def _request(service: KiroPrerequisiteService) -> MagicMock:
     }
     request = MagicMock()
     request.app = app
+    request.query = {}
     return request
 
 

@@ -6,8 +6,9 @@
  * session control.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, act, screen, fireEvent } from '@testing-library/react'
+import { act, screen, fireEvent } from '@testing-library/react'
 import { forwardRef, type ReactNode } from 'react'
+import { renderWithProviders as render } from '../test/helpers'
 
 type Captured = Record<string, (...args: never[]) => unknown> & Record<string, unknown>
 const seen = vi.hoisted(() => ({} as Record<string, Captured | null>))
@@ -36,12 +37,6 @@ vi.mock('./chat/TaskProgressBar', () => ({ default: () => null }))
 vi.mock('./chat/WorkflowProgressBar', () => ({ default: () => null }))
 vi.mock('./chat/KnowledgePicker', () => ({ KnowledgePicker: (p: Captured) => { seen.knowledge = p; return null } }))
 vi.mock('../app-sdk/ChatScrollChrome', async (orig) => ({ ...(await orig<typeof import('../app-sdk/ChatScrollChrome')>()), JumpToBottomButton: () => null }))
-// The dock reads where the chat runs (a react-query read); here it runs on this machine.
-const runsHere = vi.hoisted(() => ({ value: true as boolean | undefined }))
-vi.mock('../components/sessionEnvironmentHooks', async (orig) => ({
-  ...(await orig<typeof import('../components/sessionEnvironmentHooks')>()),
-  useSlotRunsHere: () => runsHere.value,
-}))
 
 import ComposerDockView from './chat/page/ComposerDockView'
 import { dismissFollowupItem } from '../store/chatSlice'
@@ -62,19 +57,9 @@ function dockProps(over: Partial<DockProps> = {}): DockProps {
   } as DockProps
 }
 
-beforeEach(() => { for (const k of Object.keys(seen)) seen[k] = null; runsHere.value = true })
+beforeEach(() => { for (const k of Object.keys(seen)) seen[k] = null })
 
 describe('ComposerDockView', () => {
-  it.each([
-    [true, 'local'],
-    [false, 'remote'],
-    [undefined, 'pending'],
-  ] as const)('sends ! commands where the chat runs (runs here: %s -> %s)', (here, target) => {
-    runsHere.value = here
-    render(<ComposerDockView {...dockProps()} />)
-    expect(seen.chatInput!.terminalCommands).toBe(target)
-  })
-
   it('dismisses the prefill hint from the composer', () => {
     const setPrefillHint = vi.fn()
     render(<ComposerDockView {...dockProps({ setPrefillHint })} />)

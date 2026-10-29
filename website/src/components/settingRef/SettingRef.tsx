@@ -8,14 +8,13 @@
  * - Unknown/malicious key: plain <code>, NO link
  */
 import { Link, useNavigate } from 'react-router-dom'
-import type { MouseEvent, ReactElement } from 'react'
+import type { MouseEvent } from 'react'
 import { Settings, Terminal } from 'lucide-react'
 import { Popover, PopoverContent, PopoverTrigger } from '../ui/popover'
 import { resolveSettingRef } from './resolveSettingRef'
 import type { SchemaEntry } from './resolveSettingRef'
 import type { SettingEntry } from '../commandPalette/settingsTypes'
 import { useConfigSchema } from './useConfigSchema'
-import { LockedByPolicyBadge, schemaLockedByPolicy } from './LockedByPolicyBadge'
 import { i18nT } from '../../i18n/t'
 import { toPathSegment, SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS } from '../subNavParams'
 import { settingsPath } from '../settingsPath'
@@ -138,9 +137,6 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
 
   // Config key mode: resolve against registry + schema
   const resolution = resolveSettingRef(configKey, schemaIndex)
-  // An enterprise build ignores this local value; the badge says so beside the chip.
-  const locked = schemaLockedByPolicy(configKey, schemaIndex)
-  const withLock = (chip: ReactElement) => (locked ? <>{chip} <LockedByPolicyBadge /></> : chip)
 
   if (resolution.mode === 'ui') {
     const route = buildSettingsRoute(resolution.entry, configKey)
@@ -154,7 +150,7 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
       e.preventDefault()
       guardedLeave(() => navigate(route), route)
     }
-    return withLock(
+    return (
       <Link
         to={route}
         onClick={onClick}
@@ -168,7 +164,7 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
   }
 
   if (resolution.mode === 'file') {
-    return withLock(
+    return (
       <Popover>
         <PopoverTrigger asChild>
           <button
@@ -181,24 +177,17 @@ export function SettingRef({ configKey, kind = 'config', schemaIndex: schemaInde
           </button>
         </PopoverTrigger>
         <PopoverContent className="w-96 max-w-[90vw] p-3">
-          {locked ? (
-            // A set command would only store a value this build ignores.
-            <p className="text-xs text-muted">{i18nT('components.lockedByPolicyBadge.tooltip')}</p>
-          ) : (
-            <>
-              <p className="text-xs text-muted mb-2">{i18nT('components.settingRef.fileOnlyDescription')}</p>
-              <div className="mb-1.5">
-                <ConfigSetCommandRow
-                  configKey={configKey}
-                  schemaType={resolution.schemaEntry.type}
-                  initialValue={valuePlaceholder === 'value' ? undefined : valuePlaceholder}
-                  valuePlaceholder={valuePlaceholder}
-                  hints={configSetHints}
-                />
-              </div>
-              <p className="text-[11px] text-muted">{i18nT('components.settingRef.orEditConfigJson')}</p>
-            </>
-          )}
+          <p className="text-xs text-muted mb-2">{i18nT('components.settingRef.fileOnlyDescription')}</p>
+          <div className="mb-1.5">
+            <ConfigSetCommandRow
+              configKey={configKey}
+              schemaType={resolution.schemaEntry.type}
+              initialValue={valuePlaceholder === 'value' ? undefined : valuePlaceholder}
+              valuePlaceholder={valuePlaceholder}
+              hints={configSetHints}
+            />
+          </div>
+          <p className="text-[11px] text-muted">{i18nT('components.settingRef.orEditConfigJson')}</p>
         </PopoverContent>
       </Popover>
     )

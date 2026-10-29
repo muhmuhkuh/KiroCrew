@@ -33,7 +33,6 @@ from kiro_crew.acp.types import (
     UPDATE_AGENT_MESSAGE_CHUNK,
     AcpEvent,
     JsonRpcMessage,
-    wrap_user_message,
 )
 
 if TYPE_CHECKING:
@@ -116,7 +115,7 @@ async def steer(client: AcpClient, text: str) -> bool:
         return False
     if len(text) > MAX_STEERING_TEXT_CHARS:
         return False
-    wrapped = wrap_user_message(text)
+    wrapped = f"<user_message>\n{text}\n</user_message>"
     async with client._pi_steer_lock:
         pending = client._pi_steers_pending
         if (

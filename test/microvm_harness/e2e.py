@@ -164,9 +164,15 @@ def install_harness_credentials(work: Path) -> dict[str, str]:
     config.write_text(f"[profile {HARNESS_PROFILE}]\nregion = us-east-1\n")
     for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
         os.environ.pop(name, None)
-    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(credentials)
-    os.environ["AWS_CONFIG_FILE"] = str(config)
-    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = str(
+        credentials
+    )  # flake-ok: standalone harness pins dummy credentials for its own process and children
+    os.environ["AWS_CONFIG_FILE"] = str(
+        config
+    )  # flake-ok: standalone harness must replace the operator's AWS config for its own process
+    os.environ["AWS_DEFAULT_REGION"] = (
+        "us-east-1"  # flake-ok: standalone harness uses a fixed region for its loopback AWS emulator
+    )
     return dict(os.environ)
 
 
@@ -208,7 +214,9 @@ def loopback_only_aws(*endpoints: str):
         yield
     finally:
         if saved is not None:
-            os.environ["KIROCREW_SESSION_KEY"] = saved
+            os.environ["KIROCREW_SESSION_KEY"] = (
+                saved  # flake-ok: finally restores the exact session key temporarily cleared by this context
+            )
 
 
 def _http(url: str, *, timeout: float = 5.0, headers: Optional[dict] = None) -> tuple[int, bytes]:

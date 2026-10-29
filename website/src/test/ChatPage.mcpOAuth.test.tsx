@@ -31,21 +31,15 @@ import { defaultMessageRenderers, resolveRenderer } from '../app-sdk/messageRend
 import type { ChatMessage } from '../types'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const pagesDir = resolve(here, '../pages')
-const ownerDir = resolve(pagesDir, 'chat/page')
-// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and
-// those owners, and a page-level banner cannot come back through one of them.
-const ownerSrcs = [
-  ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(join(ownerDir, f), 'utf8')),
-  ...readdirSync(pagesDir).filter(f => /^useChatPage.*\.tsx?$/.test(f) && !/\.test\./.test(f)).sort()
-    .map(f => readFileSync(join(pagesDir, f), 'utf8')),
-]
-const chatPageSrc = [readFileSync(resolve(pagesDir, 'ChatPage.tsx'), 'utf8'), ...ownerSrcs].join('\n')
+const chatPageSrc = readFileSync(resolve(here, '../pages/chat/page/transcriptRendering.tsx'), 'utf8')
+// ChatPage's owners (pages/chat/page/), so a page-level banner cannot come back through one of them.
+const ownerSrcs = readdirSync(resolve(here, '../pages/chat/page'))
+  .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+  .map(f => readFileSync(join(resolve(here, '../pages/chat/page'), f), 'utf8'))
 
 function rendererBlock(): string {
-  const start = chatPageSrc.indexOf('fallback: bubbleRenderer } = useMemo')
-  const end = chatPageSrc.indexOf('const renderMessage = useCallback', start)
+  const start = chatPageSrc.indexOf('const renderers = mergeRenderers([')
+  const end = chatPageSrc.indexOf('return { renderers, fallback: bubble }', start)
   if (start < 0 || end < 0) throw new Error('ChatPage renderer block not found -- did the P5-a dispatch move?')
   return chatPageSrc.slice(start, end)
 }
@@ -98,10 +92,11 @@ describe('ChatPage – MCP OAuth banner wiring', () => {
    * shared hook and reach the registry through the render context.
    */
   it('gates the card-owned suppression on the shared connections_ui flag, through ctx', () => {
-    expect(chatPageSrc).toMatch(
-      /import\s*\{\s*useConnectionsUiEnabled\s*\}\s*from\s*['"][^'"]*useConnectionsUi['"]/,
+    const pageSource = [chatPageSrc, ...ownerSrcs].join('\n')
+    expect(pageSource).toMatch(
+      /import\s*\{\s*useConnectionsUiEnabled\s*\}\s*from\s*['"][^'"]*useConnectionsUi['"]/
     )
-    expect(chatPageSrc).toMatch(/const\s+connectionsUiOn\s*=\s*useConnectionsUiEnabled\(\)/)
+    expect(pageSource).toMatch(/const\s+connectionsUiOn\s*=\s*useConnectionsUiEnabled\(\)/)
     expect(chatPageSrc).toMatch(/hideCardOwnedOAuth:\s*connectionsUiOn\s*,/)
   })
 })

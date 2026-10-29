@@ -20,9 +20,10 @@ _TO_DICT_KEYS = (
     "title",
     "agent",
     "agent_kind",
-    "crew_mode_agent",
     "effective_agent",
     "model",
+    "acp_backend",
+    "backend_selection_supported",
     # The owner's per-turn model-routing choice (the picker's "Auto (Jev)" entry).
     # Present on EVERY slot, so an absent key and "pinned by hand" are not the
     # same reading for a stale client.

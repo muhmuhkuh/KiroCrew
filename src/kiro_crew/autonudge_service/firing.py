@@ -23,7 +23,7 @@ import logging
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Callable
 
 from kiro_crew import probes, shutdown_event
 from kiro_crew.autonudge_service.gate import (
@@ -55,7 +55,6 @@ from kiro_crew.autonudge_service.model import (
     runtime_elapsed,
 )
 from kiro_crew.autonudge_service.timers import (
-    _ACTING_TIMER,
     _REARM_BACKOFF_MAX_SHIFT,
     _REARM_BACKOFF_SECS,
     _REARM_MAX_BACKOFF_SECS,
@@ -69,24 +68,6 @@ if TYPE_CHECKING:
 
 # The service's own logger: callers and tests filter on it by name.
 logger = logging.getLogger("kiro_crew.autonudge")
-
-
-async def _tick_update(svc: AutoNudgeService, loop_id: str, **changes: Any) -> NudgeLoop | None:
-    """Apply one of the running tick's own updates to its loop.
-
-    ``update`` mutates in a shielded task of its own, which copies the caller's context
-    when it is created. Bound here, :data:`_ACTING_TIMER` names the calling task in that
-    copy, so ``_cancel_timer`` retires the tick's registration without cancelling the
-    tick while it awaits the update. The previous value is restored before returning,
-    so nothing else the tick runs or spawns (an agent turn started from ``_on_fire``)
-    carries the binding, and a direct ``await svc._timer(...)`` leaves its caller's
-    context as it found it.
-    """
-    token = _ACTING_TIMER.set(_current_task_or_none())
-    try:
-        return await svc.update(loop_id, **changes)
-    finally:
-        _ACTING_TIMER.reset(token)
 
 
 async def _timer(self: AutoNudgeService, loop: NudgeLoop, delay: float | None = None) -> None:
@@ -191,7 +172,12 @@ async def _run_timer_callback(self: AutoNudgeService, loop: NudgeLoop) -> None:
     # this stop is the agent reporting the goal reached.
     if loop.stop_sentinel_path and Path(loop.stop_sentinel_path).exists():
         logger.info("AutoNudge: stop sentinel found for %s — deactivating loop", loop.id)
-        await _tick_update(self, loop.id, active=False, stopped_reason=STOP_SENTINEL_REASON)
+        # Retire THIS task's registration first. ``update`` runs its mutation in a
+        # shielded task, from which ``_cancel_timer`` cannot recognise this timer as
+        # the current task and would cancel it mid-await; popped here, from the task
+        # itself, the self-guard applies and the deactivation returns normally.
+        self._cancel_timer(loop.id)
+        await self.update(loop.id, active=False, stopped_reason=STOP_SENTINEL_REASON)
         return
     # The person-wait HOLD, ahead of both bounds: a work-ledger watch whose open items
     # all wait on a person, unchanged since its last delivered turn, has nothing to
@@ -204,7 +190,7 @@ async def _run_timer_callback(self: AutoNudgeService, loop: NudgeLoop) -> None:
         if await self._extend_for_open_ledger(loop, "max_cycles"):
             return
         logger.info("AutoNudge: loop %s reached max_cycles — deactivating", loop.id)
-        await _tick_update(self, loop.id, active=False, stopped_reason="cycle_cap")
+        await self.update(loop.id, active=False, stopped_reason="cycle_cap")
         # Signal the cap. Reaching max_cycles is NOT a successful finish —
         # the loop ran out of cycles with its goal possibly unmet — yet without
         # a signal of its own the only trace is this log line plus an ``updated``
@@ -256,7 +242,7 @@ async def _run_timer_callback(self: AutoNudgeService, loop: NudgeLoop) -> None:
             loop.id,
             loop.max_runtime_secs,
         )
-        await _tick_update(self, loop.id, active=False, stopped_reason="runtime_budget")
+        await self.update(loop.id, active=False, stopped_reason="runtime_budget")
         self._emit("expired", loop)
         return
     # Cycles that never reach a model session. A delivered cycle whose turn
@@ -285,7 +271,7 @@ async def _run_timer_callback(self: AutoNudgeService, loop: NudgeLoop) -> None:
             loop.cycle_count + 1,
         )
         self._start_failure_deferred.pop(loop.id, None)
-        await _tick_update(self, loop.id, active=False, stopped_reason=SESSION_START_FAILURE_REASON)
+        await self.update(loop.id, active=False, stopped_reason=SESSION_START_FAILURE_REASON)
         self._emit("expired", loop)
         return
     if loop.consecutive_start_failures >= _START_FAILURE_BACKOFF_AFTER:
@@ -347,7 +333,7 @@ async def _run_timer_callback(self: AutoNudgeService, loop: NudgeLoop) -> None:
             loop.consecutive_failed_cycles,
             loop.cycle_count + 1,
         )
-        await _tick_update(self, loop.id, active=False, stopped_reason=CONSECUTIVE_FAILURE_REASON)
+        await self.update(loop.id, active=False, stopped_reason=CONSECUTIVE_FAILURE_REASON)
         self._emit("expired", loop)
         return
     # Fire. Update state only if the callback reports actual delivery —
@@ -698,9 +684,10 @@ async def _settle_fire_cycle(
             # for, but a refused fire accounts for nothing: the next tick takes
             # the observation-free bypass, DELIVERS the turn, and finds no claim
             # to charge -- so a wake that really happened and really woke the
-            # agent was missing from ``wakes`` entirely. That counter has to be
-            # trustworthy, and omitting a delivered wake makes the saving look
-            # BETTER than it is.
+            # agent was missing from ``wakes`` entirely. That counter is the one
+            # artifact this PR exists to make trustworthy, and omitting a
+            # delivered wake makes the saving look BETTER than it is, which is
+            # the same dishonesty as the zero nothing surfaced before.
             #
             # Re-adding cannot double-charge: the charge happens once, at the
             # single point delivery is confirmed, and the claim is discarded
@@ -1153,17 +1140,24 @@ async def _extend_for_open_ledger(self: AutoNudgeService, loop: NudgeLoop, bound
         None, _ledger_has_open_items, loop.slot_key
     ):
         return False
+    # Detach THIS tick from the timer table before the update. ``update`` cancels
+    # the loop's registered timer from inside its own shielded task, where the
+    # running tick is not "the current task", so it would cancel this tick
+    # mid-await and the WARNING and the re-arm below would never run. Detached,
+    # the update finds no timer to cancel and arms one of its own.
+    if self._timers.get(loop.id) is _current_task_or_none():
+        self._timers.pop(loop.id, None)
     if bound == "max_cycles":
         current = int(loop.max_cycles)
         raised = loop.cycle_count + max(_LEDGER_EXTEND_MIN_CYCLES, current // _LEDGER_EXTEND_SHARE)
-        updated = await _tick_update(self, loop.id, max_cycles=raised)
+        updated = await self.update(loop.id, max_cycles=raised)
     else:
         current = int(loop.max_runtime_secs)
         step = max(_LEDGER_EXTEND_MIN_RUNTIME_SECS, current // _LEDGER_EXTEND_SHARE)
         raised = min(int(age) + step, ceiling)
         if raised <= current:
             return False
-        updated = await _tick_update(self, loop.id, max_runtime_secs=raised)
+        updated = await self.update(loop.id, max_runtime_secs=raised)
     if updated is None or not updated.active:
         return False
     logger.warning(

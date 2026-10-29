@@ -17,7 +17,7 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  *
  * ## Why a hook and not six `useQuery` calls
  *
- * Six surfaces render a model picker (ChatPage, ChatPane, chat-sidebar/bulkModelSwitch.tsx's bulk
+ * Six surfaces render a model picker (ChatPage, ChatPane, ChatSidebar's bulk
  * switcher, AgentsPage, Settings ▸ Chat, KiroCrewAgentsPage) and all six used
  * the SAME query key — deliberately, so kiro-cli's `--list-models` is spawned
  * once — while each declared its own `queryFn`. React Query stores one cache
@@ -38,19 +38,20 @@ const PLACEHOLDER: ModelInfo[] = [{ name: 'auto', description: '' }]
  * cannot supply a shape, only read one.
  *
  * `enabled` is the one option callers still control, because it is per-observer
- * and cannot corrupt the cached value: chat-sidebar/bulkModelSwitch.tsx's bulk switcher passes
+ * and cannot corrupt the cached value: ChatSidebar's bulk switcher passes
  * `false` until its panel opens so merely rendering the sidebar does not spawn
  * kiro-cli. Other mounted observers still fetch normally — `enabled` gates who
  * *triggers* a fetch, not what lands in the cache.
  */
-type AvailableModelsOptions = { enabled?: boolean }
+type AvailableModelsOptions = { enabled?: boolean; backend?: string }
 
-export function useAvailableModelsQuery({ enabled }: AvailableModelsOptions = {}) {
+export function useAvailableModelsQuery({ enabled, backend }: AvailableModelsOptions = {}) {
   const provider = useProvider()
-  const isDegraded = useModelsDegraded(provider.id)
+  const healthKey = backend === undefined ? provider.id : `${provider.id}:${backend}`
+  const isDegraded = useModelsDegraded(healthKey)
   const query = useQuery({
-    queryKey: ['available-models', provider.id],
-    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels()),
+    queryKey: ['available-models', healthKey],
+    queryFn: async () => withAutoFirst(await provider.fetchAvailableModels(backend)),
     refetchInterval: modelListRefetchInterval,
     ...(enabled === undefined ? {} : { enabled }),
   })

@@ -772,7 +772,7 @@ make this tool possible:
 <a href="https://github.com/kiavashsamadi" title="Kiavash"><img src="https://github.com/kiavashsamadi.png?size=64" width="64" height="64" alt="Kiavash" /></a>
 <a href="https://github.com/kirankumar15" title="kirankumar"><img src="https://github.com/kirankumar15.png?size=64" width="64" height="64" alt="kirankumar" /></a>
 <a href="https://github.com/kiro" title="Kiril Minkov"><img src="https://github.com/kiro.png?size=64" width="64" height="64" alt="Kiril Minkov" /></a>
-<a href="https://github.com/KiroCrew" title="KiroCrew"><img src="https://github.com/KiroCrew.png?size=64" width="64" height="64" alt="KiroCrew" /></a>
+<a href="https://github.com/KiroCrew" title="Kiro Crew"><img src="https://github.com/KiroCrew.png?size=64" width="64" height="64" alt="Kiro Crew" /></a>
 <a href="https://github.com/KiroCrewCaptain" title="KiroCrewCaptain"><img src="https://github.com/KiroCrewCaptain.png?size=64" width="64" height="64" alt="KiroCrewCaptain" /></a>
 <a href="https://github.com/kishoreb95" title="Kishore Baskar"><img src="https://github.com/kishoreb95.png?size=64" width="64" height="64" alt="Kishore Baskar" /></a>
 <a href="https://github.com/Kive1ru" title="Jiahao Guo"><img src="https://github.com/Kive1ru.png?size=64" width="64" height="64" alt="Jiahao Guo" /></a>

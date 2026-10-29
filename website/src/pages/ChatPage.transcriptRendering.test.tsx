@@ -45,8 +45,7 @@ function props(over: Partial<Props> = {}): Props {
     handleAsk: undefined, handleQuote: fn(), handleEditResend: fn(), editLast: null, farmPassRef: { current: false }, handleEditConsumed: fn(),
     renderUserContentCb: () => <span />, transcriptHot: false, toggleAct: fn(), handleSpeak: fn(), handleApplyPlan: vi.fn(async () => true),
     renderedDisplayItems: [], stableMsgKey: (m: ChatMessage) => String(m.ts), handleLoadEarlier: fn(), isPinned: () => false,
-    handleJumpToQuote: fn(), handleTogglePinForMessage: fn(), handleSteerAction: fn(),
-    steerActionPending: {}, steerActionRefusals: {}, steerActionRequestFailures: {},
+    handleJumpToQuote: fn(), handleTogglePinForMessage: fn(),
     ...over,
   }
 }

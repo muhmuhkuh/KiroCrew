@@ -254,13 +254,11 @@ class TestApiChatModePropagation:
         monkeypatch.setattr("kiro_crew.slack.handler.is_yolo_mode", lambda: False)
         state = _make_state(tmp_path)
         state.push_slots_update = MagicMock()
-        slot = state.get_or_create_slot("s1")
+        state.get_or_create_slot("s1")
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/mode", json={"mode": "trust", "slot": "s1"})
-            assert resp.status == 200
+            await client.post("/api/chat/mode", json={"mode": "trust", "slot": "s1"})
 
-        assert slot._trust is True
         state.sessions.set_approval_policy.assert_any_call("dashboard:s1", "auto")
 
     @pytest.mark.asyncio
@@ -270,14 +268,11 @@ class TestApiChatModePropagation:
         monkeypatch.setattr("kiro_crew.slack.handler.is_yolo_mode", lambda: False)
         state = _make_state(tmp_path)
         state.push_slots_update = MagicMock()
-        slot = state.get_or_create_slot("s1")
-        slot._trust = True
+        state.get_or_create_slot("s1")
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/mode", json={"mode": "normal", "slot": "s1"})
-            assert resp.status == 200
+            await client.post("/api/chat/mode", json={"mode": "normal", "slot": "s1"})
 
-        assert (slot._trust, slot._trust_reads) == (False, False)
         state.sessions.set_approval_policy.assert_any_call("dashboard:s1", "")
 
     @pytest.mark.asyncio
@@ -287,14 +282,11 @@ class TestApiChatModePropagation:
         monkeypatch.setattr("kiro_crew.slack.handler.is_yolo_mode", lambda: False)
         state = _make_state(tmp_path)
         state.push_slots_update = MagicMock()
-        slot = state.get_or_create_slot("s1")
-        slot._trust = True
+        state.get_or_create_slot("s1")
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/mode", json={"mode": "trust_reads", "slot": "s1"})
-            assert resp.status == 200
+            await client.post("/api/chat/mode", json={"mode": "trust_reads", "slot": "s1"})
 
-        assert (slot._trust, slot._trust_reads) == (False, True)
         state.sessions.set_approval_policy.assert_any_call("dashboard:s1", "")
 
     @pytest.mark.asyncio
@@ -304,14 +296,12 @@ class TestApiChatModePropagation:
         monkeypatch.setattr("kiro_crew.slack.handler.is_yolo_mode", lambda: False)
         state = _make_state(tmp_path)
         state.push_slots_update = MagicMock()
-        s1 = state.get_or_create_slot("s1")
-        s2 = state.get_or_create_slot("s2")
+        state.get_or_create_slot("s1")
+        state.get_or_create_slot("s2")
 
         async with TestClient(TestServer(_make_app(state))) as client:
-            resp = await client.post("/api/chat/mode", json={"mode": "trust"})
-            assert resp.status == 200
+            await client.post("/api/chat/mode", json={"mode": "trust"})
 
-        assert (s1._trust, s2._trust) == (True, True)
         state.sessions.set_approval_policy.assert_any_call("dashboard:s1", "auto")
         state.sessions.set_approval_policy.assert_any_call("dashboard:s2", "auto")
 

@@ -401,13 +401,11 @@ describe('MembersPage star', () => {
   })
 })
 
-/* The default roster lists a mate the person created (on the page, or by
- * approving Mate's card) even with an empty chat, and any other row once its DM
- * thread holds a message, whoever sent it, or when it is starred -- like a
- * messages app, which lists no empty thread it did not start. Everything else
- * is hidden until the search reaches it; the reserved default member is listed
- * only once the person sent it a message. Every fixture above omits the
- * fields, as an older gateway does, and those rows stay listed. */
+/* The default roster lists a row when its DM thread holds a message, whoever
+ * sent it, or when it is starred -- like a messages app, which lists no empty
+ * thread. Everything else is hidden until the search reaches it; the built-in
+ * default crewmate follows the same rule. Every fixture above omits the field,
+ * as an older gateway does, and those rows stay listed. */
 describe('MembersPage hides unlisted mates', () => {
   const NO = { dashboard_created: false, has_dm_message: false }
   const MIXED = [
@@ -425,25 +423,6 @@ describe('MembersPage hides unlisted mates', () => {
     // Not "filtered out": hidden rows are unlisted, so no chip and no notice.
     expect(screen.queryByTestId('member-filter-chips')).toBeNull()
     expect(screen.queryByTestId('member-filtered-out')).toBeNull()
-  })
-
-  it('lists a mate the person created with an empty, never-opened chat, and still hides an auto-made one', async () => {
-    await renderPage([
-      ...MIXED,
-      row('nova-sky', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Nova Sky' }),
-    ])
-    await waitFor(() => expect(names()).toContain('nova-sky'))
-    expect(names()).not.toContain('pkg-tool')
-    expect(screen.getByTestId('member-count')).toHaveTextContent('4 mates')
-    expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent('legacy-aim and pkg-tool')
-  })
-
-  it('hides the reserved default member until the person sent it a message', async () => {
-    await renderPage([
-      ...MIXED,
-      row('default', { source: 'builtin', ...NO, has_dm_message: true, has_user_dm_message: false }),
-    ])
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
   })
 
   it('the search reaches a hidden row, and the count grows to include it', async () => {
@@ -482,7 +461,7 @@ describe('MembersPage hides unlisted mates', () => {
   it('names a single hidden mate by the label its row shows, in the singular', async () => {
     await renderPage([
       ...MIXED.filter((m) => m.name !== 'pkg-tool' && m.name !== 'legacy-aim'),
-      row('nova-sky', { source: 'radar-app', ...NO, display_name: 'Nova Sky' }),
+      row('nova-sky', { ...NO, display_name: 'Nova Sky' }),
     ])
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent(
@@ -503,19 +482,19 @@ describe('MembersPage hides unlisted mates', () => {
     )
   })
 
-  it('names the mates the user made ahead of package and app rows', async () => {
-    // A legacy crewmate the user made (source kirocrew, no member id yet)
-    // sorts last by name here, behind four package rows; it is still one of
-    // the three named, and named first.
+  it('lists a dashboard-created mate instead of naming it as hidden', async () => {
+    // Explicitly created mates are listed even with no message; only the
+    // untouched package/app rows belong in the hidden hint.
     await renderPage([
       ...MIXED,
       row('pkg-two', { ...NO }),
       row('pkg-three', { ...NO }),
-      row('zebra-notes', { source: 'kirocrew', ...NO, display_name: 'Zebra Notes' }),
+      row('zebra-notes', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Zebra Notes' }),
     ])
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'zebra-notes']))
+    expect(screen.getByTestId('member-count')).toHaveTextContent('4 mates')
     expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
-      "Zebra Notes, legacy-aim, pkg-three and 2 more mates you haven't used yet are hidden and aren't counted above.",
+      "legacy-aim, pkg-three, pkg-tool and 1 more mate you haven't used yet are hidden and aren't counted above.",
     )
   })
 

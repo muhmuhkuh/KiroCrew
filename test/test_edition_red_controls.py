@@ -114,8 +114,7 @@ def test_user_kiro_hooks_follow_the_policy_in_enterprise(
 
     installed = bool(config["hooks"].get("preToolUse"))
     assert installed is (policy_enables or not enterprise)
-    # Asked on the host key only: the gate, then each event's list entry.
-    assert set(seen) == ({governance_profiles.HOST_SESSION_KEY} if enterprise else set())
+    assert seen == ([governance_profiles.HOST_SESSION_KEY] if enterprise else [])
 
 
 # --- Webhooks by source ----------------------------------------------------------
@@ -210,9 +209,6 @@ class _Installer:
 
     async def sync_plugins(self):
         return await self._ok("sync_plugins")
-
-    async def plugins_out_of_sync(self):
-        return []
 
 
 @pytest.mark.parametrize("edition", EDITIONS)

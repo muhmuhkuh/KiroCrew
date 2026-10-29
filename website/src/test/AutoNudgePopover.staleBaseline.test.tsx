@@ -81,8 +81,13 @@ async function editGoalAndSave(text: string) {
 }
 
 describe('AutoNudgePopover goal baseline', () => {
-  beforeEach(() => { localStorage.clear(); __resetForTests() })
-  afterEach(() => { vi.unstubAllGlobals() })
+  beforeEach(() => {
+    localStorage.clear()
+    __resetForTests()
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-06-15T12:00:00Z'))
+  })
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals() })
 
   it('reads the baseline at open even when the record came through a frame, and sends it with a goal save', async () => {
     fakeGateway({ message: 'the stored goal', token: 'tok-0' })

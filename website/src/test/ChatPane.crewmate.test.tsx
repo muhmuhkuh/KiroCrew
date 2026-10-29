@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { ReactNode } from 'react'
 import { render, waitFor, fireEvent } from '@testing-library/react'
 import type { RootState } from '../store'
@@ -94,7 +94,10 @@ function renderPane(opts: { onOpenCrewWorkLog?: () => void; crewmate?: boolean; 
   )
 }
 
+afterEach(() => vi.useRealTimers())
+
 beforeEach(() => {
+  vi.setSystemTime(1_791_091_200_000)
   vi.clearAllMocks()
   ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue({
     messages: MACHINERY, running: false, has_more: false, total: MACHINERY.length,

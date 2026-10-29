@@ -138,21 +138,22 @@ export const LOCATIONS = {
     },
     placements: [{ surface: 'chat', parent: 'composer.add-menu', entry: 'menu' }],
   },
-  // Visible text is "Slash command"; the title is "Slash commands".
+  // Visible text is "Command" (plus a description line); the title is
+  // "Slash commands".
   'composer.add-menu.slash': {
     kind: 'menu-item',
     label: { from: 'text', key: 'components.chatInput.command' },
     aliasKeys: ['components.chatInput.slash_commands'],
     terms: {
-      en: ['chat commands', 'quick commands', 'commands menu'],
+      en: ['slash command', 'chat commands', 'quick commands', 'commands menu'],
       'zh-CN': ['斜杠', '快捷命令', '命令菜单', '聊天命令'],
     },
     placements: [{ surface: 'chat', parent: 'composer.add-menu', entry: 'menu' }],
   },
   'composer.add-menu.reference-file': {
     kind: 'menu-item',
-    label: { from: 'text', key: 'components.chatInput.reference_a_file' },
-    aliasKeys: ['components.chatInput.file'],
+    label: { from: 'text', key: 'components.chatInput.file' },
+    aliasKeys: ['components.chatInput.reference_a_file'],
     terms: {
       en: ['mention a file', 'point the agent at a file', 'let the agent read a file', 'at mention a file'],
       'zh-CN': ['提及文件', '引用一个文件', '让代理读取文件'],
@@ -161,8 +162,8 @@ export const LOCATIONS = {
   },
   'composer.add-menu.skill': {
     kind: 'menu-item',
-    label: { from: 'text', key: 'components.chatInput.use_a_skill' },
-    aliasKeys: ['components.chatInput.skill'],
+    label: { from: 'text', key: 'components.chatInput.skill' },
+    aliasKeys: ['components.chatInput.use_a_skill'],
     terms: {
       en: ['apply a skill', 'run a skill', 'pick a skill', 'choose a skill'],
       'zh-CN': ['用技能', '选择技能', '应用技能', '调用技能'],
