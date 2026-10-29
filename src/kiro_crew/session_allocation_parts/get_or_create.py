@@ -630,6 +630,21 @@ async def _get_or_create_impl(
             )
         extra_env = bound_env
 
+    from kiro_crew.agent_backend_selection import agent_backend_pin
+
+    if (
+        extra_factory_kwargs.get("acp_backend_override") is None
+        and extra_factory_kwargs.get("backend_override") is None
+    ):
+        backend_cfg = (
+            await asyncio.to_thread(self._deps.load_config) if preparation.revision else owner._cfg
+        )
+        pin = await asyncio.to_thread(
+            agent_backend_pin, backend_cfg, preparation.member or agent, claim_crew, session_key=key
+        )
+        if pin is not None:
+            extra_factory_kwargs["acp_backend_override"] = pin
+
     # Reconciliation can publish a new template model. Resolve only after
     # that boundary, while retaining an explicit caller model unchanged.
     if model is None:

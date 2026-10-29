@@ -389,6 +389,9 @@ async def api_members(request: web.Request) -> web.Response:
                 "memory_version": version,
                 "memory_owner": _roster_mask(owner),
                 "model": _roster_mask(agent_cfg.model),
+                "acp_backend": (
+                    None if agent_cfg.acp_backend is None else _roster_mask(agent_cfg.acp_backend)
+                ),
                 # The profile card's own settings. The effort is free text like
                 # the model; the approval mode is load-time coerced to a fixed
                 # vocabulary ("" = never chosen, which opens the thread in trust).

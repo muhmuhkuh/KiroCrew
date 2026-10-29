@@ -396,25 +396,13 @@ def _session_model(
     Blocking I/O (globs + reads ``~/.kiro/agents/*.json``): call in an executor.
     """
     from kiro_crew.config.loader import resolve_effective_model
-    from kiro_crew.members import (
-        is_crewmate_worker_session,
-        is_member_session_key,
-        select_provider_backend,
-    )
 
     try:
-        backend: str | None = None
-        if (
-            backend_override is not None
-            or is_member_session_key(session_key)
-            or is_crewmate_worker_session(session_key)
-        ):
-            backend = select_provider_backend(
-                session_key,
-                cfg.agent.member_acp_backend,
-                cfg.agent.acp_backend,
-                backend_override=backend_override,
-            )
+        from kiro_crew.agent_backend_selection import session_backend
+
+        backend = session_backend(
+            cfg, agent, crew_agent, session_key=session_key, backend_override=backend_override
+        )
         crew_name = _resolve_allocation_crew_identity(cfg, agent, crew_agent)
         if crew_name and crew_name in cfg.agents:
             model = resolve_effective_model(cfg, crew_name, app_name=app_name, backend=backend)

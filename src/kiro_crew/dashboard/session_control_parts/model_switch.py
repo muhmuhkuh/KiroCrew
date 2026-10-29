@@ -152,8 +152,10 @@ async def set_model_target(
                 status=400,
             )
         model_name = _normalize_model(model)
+    backend_config = None
     try:
-        agent_cfg = (await asyncio.to_thread(KiroCrewConfig.load)).agent
+        backend_config = await asyncio.to_thread(KiroCrewConfig.load)
+        agent_cfg = backend_config.agent
         provider = agent_cfg.provider
         member_backend, default_backend = agent_cfg.member_acp_backend, agent_cfg.acp_backend
     except Exception:  # pragma: no cover - config load is resilient
@@ -183,6 +185,21 @@ async def set_model_target(
     # member DM routes to agent.member_acp_backend, which can differ from the
     # configured default, and a Claude backend takes canonical keys as wire ids.
     backend = select_provider_backend(effective_session_key(slot), member_backend, default_backend)
+    if slot.acp_backend is not None:
+        from kiro_crew.agent_backend_selection import validate_agent_backend
+
+        backend = validate_agent_backend(slot.acp_backend) or ""
+    elif backend_config is not None:
+        from kiro_crew.agent_backend_selection import agent_backend_pin
+
+        pin = agent_backend_pin(
+            backend_config,
+            slot.agent,
+            "" if slot.agent_kind == "template" else None,
+            session_key=effective_session_key(slot),
+        )
+        if pin is not None:
+            backend = pin
     target_provider = (
         provider if is_claude_code(provider) else capabilities_for(backend).provider_seam
     )

@@ -1401,11 +1401,16 @@ async def api_models(request: web.Request) -> web.Response:
     live session's entitlement); advertised-selection backends read their own
     adapter's namespace, because they do not accept ids from that catalog.
     """
-    from kiro_crew.agent_sdk.backends import selectable_backends
+    from kiro_crew.agent_backend_selection import validate_agent_backend
 
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    backend = request.query.get("backend", getattr(cfg.agent, "acp_backend", ""))
-    if backend not in selectable_backends():
+    try:
+        backend = validate_agent_backend(
+            request.query.get("backend", getattr(cfg.agent, "acp_backend", ""))
+        )
+        if backend is None:
+            raise ValueError("missing backend")
+    except ValueError:
         return web.json_response(
             {"error": "invalid backend", "code": "invalid_backend"}, status=400
         )
@@ -1767,7 +1772,12 @@ def _pin_entitlement_backend(cfg: Any) -> str:
 
 
 async def _revalidate_crew_pin(
-    model: str, request: web.Request, *, for_workers: bool = False
+    model: str,
+    request: web.Request,
+    *,
+    for_workers: bool = False,
+    member: str | None = None,
+    backend_choice: dict[str, Any] | None = None,
 ) -> str | None:
     """Revalidate the snapshot a crew's model pin is about to be judged by.
 
@@ -1795,6 +1805,15 @@ async def _revalidate_crew_pin(
     from kiro_crew.mate_worker import crewmate_worker_backend
 
     backend = crewmate_worker_backend(cfg.agent) if for_workers else _pin_entitlement_backend(cfg)
+    if member is not None or backend_choice is not None:
+        from kiro_crew.agent_backend_selection import member_backend_for_write
+
+        try:
+            backend = member_backend_for_write(
+                cfg, member or "", backend_choice or {}, for_workers=for_workers
+            )
+        except ValueError:
+            return "backend is not selectable"
     return await _revalidate_role_pin_evidence(model, request, backend=backend)
 
 

@@ -19,6 +19,12 @@ import type { AcpBackendProbe } from './client/config'
  */
 export const ACP_BACKEND_KIRO = 'kiro'
 
+/** Probe/config ids entering a chat or member override. Empty means explicit
+ * Kiro here; only null means inheritance. Do not apply config defaulting. */
+export function runtimeAcpBackendId(id: string): string {
+  return id === ACP_BACKEND_KIRO ? '' : id
+}
+
 /** The KAS backend's id (`ACP_BACKEND_KAS` on the gateway): kiro-cli's relay,
  *  which completes first-run setup on kiro-cli ACP support, not a kiro-cli login. */
 export const ACP_BACKEND_KAS = 'kas'

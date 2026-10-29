@@ -27,7 +27,6 @@ if TYPE_CHECKING:
         _lineage_unverifiable_error,
         _model_pin_rejected,
         _name_would_be_masked,
-        _pin_entitlement_backend,
         _require_owner,
         _revalidate_crew_pin,
         _safe_avatar,
@@ -108,9 +107,16 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     # Globs ~/.kiro/agents and may read the installed agent file — keep the
     # filesystem work off the event loop.
-    model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None, **app_kw)
     alias, kiro_agent, model_pin = await asyncio.to_thread(
         resolve_agent_identity, cfg, agent_name or None
+    )
+    from kiro_crew.acp_backends import resolve_selected_backend
+    from kiro_crew.agent_backend_selection import agent_backend_pin
+
+    pin = agent_backend_pin(cfg, kiro_agent, alias or "")
+    backend = pin if pin is not None else resolve_selected_backend(cfg.agent.member_acp_backend)
+    model = await asyncio.to_thread(
+        resolve_effective_model, cfg, agent_name or None, backend=backend, **app_kw
     )
     # Effort resolves through its own chain, served from the SAME resolver the
     # provider factory calls so the pane cannot disagree with what a session will
@@ -123,6 +129,7 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     return web.json_response(
         {
             "model": model,
+            "acp_backend": backend,
             "agent": agent_name,
             "kiro_agent": kiro_agent,
             # Whether the agent itself pins the model, vs inheriting it.
@@ -344,6 +351,14 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
     # {"model": 123} into the literal "123", which normalizes to a string the
     # backend then rejects as an unknown model id.
     model = normalize_agent_model(body.get("model"))
+    from kiro_crew.agent_backend_selection import member_backend_for_write, validate_agent_backend
+
+    try:
+        backend_pin = validate_agent_backend(body.get("acp_backend"))
+    except ValueError:
+        return web.json_response(
+            {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
+        )
     _raw_color = body.get("session_color", "")
     session_color = _safe_color(_raw_color)
     if _raw_color not in ("", None) and not session_color:
@@ -457,7 +472,7 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "workspace must be a string", "code": "invalid_workspace"}, status=400
         )
     workspace = _raw_workspace.strip()
-    pending_reason = await _revalidate_crew_pin(model, request)
+    pending_reason = await _revalidate_crew_pin(model, request, backend_choice=body)
     if pending_reason:
         return web.json_response({"error": pending_reason, "code": "invalid_model"}, status=400)
     async with _get_config_lock():
@@ -471,8 +486,14 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 status=409,
             )
         name, display_name = keyed.key, keyed.display_name
+        try:
+            selected_backend = member_backend_for_write(cfg, "", body)
+        except ValueError:
+            return web.json_response(
+                {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
+            )
         model_reason = _model_pin_rejected(
-            model, request, cfg.agent.provider, backend=_pin_entitlement_backend(cfg)
+            model, request, cfg.agent.provider, backend=selected_backend
         )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
@@ -523,6 +544,7 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
         # create and team the same name between the purge and the registration.
         # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
+            acp_backend=backend_pin,
             kiro_agent=kiro_agent,
             workspace=workspace,
             memory_store=memory_store,

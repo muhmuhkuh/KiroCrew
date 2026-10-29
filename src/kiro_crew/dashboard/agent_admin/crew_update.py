@@ -28,7 +28,6 @@ if TYPE_CHECKING:
         _lineage_unverifiable_error,
         _live_avatar_file,
         _model_pin_rejected,
-        _pin_entitlement_backend,
         _promote_pending_avatar,
         _rebind_crew_locked,
         _refresh_session_defaults,
@@ -139,6 +138,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     # by recomputing the redaction of `agent` would have to wait for the config
     # load inside the lock, and would therefore sit after these validations.
     body = {key: val for key, val in body.items() if not _carries_mask(val)}
+    from kiro_crew.agent_backend_selection import validate_agent_backend
+
+    if "acp_backend" in body:
+        try:
+            validate_agent_backend(body["acp_backend"])
+        except ValueError:
+            return web.json_response(
+                {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
+            )
     # Binding-only fast path (the template pane's saved-as-you-go switch). The
     # generic path below writes a full ``cfg.save()`` snapshot, which races
     # every other config writer (CLI, settings PUTs) and silently reverts
@@ -308,11 +316,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             status=400,
         )
     if "model" in body:
-        pending_reason = await _revalidate_crew_pin(pending_model, request)
+        pending_reason = await _revalidate_crew_pin(
+            pending_model, request, member=name, backend_choice=body
+        )
         if pending_reason:
             return web.json_response({"error": pending_reason, "code": "invalid_model"}, status=400)
     if "worker_model" in body:
-        pending_reason = await _revalidate_crew_pin(pending_worker_model, request, for_workers=True)
+        pending_reason = await _revalidate_crew_pin(
+            pending_worker_model, request, for_workers=True, member=name, backend_choice=body
+        )
         if pending_reason:
             return web.json_response(
                 {"error": pending_reason, "code": "invalid_worker_model"}, status=400
@@ -321,6 +333,14 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
             return web.json_response({"error": f"Agent '{name}' not found"}, status=404)
+        from kiro_crew.agent_backend_selection import member_backend_for_write
+
+        try:
+            selected_backend = member_backend_for_write(cfg, name, body)
+        except ValueError:
+            return web.json_response(
+                {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
+            )
         if "model" in body:
             # Validated before the write, reusing the config loaded just above so
             # this costs no extra read.
@@ -328,7 +348,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 pending_model,
                 request,
                 cfg.agent.provider,
-                backend=_pin_entitlement_backend(cfg),
+                backend=selected_backend,
             )
             if model_reason:
                 return web.json_response(
@@ -339,13 +359,11 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # its crewmate's backend (`mate_worker.crewmate_worker_backend`), and
             # `create_session` trusts this pin for exactly that harness
             # (`_inherited_pin_foreign_to_child`).
-            from kiro_crew.mate_worker import crewmate_worker_backend
-
             model_reason = _model_pin_rejected(
                 pending_worker_model,
                 request,
                 cfg.agent.provider,
-                backend=crewmate_worker_backend(cfg.agent),
+                backend=member_backend_for_write(cfg, name, body, for_workers=True),
             )
             if model_reason:
                 return web.json_response(
@@ -398,7 +416,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 status=409,
             )
         # Captured BEFORE any mutation: what the effort chain reads today.
-        effort_inputs_before = _effort_inputs(agent)
+        effort_inputs_before = (_effort_inputs(agent), agent.acp_backend)
         # Best-effort per-member event log: snapshot the config-derived roster
         # fields before mutation so member/config can report which changed.
         _ev_before = {
@@ -412,6 +430,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             "display_name": agent.display_name,
         }
         changed: list[str] = []
+        if "acp_backend" in body:
+            agent.acp_backend = validate_agent_backend(body["acp_backend"])
+            changed.append("acp_backend")
         if "kiro_agent" in body:
             try:
                 owner = await asyncio.to_thread(
@@ -619,7 +640,7 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # Already validated above, before any mutation.
             agent.starred = body["starred"]
             changed.append("starred")
-        effort_inputs_after = _effort_inputs(agent)
+        effort_inputs_after = (_effort_inputs(agent), agent.acp_backend)
         # Avatar rollback applies only to ordinary failure: cancellation may
         # arrive after the drained worker published the new avatar pin. Store
         # cleanup independently checks the current locked config, so a landed

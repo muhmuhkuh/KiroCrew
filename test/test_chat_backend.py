@@ -34,6 +34,32 @@ def cfg(monkeypatch):
     return cfg
 
 
+@pytest.mark.asyncio
+async def test_kiro_registry_row_is_accepted_as_the_actual_picker_request(state):
+    from kiro_crew.agent_sdk.backend_install import BackendInstallState
+    from kiro_crew.dashboard.handlers.acp_backend_status import _row
+
+    row = _row(BackendInstallState("", "kiro", "installed"), {""})
+    assert row["id"] == "kiro" and row["selectable"] is True
+    slot = state.get_or_create_slot("kiro-picker", model="auto")
+    status, body = await post_backend(state, slot, {"acp_backend": row["id"]})
+    assert status == 200, body
+    assert body["acp_backend"] == "" and slot.acp_backend == ""
+
+
+def test_legacy_kiro_alias_in_slot_starts_explicit_kiro_not_configured_default(cfg, tmp_path):
+    cfg.agent.acp_backend = "kas"
+    slot = _ChatSlot("legacy-kiro", model="auto")
+    slot.acp_backend = "kiro"
+    selection = chat_session_selection(slot, cfg, "auto")
+    selection.pop("model")
+    assert selection["acp_backend_override"] == ""
+    provider = cfg.create_provider_factory()(
+        "dashboard:legacy-kiro", cwd=str(tmp_path), **selection
+    )
+    assert provider.client.backend == ""
+
+
 @pytest.fixture
 def state(tmp_path, monkeypatch, cfg):
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
@@ -50,6 +76,76 @@ def state(tmp_path, monkeypatch, cfg):
     state.push_slots_update = MagicMock()
     monkeypatch.setattr(chat_handlers, "_subagents_attached_response", AsyncMock(return_value=None))
     return state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wire,expected",
+    [
+        ("kiro", ""),
+        ("", ""),
+        (None, "kas"),
+        ("kas", "kas"),
+        ("claude", "claude"),
+        ("codex", "codex"),
+        ("pi", "pi"),
+        ("opencode", "opencode"),
+        ("goose", "goose"),
+        ("deepseek", "deepseek"),
+    ],
+)
+async def test_picker_wire_values_do_not_conflate_kiro_and_default(state, cfg, wire, expected):
+    cfg.agent.acp_backend = "kas"
+    slot = state.get_or_create_slot("wire-matrix", model="auto")
+    slot.acp_backend = "codex" if expected == "pi" else "pi"
+    slot.model_backend = slot.acp_backend
+    status, body = await post_backend(state, slot, {"acp_backend": wire})
+    assert status == 200, body
+    assert slot.acp_backend == (None if wire is None else expected)
+    assert slot.model_backend == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire", ["kiro", ""])
+async def test_kiro_alias_cannot_bypass_narrowed_registry(state, monkeypatch, wire):
+    monkeypatch.setattr(
+        "kiro_crew.agent_sdk.backends.selectable_backends", lambda: frozenset({"pi"})
+    )
+    slot = state.get_or_create_slot("kiro-denied", model="keep")
+    assert (await post_backend(state, slot, {"acp_backend": wire}))[0] == 400
+    assert slot.acp_backend is None and slot.model == "keep"
+    state.sessions.reset.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clearing_override_follows_profile_instead_of_global(state, cfg):
+    from kiro_crew.config.loader import KiroCrewAgentConfig
+
+    cfg.agent.acp_backend = "kas"
+    cfg.agents["profile"] = KiroCrewAgentConfig(acp_backend="codex")
+    slot = state.get_or_create_slot("clear-to-profile", agent="profile", model="old")
+    slot.acp_backend = "pi"
+    slot.model_backend = "pi"
+    status, body = await post_backend(state, slot, {"acp_backend": None})
+    assert status == 200, body
+    assert slot.acp_backend is None and slot.model_backend == "codex"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire", ["kiro", ""])
+async def test_kiro_models_query_reaches_existing_auth_gate_without_defaulting_to_kas(
+    cfg, monkeypatch, wire
+):
+    cfg.agent.acp_backend = "kas"
+    guard = AsyncMock(return_value=web.json_response({"code": "kiro_unverified"}, status=503))
+    monkeypatch.setattr(agents, "reject_if_kiro_unverified", guard)
+    app = web.Application()
+    app.router.add_get("/api/models", agents.api_models)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/api/models", params={"backend": wire})
+        assert response.status == 503
+        assert (await response.json())["code"] == "kiro_unverified"
+    guard.assert_awaited_once()
 
 
 async def post_backend(state, slot, body, *, caller_app=""):
@@ -185,7 +281,15 @@ async def test_revoked_old_backend_does_not_block_permitted_replacement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "body", [{}, {"acp_backend": "unknown"}, {"acp_backend": []}, {"acp_backend": 1}]
+    "body",
+    [
+        {},
+        {"acp_backend": "unknown"},
+        {"acp_backend": "default"},
+        {"acp_backend": "vibe"},
+        {"acp_backend": []},
+        {"acp_backend": 1},
+    ],
 )
 async def test_invalid_backend_never_mutates_or_resets(state, body):
     slot = state.get_or_create_slot("a", model="keep-pin")

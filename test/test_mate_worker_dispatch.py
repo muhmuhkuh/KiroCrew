@@ -129,6 +129,115 @@ def test_the_crewmates_own_chat_runs_on_the_conductor(crewmate):
     assert execution.template_id == MATE_CONDUCTOR_AGENT
 
 
+@pytest.mark.parametrize("backend", ["kas", "claude"])
+def test_profile_backend_routes_worker_without_pinning_chat_override(crewmate, backend):
+    from kiro_crew.agent_backend_selection import session_backend
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.chat_backend import chat_session_selection
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["pixel"].acp_backend = backend
+    cfg.save()
+    state, caller, _ = crewmate
+    child = state.get_slot(_create(state, caller)["target"])
+    assert child.acp_backend is None
+    cfg = KiroCrewConfig.load()
+    assert session_backend(cfg, child.agent, "", session_key=slot_history_key(child)) == backend
+    selection = chat_session_selection(child, cfg, "auto")
+    assert selection["acp_backend_override"] == backend
+    cfg.agents["pixel"].acp_backend = "kas"
+    assert chat_session_selection(child, cfg, "auto")["acp_backend_override"] == "kas"
+
+
+@pytest.mark.parametrize("backend", ["codex", "pi", ""])
+def test_profile_cannot_bypass_worker_kit_boundary(crewmate, backend):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["pixel"].acp_backend = backend
+    cfg.save()
+    state, caller, _ = crewmate
+    before = set(state._slots)
+    with pytest.raises(sc.SessionControlError) as refused:
+        _create(state, caller)
+    assert refused.value.code == "capability_harness_unsupported"
+    assert set(state._slots) == before
+
+
+def test_worker_keeps_model_pin_chosen_for_the_profile_backend(crewmate):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.agent.member_acp_backend = "kas"
+    cfg.agents["pixel"].acp_backend = "claude"
+    cfg.agents["pixel"].model = "profile-native-model"
+    cfg.save()
+    state, caller, _ = crewmate
+    child = state.get_slot(_create(state, caller)["target"])
+    assert child.model == "profile-native-model"
+
+
+@pytest.mark.parametrize(
+    "profile,model", [("claude", "fable-5-1m"), ("claude", "auto"), (None, "auto")]
+)
+def test_explicit_member_model_uses_target_backend(crewmate, profile, model):
+    from kiro_crew.config.loader import KiroCrewConfig
+    from kiro_crew.dashboard.chat_backend import chat_session_selection
+    from kiro_crew.execution_context import read_session_execution
+
+    cfg = KiroCrewConfig.load()
+    cfg.agent.acp_backend = "kas"
+    cfg.agents["pixel"].acp_backend = profile
+    cfg.save()
+    state, caller, execution = crewmate
+    worker = state.get_slot(_create(state, caller)["target"])
+    # A parent's explicit chat choice must not become the selected member's.
+    worker.acp_backend = "codex"
+    child = state.get_slot(_create(state, worker, agent="pixel", model=model)["target"])
+    actual = read_session_execution(slot_history_key(child), required=True)
+    assert actual.member_id == execution.member_id
+    assert actual.store == execution.store
+    assert child.acp_backend is None
+    assert child.model == model
+    selection = chat_session_selection(child, cfg, model)
+    provider = cfg.create_provider_factory()(
+        slot_history_key(child), agent=actual.template_id, crew_agent="pixel", **selection
+    )
+    assert provider.client.backend == (profile or "kas")
+
+
+def test_explicit_member_rejects_foreign_model_before_allocation(crewmate, tmp_path):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["pixel"].acp_backend = "kas"
+    cfg.save()
+    _set_backends(tmp_path, default="claude", member="kas")
+    assert KiroCrewConfig.load().agent.acp_backend == "claude"
+    state, caller, _ = crewmate
+    worker = state.get_slot(_create(state, caller)["target"])
+    before = set(state._slots)
+    with pytest.raises(sc.SessionControlError) as refused:
+        _create(state, worker, agent="pixel", model="fable-5-1m")
+    assert refused.value.code == "model_rejected"
+    assert set(state._slots) == before
+
+
+def test_target_profile_does_not_authorize_foreign_workspace(crewmate):
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    cfg.agents["ada"].acp_backend = "claude"
+    cfg.save()
+    state, caller, _ = crewmate
+    worker = state.get_slot(_create(state, caller)["target"])
+    before = set(state._slots)
+    with pytest.raises(sc.SessionControlError) as refused:
+        _create(state, worker, agent="ada", model="fable-5-1m")
+    assert refused.value.code == "agent_workspace_mismatch"
+    assert set(state._slots) == before
+
+
 @pytest.mark.parametrize(
     "named, kind",
     [

@@ -2,6 +2,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 
 import { api } from '../api/client'
+import { runtimeAcpBackendId } from '../api/acpBackend'
 import { useAppDispatch } from '../store'
 import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
 import type { ChatSlot } from '../types'
@@ -30,14 +31,14 @@ export default function ChatBackendSelect({ slot }: { slot?: ChatSlot }) {
     onError: () => { dispatch(triggerRefresh()) },
   })
   if (!slot) return null
-  const backends = probes.data?.backends.filter(row => row.selectable) ?? []
+  const backends = probes.data?.backends.filter(row => row.selectable).map(row => ({ ...row, id: runtimeAcpBackendId(row.id) })) ?? []
   return (
     <div className="px-4 py-1 flex flex-wrap items-center gap-2 text-[12px] text-muted">
       <SimpleSelect
         aria-label={t('chatBackend.label')}
         options={[INHERIT, ...backends.map(row => row.id)]}
         optionLabels={[t('chatBackend.inherit'), ...backends.map(row => row.policy_id)]}
-        value={slot.acp_backend ?? INHERIT}
+        value={slot.acp_backend == null ? INHERIT : runtimeAcpBackendId(slot.acp_backend)}
         triggerFallback={slot.acp_backend ?? t('chatBackend.inherit')}
         onChange={value => change.mutate({ key: slot.key, backend: value === INHERIT ? null : value })}
         disabled={!supported || slot.running || change.isPending || !probes.data}

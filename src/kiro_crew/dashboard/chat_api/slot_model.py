@@ -58,6 +58,7 @@ def _model_rejected_reason(
     backend: str | None = None,
     *,
     session_keys: Iterable[str | None] | None = None,
+    slots: Iterable[_ChatSlot] | None = None,
 ) -> str | None:
     """Reason to reject ``model_name`` for the harness that will run it, or None.
 
@@ -93,6 +94,11 @@ def _model_rejected_reason(
         return None
     if backend is not None:
         backends: list[str] = [backend]
+    elif slots is not None:
+        from kiro_crew.dashboard.chat_backend import effective_chat_backend
+
+        config = KiroCrewConfig.load()
+        backends = [effective_chat_backend(slot, config) for slot in slots]
     else:
         from kiro_crew.members import select_provider_backend
 
@@ -355,7 +361,7 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         return _owner_denial_response(request, "arming Jev routing is owner-only")
     model_name = "auto" if jev_route else _normalize_model(body.get("model", ""))
     # Judged on THIS slot's harness: a member DM runs on agent.member_acp_backend.
-    reason = _model_rejected_reason(model_name, session_keys=(effective_session_key(slot),))
+    reason = _model_rejected_reason(model_name, slots=(slot,))
     if reason:
         logger.warning("Slot %s model rejected: %s", name, reason)
         return web.json_response({"error": reason}, status=400)
@@ -876,9 +882,7 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
     assert body is not None  # read_bounded_json returns (dict, None) on success
     model_name = _normalize_model(body.get("model", ""))
     # One pick lands on every slot, so it must pass on every slot's harness.
-    reason = _model_rejected_reason(
-        model_name, session_keys=[effective_session_key(s) for s in list(state._slots.values())]
-    )
+    reason = _model_rejected_reason(model_name, slots=list(state._slots.values()))
     if reason:
         return web.json_response({"error": reason}, status=400)
     skip_running = body.get("skip_running", True)

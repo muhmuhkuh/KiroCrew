@@ -874,6 +874,7 @@ def build_config(
                 # ``agent list`` renders a malformed ``memory_store``.
                 raw_worker_model = crew.get("worker_model")
                 agents[name] = KiroCrewAgentConfig(
+                    acp_backend=crew.get("acp_backend"),
                     member_id=crew.get("member_id"),
                     kiro_agent=crew.read("kiro_agent", _safe_str),
                     workspace=crew.read("workspace", _safe_str),

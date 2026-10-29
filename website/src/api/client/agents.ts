@@ -79,6 +79,7 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  acp_backend?: string | null
   /** The crewmate's own effort pin; '' inherits. */
   reasoning_effort?: string
   /** What the sessions this crewmate opens through `session_create` run on

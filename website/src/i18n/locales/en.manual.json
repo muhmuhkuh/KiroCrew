@@ -9808,6 +9808,7 @@
     "tool_access_tool_on_server": "Can use {{tool}} on {{server}}"
   },
   "chatBackend": {
+    "agentHint": "Applies to new sessions and this agent’s workers. An explicit chat backend takes priority.",
     "label": "Backend",
     "inherit": "Use global default",
     "managed": "Backend managed by this chat’s owner"

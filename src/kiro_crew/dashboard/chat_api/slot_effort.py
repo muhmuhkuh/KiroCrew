@@ -43,13 +43,9 @@ if TYPE_CHECKING:
 async def _configured_backend_for_slot(slot: _ChatSlot) -> str:
     """Resolve a cold slot through the same member-aware gate as the provider factory."""
     config = await asyncio.to_thread(KiroCrewConfig.load)
-    from kiro_crew.members import select_provider_backend
+    from kiro_crew.dashboard.chat_backend import effective_chat_backend
 
-    return select_provider_backend(
-        effective_session_key(slot),
-        config.agent.member_acp_backend,
-        config.agent.acp_backend,
-    )
+    return effective_chat_backend(slot, config)
 
 
 async def api_chat_slot_selection_capabilities(request: web.Request) -> web.Response:

@@ -568,12 +568,27 @@ async def create_session(
     # so. An explicit pin is the caller's own and stays a refusal.
     inherited_model_dropped = ""
     # The harness the child runs on: a crewmate's own worker runs on its
-    # crewmate's backend (``members.select_provider_backend``), every other child
-    # on the configured default. A worker on a backend that cannot carry its kit
+    # crewmate's backend (``members.select_provider_backend``), a selected member
+    # on its resolved profile route, and other children on the configured default.
+    # A worker on a backend that cannot carry its kit
     # is refused here, before anything is allocated.
     from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
 
     child_backend = crewmate_worker_backend(cfg.agent) if own_worker else cfg.agent.acp_backend
+    if not own_worker and bindings.selection_kind == "member":
+        from kiro_crew.agent_backend_selection import session_backend
+
+        child_backend = session_backend(cfg, None, bindings.resolved_alias or agent_name)
+    dispatching_member = _dispatching_crewmate(cfg, caller_slot, caller_execution)
+    member_backend = cfg.agent.member_acp_backend
+    if dispatching_member is not None:
+        from kiro_crew.agent_backend_selection import validate_agent_backend
+
+        pin = validate_agent_backend(dispatching_member.acp_backend)
+        if pin is not None:
+            member_backend = pin
+    if own_worker and dispatching_member is not None and dispatching_member.acp_backend is not None:
+        child_backend = member_backend
     if own_worker:
         backend_reason = worker_kit_backend_refusal(child_backend)
         if backend_reason is not None:
@@ -581,7 +596,11 @@ async def create_session(
     model_reason = _model_pin_refusal(model_name, child_backend) if model_name else None
     if model_reason is None and "model" in inherited_fields:
         model_reason = _inherited_pin_foreign_to_child(
-            model_name, cfg, child_backend, validated_for_worker=model_from_worker_pin
+            model_name,
+            cfg,
+            child_backend,
+            validated_for_worker=model_from_worker_pin,
+            member_backend=member_backend,
         )
     if model_reason is not None:
         if "model" not in inherited_fields:
@@ -1444,7 +1463,12 @@ def _model_pin_refusal(model_name: str, backend: str) -> str | None:
 
 
 def _inherited_pin_foreign_to_child(
-    model_name: str, cfg: KiroCrewConfig, child_backend: str, *, validated_for_worker: bool
+    model_name: str,
+    cfg: KiroCrewConfig,
+    child_backend: str,
+    *,
+    validated_for_worker: bool,
+    member_backend: str | None = None,
 ) -> str | None:
     """Why a crewmate's model pin cannot follow its worker onto the child's harness, or ``None``.
 
@@ -1471,11 +1495,12 @@ def _inherited_pin_foreign_to_child(
     if model_name == DEFAULT_MODEL:
         return None
     child_namespace = capabilities_for(child_backend).model_id_namespace
-    member_namespace = capabilities_for(cfg.agent.member_acp_backend).model_id_namespace
+    source_backend = cfg.agent.member_acp_backend if member_backend is None else member_backend
+    member_namespace = capabilities_for(source_backend).model_id_namespace
     if not validated_for_worker and child_namespace != member_namespace:
         return (
             "the crewmate's model pin was chosen for its own harness "
-            f"({cfg.agent.member_acp_backend or 'default'}), and the worker runs on "
+            f"({source_backend or 'default'}), and the worker runs on "
             f"{child_backend or 'the default backend'}"
         )
     if not model_scope.pin_applies(model_name, child_namespace):

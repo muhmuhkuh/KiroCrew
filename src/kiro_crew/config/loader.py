@@ -585,6 +585,10 @@ def resolve_effective_model(
     from *agent_name*, so the answer is the template the backend really starts.
     ``""`` names no template, leaving tier 2 empty.
     """
+    if backend is None and template is None and selection_kind != "template":
+        from kiro_crew.agent_backend_selection import agent_backend_pin
+
+        backend = agent_backend_pin(config, agent_name or config.default_agent)
     _in_scope = _model_scope_filter(config, backend)
 
     agent_pin = _agent_tier_model(

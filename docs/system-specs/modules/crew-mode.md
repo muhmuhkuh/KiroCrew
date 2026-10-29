@@ -1,5 +1,19 @@
 # Crews
 
+Each member can set `acp_backend` in Profile settings. This default is independent
+of other members and applies to newly allocated sessions and the member's own
+workers. An explicit chat or spawn backend wins. `null` inherits the existing
+installation routing; existing members and adopted templates therefore keep their
+previous behavior until a choice is saved. The selectable registry and existing
+worker-kit capability guards still decide which harness can actually run a task.
+See [config](config.md) for persistence and allocation semantics.
+
+`session_create` validates an explicitly selected member's model against the
+backend of that resolved member, matching subsequent provider allocation. It
+does not copy the dispatcher's chat override or profile onto the target. The
+workspace and vouched private-store checks still authorize the child separately;
+selecting a profile supplies no authority to use its identity or memory.
+
 A **crew** is a named entry in the config's `agents` map. It binds a kiro-cli
 agent template plus a workspace, a memory store, a model and a reasoning effort,
 and it carries free-text `triggers` that decide whether the orchestrator may

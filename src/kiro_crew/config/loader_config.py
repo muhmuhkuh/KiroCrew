@@ -1409,6 +1409,7 @@ class KiroCrewConfig:
             # kiro -- the member thread then runs as plain chat and the mount
             # step logs why.
             # circular import: members sits above config in the layering.
+            from kiro_crew.agent_backend_selection import agent_backend_pin
             from kiro_crew.members import select_provider_backend
 
             _backend = select_provider_backend(
@@ -1416,6 +1417,11 @@ class KiroCrewConfig:
                 self.agent.member_acp_backend,
                 self.agent.acp_backend,
                 backend_override=backend_override,
+                agent_backend=(
+                    agent_backend_pin(self, agent, crew_agent, session_key=session_key)
+                    if backend_override is None and acp_backend_override is None
+                    else None
+                ),
             )
             if acp_backend_override is not None:
                 from kiro_crew.agent_sdk.backends import selectable_backends

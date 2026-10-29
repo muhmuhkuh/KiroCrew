@@ -416,6 +416,12 @@ class KiroCrewAgentConfig:
             "reads the stamp to reach the sender.",
         ),
     )
+    acp_backend: str | None = field(
+        default=None,
+        metadata=_meta(
+            "Agent backend", "Default harness for this member. Null inherits; a chat override wins."
+        ),
+    )
 
 
 @dataclass

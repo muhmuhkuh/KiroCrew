@@ -114,12 +114,15 @@ def select_provider_backend(
     member_backend: str,
     configured_default: str,
     backend_override: str | None = None,
+    agent_backend: str | None = None,
 ) -> str:
     """The per-session half of the ONE backend-selection gate (H3/H13).
 
     Precedence: the caller's explicit backend (``backend_override``, a
-    sub-agent spawned with ``spawn_run(backend=...)``), then the member-DM
-    auto-route, then the configured default. A crewmate's own worker session
+    sub-agent spawned with ``spawn_run(backend=...)``), then the optional agent
+    profile pin, then the member-DM auto-route and the configured default.
+    Profile pins are validated against the live registry and refuse when denied.
+    A crewmate's own worker session
     (:func:`is_crewmate_worker_session`) takes the member route too: a worker
     runs on the same backend as the crewmate that opened it, and its kit is
     applied by that backend's projection. ``None`` is no override, so the
@@ -148,6 +151,11 @@ def select_provider_backend(
             backend,
         )
         return backend
+    if agent_backend is not None:
+        from kiro_crew.agent_backend_selection import validate_agent_backend
+
+        validate_agent_backend(agent_backend)
+        return agent_backend
     if is_member_session_key(session_key) or is_crewmate_worker_session(session_key):
         backend = resolve_selected_backend(member_backend)
         logger.info(

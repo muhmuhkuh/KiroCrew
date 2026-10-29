@@ -54,6 +54,7 @@ from kiro_crew.config.sections import (  # noqa: F401 -- read by chat_api.slot_s
     AutocompactPctError,
     parse_autocompact_pct,
 )
+from kiro_crew.dashboard import chat_runner as _chat_runner
 from kiro_crew.dashboard import display_verdicts  # noqa: F401 -- read by chat_api.slot_detail
 from kiro_crew.dashboard.body_numbers import body_int  # noqa: F401
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed  # noqa: F401
@@ -366,7 +367,6 @@ from kiro_crew.dashboard.chat_runner import (  # noqa: F401
     schedule_eager_spawn,
     subagents_hold_user_messages,
 )
-from kiro_crew.dashboard import chat_runner as _chat_runner
 from kiro_crew.dashboard.chat_slack import maybe_auto_link_slack, slot_is_live  # noqa: F401
 from kiro_crew.dashboard.chat_summary import (  # noqa: F401
     generate_session_summary,
@@ -963,6 +963,7 @@ _slot_switch_session_lock = slot_switch_session_lock
 
 async def api_chat_slot_backend(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/backend — nullable, chat-local harness override."""
+    from kiro_crew.agent_backend_selection import session_backend, validate_agent_backend
     from kiro_crew.agent_sdk.backends import selectable_backends
     from kiro_crew.dashboard.chat_backend import backend_selection_supported
 
@@ -977,11 +978,11 @@ async def api_chat_slot_backend(request: web.Request) -> web.Response:
     if error is not None:
         return error
     assert body is not None
-    backend = body.get("acp_backend")
-    if "acp_backend" not in body or (
-        backend is not None
-        and (not isinstance(backend, str) or backend not in selectable_backends())
-    ):
+    try:
+        if "acp_backend" not in body:
+            raise ValueError("missing backend")
+        backend = validate_agent_backend(body["acp_backend"])
+    except ValueError:
         return web.json_response(
             {"error": "invalid backend", "code": "invalid_backend"}, status=400
         )
@@ -999,15 +1000,32 @@ async def api_chat_slot_backend(request: web.Request) -> web.Response:
         key = effective_session_key(slot)
         await stack.enter_async_context(_slot_switch_session_lock(key))
         await stack.enter_async_context(slot._model_pick_lock)
-        target = cfg.agent.acp_backend if backend is None else backend
-        if target not in selectable_backends():
+        try:
+            target = (
+                session_backend(
+                    cfg,
+                    slot.agent,
+                    "" if slot.agent_kind == "template" else None,
+                    session_key=key,
+                )
+                if backend is None
+                else backend
+            )
+        except ValueError:
+            target = None
+        if target is None or target not in selectable_backends():
             return web.json_response(
                 {"error": "backend is not selectable", "code": "backend_not_selectable"},
                 status=400,
             )
         provider = state.sessions.get_provider(key)
         resident_backend = getattr(getattr(provider, "client", None), "backend", None)
-        previous = cfg.agent.acp_backend if slot.acp_backend is None else slot.acp_backend
+        try:
+            from kiro_crew.dashboard.chat_backend import effective_chat_backend
+
+            previous = effective_chat_backend(slot, cfg)
+        except ValueError:
+            previous = None
         changed = (
             target != previous
             or (slot.model_backend is not None and slot.model_backend != target)

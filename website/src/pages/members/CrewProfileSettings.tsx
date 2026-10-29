@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next'
 import { Check, Gauge, Loader2, Lock, Puzzle, Shield, SlidersHorizontal, Sparkles, Users } from 'lucide-react'
 import { api, type MemberRosterRow } from '../../api/client'
 import { ApiError } from '../../api/apiError'
+import { runtimeAcpBackendId } from '../../api/acpBackend'
 import { MEMBERS_ROSTER_QUERY_KEY } from '../../api/membersQuery'
 import { MEMBER_DASHBOARD_QUERY_PREFIX } from '../../hooks/useWebSocket'
 import { Toggle } from '../../components/ui'
@@ -22,7 +23,7 @@ import { Row, RowGroup, RowStatic, type TONE } from './profileRow'
 
 /** The approval modes a crewmate's record may pin, in label order; YOLO is process-global. */
 const MODES = ['normal', 'trust_reads', 'trust'] as const
-type Setting = 'approval_mode' | 'model' | 'reasoning_effort' | 'worker_model' | 'worker_reasoning_effort'
+type Setting = 'approval_mode' | 'acp_backend' | 'model' | 'reasoning_effort' | 'worker_model' | 'worker_reasoning_effort'
 /** The record's "workers run the crewmate's own" spelling for both worker fields. */
 const SAME_AS_CREWMATE = ''
 /** A REAL worker-model pin, unlike the crewmate's own `model` where it means
@@ -95,12 +96,17 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
   const [shown, setShown] = useState<Setting | null>(null)
   // The Settings page (the group) is open over the card.
   const [open, setOpen] = useState(false)
-  const models = useAvailableModelsQuery({ enabled: true })
+  const backend = runtimeAcpBackendId(draft.acp_backend ?? member.acp_backend ?? INHERIT_MODEL)
+  const probes = useQuery({
+    queryKey: ['acpBackends'], queryFn: () => api.acpBackends(), retry: false, staleTime: 30_000,
+  })
   const { data: resolved, error: resolvedError } = useQuery({
     queryKey: ['agent-resolved-model', member.name],
     queryFn: () => api.agentResolvedModel(member.name),
   })
+  const models = useAvailableModelsQuery({ enabled: true, backend: backend === INHERIT_MODEL ? resolved?.acp_backend : backend })
   const stored = {
+    acp_backend: member.acp_backend ?? INHERIT_MODEL,
     approval_mode: String(member.approval_mode || 'trust'),
     model: member.model || INHERIT_MODEL,
     reasoning_effort: String(member.reasoning_effort || ''),
@@ -192,7 +198,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
     setError('')
     setNotice('')
     // The record spells "inherit" as ''; the picker spells it INHERIT_MODEL.
-    const wire = key === 'model' && next === INHERIT_MODEL ? '' : next
+    const wire = key === 'acp_backend' && next === INHERIT_MODEL ? null : key === 'model' && next === INHERIT_MODEL ? '' : next
     try {
       // The permission is compare-and-set: the server applies it only if the
       // record still holds what this card read, so a stale card can never
@@ -219,8 +225,8 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
       // that write fails the error says so, and the next thread uses the record.
       // The worker pair touches no thread: it is read when the crewmate next
       // opens a session, so the record is the whole write.
-      if (slotKey && key === 'model') await api.chatSlotModel(slotKey, wire)
-      else if (slotKey && key === 'reasoning_effort') await api.chatSlotReasoningEffort(slotKey, wire)
+      if (slotKey && key === 'model') await api.chatSlotModel(slotKey, wire as string)
+      else if (slotKey && key === 'reasoning_effort') await api.chatSlotReasoningEffort(slotKey, wire as string)
     } catch (e) {
       setDraft((d) => ({ ...d, [key]: undefined }))
       setError(e instanceof Error ? e.message : String((e as { message?: string })?.message ?? e))
@@ -245,6 +251,16 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
 
   // The group, top to bottom: the ceiling first, then what runs, then the workers.
   const pickers: Picker[] = [
+    {
+      key: 'acp_backend', label: t('chatBackend.label'),
+      icon: <SlidersHorizontal size={16} />, tone: 'accent',
+      value: backend, valueLabel: backend === INHERIT_MODEL ? t('pages.kiroCrewAgentsPage.inherited') : probes.data?.backends.find((b) => runtimeAcpBackendId(b.id) === backend)?.policy_id || backend,
+      options: [
+        { value: INHERIT_MODEL, label: t('pages.kiroCrewAgentsPage.inherited') },
+        ...(probes.data?.backends.filter((b) => b.selectable).map((b) => ({ value: runtimeAcpBackendId(b.id), label: b.policy_id })) ?? []),
+      ],
+      caption: t('chatBackend.agentHint'),
+    },
     {
       key: 'approval_mode',
       label: t('pages.membersPage.profile_permissions'),
@@ -382,6 +398,10 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
   // hold an unsent draft to this crewmate, and "Ask the agent" navigates away.
   const notices = (
     <>
+      <ErrorNotice
+        message={probes.error?.message || null}
+        testId="crew-profile-settings-backend-error"
+      />
       <ErrorNotice
         message={resolvedError ? (resolvedError instanceof Error ? resolvedError.message : String(resolvedError)) : null}
         testId="crew-profile-settings-resolve-error"

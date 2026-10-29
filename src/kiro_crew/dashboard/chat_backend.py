@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_backend_selection import (
+    agent_backend_pin,
+    session_backend,
+    validate_agent_backend,
+)
 from kiro_crew.agent_sdk.backends import selectable_backends
-from kiro_crew.members import select_provider_backend
 
 if TYPE_CHECKING:
     from kiro_crew.config import KiroCrewConfig
@@ -23,12 +27,19 @@ def backend_selection_supported(slot: _ChatSlot) -> bool:
 
 
 def effective_chat_backend(slot: _ChatSlot, cfg: KiroCrewConfig) -> str:
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+
     backend = (
-        select_provider_backend(slot.key, cfg.agent.member_acp_backend, cfg.agent.acp_backend)
+        session_backend(
+            cfg,
+            slot.agent,
+            "" if slot.agent_kind == "template" else None,
+            session_key=effective_session_key(slot),
+        )
         if slot.acp_backend is None
-        else slot.acp_backend
+        else validate_agent_backend(slot.acp_backend)
     )
-    if backend not in selectable_backends():
+    if backend is None or backend not in selectable_backends():
         raise ValueError("backend is not selectable")
     return backend
 
@@ -45,7 +56,19 @@ def chat_session_selection(
         if slot.acp_backend is not None:
             raise ValueError("chat backend configuration is unavailable")
         return {"model": slot.model or inherited_model}
-    if slot.acp_backend is None and slot.model_backend is None:
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+
+    pin = (
+        agent_backend_pin(
+            cfg,
+            slot.agent,
+            "" if slot.agent_kind == "template" else None,
+            session_key=effective_session_key(slot),
+        )
+        if slot.acp_backend is None
+        else None
+    )
+    if slot.acp_backend is None and slot.model_backend is None and pin is None:
         # Untouched chats retain the existing global allocation / warm-pool path.
         slot.model_backend = cfg.agent.acp_backend
         return {"model": slot.model or inherited_model}
@@ -59,6 +82,6 @@ def chat_session_selection(
     selection: dict[str, Any] = {
         "model": slot.model or ("auto" if slot.acp_backend is not None else inherited_model)
     }
-    if slot.acp_backend is not None:
+    if slot.acp_backend is not None or pin is not None:
         selection["acp_backend_override"] = backend
     return selection
