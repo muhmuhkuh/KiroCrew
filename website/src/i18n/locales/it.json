@@ -3325,6 +3325,11 @@
       }
     },
     "meetings": {
+      "audio": {
+        "start": "Condividi audio della riunione",
+        "stop": "Interrompi condivisione audio",
+        "failed": "Impossibile acquisire l’audio. Scegli la scheda della riunione o lo schermo e attiva la condivisione audio. Il supporto dipende dal browser e dal sistema operativo."
+      },
       "agentPanel": {
         "awaitingOutput": "L’output di {{name}} apparirà qui.",
         "cancel": "Annulla",

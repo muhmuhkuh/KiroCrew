@@ -787,6 +787,11 @@ def _cc_models(request: web.Request, configured_default: str = "") -> list[dict]
     present a specific paid model as the default in the picker.
     """
     advertised = _advertised_cc_models(request, "claude_code")
+    if not advertised:
+        advertised = [
+            {"model_name": name, "display_name": name, "description": ""}
+            for name in model_registry.advertised_models("claude_code")
+        ]
     registry_rows = model_registry.display_list("claude_code")
 
     if advertised:

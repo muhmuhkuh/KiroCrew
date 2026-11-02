@@ -3341,6 +3341,11 @@
       }
     },
     "meetings": {
+      "audio": {
+        "start": "Meeting-Ton teilen",
+        "stop": "Meeting-Ton nicht mehr teilen",
+        "failed": "Der Meeting-Ton konnte nicht aufgenommen werden. Wähle den Meeting-Tab oder Bildschirm und aktiviere die Audiofreigabe. Die Unterstützung hängt von Browser und Betriebssystem ab."
+      },
       "agentPanel": {
         "awaitingOutput": "Die Ausgabe von {{name}} erscheint hier.",
         "cancel": "Abbrechen",

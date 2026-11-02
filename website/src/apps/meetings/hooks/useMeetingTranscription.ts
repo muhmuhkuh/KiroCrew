@@ -459,6 +459,10 @@ export function useMeetingTranscription({
       channelCount: 1,
       channelCountMode: 'explicit',
     })
+<<<<<<< HEAD
+=======
+    workletRef.current = node
+>>>>>>> 7d8677836b (feat: add Meetings Audio feature (MeetingAudioControl, useMeetingAudio, tests))
 
     // Buffer PCM until the server is ready, then flush and switch to live send.
     // Over the cap, drop the OLDEST frames — the most recent speech wins.
@@ -540,8 +544,11 @@ export function useMeetingTranscription({
   const stop = useCallback(() => {
     stoppingRef.current = true
     stopMeetingAudio()
+<<<<<<< HEAD
     haltedRef.current = false
     setHalted(false)
+=======
+>>>>>>> 7d8677836b (feat: add Meetings Audio feature (MeetingAudioControl, useMeetingAudio, tests))
     clearWatchdog()
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -556,5 +563,9 @@ export function useMeetingTranscription({
     }, CLOSE_GRACE_MS)
   }, [cleanup, clearWatchdog, stopMeetingAudio])
 
+<<<<<<< HEAD
   return { active, connecting, halted, start, stop, meetingAudio, supported: transcriptionSupported }
+=======
+  return { active, start, stop, meetingAudio, supported: transcriptionSupported }
+>>>>>>> 7d8677836b (feat: add Meetings Audio feature (MeetingAudioControl, useMeetingAudio, tests))
 }

@@ -1960,6 +1960,11 @@
       }
     },
     "meetings": {
+      "audio": {
+        "start": "Share meeting audio",
+        "stop": "Stop sharing meeting audio",
+        "failed": "No meeting audio could be captured. Select the meeting tab or screen and enable audio sharing. Support depends on your browser and operating system."
+      },
       "agentPanel": {
         "awaitingOutput": "{{name}} output will appear here.",
         "cancel": "Cancel",

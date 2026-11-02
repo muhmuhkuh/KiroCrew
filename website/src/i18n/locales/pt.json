@@ -3325,6 +3325,11 @@
       }
     },
     "meetings": {
+      "audio": {
+        "start": "Compartilhar áudio da reunião",
+        "stop": "Parar de compartilhar áudio",
+        "failed": "Não foi possível capturar o áudio. Escolha a aba da reunião ou a tela e ative o compartilhamento de áudio. O suporte depende do navegador e do sistema operacional."
+      },
       "agentPanel": {
         "awaitingOutput": "O resultado de {{name}} aparecerá aqui.",
         "cancel": "Cancelar",

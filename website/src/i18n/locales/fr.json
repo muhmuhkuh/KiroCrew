@@ -3415,6 +3415,11 @@
       }
     },
     "meetings": {
+      "audio": {
+        "start": "Partager le son de la réunion",
+        "stop": "Arrêter le partage du son",
+        "failed": "Impossible de capturer le son. Choisissez l’onglet de la réunion ou l’écran et activez le partage audio. La prise en charge dépend du navigateur et du système."
+      },
       "agentPanel": {
         "awaitingOutput": "Le résultat de {{name}} apparaîtra ici.",
         "cancel": "Annuler",
