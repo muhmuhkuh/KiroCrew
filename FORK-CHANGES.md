@@ -41,4 +41,26 @@ Stand: 2026-11-02 · Branch `main` · letzter Sync-Commit `d2ce39a0f3`
 
 ---
 
+## Upstream-PR-Status
+
+Geprueft: 2026-11-02
+
+| Eigenentwicklung | In upstream/main? | Upstream-PR/Issue | Empfehlung |
+|---|---|---|---|
+| ACP_BACKEND_VIBE | Nein | Kein PR/Issue | Erhalten |
+| Chat-lokale Backend-Selektion (acp_backend_override) | Nein | Kein PR/Issue | Erhalten |
+| Meetings-Frontend Audio | Nein | Issue #2814 offen (T2, enhancement) | Beobachten |
+| Meetings-Backend Reduktion | Teilweise | Kein PR | Erhalten (Pi-Hardware) |
+| Import-Refactoring (agent_admin.compose) | Divergenz in agents.py L46 | Kein PR | Erhalten, L46 bei naechstem Sync pruefen |
+| ACP_BACKEND_COPILOT entfernt | Upstream hat Copilot+Strands | Kein PR | Erhalten (Copilot nicht auf Pi verfuegbar) |
+
+## Sync-Checkliste
+
+1. src/kiro_crew/agent_sdk/acp_backends.py + src/kiro_crew/acp/harness/__init__.py: nach Merge VIBE manuell restaurieren
+2. src/kiro_crew/dashboard/handlers/agents.py L46: Import-Divergenz pruefen
+3. Meetings-Backend: 5 Dateien mit --ours behalten
+4. Issue #2814 beobachten (Upstream plant Meetings-Audio)
+
+---
+
 *Dieses Dokument wird bei jedem Upstream-Sync aktualisiert.*
