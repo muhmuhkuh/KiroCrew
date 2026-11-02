@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────
-# KiroCrew Installer
-# One-command setup for macOS and Linux. Public build — no Brazil workspace,
-# no internal tooling required. Uses python3/pip (backend) + npm/vite (frontend).
+# Kiro Crew from-source installer (contributor layout)
+# Builds the git clone it sits in, on macOS and Linux. Public build — no Brazil
+# workspace, no internal tooling required. Uses python3/pip (backend) +
+# npm/vite (frontend).
+#
+# This is NOT the end-user install. The result follows the clone's checked-out
+# branch, and `main` is the Nightly lane: dev builds (0.X.0.devYYYYMMDD) ahead of
+# Stable, which the desktop app and the one-line install follow. For a Stable
+# install on a laptop or a server, use the signed wheel instead:
+#   curl -fsSL https://download.crew.kiro.dev/cli.sh | sh
 #
 # Usage (from a local clone):
 #   git clone https://github.com/kirodotdev/KiroCrew.git
@@ -11,11 +18,14 @@
 #
 # Options:
 #   --voice   Install optional voice extras (pip install -e .[voice])
-#   --kas     Download the KAS engine this release pins (kirocrew kas install)
-#             so the built-in engine route can be turned on later with no
-#             download. The switch (agent.kas_bundle) is NOT turned on: the
-#             route is in shadow testing on every platform, so the default
-#             stays kiro-cli until you flip it yourself.
+#   --no-kas  Skip downloading the KAS engine this release pins. By default
+#             the installer runs `kirocrew kas install` after installing, so
+#             the built-in engine route can be turned on with no download; a
+#             failed download only warns and prints the command to retry.
+#             The switch (agent.kas_bundle) is NOT turned on: the route is in
+#             shadow testing on every platform, so the default stays kiro-cli
+#             until you flip it yourself. (--kas, the former opt-in, is still
+#             accepted and changes nothing.)
 #   --mise    Use mise (https://mise.jdx.dev) for Python and Node.js
 #             instead of system package managers. Does not modify your
 #             global mise config.
@@ -38,12 +48,14 @@ unset PYTHONPATH PYTHONHOME
 # ── Parse arguments ──
 USE_MISE=0
 WITH_VOICE=0
-WITH_KAS=0
+KAS_DOWNLOAD_FAILED=0
+WITH_KAS=1
 for _arg in "$@"; do
     case "$_arg" in
         --mise)  USE_MISE=1 ;;
         --voice) WITH_VOICE=1 ;;
         --kas)   WITH_KAS=1 ;;
+        --no-kas) WITH_KAS=0 ;;
         *) echo "Error: unknown argument '$_arg'" >&2; exit 1 ;;
     esac
 done
@@ -138,6 +150,39 @@ spinner() {
 
 has() { command -v "$1" >/dev/null 2>&1; }
 
+# What the clone is checked out at, as `branch:<name>`, `detached:<tag or sha>`,
+# or `unknown` (no git, or not a work tree). A from-source install follows
+# exactly this, so it decides which lane the box ends up on.
+source_checkout_ref() {
+    _ref="$(git -C "$KIROCREW_APP_DIR" symbolic-ref --short -q HEAD 2>/dev/null)" \
+        && [ -n "$_ref" ] && { printf 'branch:%s\n' "$_ref"; return 0; }
+    _ref="$(git -C "$KIROCREW_APP_DIR" describe --tags --exact-match HEAD 2>/dev/null \
+        || git -C "$KIROCREW_APP_DIR" rev-parse --short HEAD 2>/dev/null)" \
+        && [ -n "$_ref" ] && { printf 'detached:%s\n' "$_ref"; return 0; }
+    printf 'unknown\n'
+}
+
+# Say which lane this install follows and where the Stable install lives, so a
+# box set up from a clone does not land on Nightly by surprise.
+source_lane_notice() {
+    _lane_ref="$(source_checkout_ref)"
+    case "$_lane_ref" in
+        branch:main)
+            warn "This clone is on ${BOLD}main${RESET}: the install follows the ${BOLD}Nightly${RESET} lane"
+            detail "(dev builds ahead of Stable). This installer is for contributors." ;;
+        branch:*)
+            warn "This clone is on branch ${BOLD}${_lane_ref#branch:}${RESET}: the install follows that branch, not a release lane." ;;
+        detached:*)
+            warn "This clone is pinned at ${BOLD}${_lane_ref#detached:}${RESET} (detached HEAD): git pull and kirocrew update cannot update it." ;;
+        *)
+            warn "This is a from-source install: it follows the clone, not a release lane." ;;
+    esac
+    # Named by URL and guide, not as a `curl … | sh` line: this script never
+    # prints or runs a pipe-to-shell (test_installer_tool_pins.py).
+    detail "For Stable on a laptop or server, use the one-line install of the signed"
+    detail "wheel instead: https://download.crew.kiro.dev/cli.sh (docs/guides/install.md)."
+}
+
 # True only when a usable node is on PATH: present AND at or above the build's
 # supported floor. `has node` alone was not enough -- Amazon Linux 2023 ships
 # node 18, so the "already installed" branch matched, every install branch
@@ -173,6 +218,9 @@ if [ ! -f "$KIROCREW_APP_DIR/pyproject.toml" ]; then
     die "Run this from inside a KiroCrew clone (pyproject.toml not found in $KIROCREW_APP_DIR).
      git clone https://github.com/kirodotdev/KiroCrew.git && cd kirocrew && bash install.sh"
 fi
+
+source_lane_notice
+echo ""
 
 # ══════════════════════════════════════════════════════════════════════
 # Step 1: Dependencies
@@ -426,11 +474,11 @@ else
     detail "npm i -g $ACP_NPM_PKG"
 fi
 if [ "$WITH_KAS" -eq 1 ]; then
-    info "The built-in KAS engine will be downloaded (--kas); the switch stays off until you turn it on."
+    info "The built-in KAS engine will be downloaded after install (skip with --no-kas); the switch stays off until you turn it on."
 else
     warn "The default Kiro agent requires Kiro CLI; this installer does not install or sign in to it."
     detail "Install it separately from https://kiro.dev/cli/ and run: kiro-cli login"
-    detail "Or re-run with --kas to download the built-in engine instead (no kiro-cli)."
+    detail "Or run kirocrew kas install after install to download the built-in engine instead (no kiro-cli)."
 fi
 
 # ══════════════════════════════════════════════════════════════════════
@@ -796,14 +844,21 @@ if [ -n "$_kirocrew" ]; then
         # verified against the pin baked into this checkout. The switch is left
         # alone on purpose: the route is in shadow testing, so turning it on is
         # the user's own step (Settings → Agent Harness, or `kirocrew config set
-        # agent.kas_bundle true`), never the installer's.
+        # agent.kas_bundle true`), never the installer's. A failed download
+        # (offline host, CDN outage) leaves a working install, so it only warns.
         info "Downloading the built-in KAS engine (kirocrew kas install)…"
         if "$_kirocrew" kas install; then
             ok "Built-in KAS engine installed (switch it on: kirocrew config set agent.kas_bundle true)"
         else
-            warn "kirocrew kas install failed — run it again after install"
+            KAS_DOWNLOAD_FAILED=1
+            warn "Could not download the built-in KAS engine; Kiro Crew is installed without it."
+            detail "Retry when online: kirocrew kas install"
         fi
     fi
+elif [ "$WITH_KAS" -eq 1 ]; then
+    KAS_DOWNLOAD_FAILED=1
+    warn "kirocrew not in PATH — the built-in KAS engine was not downloaded."
+    detail "After reloading your shell, run: kirocrew kas install"
 fi
 
 ok "Run ${CYAN}kirocrew setup${RESET} to configure agent, workspace, and integrations"
@@ -837,6 +892,9 @@ echo "       ${GREEN}Install Kiro CLI from https://kiro.dev/cli/${RESET}"
 echo "       ${GREEN}kiro-cli login${RESET}"
 if [ "$WITH_KAS" -eq 1 ]; then
 echo "       To try the built-in KAS engine instead (shadow testing, off by default):"
+if [ "$KAS_DOWNLOAD_FAILED" -eq 1 ]; then
+echo "       ${GREEN}kirocrew kas install${RESET}  (the download failed during install; retry it first)"
+fi
 echo "       ${GREEN}kirocrew config set agent.kas_bundle true${RESET}  then sign in from the dashboard"
 fi
 echo ""
@@ -863,5 +921,16 @@ if [ "$(uname)" != "Darwin" ]; then
 fi
 echo "  ${DIM}────────────────────────────────────────${RESET}"
 echo ""
-echo "  ${DIM}Update anytime:${RESET}  ${GREEN}git pull && bash install.sh${RESET}"
+source_lane_notice
+echo ""
+case "$(source_checkout_ref)" in
+    branch:*)
+        echo "  ${DIM}Update anytime:${RESET}  ${GREEN}git pull && bash install.sh${RESET}"
+        detail "The dashboard Update (kirocrew update) resets this clone to its origin branch"
+        detail "when it is only behind; a clone both ahead and behind is refused, and --force"
+        detail "discards its local commits." ;;
+    detached:*)
+        detail "A detached checkout has no branch to update from: switch to a branch"
+        detail "(git switch main) before updating, or use the one-line install." ;;
+esac
 echo ""

@@ -144,7 +144,9 @@ describe('CrewmateSwitcher open list', () => {
     setup()
     const list = await open()
     const search = screen.getByTestId('crewmate-switcher-search')
-    expect(search).toHaveAccessibleName('Find a mate')
+    // Same words as the roster column's search over the same roster (#24448).
+    expect(search).toHaveAccessibleName('Search mates…')
+    expect(search).toHaveAttribute('placeholder', 'Search mates…')
 
     fireEvent.change(search, { target: { value: 'radar' } })
     // Matches the display name AND the agent template ("radar-template").
@@ -274,6 +276,20 @@ describe('CrewmateSwitcher live signals', () => {
     expect(within(radar).queryByTestId('crewmate-switcher-presence-dot')).toBeNull()
     expect(within(radar).queryByTestId('crewmate-switcher-needs-you-dot')).toBeNull()
     expect(within(radar).queryByTestId('crewmate-switcher-unread-dot')).toBeNull()
+  })
+
+  it('the face wrapper is a flex box, so no text line box grows it below the face and pulls it off the text centre', async () => {
+    // jsdom has no layout, so this pins the structure Chromium measured: a
+    // BLOCK wrapper around the inline-flex avatar opened a line box whose
+    // strut descent made the box 38.7px for a 32px face, and the row's
+    // `items-center` then left the face 3.3px above the name + status block.
+    setup({ signals: signalsBy({ scribe: { running: true } }) })
+    const list = await open()
+    for (const option of options(list)) {
+      const face = within(option).getByTestId('crewmate-switcher-row-face')
+      expect(face).toHaveClass('flex')
+      expect(face.firstElementChild).toHaveClass('inline-flex')
+    }
   })
 
   it('a row parked on you AND unread shows both markers, needs-you first', async () => {

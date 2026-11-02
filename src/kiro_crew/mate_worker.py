@@ -16,8 +16,9 @@ above POLICY ∩ PROFILE. Stateless.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from kiro_crew import crewmate_prompts
 from kiro_crew.agent_files import (
@@ -26,6 +27,9 @@ from kiro_crew.agent_files import (
     is_mate_service_agent,
 )
 from kiro_crew.user_json import copy_json_document
+
+if TYPE_CHECKING:
+    from kiro_crew.config.loader import KiroCrewConfig
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +229,23 @@ def _server_of(ref: str) -> str:
     if not ref.startswith("@"):
         return ""
     return ref[1:].split("/", 1)[0]
+
+
+def covered_by(ref: str, selectors: Iterable[str]) -> bool:
+    """Whether a strictly broader selector grants everything *ref* selects.
+
+    Grant/approval decisions use ``mcp_refs.entry_reaches``; this is deduplication.
+    """
+    refs = set(selectors)
+    return (ref != "*" and "*" in refs) or (
+        ref.startswith("@") and "/" in ref and f"@{_server_of(ref)}" in refs
+    )
+
+
+def collapse_selectors(refs: Iterable[str]) -> list[str]:
+    """Keep unique selectors in order, omitting those covered by a broader one."""
+    unique = dict.fromkeys(refs)
+    return [ref for ref in unique if not covered_by(ref, unique)]
 
 
 def _strings(value: Any) -> list[str]:
@@ -668,6 +689,28 @@ def cron_worker_execution(execution: Any, config: Any = None) -> Any:
     return execution.with_template(MATE_WORKER_AGENT, MATE_WORKER_AGENT)
 
 
+def spawn_worker_execution(execution: Any) -> Any:
+    """The worker execution a sub-agent selected as a crewmate runs, else ``None``.
+
+    A ``spawn_run(crew=...)`` (or ``target_member``) with no ``agent`` resolves
+    the crewmate to a ``member`` selection on the agent its chat runs on. For a
+    crewmate that owns its file that is the conductor, which hands work off
+    rather than doing it. The run is work, so it runs on that crewmate's worker
+    instead, member, store, mode and app kept: the record shape a hand-off and a
+    scheduled turn give the worker (:func:`cron_worker_execution`). Answered
+    from the record alone, so it reads no file and is safe on the event loop.
+    ``None`` for any other record.
+    """
+    if (
+        execution is None
+        or getattr(execution, "selection_kind", "") != "member"
+        or not getattr(execution, "member_id", None)
+        or getattr(execution, "template_id", "") != MATE_CONDUCTOR_AGENT
+    ):
+        return None
+    return execution.with_template(MATE_WORKER_AGENT, MATE_WORKER_AGENT)
+
+
 def note_worker_session(session_key: str, execution: Any) -> bool:
     """Publish *session_key* as a crewmate's worker when its record says so.
 
@@ -684,7 +727,7 @@ def note_worker_session(session_key: str, execution: Any) -> bool:
     if not is_own_worker_execution(execution):
         forget_crewmate_worker_session(session_key)
         return False
-    note_crewmate_worker_session(session_key)
+    note_crewmate_worker_session(session_key, str(execution.member_id))
     return True
 
 
@@ -726,16 +769,33 @@ def worker_session_spec(
     return resolve_worker_spec(literal_base, member_id)
 
 
-def crewmate_worker_backend(agent_cfg: Any) -> str:
+def crewmate_worker_backend(config: KiroCrewConfig, crewmate: str | None = None) -> str:
     """The backend a crewmate's worker runs on: its crewmate's, through the one gate.
 
-    ``agent.member_acp_backend`` as the loader reads it (a stored ``kiro`` already
-    reads as KAS) crossed through ``resolve_selected_backend``, the same gate
-    ``members.select_provider_backend`` applies to the member route.
+    *crewmate* is the crewmate's ``config.agents`` key. Its own harness pin
+    (``agents.<name>.acp_backend``) wins and fails closed through the pre-gate
+    check (H17), raising
+    :class:`~kiro_crew.crewmate_harness.CrewmateHarnessUnavailable` as
+    ``crewmate_harness.crewmate_backend_pin`` does for the worker's own session
+    before ``members.select_provider_backend`` runs.
+    Without a pin it is ``agent.member_acp_backend`` as the loader reads it (a
+    stored ``kiro`` already reads as KAS) crossed through
+    ``resolve_selected_backend``, the same gate the member route applies.
+
+    *config* is the whole loaded config, never its ``agent`` section: the pin
+    lives in ``config.agents``, so a section passed here raises instead of
+    silently reading as no pin and no member route.
     """
     from kiro_crew.acp_backends import resolve_selected_backend
+    from kiro_crew.crewmate_harness import pinned_backend
 
-    return resolve_selected_backend(getattr(agent_cfg, "member_acp_backend", ""))
+    if not hasattr(config, "agent"):
+        raise TypeError("crewmate_worker_backend takes the whole config, not its agent section")
+    return pinned_backend(
+        config,
+        crewmate,
+        resolve_selected_backend(getattr(config.agent, "member_acp_backend", "")),
+    )
 
 
 def worker_kit_backend_refusal(backend: str) -> str | None:

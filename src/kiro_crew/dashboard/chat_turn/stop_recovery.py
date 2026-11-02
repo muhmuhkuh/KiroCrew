@@ -59,7 +59,7 @@ if TYPE_CHECKING:
         _persist_partial_reply,
     )
     from kiro_crew.dashboard.chat_turn.turn_stats import (
-        _attach_owned_turn_stats,
+        _attach_turn_stats,
         _emit_recovery_outcome,
         _turn_outcome,
     )
@@ -67,6 +67,8 @@ if TYPE_CHECKING:
 
 async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
     """Recover from the stop reasons the turn can retry on its own."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _is_synthetic = turn._is_synthetic
     _prompt_depth = turn._prompt_depth
     _stall_command = turn._stall_command
@@ -80,6 +82,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
     message = turn.message
     needs_session_reset = turn.needs_session_reset
     slot = turn.slot
+
     # Turn stream ended: flush any withheld thinking tail (a thinking-final turn never
     # hit the loop-top flush in _run_chat's stream loop for a following non-thinking event).
     _flush_thinking_stream(turn)
@@ -114,7 +117,12 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
                 kind=SYNTHETIC_RECOVERY_KIND,
                 payload=RecoveryPayload.CONTINUATION,
             )
-            _emit_stale(turn, "⟳ Recovering a stalled turn…", will_retry=True)
+            _emit_stale(
+                turn,
+                gn.GATEWAY_TURN_STALLED_RECOVERING_TEXT,
+                will_retry=True,
+                notice=gn.GATEWAY_NOTICE_TURN_STALLED_RECOVERING,
+            )
         elif slot._stale_recovery_retries >= STOP_RECOVERY_MAX_RETRIES:
             # Budget exhausted — terminal for this slot until a turn
             # actually completes. The budget is deliberately NOT reset
@@ -126,12 +134,16 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
             if not slot._stale_recovery_exhausted_emitted:
                 _emit_recovery_outcome("stale_recover", "exhausted", slot._stale_recovery_retries)
                 slot._stale_recovery_exhausted_emitted = True
-            _emit_stale(turn, "Session stuck — please start a new chat.")
+            _emit_stale(turn, gn.GATEWAY_SESSION_STUCK_TEXT, notice=gn.GATEWAY_NOTICE_SESSION_STUCK)
         else:
             # depth>0 (nested turn) with budget remaining: reset the session
             # but don't re-queue (mirrors the pipe-death depth>0 handling);
             # surface feedback so the nested turn doesn't fail silently.
-            _emit_stale(turn, "⟳ Turn stalled — please retry.")
+            _emit_stale(
+                turn,
+                gn.GATEWAY_TURN_STALLED_GIVE_UP_TEXT,
+                notice=gn.GATEWAY_NOTICE_TURN_STALLED_GIVE_UP,
+            )
         return _Flow.END
 
     # Dedicated tool-stall recovery — MUST precede the generic "error:"
@@ -170,7 +182,12 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
                 kind=SYNTHETIC_RECOVERY_KIND,
                 payload=RecoveryPayload.CONTINUATION,
             )
-            _emit_stall(turn, "⟳ Tool appeared stalled — recovering…", will_retry=True)
+            _emit_stall(
+                turn,
+                gn.GATEWAY_TOOL_STALLED_RECOVERING_TEXT,
+                will_retry=True,
+                notice=gn.GATEWAY_NOTICE_TOOL_STALLED_RECOVERING,
+            )
         elif slot._tool_stall_retries >= STOP_RECOVERY_MAX_RETRIES:
             # Budget exhausted — mirrors the stale_recover branch above:
             # budget left alone (a wedged slot must not re-enter a fresh
@@ -179,9 +196,13 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
             if not slot._tool_stall_exhausted_emitted:
                 _emit_recovery_outcome("tool_stall", "exhausted", slot._tool_stall_retries)
                 slot._tool_stall_exhausted_emitted = True
-            _emit_stall(turn, "Session stuck — please start a new chat.")
+            _emit_stall(turn, gn.GATEWAY_SESSION_STUCK_TEXT, notice=gn.GATEWAY_NOTICE_SESSION_STUCK)
         else:
-            _emit_stall(turn, "⟳ Tool appeared stalled — please retry.")
+            _emit_stall(
+                turn,
+                gn.GATEWAY_TOOL_STALLED_GIVE_UP_TEXT,
+                notice=gn.GATEWAY_NOTICE_TOOL_STALLED_GIVE_UP,
+            )
         return _Flow.END
 
     # Automatic compaction failed and the backend then abandoned the turn.
@@ -270,7 +291,10 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
                 "error",
                 "⟳ Compaction failed — retrying…",
                 "msg msg-err",
-                meta={"kind": TRANSIENT_RETRY_KIND},
+                meta={
+                    "kind": TRANSIENT_RETRY_KIND,
+                    **gn.gateway_notice_meta(gn.GATEWAY_NOTICE_COMPACTION_RETRYING),
+                },
             )
         return _Flow.END
 
@@ -286,6 +310,8 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
         await _persist_partial_reply(turn, _stop_reason)
         _rc = getattr(client, "exit_code", None)
         _rc_suffix = f" (exit {_rc})" if _rc is not None else ""
+        # The localized copy shows the exit code from the notice args.
+        _rc_args: dict = {"exit_code": _rc} if _rc is not None else {}
 
         # Attribution, as in the AcpProcessDied handler: a process this slot
         # shared dying is not this slot's failure, so it advances the
@@ -316,18 +342,36 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
                 kind=SYNTHETIC_RECOVERY_KIND,
                 payload=_requeue_payload,
             )
-            _emit_error(turn, f"⟳ Connection lost{_rc_suffix} — retrying...", will_retry=True)
+            _emit_error(
+                turn,
+                f"⟳ Connection lost{_rc_suffix} — retrying...",
+                will_retry=True,
+                notice=gn.GATEWAY_NOTICE_CONNECTION_LOST_RETRYING,
+                **_rc_args,
+            )
         elif _death_attempts >= SESSION_RECOVERY_MAX_ATTEMPTS:
             if _own_fault:
-                _emit_error(turn, f"Session stuck{_rc_suffix} — please start a new chat.")
+                _emit_error(
+                    turn,
+                    f"Session stuck{_rc_suffix} — please start a new chat.",
+                    notice=gn.GATEWAY_NOTICE_SESSION_STUCK,
+                    **_rc_args,
+                )
             else:
                 _emit_error(
                     turn,
                     f"The agent process this chat shares kept restarting{_rc_suffix}"
                     " — please retry.",
+                    notice=gn.GATEWAY_NOTICE_SHARED_RUNTIME_RESTARTING,
+                    **_rc_args,
                 )
         else:
-            _emit_error(turn, f"⟳ Connection lost{_rc_suffix} — please retry.")
+            _emit_error(
+                turn,
+                f"⟳ Connection lost{_rc_suffix} — please retry.",
+                notice=gn.GATEWAY_NOTICE_CONNECTION_LOST_GIVE_UP,
+                **_rc_args,
+            )
         return _Flow.END
     return None
 
@@ -357,15 +401,12 @@ async def _turn_persist_and_settle(turn: _ChatTurn) -> None:
     slot = turn.slot
     state = turn.state
     if not _retrying_empty:
-        # Attach per-turn stats (elapsed / credits) to the last assistant
-        # message so the footer can show them (parity with kiro-cli).
-        # Scoped to this turn's messages via _turn_msg_boundary, and to the
-        # rows this runner appended when it appended any: a workflow result
-        # another writer appended mid-turn must not take this turn's figures.
-        # A turn whose only row is not a recorded reply (a command's own
-        # confirmation) keeps the plain boundary scan.
+        # Attach per-turn stats (elapsed / credits) to the reply this turn
+        # recorded so the footer can show them (parity with kiro-cli).
+        # Scoped to this turn's rows via _turn_msg_boundary and
+        # _turn_start_mid, like the file-change flush below.
         _reply_mids = getattr(slot, "_turn_reply_mids", None)
-        _stats_attached = _attach_owned_turn_stats(
+        _stats_attached = _attach_turn_stats(
             slot,
             _turn_elapsed_ms,
             _turn_credits,
@@ -373,9 +414,10 @@ async def _turn_persist_and_settle(turn: _ChatTurn) -> None:
             turn_boundary=_turn_msg_boundary,
             model=_turn_model,
             ttft_ms=_ttft_visible.ms,
-            reply_mids=_reply_mids if isinstance(_reply_mids, list) and _reply_mids else None,
+            turn_start_mid=_turn_start_mid,
             retries=sum(slot._turn_retries.values()) if _prompt_depth == 0 else 0,
         )
+        turn._turn_footer_attached = True
         if _prompt_depth == 0 and _stats_attached:
             slot._carried_ttft_clock = None
         # Attach accumulated file changes to this turn's assistant row before persist.

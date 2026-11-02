@@ -184,13 +184,17 @@ class TestPageAndAssets:
         assert resp.content_type == "text/html"
 
     @pytest.mark.asyncio
-    async def test_branding_defaults_to_product_name(self) -> None:
+    async def test_branding_defaults_to_product_name(self, monkeypatch) -> None:
+        # The launcher answer is a fact about the host running the test, so it is
+        # pinned here; its own test is in test_dashboard_branding.py.
+        monkeypatch.setattr(core_mod.platform_compat, "desktop_launcher_available", lambda: True)
         resp = await core_mod.api_branding(_req())
         body = json.loads(resp.body)
         assert body == {
             "bot_name": "Kiro Crew",
             "avatar": "/logo.png",
             "direct_local": True,
+            "desktop_launcher": True,
         }
 
     @pytest.mark.asyncio
@@ -925,6 +929,7 @@ class TestSttConfigEndpoint:
         # Settings UI gates on a CAPABILITY rather than a provider name. `local`
         # streams too, so every advertised provider is in it.
         assert body["streaming_providers"] == ["local", "apple", "transcribe"]
+        assert body["language_identification_providers"] == ["transcribe"]
         # Tracks _STT_MODEL_SIZES (the PUT allowlist) rather than pinning one
         # literal, so a catalog entry added or resized cannot make the picker
         # offer a value this endpoint would reject.

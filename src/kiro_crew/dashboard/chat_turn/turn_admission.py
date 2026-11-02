@@ -89,6 +89,7 @@ if TYPE_CHECKING:
         _expand_prompt_mention_off_loop,
         _prewarm_startup_query,
     )
+    from kiro_crew.dashboard.chat_turn.regenerate_swap import rows_before_regenerate_target
     from kiro_crew.dashboard.chat_turn.session_reset import _consume_pending_reset
     from kiro_crew.dashboard.chat_turn.slash_commands import _refuse_blocked_slash
     from kiro_crew.dashboard.chat_turn.tool_approval import _persistable_session_policy
@@ -192,6 +193,8 @@ def _release_dispatch_lock(turn) -> None:
 
 async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     """Admit the turn onto its session: the admission wait, the dispatch lock, the bindings and the session claim."""
+    from kiro_crew.dashboard import gateway_notice as gn
+
     _spec_hooks: list
     _spec_hooks_cwd: str | None
     _turn_stats0: object
@@ -236,6 +239,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
 
@@ -459,6 +463,7 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
             "error",
             "This thread's crew name cannot be dispatched. Rename or recreate the Crew Member.",
             "msg msg-err",
+            meta=gn.gateway_notice_meta(gn.GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE),
         )
         return _Flow.END
     # A session a palette command opened to run as its app's OWN agent runs the
@@ -860,12 +865,18 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # session/new is on its send path: the first message's embedding starts now
     # and runs beside it. A resumable key restores its transcript instead and
     # builds no session-start memory.
-    if (
-        not _wait_if_busy
-        and not is_slash
-        and not state.sessions.resumable_hint(session_key)
-        and not _message_rewritten_before_build(slot, message)
-    ):
+    #
+    # A prewarmed session nobody has claimed yet is the other case that builds
+    # session-start memory. Its own registration mapped its id, so the resumable
+    # hint is set for it, but it restores nothing: the claim takes its FRESH
+    # observation. The reads then run beside the claim and the steps before the
+    # build (model settle, replay, store preparation).
+    _starts_fresh = (
+        state.sessions.fresh_start_unclaimed(session_key)
+        if _wait_if_busy
+        else not state.sessions.resumable_hint(session_key)
+    )
+    if _starts_fresh and not is_slash and not _message_rewritten_before_build(slot, message):
         await _prewarm_startup_query(
             state,
             slot,
@@ -1464,8 +1475,11 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     # `durable_row_count` is the SHARED counting rule every
     # site that sets or advances that base uses, so the ordinal cannot disagree
     # with the base about which rows are durable.
+    # A Regenerate leaves the reply it replaces in the window until the turn
+    # ends; that reply is not counted, so the re-run draws the ordinal of the
+    # turn it repeats and the emitter's `attempt` increments.
     _crew_log_turn_no = int(getattr(slot, "_disk_older_durable_count", 0) or 0) + durable_row_count(
-        slot.messages
+        rows_before_regenerate_target(slot, slot.messages)
     )
     turn._crew_log_turn_no = _crew_log_turn_no
     # A quick prompt is a REPLACING expansion, the same class as @prompt: the

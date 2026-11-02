@@ -67,6 +67,7 @@ __all__ = sorted(name for name in set(globals()) | set(_EXPORTS) if not name.sta
 
 if TYPE_CHECKING:  # every owner-defined name this module forwards, for type checkers
     from kiro_crew.dashboard.handlers.artifacts_parts.artifact_comments import (  # noqa: F401
+        _comment_identity,
         api_artifact_comments,
         api_artifact_delete_comment,
         api_artifact_edit_comment,
@@ -77,10 +78,15 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         api_artifact_resolve_comment,
     )
     from kiro_crew.dashboard.handlers.artifacts_parts.artifact_folders import (  # noqa: F401
+        _ARTIFACT_FOLDER_ICON_INFLIGHT,
+        _ARTIFACT_FOLDER_ICON_NEXT,
         _ARTIFACT_FOLDER_ICON_TASKS,
+        _cancel_artifact_folder_icon_tasks,
+        _prune_icon_state_from_other_loops,
         _serialize_folder,
         _set_pinned_and_reload,
         _spawn_artifact_folder_icon_task,
+        _start_artifact_folder_icon_task,
         _withdraw_subtree_publications,
         api_artifact_folder_create,
         api_artifact_folder_delete,
@@ -203,9 +209,11 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         api_remote_artifacts_fork,
     )
     from kiro_crew.dashboard.handlers.artifacts_parts.route_plumbing import (  # noqa: F401
+        _ANCHOR_INT_MAX,
         _MAX_BODY_BYTES,
         _REMOTE_PROVIDER_TIMEOUT_S,
         _SESSION_KEY_RE,
+        _anchor_int_error,
         _artifact_source_for_request,
         _audit,
         _clean_origin_session_key,

@@ -475,6 +475,16 @@ class LLMProvider(ABC):
         """
         return None
 
+    def set_delete_delay(self, seconds: float) -> None:
+        """Keep the session's record for ``seconds`` after it ends, then delete it.
+
+        Set by a workflow worker from ``session.kas_delete_delay_secs``. Only a
+        session on a host that can free a session and keep its record acts on it
+        (``AcpSessionHandle.destroy``). Default no-op for a provider whose
+        sessions end as they always did.
+        """
+        return None
+
     def disown_work_dir(self) -> None:
         """Declare that this provider does not own its work directory for reclaim.
 
@@ -615,6 +625,16 @@ class LLMProvider(ABC):
     # AttributeError-ing. Concrete providers override; the caller-side
     # ``getattr``/``hasattr`` guards remain where they additionally defend
     # against test doubles (AsyncMock) that are not LLMProvider instances.
+
+    @property
+    def switches_by_relaunch(self) -> bool:
+        """Whether a model or effort change relaunches this session's process.
+
+        True only where a switch either lands on the same chat or raises with the
+        prior values back in force, so a caller answers the raise as a refusal
+        rather than resetting onto the refused value. Default: ``False``.
+        """
+        return False
 
     def has_active_turn(self) -> bool:
         """True if a prompt is in flight and not yet cancelled. Default False."""
@@ -879,6 +899,21 @@ class LLMProvider(ABC):
         :meth:`mark_mcp_config_changed`."""
         return False
 
+    @property
+    def mcp_config_relaunch_reload(self) -> bool:
+        """True when this provider's session takes a changed MCP server set by Crew
+        relaunching its process with the new launch-time config and loading the
+        same session there, at the session's next turn boundary, with the
+        conversation kept -- the third way a dashboard MCP write is applied
+        without the all-sessions reset.
+
+        Default False, for the reason ``mcp_config_hot_reload`` defaults False
+        (harness-parity H6/H14). The ACP implementation answers from
+        ``ACP_BACKENDS_MCP_RELAUNCH_RELOAD`` membership. Consumers act only on a
+        literal ``True``, and a True answer is collected by calling
+        :meth:`mark_mcp_config_changed`."""
+        return False
+
     def mark_mcp_config_changed(self) -> None:
         """Note that the MCP config this session was projected from has changed.
 
@@ -919,6 +954,15 @@ class LLMProvider(ABC):
         differently, which is indistinguishable from a session that reported
         nothing — and that silence is the false all-clear the report exists to
         remove. A provider without one returns None explicitly.
+        """
+        return None
+
+    def note_user_message(self, text: str) -> None:
+        """Hand the user's own message, as typed, to the MCP sign-in trigger.
+
+        A KAS session offers a server's sign-in only when the user names it
+        (see ``AcpSessionHandle.want_mcp_sign_in_named``). A provider with no
+        such trigger ignores it. Never raises.
         """
         return None
 

@@ -788,15 +788,23 @@ from kiro_crew.mcp_dashboard_references import (  # noqa: E402, F401
     _resolve_chat_slot_key,
     _resolve_chat_tag_column,
     _resolve_chat_tag_ids,
+    _resolve_existing_chat_folder_prefix,
     _walk_chat_folder_segments,
 )
 from kiro_crew.mcp_dashboard_session_runs import (  # noqa: E402, F401
     _PROFILE_COPY_NOTE,
+    _WORK_RECORD_ROUTE,
     GENERATE_TITLE_TIMEOUT_SECS,
     SESSION_STATUS_READ_TIMEOUT_SECS,
     _closed_at_display,
     _create_refusal_remedy,
+    _create_session,
+    _Created,
+    _dispatch_cleanup,
+    _dispatch_failed,
+    _dispatch_outcome,
     _pending_approval_phrase,
+    _RefusalCodes,
     _render_session_summary,
     _resolve_folder_for_new_session,
     _run_session_adopt,
@@ -820,6 +828,7 @@ from kiro_crew.mcp_dashboard_session_runs import (  # noqa: E402, F401
     _run_session_status,
     _run_session_stop,
     _run_session_summary,
+    _run_work_dispatch,
     _summary_time,
     _worker_capabilities_line,
 )
@@ -878,9 +887,14 @@ def _list_tools() -> list[dict[str, Any]]:
     """The tool surface, unconditionally.
 
     Reaching this process at all means an agent spec referenced this server, so
-    the assignment already happened; there is nothing left to gate here.
+    the assignment already happened; there is nothing left to gate here. The one
+    conditional part is the ``crew`` argument on the five session tools, which is
+    advertised only while ``work_ledger.remote_dispatch`` is on.
     """
-    return TABLE.list()
+    from kiro_crew.mcp_session_crew import with_crew_schema
+    from kiro_crew.remote_dispatch import remote_dispatch_enabled
+
+    return with_crew_schema(TABLE.list(), remote_dispatch_enabled())
 
 
 def _validate_args(name: str, args: dict[str, Any]) -> dict[str, Any]:

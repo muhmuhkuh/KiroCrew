@@ -165,6 +165,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, questions: 'list[dict]') -> 'list[dict]'",
     ),
+    "_reload_cron_folders_if_unknown": ("function", False, False, "(self) -> 'None'"),
+    "_reload_folders_if_unknown": ("function", False, False, "(self) -> 'None'"),
     "_remove_ws": ("function", False, False, "(self, ws: 'web.WebSocketResponse') -> 'None'"),
     "_reproject_slots": (
         "function",
@@ -288,6 +290,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, msg_type: 'str', data: 'WsPayload') -> 'None'",
     ),
     "bump_pinned_order_rev": ("function", False, False, "(self) -> 'None'"),
+    "bump_tags_generation": ("function", False, False, "(self) -> 'None'"),
     "cancel_questions_for_slot": ("function", False, False, "(self, slot_key: 'str') -> 'int'"),
     "channel_status": ("function", False, False, "(self) -> 'dict[str, dict[str, Any]]'"),
     "clear_notifications": ("function", True, False, "(self) -> 'None'"),
@@ -475,6 +478,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, *, legacy_only: 'bool' = False) -> 'None'",
     ),
     "push_source_status": ("function", False, False, "(self, delta: 'dict') -> 'None'"),
+    "push_subagent_patch": ("function", False, False, "(self) -> 'None'"),
     "push_update_progress": (
         "function",
         False,
@@ -566,7 +570,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, ask_id: 'str', answers: 'dict[str, str] | None', *, reason: 'str "
-        "| None' = None) -> 'bool'",
+        "| None' = None, responder: 'Any' = None, response_id: 'str' = '') -> 'bool'",
     ),
     "resolve_skill_review_notifications": (
         "function",
@@ -675,6 +679,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self) -> \"'Iterator[Callable[[str], None]]'\"",
     ),
+    "tags_generation": ("function", False, False, "(self) -> 'int'"),
     "unack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
     "unregister_sse": (
         "function",
@@ -699,6 +704,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "wire_session_bind_listener": ("function", False, False, "(self) -> 'None'"),
     "wire_session_compact_callback": ("function", False, False, "(self) -> 'None'"),
     "wire_session_recycle_callback": ("function", False, False, "(self) -> 'None'"),
+    "wire_session_release_listener": ("function", False, False, "(self) -> 'None'"),
     "wire_session_unbind_listener": ("function", False, False, "(self) -> 'None'"),
     "withdraw_agent_ask": (
         "function",

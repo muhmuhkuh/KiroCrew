@@ -74,6 +74,9 @@ class _EmptyVectorStore:
     def close(self) -> None:
         pass
 
+    def recorded_embedding_space(self) -> None:
+        return None
+
     def get_all_semantic(self) -> list:
         return []
 
@@ -561,7 +564,7 @@ class TestAtomicMemoryWrites:
         ms = _store(tmp_path)
         ms.init()
 
-        def boom(src: object, dst: object) -> None:
+        def boom(src: object, dst: object, **kwargs: object) -> None:
             raise OSError("simulated replace failure")
 
         # Patch the rename step inside the atomic_write helper the memory

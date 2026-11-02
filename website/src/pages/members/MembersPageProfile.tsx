@@ -197,7 +197,9 @@ export function useMembersPageProfile({ layout, activeName, profile, setProfile 
   // user can see. `openMemberRef` is read rather than closed over so the
   // listener binds once instead of re-binding per selection.
   const openMemberRef = useRef(false)
-  const togglePanel = useCallback(() => {
+  /** The toggle itself. `onRevealed` runs once a reveal has gone through,
+   *  including after the guard's Discard, and never on a refusal or a hide. */
+  const runTogglePanel = useCallback((onRevealed?: () => void) => {
     if (!openMemberRef.current) return
     // Hiding the panel leaves the Profile card mounted, so it cannot discard
     // the schedule draft now hosted there. Revealing still guards the Profile
@@ -206,6 +208,7 @@ export function useMembersPageProfile({ layout, activeName, profile, setProfile 
     const flip = () => {
       if (beside) setDockedOpen((v) => !v)
       else setOverlayOpen((v) => !v)
+      if (!hiding) onRevealed?.()
     }
     const revealAndFoldProfile = () => {
       flip()
@@ -218,6 +221,9 @@ export function useMembersPageProfile({ layout, activeName, profile, setProfile 
     }
     flip()
   }, [beside, dockedOpen, overlayOpen, setDockedOpen, profile, setOverlayOpen, setProfile])
+  const togglePanel = useCallback(() => runTogglePanel(), [runTogglePanel])
+  /** Reveal through the same guard, then run `then` once it has gone through. */
+  const revealPanelThen = useCallback((then: () => void) => runTogglePanel(then), [runTogglePanel])
   useEffect(() => {
     const onToggle = () => togglePanel()
     window.addEventListener('toggle-activity-panel', onToggle)
@@ -226,7 +232,7 @@ export function useMembersPageProfile({ layout, activeName, profile, setProfile 
 
   return {
     pillFaceRef, cardFaceRef, flightFromRef, openProfile, schedGuardRef, schedAtStakeRef, requestCloseProfile,
-    closeDocked, openMemberRef, togglePanel,
+    closeDocked, openMemberRef, togglePanel, revealPanelThen,
   }
 }
 

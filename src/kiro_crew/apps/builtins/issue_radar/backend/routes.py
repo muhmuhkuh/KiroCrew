@@ -127,6 +127,11 @@ from .http_routes.ci_runs import (  # noqa: F401
     _handle_ci_runs,
     _repo_runs,
 )
+from .http_routes.comments import (  # noqa: F401
+    _drop_detail_cache,
+    _handle_comments,
+    _items_field,
+)
 from .http_routes.deps import (  # noqa: F401
     _DEPS_REBUILD_LOCKS_APP_KEY,
     _DEPS_REFRESH_TASKS_APP_KEY,
@@ -458,7 +463,10 @@ async def _handle_connect(request: web.Request) -> web.Response:
     — but it keeps the repo-centric routes/UI consistent and is round-tripped by
     ``_identity`` so the frontend can address the project.
     """
-    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+    from kiro_crew.dashboard.handlers._shared import (
+        require_owner_dashboard_request,
+        string_field_error,
+    )
 
     # Connecting probes the repo with the OWNER's provider CLI, and the read routes
     # then serve whatever it can see, private repos included: owner only.
@@ -473,7 +481,11 @@ async def _handle_connect(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response({"error": "request body must be a JSON object"}, status=400)
 
-    url = (body.get("url") or "").strip()
+    # A truthy non-string (`{"url": 1}`) would crash `.strip()` into a 500.
+    url = body.get("url") or ""
+    if (not_string := string_field_error("url", url)) is not None:
+        return not_string
+    url = url.strip()
     if not url:
         return web.json_response({"error": "missing 'url'"}, status=400)
 
@@ -765,6 +777,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get("/api/apps/issue-radar/ci-runs", _require_enabled(_handle_ci_runs))
     app.router.add_post("/api/apps/issue-radar/pull/run", _require_enabled(_handle_pull_run_action))
     app.router.add_post("/api/apps/issue-radar/pulls/bulk", _require_enabled(_handle_pulls_bulk))
+    # Timeline comments and replies, posted singly or as a pending batch (see
+    # ``http_routes/comments.py``).
+    app.router.add_post("/api/apps/issue-radar/comments", _require_enabled(_handle_comments))
     app.router.add_get(
         "/api/apps/issue-radar/investigation", _require_enabled(_handle_get_investigation)
     )

@@ -130,6 +130,38 @@ export interface MemberRosterRow {
  *  an orchestrator routing decision ('select_crew', intent, not a run), a
  *  delegated `spawn_run(crew=...)` run ('spawn') and an auto-improvement
  *  run ('auto-improvement'). */
+/** `GET /api/agents/resolved-model`: what a new session on a crew runs. The
+ *  harness fields come only for the owner and only for a configured crew: the
+ *  crewmate's pin is read here and nowhere else (`GET /api/agents` leaves it out). */
+export interface AgentResolvedModel {
+  model: string
+  agent: string
+  kiro_agent: string
+  pinned: boolean
+  reasoning_effort: string
+  effort_pinned: boolean
+  /** The stored pin in the config spelling (`kiro`, `kas`, ...); `''` inherits. */
+  acp_backend?: string
+  /** What clearing the pin would run on (the install's member harness), same spelling. */
+  inherited_harness?: string
+  /** What the crewmate's chat runs on, same spelling; `''` when the pin cannot start. */
+  harness?: string
+  /** Why the pinned harness cannot start, when it cannot. */
+  harness_error?: string
+  /** Every harness a crewmate may be pinned to. */
+  harnesses?: string[]
+  /** The harnesses a crewmate's worker sessions can run on. */
+  worker_harnesses?: string[]
+  /** The harness whose own model list the editor offers, when it is not the configured one. */
+  models_backend?: string
+  /** The id that harness serves the pin as (`''` for none); absent until a session advertises. */
+  pin_served_as?: string
+  /** Whether a pair-id harness's build takes an effort pin; `null` until a live session answers. */
+  effort_supported?: boolean | null
+  /** The levels that build takes, when it answered. */
+  effort_levels?: string[]
+}
+
 export interface MemberActivityEntry {
   /** Epoch seconds (UTC) the engagement was recorded. */
   ts: number
@@ -140,16 +172,6 @@ export interface MemberActivityEntry {
 /** One team of crewmates (GET /api/teams). `members` are exact crew NAMES in
  *  the user's order; a crewmate is on at most one team, which the store
  *  enforces on every write. */
-/** GET /api/members/{slug}/recap: the work a crewmate holds, for its cold-start
- *  welcome. Goals still open (in its thread or a recent session), then the
- *  newest other sessions that ran as it. */
-export interface MemberRecap {
-  slug: string
-  member: string
-  paused: { goal: string; next: string }[]
-  recent: { title: string; ts: number }[]
-}
-
 /** One key result: how the crewmate will know its goal is reached. */
 export interface GoalKeyResult {
   id: string
@@ -325,7 +347,7 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
      *  app's own model setting. */
     agentResolvedModel: (agent: string, app?: string) =>
       fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)
-        + (app ? '&app=' + encodeURIComponent(app) : '')).then(j),
+        + (app ? '&app=' + encodeURIComponent(app) : '')).then(j) as Promise<AgentResolvedModel>,
     /** Execution choices for a chat: configured members AND installed shared
      *  templates, each row tagged with its `selection_kind`. Read-only -- unlike
      *  the sync route it enrols nothing and allocates no member memory, so
@@ -344,6 +366,10 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
         markdown_refused_backends?: string[]
         /** The harnesses that load a markdown agent spec. */
         markdown_spec_backends?: string[]
+        /** The conductor Crew Mode runs (`agent.crew_mode_agent`). */
+        crew_mode_agent?: string
+        /** Every conductor template; a normal chat's picker leaves these out. */
+        conductor_agents?: string[]
       }>,
     /** `extra` carries per-request headers (a guided create's `X-Guide-*`);
      *  it rides THIS request only, never the shared transport. */
@@ -509,12 +535,6 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
         } | null
         truncated: boolean
       }>,
-    // The work a crewmate holds (open goals, recent sessions), read for its
-    // cold-start welcome. `member` is the exact crew name (slugs are lossy).
-    memberRecap: (slug: string, member: string) =>
-      fetch(
-        '/api/members/' + encodeURIComponent(slug) + '/recap?member=' + encodeURIComponent(member),
-      ).then(j) as Promise<MemberRecap>,
     // A crewmate's goals (the Goals tab). Every write is an owner action and
     // answers the whole record; `member` is the exact crew name (slugs are lossy).
     memberGoals: (() => {

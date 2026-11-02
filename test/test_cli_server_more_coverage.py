@@ -144,6 +144,11 @@ def git_checkout(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "kiro_crew.platform.update_governance.update_blocked_reason", lambda url: ""
     )
+    # The fake `subprocess.run` below cannot answer the repo-config probe; that
+    # refusal is covered against a real repo in test_host_git_repo_exec_neutralization.
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_governance.repo_exec_config_reason", lambda proj, **_k: ""
+    )
     monkeypatch.setattr(cli_server.shutil, "which", lambda name: None)
     # The optional kiro-cli step spawns only a PINNED install (resolved with the
     # inherited PATH excluded); none by default, so the host's own install
@@ -464,6 +469,23 @@ class TestUpdateGitPath:
         assert "Kiro Crew updated!" in capsys.readouterr().out
         assert poked == [True], "the completed update never poked the gateway"
 
+    def test_success_tells_the_user_to_restart(self, monkeypatch, git_checkout, capsys) -> None:
+        """The git path prints the same restart hint as the other paths."""
+        monkeypatch.setattr(subprocess, "run", _GitStub())
+        cli_server._update()
+        out = capsys.readouterr().out
+        assert "Restart the gateway to use the new version:" in out
+        assert "kirocrew restart" in out
+        assert out.index("Kiro Crew updated!") < out.index("kirocrew restart")
+
+    def test_a_failed_update_prints_no_restart_hint(
+        self, monkeypatch, git_checkout, capsys
+    ) -> None:
+        monkeypatch.setattr(subprocess, "run", _GitStub(reset=1))
+        with pytest.raises(SystemExit):
+            cli_server._update()
+        assert "kirocrew restart" not in capsys.readouterr().out
+
 
 class TestUpdateGatewayPoke:
     """``_revalidate_gateway_update_check`` — best-effort, never fatal.
@@ -744,6 +766,9 @@ def wheel_feed(monkeypatch):
     )
     monkeypatch.setattr(
         "kiro_crew.platform.update_governance.update_blocked_reason", lambda url: ""
+    )
+    monkeypatch.setattr(
+        "kiro_crew.platform.update_governance.repo_exec_config_reason", lambda proj, **_k: ""
     )
 
     def _no_network(*a, **k):

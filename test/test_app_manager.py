@@ -566,6 +566,167 @@ class TestUninstall:
         assert result.ok
         assert not (app_home / "apps" / "test-app").exists()
 
+    @staticmethod
+    def _sharing_violation(path):
+        """The ``PermissionError`` Windows raises deleting a file another process holds open."""
+        exc = PermissionError(13, "The process cannot access the file", str(path))
+        exc.winerror = 32
+        return exc
+
+    def _hold_app_dir(self, monkeypatch, app_root, *, releases_after, exc_factory):
+        """Make ``rmtree`` of *app_root* fail ``releases_after`` times, then delete it."""
+        import kiro_crew.apps.manager_uninstall as uninstall_mod
+
+        monkeypatch.setattr(uninstall_mod, "_RMTREE_BACKOFF_SECONDS", 0)
+        real_rmtree = shutil.rmtree
+        attempts = []
+
+        def held_rmtree(path, *args, **kwargs):
+            if str(path) == str(app_root):
+                attempts.append(path)
+                if releases_after is None or len(attempts) <= releases_after:
+                    raise exc_factory(Path(path) / "backend.log")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(shutil, "rmtree", held_rmtree)
+        return attempts
+
+    @pytest.mark.parametrize("keep_data", [False, True])
+    def test_uninstall_retries_a_file_held_open_until_it_is_released(
+        self, tmp_path, app_home, monkeypatch, keep_data
+    ):
+        """A sharing violation on the app dir delete clears once the holder lets go."""
+        install_app(_make_app_source(tmp_path))
+        app_root = app_home / "apps" / "test-app"
+        attempts = self._hold_app_dir(
+            monkeypatch, app_root, releases_after=2, exc_factory=self._sharing_violation
+        )
+
+        result = uninstall_app("test-app", keep_data=keep_data)
+
+        assert result.ok, result.error
+        assert len(attempts) == 3
+        assert not (app_root / APP_MANIFEST_FILENAME).exists()
+
+    def test_uninstall_fails_naming_the_file_still_held_after_the_retries(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """A holder that never releases fails the purge, names the file, keeps the app."""
+        import kiro_crew.apps.manager_uninstall as uninstall_mod
+
+        install_app(_make_app_source(tmp_path))
+        app_root = app_home / "apps" / "test-app"
+        attempts = self._hold_app_dir(
+            monkeypatch, app_root, releases_after=None, exc_factory=self._sharing_violation
+        )
+
+        result = uninstall_app("test-app", keep_data=False)
+
+        assert not result.ok
+        assert len(attempts) == uninstall_mod._RMTREE_MAX_ATTEMPTS
+        assert str(app_root / "backend.log") in result.error
+        assert "held open by another process" in result.error
+        assert (app_root / APP_MANIFEST_FILENAME).is_file()
+
+    def test_uninstall_does_not_retry_a_permission_error_that_is_not_a_sharing_violation(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        """Only winerror 32/33 is transient; any other refusal fails on the first attempt."""
+        install_app(_make_app_source(tmp_path))
+        app_root = app_home / "apps" / "test-app"
+        attempts = self._hold_app_dir(
+            monkeypatch,
+            app_root,
+            releases_after=None,
+            exc_factory=lambda path: PermissionError(13, "Access is denied", str(path)),
+        )
+
+        result = uninstall_app("test-app", keep_data=False)
+
+        assert not result.ok
+        assert len(attempts) == 1
+        assert (app_root / APP_MANIFEST_FILENAME).is_file()
+
+    def test_uninstall_removes_the_agent_lock_and_gateway_overlay(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # Deregistration unlinks ``<app>--<agent>.json``; uninstall also removes
+        # the empty ``<app>--<agent>.lock`` beside it and the MCP gateway's
+        # overlay copy ``mcp-gateway/agents/<app>--<agent>.json``.
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        overlay = app_home / "mcp-gateway" / "agents"
+        overlay.mkdir(parents=True)
+
+        mine_lock = agents / "test-app--bg.lock"
+        mine_lock.touch()
+        mine_overlay = overlay / "test-app--bg.json"
+        mine_overlay.write_text("{}", encoding="utf-8")
+        # Another app's files, and a user agent's, must be left alone.
+        other_lock = agents / "test-app-two--bg.lock"
+        other_lock.touch()
+        other_overlay = overlay / "test-app-two--bg.json"
+        other_overlay.write_text("{}", encoding="utf-8")
+        user_overlay = overlay / "kirocrew.json"
+        user_overlay.write_text("{}", encoding="utf-8")
+
+        install_app(_make_app_source(tmp_path))
+        result = uninstall_app("test-app")
+
+        assert result.ok
+        assert not mine_lock.exists()
+        assert not mine_overlay.exists()
+        assert other_lock.exists()
+        assert other_overlay.exists()
+        assert user_overlay.exists()
+
+    def test_uninstall_keeps_agent_residue_whose_spec_or_content_survives(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # A spec that is still on disk (deregistration did not run or failed)
+        # keeps its lock and overlay; a non-empty ``.lock`` is not the launcher's
+        # empty sentinel and is never deleted.
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        overlay = app_home / "mcp-gateway" / "agents"
+        overlay.mkdir(parents=True)
+
+        (agents / "test-app--live.json").write_text("{}", encoding="utf-8")
+        live_lock = agents / "test-app--live.lock"
+        live_lock.touch()
+        live_overlay = overlay / "test-app--live.json"
+        live_overlay.write_text("{}", encoding="utf-8")
+        full_lock = agents / "test-app--gone.lock"
+        full_lock.write_text("not empty", encoding="utf-8")
+
+        install_app(_make_app_source(tmp_path))
+        assert uninstall_app("test-app").ok
+
+        assert live_lock.exists()
+        assert live_overlay.exists()
+        assert full_lock.exists()
+
+    def test_uninstall_leaves_a_held_agent_lock(self, tmp_path, app_home, monkeypatch):
+        from kiro_crew.apps import bridges
+
+        agents = tmp_path / "kiro-agents"
+        agents.mkdir()
+        monkeypatch.setattr(bridges, "KIRO_AGENTS_DIR", agents)
+        held = agents / "test-app--bg.lock"
+        held.touch()
+        monkeypatch.setattr(platform_compat, "try_acquire_lock", lambda fd, exclusive: False)
+
+        install_app(_make_app_source(tmp_path))
+        assert uninstall_app("test-app").ok
+
+        assert held.exists()
+
     def test_uninstall_not_installed(self, app_home):
         result = uninstall_app("nonexistent")
         assert not result.ok

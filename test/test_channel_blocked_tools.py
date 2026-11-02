@@ -173,6 +173,7 @@ def test_dispatch_tuple_names_the_verbs_that_start_work():
         "task_run",
         "register_hook",
         "pod_up",
+        "pod_restart",
     }
 
 

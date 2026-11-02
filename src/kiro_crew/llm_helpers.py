@@ -149,7 +149,9 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _steer_host_deny,
     )
     from kiro_crew.llm_helpers_parts.tool_input_denials import (  # noqa: F401
+        _DIFF_TRUNCATION_MARK,
         _MAX_SCANNABLE_TOOL_INPUT_CHARS,
+        _diff_candidates,
         _edit_target_denial,
         _extract_tool_input_strings,
         _first_tool_input_denial,
@@ -195,6 +197,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.agent_sdk import (  # noqa: F401
         CONTEXT_EVENT_COMPACTION,
     )
+    from kiro_crew.agent_sdk.backends import ACP_BACKENDS_MODEL_AT_LAUNCH  # noqa: F401
     from kiro_crew.agent_sdk.drivers.acp import (  # noqa: F401
         provider_error_client,
         resolve_pin_spelling_on,
@@ -250,6 +253,9 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     )
     from kiro_crew.messaging.link import (  # noqa: F401
         canonical_key,
+    )
+    from kiro_crew.metrics.usage_attrs import (  # noqa: F401
+        TRIGGER_SYSTEM,
     )
     from kiro_crew.permission_floor import (  # noqa: F401
         OUTCOME_REJECTED_TRANSPORT_FLOOR,

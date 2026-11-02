@@ -106,8 +106,8 @@ _STABLE_TEXT_SHA256 = {
     "critical_rules": "16827ce030089653769a3f16a6fb96e6c9fcda799ef4750630080011b5ac1647",
     "critical_rules_channel": "7b7ea4db70ccbc233959938b561281591e3b3c26544b383046942ce229eacf7e",
     "docs_section": "971b6008afbd9ff048c498c06cffecc6dafc7a58b0df75ff9db0b15cf9e26c09",
-    "member_how_you_work": "eaecc5424f7093f793bb68228cd9231752f7f0ba6c75204d6d7a392ad3dca3f1",
-    "member_how_you_work_unavailable": "8b763af41df7bf48da8ac0e6080746273ea8fcf2e2239c4467e1958041adf02f",
+    "member_how_you_work": "0eaf81da81eb98552dd0ee9f0de078b06da2855579f9107adf0bebd1736557b2",
+    "member_how_you_work_unavailable": "861580229057bd9163fa665b6356d947bafa1c8232f368f55a69b67d2ed73b6b",
     "reply_answer_only": "f0bd694165ff81cdbe123048042070588b846bd43a224b31adc79d9f8768bfce",
     "reply_concise": "5d3e25d89e682469332237e46373f0e9aac8516eefd63047134d1ec0575aac2a",
     "response_preferences_frame": "08ee149ae459c828213d47643f1cdbd6661d8a77a2223b8be5d0aa6fbb6cdc18",
@@ -150,6 +150,9 @@ def _mask_stable_text(text: str) -> str:
 
 
 def _turn(rig: _Rig, text: str, is_new: bool, **kwargs) -> str:
+    # The matrix pins the bytes of a turn a person sent. An automation turn's
+    # guidance is covered in test_followup_guidance_origin_gate.py.
+    kwargs.setdefault("directive_user_origin", True)
     message, _hook = rig.builder.build_message(text, is_new, **kwargs)
     return message
 
@@ -568,14 +571,15 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "follow_up_reinjection": (
-        "65223485bb4ae222f2e5e608ab05f015b46c775ac1e5a65173517e1a3a49d555",
+        "9d6892ea04a2776f416e8d4659d2b464d06809487f328eedcd501dd0c3320901",
         [
             ("agent_instructions", 1479),
             ("memory", 183),
             ("memory_tools", 84),
-            ("recovery", 114),
+            ("recovery", 167),
             ("skill_index", 439),
-            ("unclassified", 18),
+            ("unclassified", 36),
+            ("lessons", 181),
             ("response_preferences", 402),
             ("reply_format_rules", 1347),
             ("request_header", 46),
@@ -727,11 +731,11 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "session_context_member_mode": (
-        "758327f19b09f64d46dd8e137d69303353c0cb0645fb7b81f578f65b2200d16b",
+        "89e48fe11084555b3db2a9eaf6fddbf49bf48fddd458e9d4a07f943c1be92150",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
-            ("surface", 1360),
+            ("surface", 1687),
             ("workspace_identity", 371),
             ("docs_pointer", 235),
             ("memory_tools", 425),

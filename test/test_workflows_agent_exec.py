@@ -38,13 +38,14 @@ class FakeSessions:
     def __init__(self) -> None:
         self.created: list[tuple[str, dict]] = []
         self.released: list[str] = []
-        self.backend_overrides: list[str | None] = []
+        # Every other kwarg, index-aligned with ``created``.
+        self.extra_kwargs: list[dict] = []
 
     async def get_or_create(self, key, *, agent=None, model=None, cwd=None, extra_env=None, **kw):
-        self.backend_overrides.append(kw.get("acp_backend_override"))
         self.created.append(
             (key, {"agent": agent, "model": model, "cwd": cwd, "extra_env": extra_env})
         )
+        self.extra_kwargs.append(kw)
         return FakeProvider(key), True, False
 
     def release(self, key, *, cleanup=False):
@@ -168,24 +169,6 @@ async def test_extra_env_run_level_pin_flows_into_get_or_create() -> None:
     assert plain.created[-1][1]["extra_env"] is None
 
 
-async def test_backend_override_reaches_session_factory_through_runner() -> None:
-    from kiro_crew.workflows.runner import WorkflowRunner
-
-    sessions = FakeSessions()
-    runner = WorkflowRunner(
-        agent_fn=build_agent_fn(sessions, run_id="wf_backend"),
-        audit=lambda *a, **k: None,
-    )
-    script = (
-        'META = {"name": "backend-route"}\n'
-        "async def workflow(ctx):\n"
-        "    return await ctx.agent('review', backend='claude')\n"
-    )
-    result = await runner.run(script, run_id="wf_backend", now="2026-10-01T00:00:00Z")
-    assert result.ok, result.error
-    assert sessions.backend_overrides == ["claude"]
-
-
 async def test_end_to_end_through_runner() -> None:
     """A workflow's ctx.agent() reaches the model via the built agent_fn."""
     from kiro_crew.workflows.runner import WorkflowRunner
@@ -203,6 +186,58 @@ async def test_end_to_end_through_runner() -> None:
     assert res.ok, res.error
     assert "origin of pizza" in str(res.result)
     assert sessions.created  # the model was actually engaged
+
+
+def _effort_script(effort: str) -> str:
+    return (
+        'META = {"name": "effort"}\n'
+        "async def workflow(ctx):\n"
+        f"    return await ctx.agent('step', effort={effort!r})\n"
+    )
+
+
+async def test_step_effort_reaches_get_or_create_as_override() -> None:
+    """ctx.agent(effort=) is the step's effort: the session is created with it
+    as reasoning_effort_override, the same override spawn_run passes."""
+    from kiro_crew.workflows.runner import WorkflowRunner
+
+    sessions = FakeSessions()
+    runner = WorkflowRunner(agent_fn=build_agent_fn(sessions, run_id="wf_eff"), audit=_no_audit)
+    res = await runner.run(_effort_script("high"), run_id="wf_eff", now="2026-10-29T00:00:00Z")
+    assert res.ok, res.error
+    assert sessions.extra_kwargs == [{"reasoning_effort_override": "high"}]
+
+
+@pytest.mark.parametrize("opts", [{}, {"effort": None}, {"effort": ""}])
+async def test_unset_effort_passes_no_override(opts) -> None:
+    sessions = FakeSessions()
+    await build_agent_fn(sessions, run_id="wf_noeff")("p", opts)
+    assert sessions.extra_kwargs == [{}]
+
+
+async def test_invalid_effort_fails_the_step_before_allocating() -> None:
+    """A level outside the shared vocabulary fails the step with a named error
+    and allocates no session, instead of running at a default."""
+    from kiro_crew.workflows.runner import WorkflowRunner
+
+    sessions = FakeSessions()
+    runner = WorkflowRunner(agent_fn=build_agent_fn(sessions, run_id="wf_bad"), audit=_no_audit)
+    script = (
+        'META = {"name": "effort"}\n'
+        "async def workflow(ctx):\n"
+        "    return {'out': await ctx.agent('step', effort='turbo')}\n"
+    )
+    res = await runner.run(script, run_id="wf_bad", now="2026-10-29T00:00:00Z")
+    assert res.ok, res.error
+    assert res.result == {"out": None}
+    assert sessions.created == []
+    with pytest.raises(agent_exec.WorkflowEffortInvalid, match="turbo"):
+        await build_agent_fn(sessions, run_id="wf_bad2")("p", {"effort": "turbo"})
+    assert sessions.created == []
+
+
+def _no_audit(*_a, **_k) -> None:
+    return None
 
 
 async def test_agent_step_persists_usage_row_with_surface() -> None:

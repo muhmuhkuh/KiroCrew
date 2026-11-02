@@ -14,6 +14,8 @@ const UNUSED_REASON_KEYS = {
   gerrit_multi_host: 'settings.secrets.gerrit_global_unused_multi_host',
   gerrit_host_precedence: 'settings.secrets.gerrit_global_unused_host_credential',
 } as const
+
+import { SECRETS_AUTHORIZE_COMMAND, SECRETS_SERVER_GRANT } from './secretsAuthorizeCommand'
 import { Btn, IconButton, Input, PanelSectionHeader } from '../../components/ui'
 import { api, isAuthExpiredError, type ManagedSecret, type SecretsListResponse } from '../../api/client'
 import { i18nT } from '../../i18n/t'
@@ -159,8 +161,11 @@ function ManagedSecretRow({
     setEditing(false)
   }
 
+  // Each action clears the other's last outcome, so a past failure never sits
+  // beside a newer result ("Saved" next to "Could not delete").
   const setMutation = useMutation({
     mutationFn: () => api.secretsSave(secret.name, value),
+    onMutate: (): void => deleteMutation.reset(),
     onSuccess: finish,
   })
   const deleteMutation = useMutation({
@@ -185,6 +190,7 @@ function ManagedSecretRow({
   }, [onPendingChange, secret.name])
   const handleValueChange = (next: string) => {
     setMutation.reset()
+    deleteMutation.reset()
     setDeleteConfirm(false)
     setValue(next)
   }
@@ -482,6 +488,12 @@ export function SecretsPanel() {
               />
               <p className="text-sm text-muted">
                 {i18nT('settings.secrets.custom_description')}
+              </p>
+              <p className="text-sm text-muted">
+                {i18nT('settings.secrets.custom_authorize', { server: SECRETS_SERVER_GRANT })}
+                <code className="block mt-1.5 rounded-md border border-border bg-bg-elevated px-2.5 py-1.5 font-mono text-[12px] text-accent overflow-x-auto">
+                  {SECRETS_AUTHORIZE_COMMAND}
+                </code>
               </p>
 
               {otherNames.length > 0 ? (

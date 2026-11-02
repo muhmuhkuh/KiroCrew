@@ -99,7 +99,7 @@ jobs:
   # fork's darwin verdict before merge adds `ci:macos`.
   decide:
     name: Decide whether the macOS suite runs
-    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || 'ubuntu-latest' }}
+    runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && contains(fromJSON(vars.CODEBUILD_ACTOR_IDS || '[]'), github.actor_id) && (github.event_name == 'push' || (github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'synchronize') && github.event.pull_request.head.repo.full_name == github.repository)) && format('codebuild-kirocrew-gha-linux-{0}-{1}', github.run_id, github.run_attempt) || github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -205,10 +205,8 @@ jobs:
               - "src/kiro_crew/dashboard/handlers/terminal_transport.py"
               - "src/kiro_crew/dashboard/terminal_commands.py"
               - "src/kiro_crew/subagent_manager/terminal.py"
-              # The contracts themselves, and the two darwin gap lists a change
-              # here can silently widen.
+              # The contracts themselves.
               - "test/test_socketsec.py"
-              - "test/test_member_memory_filesystem.py"
               - "test/test_terminal_handler.py"
               - "test/test_terminal_handler_child_process.py"
               - "test/test_terminal_handler_completion.py"
@@ -232,6 +230,7 @@ jobs:
               - "src/kiro_crew/session_cleanup.py"
               - "src/kiro_crew/session_pool.py"
               - "test/test_darwin_native_provider_reap.py"
+              # The two darwin gap lists a change here can silently widen.
               - "test/macos-expected-failures.txt"
               - "test/macos-collect-ignore.txt"
               # This lane and the workflow it calls.

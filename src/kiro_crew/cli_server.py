@@ -414,6 +414,12 @@ async def _run_task(args: argparse.Namespace) -> None:
         print(f"❌ Spec file not found: {spec_path}", file=sys.stderr)
         sys.exit(1)
 
+    # A stored Kiro CLI pick runs on KAS where kiro-cli offers v3; this process
+    # never ran the gateway's KAS floor, so establish that evidence before the
+    # load reads the pick. Probes only for a Kiro CLI pick; off the event loop.
+    from kiro_crew.agent_sdk.backends import ensure_kiro_cli_kas_verdict
+
+    await asyncio.to_thread(ensure_kiro_cli_kas_verdict)
     cfg = KiroCrewConfig.load()
     factory = build_provider_factory(cfg)
     sessions = SessionManager(cfg, provider_factory=factory)  # type: ignore[arg-type]
@@ -646,7 +652,7 @@ def _logs_cmd(args: argparse.Namespace) -> None:
       4. ``~/.kiro/crew/gateway.log`` (foreground gateway)
     """
     follow = bool(getattr(args, "follow", False))
-    lines = int(getattr(args, "lines", 100) or 100)
+    lines = int(getattr(args, "lines", 100))
     plat = current_platform()
     unit = f"{SERVICE_NAME}.service"
 
@@ -858,11 +864,13 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.cli_server_requests import (  # noqa: F401
         _GATEWAY_NOT_LISTENING_HINT,
+        _TOKEN_REFUSAL_REMEDIES,
         _TOKEN_REQUEST_TIMEOUT,
         _emit_session_urls,
         _logout,
         _probe_dashboard_health,
         _token,
+        _token_refusal_message,
         _update_approve,
     )
     from kiro_crew.cli_server_restart import (  # noqa: F401
@@ -882,6 +890,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _RESTART_STOP_TIMEOUT,
         _RESTART_TOKEN_TTL,
         _RESTART_TOKEN_WAIT,
+        _died_replacement_message,
         _gateway_log_lines_since,
         _gateway_log_mark,
         _GatewayLogMark,
@@ -894,6 +903,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _replacement_is_serving,
         _resolve_restart_ready_timeout,
         _restart,
+        _signing_key_refusal_lines,
         _spawn_detached_gateway,
         _wait_for_pids_exit,
         _wait_gateway_ready,
@@ -902,9 +912,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.cli_server_stop import (  # noqa: F401
         _MAX_ECHOED_NAME_LEN,
         _SHUTDOWN_RESPONSE_MAX_BYTES,
+        _SUPERVISOR_SEARCH_DEPTH,
+        _config_dir_owner,
+        _desktop_supervisor_pid,
         _gateway_pid,
         _manual_stop_command,
         _pid_exited,
+        _process_path,
+        _refuse_desktop_supervised,
         _refuse_if_lock_held,
         _refuse_lock_holder,
         _refuse_service_alias,
@@ -915,6 +930,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _stop_mcp_gateway_daemon,
         _terminal_safe_name,
         _verified_loopback_gateway_pids,
+        desktop_app_supervisor,
     )
     from kiro_crew.cli_server_update import (  # noqa: F401
         _refresh_agent_config,
@@ -924,3 +940,4 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _update_managed_venv,
         _update_wheel,
     )
+    from kiro_crew.dashboard.tailnet import POLICY_OFF_DETAIL, policy_off  # noqa: F401

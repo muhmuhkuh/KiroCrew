@@ -12,7 +12,9 @@ import { bumpLastTsOverlay, dropCaughtUpLastTs, pruneLastTsOverlay, slotLastTsOf
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
 import { isChatPageSurface } from '../utils/channelOrigin'
 import { slotListHoldTest } from '../utils/slotListHold'
-import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
+import { crewModeEnabled } from '../lib/crewMode'
+import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, crewMemberKeys, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
+export { selectPersonSlots } from './personSlots'
 
 export interface SubagentDetail {
   id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
@@ -1940,12 +1942,15 @@ function countUnreadByMode(
   if (unread.length === 0) return 0
   const surfaceByKey = new Map(slots.map(s => [s.key, slotSurfaceKey(s)]))
   const isHeldOrphan = heldOrphanTest(new Set(surfaceByKey.keys()), heldKeys, holdChannels, listPartial)
+  // A Crew Mode crew member is no row of the person's lists (its root's Crew
+  // panel lists it), so its unread entry is kept for that panel but not counted.
+  const crewMembers = crewMemberKeys(slots)
   // The chat surface ('') counts every slot the chat page renders, legacy
   // Autopilot slots included (see `isChatPageSurface`).
   const isChatSurface = mode === ''
   let count = 0
   for (const k of unread) {
-    if (isHeldOrphan(k)) continue
+    if (isHeldOrphan(k) || crewMembers.has(k)) continue
     const sk = surfaceByKey.get(k) ?? ''
     if (isChatSurface ? isChatPageSurface(sk) : sk === mode) count++
   }
@@ -1964,15 +1969,21 @@ const _unreadByModeCache = new Map<string, UnreadByModeSelector>()
 export function selectUnreadByMode(mode: string): UnreadByModeSelector {
   let sel = _unreadByModeCache.get(mode)
   if (!sel) {
-    sel = createSelector(
+    // The Crew Mode preview decides whether crew members count (`crewMemberKeys`).
+    // It is passed as an argument, not read inside an input selector: the
+    // selector memoizes on its arguments, so a flip with the same state would
+    // otherwise answer from the cache.
+    const count = createSelector(
       (state: { dashboard: DashboardState }) => state.dashboard.slots,
       (state: { dashboard: DashboardState }) => state.dashboard.unreadSlots,
       (state: { dashboard: DashboardState }) => state.dashboard.slotsHeldKeys,
       (state: { dashboard: DashboardState }) => state.dashboard.slotsHoldChannels,
       (state: { dashboard: DashboardState }) => state.dashboard.slotsListPartial,
+      (_state: { dashboard: DashboardState }, crewMode: boolean) => crewMode,
       (slots, unread, heldKeys, holdChannels, listPartial) =>
         countUnreadByMode(slots, unread, mode, heldKeys ?? [], holdChannels === true, listPartial === true),
     )
+    sel = state => count(state, crewModeEnabled())
     _unreadByModeCache.set(mode, sel)
   }
   return sel

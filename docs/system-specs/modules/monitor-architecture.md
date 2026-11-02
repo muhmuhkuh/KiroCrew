@@ -142,7 +142,15 @@ same chokepoint as an agent's own `monitor_start`
 (`autonudge_authz.authorize_and_add_nudge`), create-only, as an OUTSIDE arm with
 no `initiator_slot_key`: the bind route knows the calling session but not the
 turn, so it cannot tell the session's own turn from a cron injection or a
-sub-agent sharing the slot. A crew/member conductor therefore refuses it. An
+sub-agent sharing the slot. A crew conductor therefore refuses it. A member
+(crewmate) slot admits it only as the exact fixed patrol on the attested
+caller's own thread (`autonudge_authz.admits_member_default_patrol`; the route
+reads the caller through `conductor_patrol.attested_caller_slot`: transport
+attestation plus a member execution record). Its trust entry is a
+default-patrol grant, not a self-arm: the fire-time guard admits its wakes only
+while the stored row still carries the fixed patrol
+(`conductor_patrol.is_fixed_patrol_payload`), and it vouches for no conversation
+reset (rfc-conductor-default-patrol.md section 10). An
 active record is left alone, so a bind never stacks a second loop. An inactive
 record the SYSTEM stopped -- its subject went terminal (every item closed), its
 budget or cap ran out, the `_stopped_row_is_replaceable` allowlist -- counts as
@@ -161,10 +169,13 @@ the bind. The MCP tool renders all three on every bind reply. A `session_create`
 the same `ensure_patrol` on its caller, with the same fields on its reply. A
 caller that holds no work ledger gets nothing armed (`no-ledger`): the watch
 would read nothing and fire on its timer, so the reply says what fits instead. A
-crew/member caller is still refused: neither route can tell the member's own
-turn from a cron, app or sub-agent turn on the same session key, and the only
-path that can (`session_directive_apply`, through `DIRECTIVE_TOOLS` and
-`mcp_core.derive_directive`) is reached by a member's own `monitor_start`. The armed loop carries `default_patrol: true`, and that tag is the one
+crew caller is still refused: neither route can tell the session's own turn
+from a cron, app or sub-agent turn on the same session key, and the only path
+that can (`session_directive_apply`, through `DIRECTIVE_TOOLS` and
+`mcp_core.derive_directive`) is reached by the session's own `monitor_start`. A
+member caller that holds a ledger gets the fixed patrol under the rule above.
+A cron, app or sub-agent turn on that thread can therefore arm it too; it can
+arm nothing else, and the repository owner accepted that residual. The armed loop carries `default_patrol: true`, and that tag is the one
 exception to create-only: ANY create-only arm of a loop that is not itself a
 default patrol -- the conductor's own `monitor_start` or `monitor_watch`, and
 equally a person's dashboard create or a channel arm -- displaces an ACTIVE
@@ -250,8 +261,9 @@ person's own queued text (#22747).
 The wake reaches the steer through `session_deliver.deliver`, the session-side entry
 point a non-human sender calls with its origin (`automation`, `cron`, `app`). The
 sender never picks idle vs running or a row role: `origin_row` maps the origin to
-its row, an idle slot gets that row and a turn, and a running slot gets the steer
-(an automation wake) or a queued card (a cron notification, an app message). A
+its row, an idle slot queues a cron notification or app message as a card that the
+queue drain starts at once (the drain writes the row), and a running slot gets the
+steer (an automation wake) or the same queued card. A
 script cron's result (`_deliver_script_result`) and a cron's `send_message` to its
 origin session (`api_send_message`), both with `evict_oldest` so a full live queue
 drops its oldest cron notification (never another kind of entry), and an MCP App's
@@ -399,7 +411,18 @@ release it. `monitor_inspect` reports the hold as
 `paused_for_approval` on the loop reading.
 
 A tool's “requested” response proves receipt only. The gateway's applied notice
-and a subsequent `monitor_inspect` prove activation. Unmatched directive delivery
+and a subsequent `monitor_inspect` prove activation. For crew/member sessions,
+self-arm provenance is positive: the directive consumer vouches for a
+`monitor_start`, `monitor_watch` or `monitor_update` only when the turn carries a
+mark its dispatcher set, either the authenticated-human origin
+(`_directive_user_origin`) or the delivered wake of a loop bound to this slot
+(`_directive_self_wake`). A turn's `user` actor is a fallback for attribution and
+never authority, so a dispatcher that names no producer grants nothing: cron, app,
+native sub-agent, peer-session, restored and untagged dispatcher turns keep the
+outside-arm 409. The human-origin mark rides a steer until it is consumed or
+requeued, so a person's steer that the turn ends before consuming drains with it.
+Successful arms use the existing self-arm trust record and SEL events; no
+gateway-patrol trust kind exists. Unmatched directive delivery
 produces an application-failure notice appended to the tool's own result text; its
 agent instruction names `monitor_inspect` only for the monitor tools and stays
 tool-neutral for every other directive tool, as does the turn-end notice for a parked

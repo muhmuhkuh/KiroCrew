@@ -1379,12 +1379,31 @@ class TestOpsMissionControlApiTool:
 
 
 class TestResourceStatusTool:
-    def _run(self, posture: str, *, cap: Any = 3, state: Any = None, lines: Any = None):
+    def _run(
+        self,
+        posture: str,
+        *,
+        cap: Any = 3,
+        state: Any = None,
+        lines: Any = None,
+        spawn_avail: float = 16.0,
+        pressure_held: bool = False,
+    ):
+        from kiro_crew.resource_status import SpawnFloorReading
+
         rstatus = SimpleNamespace(
             posture=posture,
-            memory_pressure_held=False,
+            memory_pressure_held=pressure_held,
             summary_lines=lambda: list(lines or ["Memory: 19G free", "Load: 1.2"]),
         )
+        # The gate's own figure, pinned so no case turns on the CI host's memory.
+        spawn = SpawnFloorReading(floor_gb=2.0, available_gb=spawn_avail, min_start_gb=2.15)
+        with patch("kiro_crew.resource_status.spawn_floor_reading", return_value=spawn) as read:
+            out = self._run_with(rstatus, cap=cap, state=state)
+        self.floor_reads = read.call_args_list
+        return out
+
+    def _run_with(self, rstatus: Any, *, cap: Any, state: Any):
         cfg = SimpleNamespace(load=staticmethod(lambda: object()))
         resolver = (
             (lambda _c: (_ for _ in ()).throw(RuntimeError("unreadable config")))
@@ -1400,7 +1419,12 @@ class TestResourceStatusTool:
                     with patch(
                         "kiro_crew.mcp_tools.spawn._live_adaptive_state", return_value=state
                     ):
-                        return _call_tool_inner("resource_status", {})
+                        # The caller-scoped block is its own read, pinned in
+                        # test_session_memory_scope.py; held quiet here.
+                        with patch(
+                            "kiro_crew.mcp_tools.spawn.session_memory_lines", return_value=[]
+                        ):
+                            return _call_tool_inner("resource_status", {})
 
     def test_the_live_cap_is_reported_when_the_gateway_answers(self) -> None:
         """The cap IN FORCE, not the configured ceiling.
@@ -1464,6 +1488,45 @@ class TestResourceStatusTool:
     )
     def test_each_posture_gets_its_own_guidance(self, posture: str, needle: str) -> None:
         assert needle in self._run(posture)
+
+    def test_an_ample_posture_with_the_spawn_floor_unmet_says_spawning_is_blocked(self) -> None:
+        """The posture's figure reads AMPLE while the gate's own figure
+        is under ``spawn_min_memory_gb`` plus a start's price, so every spawn
+        waits. The tool must not call that ample headroom."""
+        out = self._run("ample", spawn_avail=1.8)
+        assert "Subagent spawn floor: 2 GB must stay free after a start" in out
+        assert "BLOCKED: new top-level subagents wait in the queue" in out
+        assert "Guidance: new top-level subagents cannot start now — the gate reads 1.8 GB" in out
+        assert "at least 2.15 GB" in out
+        assert "ample headroom" not in out
+        # Said once, as the guidance, not again as a trailing line.
+        assert "Spawning:" not in out
+
+    @pytest.mark.parametrize("posture", ["critical", "tight"])
+    def test_a_pressured_posture_also_says_spawning_is_blocked(self, posture: str) -> None:
+        out = self._run(posture, spawn_avail=1.0)
+        # Right after the memory guidance, before any temp-space block.
+        lines = out.splitlines()
+        guidance = next(i for i, line in enumerate(lines) if line.startswith("Guidance:"))
+        assert "they wait in the queue until memory frees" in lines[guidance + 1]
+        assert "Spawning: new top-level subagents cannot start now" in out
+
+    def test_a_blocked_floor_outranks_the_kernel_pressure_guidance(self) -> None:
+        out = self._run("ample", spawn_avail=1.8, pressure_held=True)
+        assert "Guidance: new top-level subagents cannot start now" in out
+        assert "macOS reports memory pressure" not in out
+
+    @pytest.mark.parametrize("remote", [True, False])
+    def test_the_caller_placement_reaches_the_floor_reading(self, remote: bool) -> None:
+        with patch("kiro_crew.mcp_tools.spawn._caller_runs_remotely", return_value=remote):
+            self._run("ample")
+        assert [c.kwargs for c in self.floor_reads] == [{"remote": remote}]
+
+    def test_a_met_floor_keeps_the_ample_guidance(self) -> None:
+        out = self._run("ample", spawn_avail=16.0)
+        assert "the gate reads 16.0 GB, a top-level start needs at least 2.15 GB" in out
+        assert "BLOCKED" not in out
+        assert "ample headroom right now" in out
 
 
 class TestLiveAdaptiveState:

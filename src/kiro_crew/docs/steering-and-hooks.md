@@ -83,7 +83,10 @@ declares nothing) and lives in a root that session loads.
 The Steering files tab reads, creates, edits and deletes these documents. The
 inclusion mode is a segmented control in the editor, and the rewrite happens
 server-side so your body text is preserved byte for byte. An entry that is a
-symlink is listed and readable but never editable, and a workspace write must
+symlink is listed and readable but never editable. A symlink that points
+outside the folders the dashboard may read (for global steering, outside your
+home folder) is listed as "linked, not shown": sessions can still load it, but
+the dashboard never opens it or shows where it points. A workspace write must
 echo the project it was listed under — a chat slot's project can move, and a
 delete issued from a stale listing would otherwise unlink the same-named file in
 a different project.
@@ -133,6 +136,10 @@ tool call before it runs, or block it outright.
 | `PreToolUse` | before a tool runs | allows the tool |
 | `PostToolUse` | after a tool ran | nothing |
 | `Stop` | the turn ends | usually nothing — but see the continuation contract below |
+
+A spawned sub-agent fires `AgentSpawn` (on a new session) and `UserPromptSubmit`
+(with the task its parent wrote) before its prompt is sent, and their exit-0
+stdout is added to that prompt the same way.
 
 `PreToolUse` is the only event whose exit code can decide anything — and only
 on the path where the gateway is the one approving the call:

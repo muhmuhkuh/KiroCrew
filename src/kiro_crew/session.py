@@ -94,6 +94,7 @@ from kiro_crew.messaging.link import (  # noqa: F401
 )
 from kiro_crew.metrics.events import SESSION_IDLE_EXPIRED, emit_counter  # noqa: F401
 from kiro_crew.metrics.provider import get_recorder
+from kiro_crew.parent_turns import ParentTurnLedger as _ParentTurnLedger
 from kiro_crew.providers.base import CancelOutcome, LLMProvider
 from kiro_crew.pycache_gc import PYCACHE_GC_INTERVAL_SECS, prune_pycache  # noqa: F401
 from kiro_crew.runtime_ownership import PidRefcount  # noqa: F401
@@ -601,6 +602,7 @@ class SessionManager:
     get_or_create = _claims.get_or_create
     ending_key = _claims.ending_key
     allocation_requested_model = _claims.allocation_requested_model
+    fresh_start_unclaimed = _claims.fresh_start_unclaimed
     record_effort_override = _claims.record_effort_override
     record_success = _claims.record_success
     record_failure = _claims.record_failure
@@ -624,6 +626,11 @@ class SessionManager:
     forget_conversation_if_sid = _claims.forget_conversation_if_sid
     conversation_provider = _claims.conversation_provider
     release = _claims.release
+    turn_holder = _claims.turn_holder
+    turn_token = _claims.turn_token
+    turn_prompt_in_flight = _claims.turn_prompt_in_flight
+    note_turn_landed = _claims.note_turn_landed
+    settle_turn = _claims.settle_turn
     _safe_cleanup = _claims._safe_cleanup
     is_busy = _claims.is_busy
     touch = _claims.touch
@@ -641,6 +648,7 @@ class SessionManager:
     set_approval_policy = _claims.set_approval_policy
     # -- Background, warm-pool and companion runtimes (session_parts.runtimes).
     start_pool = _runtimes.start_pool
+    _start_cleanup_for_waiting_deletes = _runtimes._start_cleanup_for_waiting_deletes
     _ensure_background = _runtimes._ensure_background
     _configured_bg_backend_raw = _runtimes._configured_bg_backend_raw
     _configured_bg_backend = _runtimes._configured_bg_backend
@@ -776,6 +784,7 @@ class SessionManager:
     close_all = _teardown.close_all
     absorb_orphaned_release = _teardown.absorb_orphaned_release
     adopt_turn = _teardown.adopt_turn
+    retire_turn_permit = _teardown.retire_turn_permit
     cancel_current = _teardown.cancel_current
     cancel_owned_turn = _teardown.cancel_owned_turn
     stop_turn = _teardown.stop_turn
@@ -798,6 +807,7 @@ class SessionManager:
     _has_pending_injection = _sweeps._has_pending_injection
     _expire_idle_hook = _sweeps._expire_idle_hook
     _bg_drain_reap_hook = _sweeps._bg_drain_reap_hook
+    _released_sessions_hook = _sweeps._released_sessions_hook
     _orphan_mcp_hook = _sweeps._orphan_mcp_hook
     _reap_agent_scopes_hook = _sweeps._reap_agent_scopes_hook
     _rss_threshold_check = _sweeps._rss_threshold_check
@@ -867,6 +877,10 @@ class SessionManager:
         self._compaction_state = CompactionState()
         self._background_tasks: set[asyncio.Task] = set()  # type: ignore[type-arg]
         self._session_map = SessionMap()
+        # What each turn-permit holding owes at its release: whether its engine
+        # noted that it landed, and the inline marks that release confirms or
+        # revokes (``kiro_crew.parent_turns``).
+        self.parent_turns = _ParentTurnLedger()
 
         self._pool = WarmSessionPool(
             cast(Any, self),
@@ -893,6 +907,10 @@ class SessionManager:
         # surface that can reach the user (a dashboard notification, a Slack DM)
         # decides what to do with it. Args: (session_key, parked_secs).
         self.on_stuck_turn: Callable[[str, float], None] | None = None
+        # Fired after a turn lease is released (``release``), with the folded
+        # key. Also a seam: the dashboard uses it to land a model pick at a
+        # channel turn's end, which no dashboard turn boundary sees.
+        self.on_session_released: Callable[[str], None] | None = None
 
         self._compaction = CompactionCoordinator(
             self,

@@ -33,6 +33,7 @@ from kiro_crew.acp.types import (
     STEERING_INJECTED,
     STEERING_STARTED_NEW_TURN,
     STOP_REASON_END_TURN,
+    steering_advertised,
     steering_outcome,
 )
 
@@ -70,6 +71,11 @@ async def steer(self: AcpSessionHandle, message: str) -> bool:
     if not text or not self._session_id:
         return False
     if self._runtime.acp_backend in ACP_BACKENDS_STEERING_REQUEST:
+        if not steering_advertised(self.initialize_result):
+            # The process's handshake did not advertise ``_session/steering``
+            # (``_meta.steering.supported: true``): nothing is sent, and the
+            # caller queues the text as the next turn.
+            return False
         return await self._steer_via_steering_request(text)
     wrapped = f"<user_message>\n{text}\n</user_message>"
     await self._runtime.send_request(

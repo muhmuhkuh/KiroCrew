@@ -9,12 +9,15 @@ import asyncio
 import functools
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_files import is_kirocrew_default_agent
 from kiro_crew.agent_sdk.spec_hooks import (
     crew_fired_spec_hooks,
     session_agent,
     spec_hook_events,
     spec_hooks_run_nowhere,
     spec_project_dir,
+    spec_steering_read_nowhere,
+    spec_steering_resources,
     withheld_project_spec_hooks,
 )
 from kiro_crew.dashboard.chat_utils import (
@@ -156,8 +159,12 @@ async def _prepare_spec_hooks(
     one notice row, and so does a spec with ``confirm: true`` hooks, which Crew
     skips because it cannot ask for the confirmation. A new session on a backend
     where nothing runs the spec's hooks (``spec_hooks_run_nowhere``) gets one
-    notice row naming their events. None of them runs silently.
+    notice row naming their events, and one where nothing loads the spec's
+    ``file://`` steering (``spec_steering_read_nowhere``) gets one naming those
+    entries. None of them runs silently.
     """
+    if is_new and spec_steering_read_nowhere(client):
+        await _notice_unread_steering(state, slot, client, agent)
     if not capabilities_of(client).crew_fires_spec_hooks:
         if is_new and spec_hooks_run_nowhere(client):
             await _notice_spec_hooks_run_nowhere(state, slot, client, agent)
@@ -240,13 +247,67 @@ async def _notice_spec_hooks_run_nowhere(
         )
 
 
+#: How many ``file://`` entries the unread-steering notice names before it counts the rest.
+_STEERING_NOTICE_ENTRIES = 3
+
+
+def _unread_steering_notice(agent: str, entries: list[str]) -> str:
+    """The session-start notice for ``file://`` steering this backend never loads from ``resources``.
+
+    It names the field, not the files: the same file can still reach the model by
+    another route (folder steering, a crew member's essentials), so the row must
+    not claim the file has no effect.
+    """
+    # Redact each whole entry before the cut: a cut can split a credential
+    # pattern into a shape the redactors do not match.
+    shown = ", ".join(_redact_display_text(e)[:120] for e in entries[:_STEERING_NOTICE_ENTRIES])
+    more = len(entries) - _STEERING_NOTICE_ENTRIES
+    if more > 0:
+        shown += f" and {more} more"
+    return (
+        f"ℹ Agent {agent} lists steering files in resources ({shown}). This backend "
+        "does not load them from that field. They can still reach the model through "
+        "folder steering or a crew member's own context."
+    )
+
+
+async def _notice_unread_steering(
+    state: "DashboardState", slot: "_ChatSlot", client: Any, agent: str
+) -> None:
+    """One notice row naming the custom agent's ``file://`` steering *client* never loads.
+
+    Only a custom agent: the default agent's steering trees reach a mirrored
+    harness by other routes (folder steering, member essentials), so a row there
+    could claim a loss that did not happen. Best-effort: a spec that cannot be
+    read renders no row rather than failing the turn.
+    """
+    agent = session_agent(client, agent)
+    if not agent or is_kirocrew_default_agent(agent):
+        return
+    try:
+        entries = await asyncio.to_thread(spec_steering_resources, agent, spec_project_dir(client))
+    except Exception:  # noqa: BLE001 - an informational row must never fail a turn
+        logger.debug("agent spec resources for %r could not be read", agent, exc_info=True)
+        return
+    if entries:
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _redact_display_text(_unread_steering_notice(agent, entries)),
+            "msg msg-info",
+        )
+
+
 def _notice_steer_upgrade(state: "DashboardState", slot: "_ChatSlot", client: Any) -> None:
     """One notice row on a new session whose adapter is too old to take a mid-turn
-    message: the chat runs, the message waits for the turn, and the row names the
-    installed version, the minimum and the upgrade command."""
-    notice = getattr(client, "steer_upgrade_notice", "")
-    if isinstance(notice, str) and notice:
-        append_and_surface(state, slot, "notice", _redact_display_text(notice), "msg msg-info")
+    message, one whose KAS drops its agent's prompt, and one whose goose or codex is
+    outside its tested range: the chat runs, and each row names the installed version, the
+    tested one and the command that installs it."""
+    for name in ("steer_upgrade_notice", "agent_prompt_upgrade_notice", "tested_version_notice"):
+        notice = getattr(client, name, "")
+        if isinstance(notice, str) and notice:
+            append_and_surface(state, slot, "notice", _redact_display_text(notice), "msg msg-info")
 
 
 #: Notice text per ``settings_withheld_cause`` answer (see ``LLMProvider``).
@@ -410,6 +471,44 @@ async def _fire(
                         "text": f"Hook {r.hook_name}: injected {len(r.stdout)} chars",
                     },
                 )
+            elif event == HOOK_EVENT_PRE_TOOL_USE and r.exit_code != 0 and not r.pre_tool_blocks:
+                # A spec hook that a policy refused, or that crashed, was killed
+                # or timed out. kiro-cli, which runs these hooks on its own
+                # backend, warns and lets the tool run; so does Crew, so one
+                # broken hook in an agent package cannot stop every tool call.
+                logger.warning(
+                    "Spec hook %s %s (%s); tool allowed",
+                    r.hook_name,
+                    "was refused by policy" if r.refused else "failed",
+                    r.failure_detail,
+                )
+                state.broadcast_ws(
+                    "activity_event",
+                    {
+                        "slot": slot.key,
+                        "kind": "hook",
+                        "text": f"Hook {r.hook_name} skipped: {r.failure_detail[:100]}",
+                    },
+                )
+            elif r.exit_code == 2 and r.refused:
+                # A policy refused the hook, so it never ran. On PreToolUse this
+                # is a Hooks-page hook (a refused spec hook took the branch
+                # above): a gate with no verdict, which blocks. Log the refusal
+                # itself, so it does not read like a hook that asked to block.
+                injected.append(f"BLOCKED:{r.hook_name}:{r.failure_detail}")
+                logger.warning(
+                    "Hook %s refused by policy: %s",
+                    r.hook_name,
+                    r.failure_detail,
+                )
+                state.broadcast_ws(
+                    "activity_event",
+                    {
+                        "slot": slot.key,
+                        "kind": "hook",
+                        "text": f"Hook {r.hook_name} BLOCKED (refused): {r.failure_detail[:100]}",
+                    },
+                )
             elif r.exit_code == 2:
                 injected.append(
                     f"BLOCKED:{r.hook_name}:{r.stderr[:200] if r.stderr else 'hook denied'}"
@@ -434,7 +533,8 @@ async def _fire(
                     else (r.stderr[-200:] if r.stderr else f"exited with code {r.exit_code}")
                 )
                 if event == HOOK_EVENT_PRE_TOOL_USE:
-                    # Fail closed. A PreToolUse hook has a two-valued
+                    # Fail closed (Hooks-page hooks only: a failed spec hook
+                    # took the warn branch above). A PreToolUse hook has a two-valued
                     # contract — exit 0 is a delivered allow, exit 2 a
                     # delivered deny — so every other code means the gate
                     # did not decide, and for a gate that resolves to deny.

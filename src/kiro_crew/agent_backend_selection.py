@@ -1,3 +1,5 @@
+# DEPRECATED: Replaced by crewmate_harness.crewmate_backend_pin (upstream sync Nov 2026).
+# Kept to avoid breakage of any callers not yet updated. Do not add new usages.
 """Member defaults feed the existing harness gate; explicit session choices win."""
 
 from __future__ import annotations
@@ -87,6 +89,8 @@ def session_backend(
     session_key: str | None = None,
     backend_override: str | None = None,
 ) -> str:
+    # DEPRECATED: use crewmate_harness.crewmate_backend_pin + members.select_provider_backend directly.
+    from kiro_crew.crewmate_harness import crewmate_backend_pin
     from kiro_crew.members import select_provider_backend
 
     return select_provider_backend(
@@ -94,9 +98,7 @@ def session_backend(
         cfg.agent.member_acp_backend,
         cfg.agent.acp_backend,
         backend_override=backend_override,
-        agent_backend=(
-            agent_backend_pin(cfg, agent, crew_agent, session_key=session_key)
-            if backend_override is None
-            else None
+        crew_backend=(
+            crewmate_backend_pin(cfg, session_key) if backend_override is None else None
         ),
     )

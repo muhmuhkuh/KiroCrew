@@ -62,9 +62,27 @@ import re
 import secrets
 import threading
 from pathlib import Path
-from typing import Any, Callable, Optional, TypeVar
+from typing import Any, Optional
 
 from kiro_crew.deploy import engine, profiles
+from kiro_crew.publish.personal_drive_parts import (  # noqa: F401
+    _ACCOUNT_RE,
+    _EXTERNAL_ID_BYTES,
+    _ID_SEP,
+    _KEY_LOCKS,
+    _KEY_LOCKS_GUARD,
+    _SANDBOX_CSP,
+    _SANDBOX_POLICY_NAME,
+    _key_lock,
+    _no_profile_message,
+    _parse_external_id,
+    _sandbox_policy_config,
+    _serialized,
+    _unknown_profile_message,
+    bound_account,
+    make_external_id,
+    split_external_id,
+)
 from kiro_crew.publish_provider import (
     NON_TEXT_KINDS,
     Capability,
@@ -82,8 +100,6 @@ from kiro_crew.publish_provider import (
 )
 
 logger = logging.getLogger(__name__)
-
-_T = TypeVar("_T")
 
 #: This drive's registry key -- deliberately NOT ``DEFAULT_PROVIDER``.
 #:
@@ -138,12 +154,6 @@ PUBLIC_PREFIX = "public/"
 #: A published-then-made-private object moves here: still stored, not served.
 PRIVATE_PREFIX = "private/"
 
-#: ``external_id`` is ``<random>~<profile>``. The RANDOM half comes first so a profile
-#: name containing the separator cannot corrupt the object key, and the key/URL use only
-#: that half -- an account label never reaches a public link.
-_ID_SEP = "~"
-_EXTERNAL_ID_BYTES = 16
-
 #: Object metadata key holding the content digest, so a push can detect that the remote
 #: object changed under it instead of overwriting blindly.
 _SHA_META = "sha256"
@@ -168,182 +178,6 @@ _EDGE_MAX_AGE_SECONDS = 300
 #: together); a race between two machines sharing one account is not covered and shows
 #: up as the actionable ambiguity error from :meth:`_find_drive`.
 _CREATE_LOCK = threading.Lock()
-
-#: Account-global name of the response-headers policy that opaque-origins published
-#: artifacts. Account-global because a policy name is unique per account, which is
-#: exactly why the find-or-create below must VERIFY a same-named policy before reusing it
-#: (see :meth:`_sandbox_headers_policy`).
-_SANDBOX_POLICY_NAME = "kirocrew-publish-drive-sandbox"
-
-#: THE sandbox CSP directive -- one source of truth. It is spelled ONCE here so the create
-#: path and the reuse-verification path cannot drift: if a second literal existed in the
-#: verify path, a future edit to one copy would let the verifier accept (or a create
-#: emit) a policy whose CSP does not match, silently defeating the isolation. Delivered
-#: as a HEADER (a ``<meta>`` CSP ignores ``sandbox`` by spec), it gives each served
-#: document an OPAQUE origin so origin-keyed storage (localStorage/IndexedDB/cookies) is
-#: simply unreachable and cannot be shared between mutually-untrusted published documents.
-#:
-#: ``frame-ancestors 'none'`` rides along in the SAME constant deliberately, rather than
-#: living only in the ``FrameOptions`` header below, because this constant is the one thing
-#: the reuse path VERIFIES: a policy whose CSP does not match exactly fails closed. Framing
-#: protection expressed only as a header would be reused unverified, which is the same
-#: fail-open the CSP comparison exists to prevent. It is ``'none'`` and not ``'self'``
-#: because every artifact on a drive shares ONE domain -- ``'self'`` would let one published
-#: document frame another, which is precisely the cross-document relationship the opaque
-#: origin above exists to deny. Nothing legitimately frames a published copy: the
-#: dashboard's viewer renders artifact HTML from its own storage, never the public URL.
-_SANDBOX_CSP = "sandbox allow-scripts allow-popups; frame-ancestors 'none'"
-
-
-def _sandbox_policy_config() -> dict[str, Any]:
-    """The response-headers-policy config this module installs -- one source of truth.
-
-    Both the create path and the reuse-verification path derive the required CSP from the
-    SAME :data:`_SANDBOX_CSP` constant via this builder, so there is no second literal to
-    drift out of sync with the one the create path writes.
-    """
-    return {
-        "Name": _SANDBOX_POLICY_NAME,
-        "Comment": "Opaque-origin sandbox for pooled artifact publishing",
-        "SecurityHeadersConfig": {
-            "ContentSecurityPolicy": {
-                "ContentSecurityPolicy": _SANDBOX_CSP,
-                "Override": True,
-            },
-            "ContentTypeOptions": {"Override": True},
-            # Legacy companion to the CSP's `frame-ancestors`: a browser too old for CSP3
-            # honours only this header, and a published artifact is a public page whose
-            # framing a third-party origin would otherwise control. DENY rather than
-            # SAMEORIGIN for the reason given on `_SANDBOX_CSP` -- one drive serves every
-            # artifact from a single domain, so "same origin" is another published
-            # document, not a trusted host.
-            "FrameOptions": {"FrameOption": "DENY", "Override": True},
-            "StrictTransportSecurity": {
-                "AccessControlMaxAgeSec": 31536000,
-                "IncludeSubdomains": True,
-                "Override": True,
-            },
-            "ReferrerPolicy": {
-                "ReferrerPolicy": "same-origin",
-                "Override": True,
-            },
-        },
-    }
-
-
-# One lock per published artifact, so two mutations of the SAME object cannot interleave.
-# Every mutating path is read-then-write against S3 (head to decide, then copy/put/delete),
-# and the seam does not serialize per artifact -- its only lock covers cloning -- so without
-# it a push landing between a move's copy and its delete has its bytes deleted with the
-# source, leaving the record naming a version the drive does not hold and, since the
-# stored digest then matches nothing, every later push in permanent conflict.
-#
-# Keyed on the artifact's own id at this destination, so unrelated artifacts never contend.
-# Entries are never evicted: one small lock per artifact touched in this process is cheaper
-# than the bugs that come from freeing a lock somebody may be about to take.
-_KEY_LOCKS: dict[str, threading.Lock] = {}
-_KEY_LOCKS_GUARD = threading.Lock()
-
-
-def _key_lock(key_part: str) -> threading.Lock:
-    """The lock guarding one artifact's remote state."""
-    with _KEY_LOCKS_GUARD:
-        return _KEY_LOCKS.setdefault(key_part, threading.Lock())
-
-
-def _serialized(key_part: str, work: Callable[[], _T]) -> _T:
-    """Run one artifact's remote mutation under that artifact's own lock.
-
-    Called on the worker thread, never on the event loop, so a blocking lock is the right
-    primitive here and cannot stall the gateway.
-    """
-    with _key_lock(key_part):
-        return work()
-
-
-def _no_profile_message() -> str:
-    return (
-        "No AWS account is registered yet, so there is nowhere to put the drive. "
-        "Register a profile on the Artifact Deploy page first; the drive is then "
-        "created in that account on the first publish."
-    )
-
-
-def _unknown_profile_message(requested: str, known: list[str]) -> str:
-    if known:
-        return (
-            f"AWS profile {requested!r} is not registered. "
-            f"Registered profiles: {', '.join(sorted(known))}."
-        )
-    return _no_profile_message()
-
-
-#: An AWS account id is exactly twelve digits and cannot contain :data:`_ID_SEP`. That is
-#: what makes the three-field handle unambiguous even though a PROFILE NAME may contain the
-#: separator: the middle field is read as an account ONLY if it has this shape, so a
-#: two-field handle minted before binding existed cannot have its profile name mistaken for
-#: an account.
-_ACCOUNT_RE = re.compile(r"^\d{12}$")
-
-
-def make_external_id(profile: str, account: str) -> str:
-    """A publish handle binding an unguessable key to the ACCOUNT that holds the copy.
-
-    Shape: ``<key>~<account>~<profile>``. The account is what the withdrawal paths verify;
-    the profile name is retained only so the AWS calls have a credential source to resolve.
-
-    Binding the NAME alone was the earlier shape and it was a real exposure, not a nicety.
-    A profile name is a local alias the owner can repoint at another account by editing
-    their AWS config. Do that, then delete the artifact, and the withdrawal resolved the
-    name to the NEW account, found no drive there, reported a removal that removed nothing,
-    and cleared the record -- leaving the original copy public in the old account with its
-    handle erased. That needed no race and no failure, just a config edit and an ordinary
-    delete, which is why it was fixed here rather than deferred with the timing-dependent
-    windows.
-    """
-    key = secrets.token_hex(_EXTERNAL_ID_BYTES)
-    return f"{key}{_ID_SEP}{account}{_ID_SEP}{profile}"
-
-
-def _parse_external_id(external_id: str) -> tuple[str, str, str]:
-    """Return ``(key_part, bound_account, bound_profile)``; unknown fields are ``''``.
-
-    The single parser for this format, so the three readers below cannot drift apart.
-    Three shapes are accepted, and the middle one is the reason for :data:`_ACCOUNT_RE`:
-
-    * ``key~account~profile`` -- current. Account and profile both known.
-    * ``key~profile`` -- minted before binding, or hand-written by a caller. The middle
-      field fails the account shape, so it is read as the PROFILE and the account is
-      unknown. Reading it as an account would be the worst possible error: the withdrawal
-      paths would then compare a profile name against a live account id, mismatch every
-      time, and refuse every operation on every pre-existing publication.
-    * ``key`` -- no separator at all. Both unknown; the caller falls back to the registry
-      default, which is the pre-binding behaviour.
-    """
-    key_part, _, rest = (external_id or "").partition(_ID_SEP)
-    if not rest:
-        return key_part, "", ""
-    head, sep, tail = rest.partition(_ID_SEP)
-    if sep and _ACCOUNT_RE.match(head):
-        return key_part, head, tail
-    return key_part, "", rest
-
-
-def split_external_id(external_id: str) -> tuple[str, str]:
-    """Return ``(key_part, bound_profile)``; the profile is ``''`` when unbound.
-
-    Kept at two fields because that is all its callers need -- they want the object key,
-    or the credential source. The account is read through :func:`bound_account` by the one
-    place that verifies it.
-    """
-    key_part, _account, bound = _parse_external_id(external_id)
-    return key_part, bound
-
-
-def bound_account(external_id: str) -> str:
-    """The account id pinned into the handle, or ``''`` when the handle predates binding."""
-    _key, account, _profile = _parse_external_id(external_id)
-    return account
 
 
 class PersonalDriveProvider(PublishProvider):
@@ -388,20 +222,19 @@ class PersonalDriveProvider(PublishProvider):
     def _resolve_profile(self, requested: str = "") -> tuple[str, str]:
         """The (profile name, region) to run under, or raise with the fixing action.
 
-        ``requested`` wins over this instance's pinning: it carries the account an
-        EXISTING publication was bound to and must be honoured; empty means a NEW
-        publish, which follows the registry default.
+        ``requested`` is the profile an EXISTING publication was bound to and must be
+        honoured. Empty -- a NEW publish, or a handle that names no profile -- follows
+        the registry default.
 
         ``profiles.resolve_profile`` is the registry's own contract: an empty request
         resolves to the registry default and an unregistered name resolves to ``None``,
         so a publish can only ever run under a registered account.
         """
-        wanted = requested
-        resolved = profiles.resolve_profile(wanted)
+        resolved = profiles.resolve_profile(requested)
         if resolved is None:
-            if wanted:
+            if requested:
                 raise PublishUnavailableError(
-                    _unknown_profile_message(wanted, self._registered_names())
+                    _unknown_profile_message(requested, self._registered_names())
                 )
             raise PublishUnavailableError(_no_profile_message())
         name, region = resolved
@@ -440,9 +273,10 @@ class PersonalDriveProvider(PublishProvider):
         all -- refusing is recoverable by retrying, and acting on an unproven account is
         not. That is the same rule the withdrawal outcomes follow.
 
-        A handle with NO account predates binding and cannot be verified, so it keeps the
-        old behaviour rather than being refused. None exist outside this branch; refusing
-        them would strand every publication made before this change for no gain.
+        A handle with NO account predates binding and cannot be verified, so it is acted
+        on through the profile it names (or the registry default when it names none)
+        rather than refused: refusing it would strand every publication minted before
+        binding for no gain.
         """
         _key, pinned, bound = _parse_external_id(external_id)
         profile, region = self._resolve_profile(bound)
@@ -684,6 +518,13 @@ class PersonalDriveProvider(PublishProvider):
         objects, so a whole-bucket grant would serve them. The Deny is belt-and-braces:
         the Allow already omits them, and an explicit Deny keeps that true if the Allow
         is ever widened.
+
+        The last statement refuses any request to the bucket not sent over TLS. CloudFront
+        forwards to an S3 REST origin with the viewer's protocol, and the distribution
+        redirects every viewer to HTTPS (``engine.distribution_config``); the owner's CLI
+        and SDK calls use HTTPS too, so it denies nothing the drive relies on. The policy
+        is re-installed on every resolve (:meth:`_reassert_bucket_policy`), so existing
+        drives pick it up.
         """
         policy = {
             "Version": "2012-10-17",
@@ -703,6 +544,7 @@ class PersonalDriveProvider(PublishProvider):
                     "Action": "s3:GetObject",
                     "NotResource": f"arn:aws:s3:::{bucket}/{PUBLIC_PREFIX}*",
                 },
+                engine.deny_insecure_transport_statement(bucket),
             ],
         }
         return json.dumps(policy)
@@ -1547,23 +1389,15 @@ class PersonalDriveProvider(PublishProvider):
 
         if domain:
             self._domains[profile] = domain
-        result = PublishResult(
+        return PublishResult(
             external_id=external_id,
             view_url=self.view_url_for(external_id) if public else "",
             version_number=1,
             concurrency_token=digest,
             owner="",
             notice=notice,
+            notice_code=notice_code,
         )
-        # notice_code is the shared discriminator the frontend selects its per-case
-        # string from (contract: "rolling_out" / "distribution_disabled" / "unknown" /
-        # ""). It is added to PublishResult by the seam half of this change; setting it
-        # here is guarded so this module's own gate does not hard-depend on that half's
-        # landing order -- the field is additive and defaulted, so once it exists this
-        # simply populates it, and until it does the notice text still carries the state.
-        if hasattr(result, "notice_code"):
-            result.notice_code = notice_code
-        return result
 
     async def push_version(
         self, *, external_id: str, file_path: str, expected_token: str

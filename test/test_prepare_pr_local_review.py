@@ -114,7 +114,7 @@ def _git(cwd, *args):
         ["git", *args],
         cwd=str(cwd),
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=True,
         env=_fixture_git_env(),
     )
@@ -724,7 +724,7 @@ def test_cli_exits_40_on_a_contract_that_escapes_the_repo(parity_repo, tmp_path)
         out_dir = tmp_path / "out-{}".format(abs(hash(bad)))
         proc = subprocess.run(
             [
-                sys.executable,
+                sys.executable, "-X", "utf8",
                 str(SCRIPTS_DIR / "local_review.py"),
                 "--worktree",
                 str(parity_repo),
@@ -736,7 +736,7 @@ def test_cli_exits_40_on_a_contract_that_escapes_the_repo(parity_repo, tmp_path)
                 str(tmp_path / "stage-{}".format(abs(hash(bad)))),
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             cwd=parity_repo,
             env={**os.environ, "PATH": os.environ.get("PATH", ""), **NO_PYC},
         )
@@ -1605,7 +1605,7 @@ def test_cli_exits_40_when_the_prompt_assembly_is_gone(parity_repo, tmp_path):
     out_dir = tmp_path / "out"
     proc = subprocess.run(
         [
-            sys.executable,
+            sys.executable, "-X", "utf8",
             str(SCRIPTS_DIR / "local_review.py"),
             "--worktree",
             str(parity_repo),
@@ -1617,7 +1617,7 @@ def test_cli_exits_40_when_the_prompt_assembly_is_gone(parity_repo, tmp_path):
             str(tmp_path / "stage"),
         ],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=parity_repo,
         env={**os.environ, "PATH": os.environ.get("PATH", ""), **NO_PYC},
     )
@@ -1701,7 +1701,7 @@ def test_assemble_needs_a_contract_backed_reviewer(tmp_path, no_gh):
 def test_cli_json_summary_is_machine_readable(parity_repo, tmp_path):
     proc = subprocess.run(
         [
-            sys.executable,
+            sys.executable, "-X", "utf8",
             str(SCRIPTS_DIR / "local_review.py"),
             "--worktree",
             str(parity_repo),
@@ -1714,7 +1714,7 @@ def test_cli_json_summary_is_machine_readable(parity_repo, tmp_path):
             "--json",
         ],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         cwd=parity_repo,
         env={**os.environ, **NO_PYC},
     )

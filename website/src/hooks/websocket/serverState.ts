@@ -223,6 +223,15 @@ export function refreshServerStateAfterReconnect(queryClient: QueryClient): void
   queryClient.invalidateQueries({ queryKey: GUIDE_PENDING_QUERY_KEY })
   // Same for a change-card frame: every slot's cards are re-read.
   queryClient.invalidateQueries({ queryKey: CHANGE_CARDS_QUERY_PREFIX })
+  // An open Dashboard tab is moved by `dashboard_fields`, `member_projection` and
+  // `dashboard_value_written` frames, and every one sent while the socket was down
+  // is lost. Its read sets no staleTime, so without this it waits for the 60 s
+  // fallback tick. The re-read is also what re-arms a package page's live feed
+  // after a gateway restart: the restart empties the armed pages, so no push can
+  // arrive until a GET arms one again. Through `refreshDashboardReads`, so a tab
+  // whose read is already out gets one more, not a pile.
+  refreshDashboardReads(queryClient, [MEMBER_DASHBOARD_QUERY_PREFIX])
+  refreshDashboardReads(queryClient, [SESSION_DASHBOARD_QUERY_PREFIX])
   // A dropped socket is the one client-visible sign the gateway may have
   // restarted — and a restart drops an unmessaged member slot while its
   // binding survives. The Crew Members page mounts a cached thread key
@@ -344,6 +353,22 @@ export function handleDashboardMoved(queryClient: QueryClient, data: FrameData):
   const slot = String(frame.slot || '')
   if (slot) {
     refreshDashboardReads(queryClient, [SESSION_DASHBOARD_QUERY_PREFIX, slot])
+  }
+}
+
+/** A slot's crew log grew (`slot_projection` or `slot_fold`), so the root session
+ *  pages over it must re-read. *roots* is the frame's slot and every slot it was
+ *  created under, as for the work board: a worker's report moves its conductor's
+ *  items. The gateway sends no `dashboard_instance_changed` for a ledger write --
+ *  that frame is only for an adopted or moved page -- so without this an open
+ *  Overview keeps its old board until the fallback poll. */
+export function handleSlotFoldMoved(queryClient: QueryClient, roots: readonly string[]): void {
+  const cache = queryClient.getQueryCache()
+  for (const root of roots) {
+    const key = [SESSION_DASHBOARD_QUERY_PREFIX, root]
+    // Most slots have no Overview cached: skip them rather than send a no-op
+    // invalidate per ancestor on every crew-log write.
+    if (root && cache.findAll({ queryKey: key }).length > 0) refreshDashboardReads(queryClient, key)
   }
 }
 

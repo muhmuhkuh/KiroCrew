@@ -207,11 +207,21 @@ def _settle_consumed_steers(
             # cannot rehydrate the stale card.
             state.clear_question_pending(slot.key, blocking=False)
     slot._pending_steers[:] = remaining
+    from kiro_crew.dashboard.chat_handlers import crew_steer_consumed
+
     for settled_msg in set(previous) - set(remaining):
+        # A person's steer into a Crew Mode crew member lands on its ledger now.
+        crew_steer_consumed(state, slot, settled_msg)
         responsive_chat.forget_steer(slot, settled_msg)
         slot._steer_attachment_meta.pop(settled_msg, None)
         slot._steer_act_now.discard(settled_msg)
         slot._steer_automation.pop(settled_msg, None)
+        # Consumed by this turn, so no requeue will read them. The successful steer
+        # RPC leaves the admission and both origin marks in place for that requeue.
+        slot._steer_admissions.pop(settled_msg, None)
+        slot._steer_user_origin.pop(settled_msg, None)
+        slot._steer_channel_origin.pop(settled_msg, None)
+        slot._steer_owner_origin.pop(settled_msg, None)
         slot._steer_decision_strips.pop(settled_msg, None)
         slot._steer_possibly_delivered.discard(settled_msg)
 
@@ -345,6 +355,10 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
         # narrower channel authority a queued channel message carries. Absent means
         # not through a channel.
         _channel = bool(getattr(slot, "_steer_channel_origin", {}).pop(steer_msg, False))
+        # The owner mark rides the same way, from its own lockstep map: the
+        # requeued steer's turn may read a peer crew's sessions only if the
+        # owner sent it. Absent means not the owner.
+        _owner = bool(getattr(slot, "_steer_owner_origin", {}).pop(steer_msg, False))
         if _channel:
             # A channel steer that re-enters the queue runs as its own turn, so it
             # takes the mark the hand-off's queued entry carries: the text is the
@@ -368,6 +382,14 @@ def _requeue_unconsumed_steers(state: "DashboardState", slot: "_ChatSlot") -> No
             meta=_meta,
             directive_user_origin=_requeue_user_origin,
             directive_channel_origin=_channel,
+            directive_owner_origin=_owner and _requeue_user_origin,
+        )
+        from kiro_crew.dashboard.chat_handlers import crew_steer_requeued
+
+        # A person's unread steer into a crew member is recorded when the drain
+        # delivers this entry, never if the person cancels it first.
+        crew_steer_requeued(
+            slot, steer_msg, next((item for item in slot._queue if item.get("id") == qid), None)
         )
         if responsive_chat.forget_steer(slot, steer_msg):
             entry = next(item for item in slot._queue if item["id"] == qid)

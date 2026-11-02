@@ -898,7 +898,7 @@ def _board_safe_tag_name(raw: object) -> str:
 
 
 # Per-section limits are derived below; shared admission never sums them.
-def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
+def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None, crew: str = "") -> bool:
     """Whether the configured member backend can mount the dispatch tools.
 
     The member operating-mode block teaches ``session_*`` tools that arrive as
@@ -911,19 +911,23 @@ def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
 
     ``cfg`` lets a caller that already loaded the config share the handle —
     the context builder calls this once per member turn, so a second disk
-    read would be pure waste.
+    read would be pure waste. *crew* names the crewmate whose thread this is:
+    its own harness pin (``agents.<name>.acp_backend``) outranks the member
+    route, as it does in ``members.select_provider_backend``, and a pin that
+    cannot start withholds the block.
     """
     try:
         from kiro_crew.acp_backends import (
             ACP_BACKENDS_MEMBER_DISPATCH,
             resolve_selected_backend,
         )
+        from kiro_crew.crewmate_harness import pinned_backend
 
         if cfg is None:
             from kiro_crew.config import KiroCrewConfig
 
             cfg = KiroCrewConfig.load()
-        backend = resolve_selected_backend(cfg.agent.member_acp_backend)
+        backend = pinned_backend(cfg, crew, resolve_selected_backend(cfg.agent.member_acp_backend))
         return backend in ACP_BACKENDS_MEMBER_DISPATCH
     except Exception:
         logger.debug("member backend capability check failed", exc_info=True)
@@ -1162,6 +1166,7 @@ def _replay_rows(
     exclude_last_n: int = 0,
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
+    exclude_messages: list[dict] | None = None,
 ) -> list[dict]:
     """Tail of the chain under per-role quotas, in chronological order.
 
@@ -1170,7 +1175,9 @@ def _replay_rows(
     """
     messages = conversation_log.read_messages_chained(session_key) if conversation_log else []
     if pending_messages is not None or current_message is not None:
-        messages = _merge_replay_rows(messages, pending_messages or [], current_message)
+        messages = _merge_replay_rows(
+            messages, pending_messages or [], current_message, exclude_messages
+        )
     elif exclude_last_n > 0:
         messages = messages[:-exclude_last_n]
     messages = _without_warm_task_brief_messages(messages)
@@ -1223,6 +1230,7 @@ def build_session_replay(
     pending_messages: list[dict] | None = None,
     current_message: dict | None = None,
     budget_chars: int = _REPLAY_BUDGET_CHARS,
+    exclude_messages: list[dict] | None = None,
 ) -> str | None:
     """Build session replay from KiroCrew's conversation_log.
 
@@ -1237,6 +1245,8 @@ def build_session_replay(
     With *pending_messages*, merge the disk and live window by delivery identity
     and exclude *current_message* explicitly before applying quotas or budgets.
     The legacy *exclude_last_n* applies only when no live snapshot is supplied.
+    *exclude_messages* (with a live snapshot) are left out on both sides by
+    delivery identity: the previous reply a Regenerate is replacing.
 
     *model_window* scales the replay budget to the active model's context
     window (the dashboard's primary history vehicle — it must shrink on a
@@ -1250,6 +1260,7 @@ def build_session_replay(
         exclude_last_n=exclude_last_n,
         pending_messages=pending_messages,
         current_message=current_message,
+        exclude_messages=exclude_messages,
     )
     if not messages:
         return None
@@ -1290,20 +1301,17 @@ def _skills_injection_plan(
 
     inherit = provider_type == PROVIDER_ACP
     pinned = pinned_skill_globs(session_key, project_dir=project_dir, inherit_defaults=inherit)
-    globs = (
-        pinned
-        if pinned is not None
-        else (
-            agent_skill_globs(
-                agent,
-                project_dir=project_dir,
-                inherit_defaults=inherit,
-                session_key=session_key or "",
-            )
-            if agent
-            else []
+    if pinned is not None:
+        globs = pinned
+    elif agent:
+        globs = agent_skill_globs(
+            agent,
+            project_dir=project_dir,
+            inherit_defaults=inherit,
+            session_key=session_key or "",
         )
-    )
+    else:
+        globs = []
     is_custom = (
         bool(agent)
         and not is_kirocrew_default_agent(agent)

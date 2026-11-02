@@ -50,6 +50,7 @@ from kiro_crew.acp.types import (
     AcpEvent,
     AcpPromptStats,
     JsonRpcMessage,
+    steering_advertised,
 )
 from kiro_crew.recovery.ladder import InfraError
 
@@ -117,6 +118,8 @@ class AcpSessionHandle:
     wait_for_declared_mcp = _sh_mcp.wait_for_declared_mcp
     _note_mcp_sign_in_status = _sh_mcp._note_mcp_sign_in_status
     _offer_mcp_sign_in = _sh_mcp._offer_mcp_sign_in
+    want_mcp_sign_in_named = _sh_mcp.want_mcp_sign_in_named
+    _match_mcp_sign_in_ask = _sh_mcp._match_mcp_sign_in_ask
     _sync_mcp_reattempting = _sh_mcp._sync_mcp_reattempting
     _runtime_reattempts_mcp = _sh_mcp._runtime_reattempts_mcp
     _reattempt_failed_mcp_servers = _sh_mcp._reattempt_failed_mcp_servers
@@ -173,6 +176,8 @@ class AcpSessionHandle:
     _send_awaited = _sh_lifecycle._send_awaited
     bind_session_key = _sh_lifecycle.bind_session_key
     destroy = _sh_lifecycle.destroy
+    _release_ending = _sh_lifecycle._release_ending
+    _release_for_later_delete = _sh_lifecycle._release_for_later_delete
     _cleanup_transcript = _sh_lifecycle._cleanup_transcript
     cleanup_transcript_files = staticmethod(_sh_lifecycle.cleanup_transcript_files)
     _wait_for_response = _sh_lifecycle._wait_for_response
@@ -298,6 +303,15 @@ class AcpSessionHandle:
         # continuability: the transcript is spawn_continue's resume material).
         self.keep_transcript = False
         self.memory_mode = "persistent"
+        # Seconds the host keeps this session's record after destroy() before Crew
+        # deletes it, on a host that can free a session and keep its record
+        # (``AcpRuntime.can_release``). Set by the opener of a task-runner session
+        # or a workflow worker from ``session.kas_delete_delay_secs``; 0 ends the
+        # session with the teardown, which on KAS deletes the record at once.
+        self.delete_delay_secs = 0.0
+        # The release ``destroy()`` started, kept so a second ``destroy()`` waits for
+        # it instead of releasing again (``_release_ending``).
+        self._release_task: asyncio.Future[None] | None = None
         # Token carried by THIS session's injected broker-stub entries
         # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
         # that created the session. It is what a later claim-push names so
@@ -575,10 +589,18 @@ class AcpSessionHandle:
         self._pending_oauth_requests: list[dict[str, str]] = []
         # Servers whose last ``_kiro/mcp/status`` entry for this session was an
         # authorization failure and that have not connected since. Kept across a
-        # timed-out sign-in, whose entry reports ``failedAuthorization`` false,
-        # so the next turn offers the sign-in again.
+        # timed-out sign-in, whose entry reports ``failedAuthorization`` false.
         self._mcp_sign_in_needed: set[str] = set()
-        self._mcp_sign_in_last_offered = ""
+        # Needed servers a user message named and whose sign-in the runtime
+        # has not started yet. Being needed alone never starts a sign-in; see
+        # ``want_mcp_sign_in_named``.
+        self._mcp_sign_in_wanted: set[str] = set()
+        # The user message that asked for this turn's sign-ins, matched again
+        # once the pre-turn drain or a mid-turn status tracks a server it
+        # names, and the servers it already marked wanted. One turn's only:
+        # ``_run_turn`` clears both when the turn ends.
+        self._mcp_sign_in_ask = ""
+        self._mcp_sign_in_asked: set[str] = set()
         # Tracked servers whose status reported ``connected`` and whose
         # completion the dispatch loop has not yet yielded. KAS sends no
         # server-initialized frame for a completed sign-in, so the loop yields
@@ -624,6 +646,23 @@ class AcpSessionHandle:
         # The capabilities the agent batch this session registered auto-approves
         # (see ``kas_agents.projected_auto_approved``); None when no batch was sent.
         self.kas_auto_approved: frozenset[str] | None = None
+        # The built-ins that batch keeps at ``ask`` but the active agent's spec
+        # grants (``kas_permissions.crew_answered_builtins``): Crew's gate answers
+        # their permission requests itself, after the deny floor, the
+        # sensitive-path check and the governance ceiling. Empty with no batch.
+        self.kas_crew_answered: frozenset[str] = frozenset()
+        # The agent's `toolsSettings.shell.allowedCommands` as the gate matches
+        # them (``kas_permissions.crew_answered_commands``), answered the same way.
+        self.kas_crew_answered_commands: tuple[str, ...] = ()
+        # The only shell commands the agent's spec lets run when it sets
+        # `toolsSettings.shell.denyByDefault` (``kas_permissions.spec_shell_allowlist``);
+        # None when it does not. The gate refuses every other shell call.
+        self.kas_spec_shell_allowlist: tuple[str, ...] | None = None
+        # The only paths the agent's write tool may touch when its spec sets
+        # `toolsSettings.fs_write.fallbackAction: "deny"`, anchored at this
+        # session's directory (``kas_agents.projected_write_allowlist``); None when
+        # it does not. The gate refuses every other file write.
+        self.kas_spec_write_allowlist: tuple[str, ...] | None = None
         # The agent this session runs: the one the batch was registered for, then
         # whichever a KAS mode switch moves it to ("" with no batch). A turn that
         # names no agent runs this one, so its spec hooks are this agent's.
@@ -631,6 +670,13 @@ class AcpSessionHandle:
         # The agent batch this session registered, so a mode switch can answer
         # what the agent it moves to auto-approves.
         self.kas_registered_agents: list[dict[str, Any]] = []
+        # The KAS MCP launch snapshot names every projection of this session wrote
+        # (``acp.kas_env_launch``), read before ``session/load`` hoists servers out
+        # of the batch and carried across a handle swap, so shutdown removes them.
+        self.kas_launch_snapshots: list[str] = []
+        # The upgrade notice when that batch's prompt is dropped by the KAS this
+        # process runs (``harness.kas.kas_agent_prompt_issue``); "" otherwise.
+        self.kas_agent_prompt_notice: str = ""
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -811,14 +857,19 @@ class AcpSessionHandle:
         ``ACP_BACKENDS_STEERING_REQUEST``, read from the runtime's own backend id.
         The first is kiro-cli's ``_session/steer``, the same answer, from the same
         table, that ``AcpClient.supports_steer`` gives; the second is codex-acp's
-        ``_session/steering``, which only this handle speaks. A capability is
-        granted by opt-in membership, so a host the runtime learns to drive does
-        not inherit an extension it never demonstrated: answering True for one
-        would advertise the steer affordance and then meet the user's mid-turn
-        correction with ``-32601``.
+        ``_session/steering``, which only this handle speaks, and only when the
+        process's handshake advertised it (``_meta.steering.supported: true``). A
+        capability is granted by opt-in membership, so a host the runtime learns to
+        drive does not inherit an extension it never demonstrated: answering True
+        for one would advertise the steer affordance and then meet the user's
+        mid-turn correction with ``-32601``.
         """
         backend = self._runtime.acp_backend
-        return backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
+        if backend in ACP_BACKENDS_STEER:
+            return True
+        return backend in ACP_BACKENDS_STEERING_REQUEST and steering_advertised(
+            self.initialize_result
+        )
 
     @property
     def supports_refusal_steer(self) -> bool:
@@ -873,6 +924,12 @@ class AcpSessionHandle:
         session: every handle on one runtime reports the same value.
         """
         return self._runtime.agent_version
+
+    @property
+    def initialize_result(self) -> dict:
+        """The shared process's ``initialize`` result (``{}`` until its handshake)."""
+        init = getattr(self._runtime, "initialize_result", None)
+        return init if isinstance(init, dict) else {}
 
     @property
     def config_options(self) -> list[dict[str, Any]]:

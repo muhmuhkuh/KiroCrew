@@ -76,7 +76,9 @@ RUNTIME_MODULES = frozenset(
         "recall",
         "retirement",
         "semantic",
+        "semantic_scoring_patch",
         "store_bookkeeping",
+        "term_index",
         "text_scoring",
         "write_outcomes",
     }
@@ -297,7 +299,7 @@ _STORE_SIGNATURES = {
     "_infer_semantic_key": "(text: 'str') -> 'str | None'",
     "_init_database": "(self) -> 'None'",
     "_invalidate_episodic_scoring": "(self) -> 'None'",
-    "_invalidate_semantic_scoring": "(self) -> 'None'",
+    "_invalidate_semantic_scoring": "(self, key: 'str | None' = None) -> 'None'",
     "_lesson_keywords": "(text: 'str') -> 'set[str]'",
     "_log_event": "(self, event_type: 'str', memory_type: 'str', key: 'str', old_value: 'str | None', new_value: 'str | None', source: 'str') -> 'int | None'",
     "_matches_allowlist": "(self, key: 'str') -> 'bool'",
@@ -337,7 +339,7 @@ _STORE_SIGNATURES = {
     "_write_semantic": "(self, key: 'str', value_json: 'str', confidence: 'float', source: 'str', *, metadata: 'dict | None' = None, expected_revision: 'int | None' = None, correction: 'record_meta.CorrectionEvidence | None' = None, _consolidation: 'bool' = False, defer_embedding: 'bool' = False, embedding: 'list[float] | None' = None, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, retirement_embedding: 'list[float] | None' = None, retirement_embedding_resolved: 'bool' = False, retirement_value_json: 'str | None' = None) -> 'str | None'",
     "algorithm_version": "(self) -> 'str'",
     "append_history": "(self, entry: 'str') -> 'None'",
-    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None) -> 'dict'",
+    "apply_consolidation": "(self, *, source_id: 'str', session_key: 'str', source_total: 'int', result: 'dict', snapshot: 'dict', messages: 'list[dict]', facets: 'memory_schema.MemoryFacets | None' = None, kind_routing: 'KindRouting | None' = None) -> 'dict'",
     "backfill_missing_embeddings": "(self, progress: \"'Callable[[int, int], None] | None'\" = None, *, pace: 'bool' = True, max_rows_per_kind: 'int | None' = None, should_stop: \"'Callable[[], bool] | None'\" = None) -> 'int'",
     "begin_space_change": "(self) -> 'None'",
     "build_faiss_index": "(self) -> 'int'",
@@ -411,7 +413,7 @@ _STORE_SIGNATURES = {
     "with_record_metadata": "(self, rows: 'list[dict]') -> 'list[dict]'",
     "write_episodic": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> 'bool'",
     "write_episodic_outcome": "(self, text: 'str', embedding: 'list[float] | None' = None, conversation_id: 'str' = '', tags: 'list[str] | None' = None, importance: 'float' = 0.5, source: 'str' = 'consolidation', *, preserve_existing: 'bool' = False, defer_embedding: 'bool' = False, embedding_resolved: 'bool' = False, embedding_generation: 'int | None' = None, facets: \"'memory_schema.MemoryFacets | None'\" = None, metadata: 'dict | None' = None) -> \"'EpisodicWriteOutcome'\"",
-    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None) -> 'LessonWriteResult'",
+    "write_lesson": "(self, rule: 'str', category: 'str' = 'knowledge', negative: 'str | None' = None, source: 'str' = 'user_explicit', rule_emb: 'list[float] | None' = None, rule_emb_generation: 'int | None' = None, repo_scope: 'str | None' = None, *, applies: 'str | None' = None, rule_emb_resolved: 'bool' = False, defer_backfills: 'bool' = False, facets: \"'memory_schema.MemoryFacets | None'\" = None, written_by: 'Mapping[str, str] | None' = None) -> 'LessonWriteResult'",
 }
 
 #: Every name ``kiro_crew.vector_memory`` itself bound (definitions, not imports),

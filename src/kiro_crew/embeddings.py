@@ -154,12 +154,16 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     )
     from kiro_crew.embeddings_native import (  # noqa: F401
         _LIB_PATH_SEAM,
+        _LINUX_AARCH64_DOTPROD_DIRNAME,
         _LINUX_CPUINFO_PATH,
         _LINUX_X86_64_REQUIRED_CPU_FLAGS,
         _VENDOR_DIR,
         _WINDOWS_MSVC_RUNTIME_DLLS,
         _harden_llama_null_streams,
         _install_diskcache_stub,
+        _linux_aarch64_cpu_features,
+        _linux_aarch64_has_dotprod,
+        _linux_aarch64_libs_dir,
         _linux_x86_64_cpu_flags,
         _load_llama_class,
         _log_dropped_inherited_lib_path,
@@ -191,6 +195,8 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _HTTP_TIMEOUT_SECS,
         _INFER_STOP_TIMEOUT_SECS,
         _INTERACTIVE_QUEUE_RESERVE,
+        _LARGE_HOST_EMBED_THREADS,
+        _LARGE_HOST_MIN_CORES,
         _LLM_LOAD_RETRY_SECS,
         _MAX_BULK_PACE_SLEEP,
         _MAX_EMBED_BATCH_TEXTS,
@@ -221,6 +227,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         bulk_embed_threads,
         bulk_pace_delay,
         embedding_idle_evict_secs,
+        embedding_weight_repack,
         embedding_work,
     )
     from kiro_crew.embeddings_shared import (  # noqa: F401

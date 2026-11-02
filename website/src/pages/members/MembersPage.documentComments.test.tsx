@@ -24,7 +24,6 @@ vi.mock('../../api/client', () => ({
     members: vi.fn(),
     teams: { list: vi.fn(() => Promise.resolve({ teams: [] })) },
     crewBoard: vi.fn(() => Promise.reject(Object.assign(new Error('no_ledger'), { status: 404 }))),
-    memberRecap: vi.fn(() => Promise.reject(new Error('no recap in this test'))),
     memberThread: vi.fn(),
     memberActivity: vi.fn(() => Promise.resolve({ slug: '', member: '', capped: false, entries: [] })),
     memberBriefing: vi.fn(() => Promise.resolve({ slug: '', member: '', supported: true, text: '', updated_ts: null, redacted: false, truncated: false })),
@@ -54,7 +53,6 @@ vi.mock('../../utils/terminalRegistry', () => ({
   useTerminalEnabled: () => true,
   useTerminalTitle: () => 'Terminal',
 }))
-vi.mock('../../hooks/useDevMode', () => ({ useDevMode: () => false }))
 
 vi.mock('../../components/ChatPane', () => ({
   default: ({ slotKey, onFileOpen }: { slotKey: string; onFileOpen?: (path: string) => void }) => (
@@ -325,7 +323,7 @@ describe('MembersPage side panel: inline comments on a document', () => {
     fireEvent.click(within(screen.getByTestId('member-roster')).getByText('oncall'))
     await waitFor(() => expect(api.memberThread).toHaveBeenCalledTimes(2))
     // Unconfirmed: the slot-bound views are off the strip.
-    await waitFor(() => expect(screen.queryByRole('tab', { name: 'Files' })).toBeNull())
+    await waitFor(() => expect(screen.queryByRole('tab', { name: 'Workspace' })).toBeNull())
 
     // A person cannot press Submit here (its tab is withheld), so this reaches
     // the handler directly. Its slot check is the backstop: nothing is sent.
@@ -338,7 +336,7 @@ describe('MembersPage side panel: inline comments on a document', () => {
 
     // After re-confirmation the slot-bound views come back with the batch intact.
     await act(async () => { confirm({ slot_key: 'member-oncall', slug: 'oncall', member: 'oncall', created: false }) })
-    await screen.findByRole('tab', { name: 'Files' })
+    await screen.findByRole('tab', { name: 'Workspace' })
     expect(storedComments()).toHaveLength(1)
   })
 

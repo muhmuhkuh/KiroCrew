@@ -1,7 +1,8 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, fireEvent, waitFor, within } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
+import { namedCeiling } from './namedCeiling'
 import ChatInput from '../components/ChatInput'
 import { ComposerVoiceSliceOverride } from '../chat-core/composer/Composer'
 import { api } from '../api/client'
@@ -45,11 +46,16 @@ function PasteHarness({
 
 /** Resolve after one animation frame — the handlers schedule their caret
  *  restore there. Frame-driven, not a timed sleep, so it cannot flake. */
-const nextFrame = () => new Promise<void>(resolve => { requestAnimationFrame(() => resolve()) })
+const nextFrame = () => act(async () => {
+  await new Promise<void>(resolve => { requestAnimationFrame(() => resolve()) })
+})
 
 const mountTokens = (initial: string, blocks: PasteBlock[] = [block], onBlocks?: (b: PasteBlock[]) => void) => {
   renderWithProviders(<PasteHarness initial={initial} initialBlocks={blocks} onBlocks={onBlocks} />)
-  return screen.getByLabelText('Message input') as HTMLTextAreaElement
+  const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+  // fireEvent.select and the paste tests focus the box; the focus handler sets state.
+  act(() => { ta.focus() })
+  return ta
 }
 
 beforeEach(() => {
@@ -669,6 +675,21 @@ describe('ChatInput context-usage popover', () => {
     expect(screen.getByText('116K')).toBeInTheDocument()
   })
 
+  it('threads derivePctFromUsed through so a switch derives the percentage from used', () => {
+    // The switch shape: the stored pct was dropped and only used=120k kept, so
+    // the host sets derivePctFromUsed and the window resolves to the new 200k.
+    // Through ChatInput (not the control alone): if the flag is not a
+    // ChatInputProps field passed on to ContextUsageControl, the popover shows
+    // the raw 12% and ~24K, which is the gap that broke the build.
+    renderWithProviders(
+      <ChatInput {...base} contextPct={12} contextWindowTokens={200_000} contextUsedTokens={120_000} derivePctFromUsed />,
+    )
+    fireEvent.click(screen.getByLabelText('Context usage'))
+    expect(screen.getByText('60%')).toBeInTheDocument()
+    expect(screen.getByText('120K')).toBeInTheDocument()
+    expect(screen.queryByText('12%')).toBeNull()
+  })
+
   it('derives an approximate used count when the host reports only a percentage', () => {
     renderWithProviders(<ChatInput {...base} contextPct={40} contextWindowTokens={100_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
@@ -864,7 +885,7 @@ describe('ChatInput context-usage popover', () => {
     const post = vi.spyOn(api, 'setChatSlotAutocompact')
     post.mockClear()
     post.mockReturnValueOnce(firstPost).mockResolvedValue({ ok: true, pct: 71, global_pct: 70 })
-    renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
+    const { queryClient } = renderWithSlot(<ChatInput {...base} contextPct={42} contextWindowTokens={200_000} />)
     fireEvent.click(screen.getByLabelText('Context usage'))
     expect(await screen.findByText('85%')).toBeInTheDocument()
     // First write: reset to global. Its POST stays in flight (deferred).
@@ -875,7 +896,8 @@ describe('ChatInput context-usage popover', () => {
     fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' })
     // Let the 400ms debounce elapse — WITHOUT serialization the second POST
     // fires here while the first is unresolved (post count hits 2).
-    await new Promise(r => setTimeout(r, 600))
+    // The debounced second write is issued (two mutations in flight) yet queued behind the first.
+    await waitFor(() => expect(queryClient.isMutating()).toBe(2), namedCeiling('AUTOCOMPACT_SECOND_WRITE_QUEUED', 1500))
     expect(post).toHaveBeenCalledTimes(1)
     // Settle the first write; only then may the second be issued.
     resolveFirst({ ok: true, pct: null, global_pct: 70 })

@@ -173,6 +173,12 @@ def _is_pre_spawn_refusal(exc: BaseException) -> bool:
     """
     if isinstance(exc, CapabilityError):
         return True
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
+
+    if isinstance(exc, CrewmateHarnessUnavailable):
+        # Refused before the factory spawned anything, and a retry repeats it
+        # until someone changes the crewmate's harness.
+        return True
     return isinstance(exc, CapabilityStartupError) and str(exc) in _PRE_SPAWN_CAPABILITY_CODES
 
 
@@ -461,6 +467,12 @@ def schedule_eager_spawn(
         cfg = live.snapshot()
         if cfg is None or not cfg.session.eager_spawn:
             return None
+        # Shared Crew: with fair admission on, a runtime starts only inside an
+        # admitted turn, so creating sessions cannot start unbounded processes.
+        from kiro_crew.shared_crew.turn_gate import admission_active
+
+        if admission_active():
+            return None
     except Exception:
         return None
     if _eager_spawn_held_off(slot):
@@ -490,7 +502,7 @@ def schedule_eager_spawn(
     return task
 
 
-def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str, str | None]:
+def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str]:
     """The slot bindings an eager handshake bakes into the session it registers.
 
     ONE definition, because two exist to be compared: ``_eager_spawn`` snapshots
@@ -508,8 +520,29 @@ def _slot_binding(slot: "_ChatSlot") -> tuple[str, str, str, str, str, str, str 
         slot.memory_store,
         # The namespace the name is read in: a kind change is a binding change.
         slot.agent_kind,
-        slot.acp_backend,
     )
+
+
+async def _runs_on_a_session_environment(session_key: str) -> bool:
+    """Whether ``session_key`` is bound to a remote Session Environment profile.
+
+    Read from the persisted choice, never from what one request just did, so no
+    caller can prewarm a bound chat. An unreadable choices store answers yes: a
+    skipped prewarm costs one cold start, a wrong one starts billed compute.
+    Always no while the developer flag is off (the choice is never read).
+    """
+    from kiro_crew.session_environment import (
+        SessionEnvironmentUnavailable,
+        _choices,
+        session_environments_enabled,
+    )
+
+    if not session_environments_enabled():
+        return False
+    try:
+        return await asyncio.to_thread(_choices().get, session_key) is not None
+    except (OSError, ValueError, SessionEnvironmentUnavailable):
+        return True
 
 
 async def _eager_spawn(
@@ -573,6 +606,10 @@ async def _eager_spawn(
                 # simply stands down.
                 return
             session_key = effective_session_key(slot)
+            if await _runs_on_a_session_environment(session_key):
+                # Its start creates or wakes a billed remote workspace: that is
+                # left to the first real message, whichever signal armed this.
+                return
             if allow_resume:
                 # The focus signal only ever adds the RESUME case; fresh eager
                 # spawn stays owned by the create/project/agent signals. This
@@ -742,14 +779,15 @@ async def _eager_spawn(
             # same fresh-session path it always does. The backend is the
             # factory's own selection for this key, and the prefetch allocates
             # with no channel identity.
+            from kiro_crew.crewmate_harness import crewmate_backend_pin
+
             if allow_resume and resume_takes_tool_search_replay(
                 tool_search=cfg.agent.tool_search,
-                backend=(
-                    slot.acp_backend
-                    if slot.acp_backend is not None
-                    else select_provider_backend(
-                        session_key, cfg.agent.member_acp_backend, cfg.agent.acp_backend
-                    )
+                backend=select_provider_backend(
+                    session_key,
+                    cfg.agent.member_acp_backend,
+                    cfg.agent.acp_backend,
+                    crew_backend=crewmate_backend_pin(cfg, session_key),
                 ),
                 channel_id=None,
                 session_key=session_key,
@@ -825,7 +863,6 @@ async def _eager_spawn(
                     agent_model=agent_model,
                     allow_resume=allow_resume,
                     _bound=_bound,
-                    cfg=cfg,
                     start_priority=start_priority,
                 )
             finally:
@@ -861,7 +898,6 @@ async def _spawn_admitted_prefetch(
     agent_model: str,
     allow_resume: bool,
     _bound: tuple,
-    cfg: KiroCrewConfig,
     start_priority: StartPriority,
 ) -> None:
     """The admitted half of ``_eager_spawn``: handshake, guards, registration.
@@ -900,33 +936,38 @@ async def _spawn_admitted_prefetch(
         # A slot or crew pin is the caller's own selection; with neither, the
         # allocation resolves the default-model ladder itself, exactly as it
         # will for the first real turn.
-        from kiro_crew.dashboard.chat_backend import chat_session_selection
-
-        async with slot._lock:
-            selection = chat_session_selection(slot, cfg, agent_model or None)
-            _requested_model = str(selection.pop("model", "") or "")
-            try:
-                _, is_new, resumed = await sessions.get_or_create(
-                    session_key,
-                    agent=kiro_agent or slot.agent or None,
-                    crew_agent=crew_alias,
-                    model=_requested_model or None,
-                    cwd=slot.project or None,
-                    speculative=True,
-                    speculative_resume=allow_resume,
-                    reasoning_effort_override=slot.reasoning_effort or None,
-                    start_priority=start_priority,
-                    **_app_allocation_kwargs(slot),
-                    **selection,
-                )
-            except (SpeculativeResumeRefused, SessionClosingError, SessionEndingError):
-                # No agent start was attempted and failed.
-                raise
-            except Exception as exc:
-                # Count only an actual start failure, not a pre-spawn refusal.
-                if not _is_pre_spawn_refusal(exc):
-                    _note_eager_spawn_failure(slot, exc)
-                raise
+        _requested_model = slot.model or agent_model or ""
+        try:
+            _, is_new, resumed = await sessions.get_or_create(
+                session_key,
+                agent=kiro_agent or slot.agent or None,
+                # Canonical crew identity — the resolver's alias, which
+                # covers the default crew on an empty slot; plumbed to the
+                # session so per-agent watchdog windows never depend on a
+                # cross-namespace name match. "" is authoritative: no
+                # alias applied, so no override applies.
+                crew_agent=crew_alias,
+                model=_requested_model or None,
+                cwd=slot.project or None,
+                speculative=True,
+                speculative_resume=allow_resume,
+                reasoning_effort_override=slot.reasoning_effort or None,
+                start_priority=start_priority,
+                **_app_allocation_kwargs(slot),
+            )
+        except (SpeculativeResumeRefused, SessionClosingError, SessionEndingError):
+            # A refusal, a gateway shutdown, or a key being ended: no agent
+            # start was attempted and failed, so none of them is counted.
+            raise
+        except Exception as exc:
+            # The one place a background start can fail to START the agent
+            # (a failed spawn or initialize handshake). Counted here, not in
+            # ``_eager_spawn``'s catch-all, so a reset or binding error raised
+            # around this call never moves the slot toward the cap. A
+            # capability refusal raised before any process ran is not one.
+            if not _is_pre_spawn_refusal(exc):
+                _note_eager_spawn_failure(slot, exc)
+            raise
     except SpeculativeResumeRefused:
         # Two sources: the entry gate (resumable key, resume not
         # opted in — fresh eager spawn leaves it to the first turn)

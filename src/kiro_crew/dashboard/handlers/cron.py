@@ -63,11 +63,14 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _MAX_CRON_BODY_BYTES,
         _T,
         _ChatFolderGone,
+        _member_store,
         _persist_holding_folder,
+        _refuse_mate_home_chat_folder,
         _resolve_chat_folder_id,
         _resolve_one_shot_at,
         _schema_field,
         _unknown_chat_folder_response,
+        _with_schedule_warnings,
         api_cron_batch_delete,
         api_cron_delete,
         api_cron_enable,
@@ -150,6 +153,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         CronStoreBusy,
         CronStoreUnreadable,
         is_valid_timezone,
+        never_fires_warning,
         parse_time_string,
     )
     from kiro_crew.cron_script import (  # noqa: F401
@@ -163,6 +167,7 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
         validate_secret_env_grant,
     )
     from kiro_crew.cron_service.model import (  # noqa: F401
+        validate_alert_after_failures,
         validate_auto_pause_after_failures,
     )
     from kiro_crew.dashboard.chat_persistence import (  # noqa: F401
@@ -171,6 +176,8 @@ if TYPE_CHECKING:  # names it serves from outside the family, from their homes
     from kiro_crew.dashboard.cron_inject import (  # noqa: F401
         apply_cron_turn_timeout,
         chat_folder_exists,
+        chat_folder_move_refuses_store,
+        chat_folder_refuses_store,
         hydrate_slot_from_history,
         inject_cron_result_to_dashboard,
         move_cron_job_tab,

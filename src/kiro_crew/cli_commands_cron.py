@@ -414,6 +414,7 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             timeout=int(timeout) if timeout else 0,
             timeout_secs=int(timeout_secs) if timeout_secs else 0,
             auto_pause_after_failures=getattr(args, "auto_pause_after_failures", None),
+            alert_after_failures=getattr(args, "alert_after_failures", None),
         )
         # ``member_id`` rides in the call ONLY when ``--agent`` resolved to a
         # crew member; a non-member (template or default) agent keeps the exact
@@ -459,6 +460,12 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
             "cron add success audit emit failed", exc_info=True
         )
     print(f"Added job: {job.id} ({job.name}) [{sched_desc}]")
+    # Read from its home, not bound here: ``cli_commands`` serves this module's
+    # names through a frozen import inventory.
+    from kiro_crew.cron_service.schedule import never_fires_warning
+
+    if never_fires := never_fires_warning(job.schedule):
+        print(f"Warning: {never_fires}", file=sys.stderr)
 
 
 def _cron(args: argparse.Namespace) -> None:
@@ -624,6 +631,7 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
             "channel",
             "timeout_secs",
             "auto_pause_after_failures",
+            "alert_after_failures",
         ):
             val = getattr(args, field, None)
             if val is not None:
@@ -634,9 +642,10 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                         continue
                     if len(val) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(val):
                         print(
-                            f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})"
+                            f"Error: invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})",
+                            file=sys.stderr,
                         )
-                        return
+                        sys.exit(1)
                 kwargs[field] = val
         if getattr(args, "agent", None) is not None:
             agent_val = args.agent.strip()
@@ -676,6 +685,10 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 resources=audit_resources,
             )
             print(f"Updated job: {updated.id} ({updated.name})")
+            from kiro_crew.cron_service.schedule import never_fires_warning
+
+            if never_fires := never_fires_warning(updated.schedule):
+                print(f"Warning: {never_fires}", file=sys.stderr)
         else:
 
             sel().log_api_access(
@@ -686,6 +699,9 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
                 resources=f"job_id={args.job_id} reason=not_found",
             )
             print(f"Job not found: {args.job_id}")
+            # Same exit as remove/pause/resume/trigger on a missing job, so a
+            # script that updates a stale id sees the failure.
+            sys.exit(1)
 
     elif action == "remove":
         job_id = getattr(args, "job_id", None)
@@ -718,7 +734,8 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
         if removed:
             print(f"Removed job: {job_id}")
         else:
-            print(f"Job not found: {job_id}")
+            print(f"Job not found: {job_id}", file=sys.stderr)
+            sys.exit(1)
 
     elif action == "pause":
         if svc.enable_job(args.job_id, enabled=False):

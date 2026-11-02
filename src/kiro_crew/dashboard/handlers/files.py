@@ -62,6 +62,7 @@ from kiro_crew.atomic_write import (  # noqa: F401
     open_access_control_source,
     pinned_parent_replace_supported,
 )
+from kiro_crew.cli_commands_workspace import _ws_dir_in_use  # noqa: F401
 from kiro_crew.config import loader as config_loader  # noqa: F401
 from kiro_crew.config.loader import (  # noqa: F401
     KiroCrewConfig,
@@ -239,20 +240,26 @@ from kiro_crew.dashboard.file_api.project_dirs import (  # noqa: F401
     api_project_git,
 )
 from kiro_crew.dashboard.file_api.project_tree import (  # noqa: F401
+    _project_tree_add_folder_rows,
     _project_tree_allot,
     _project_tree_body,
     _project_tree_fence,
     _project_tree_file_quotas,
     _project_tree_git_layout,
+    _project_tree_has_gitmodules,
     _project_tree_identity,
+    _project_tree_in_nested_repo,
     _project_tree_is_link,
     _project_tree_listing,
+    _project_tree_nested_ignored,
+    _project_tree_nested_repos,
     _project_tree_pin,
     _project_tree_rebase,
     _project_tree_scandir,
     _project_tree_scandir_entries,
     _project_tree_subdir,
     _project_tree_walk,
+    _project_tree_walk_order,
     _project_tree_walk_pinned,
     _ProjectTreeFolderMoved,
     api_project_tree,
@@ -355,6 +362,10 @@ from kiro_crew.platform import redact_via_context as redact  # noqa: F401
 from kiro_crew.platform.context import (  # noqa: F401
     redact_log_via_context,
     redact_owner_view_via_context,
+)
+from kiro_crew.platform.update_governance import (  # noqa: F401 - owner: editor
+    git_command_env,
+    repo_exec_driver_reason,
 )
 from kiro_crew.sandbox import (  # noqa: F401
     cgroup_scope_argv,
@@ -669,6 +680,17 @@ _ALLOWED_TEXT_EXT = {
     ".cpp",
     ".h",
     ".hpp",
+    # More source and config text. Stored as uploaded bytes and read back as
+    # text: file-read answers text/plain, file-download is attachment + nosniff,
+    # and none of these is a .html/.htm the viewer would render. A server-side
+    # language extension (.php) is never executed here.
+    ".php",
+    ".sql",
+    ".kt",
+    ".swift",
+    ".cs",
+    ".vue",
+    ".toml",
 }
 _ALLOWED_DOC_EXT = {
     ".pdf",
@@ -703,6 +725,11 @@ _ALLOWED_VIDEO_EXT = {".mp4", ".m4v", ".mov", ".webm"}
 _VIDEO_HINT_EXT = frozenset(
     {".mkv", ".ogv", ".avi", ".mpg", ".mpeg", ".wmv", ".flv", ".3gp"}
 )
+#: HEIC/HEIF photo names. The dashboard converts these to JPEG in the browser
+#: before upload, so one arriving here skipped that step (a page loaded before
+#: the conversion shipped, or a client other than the dashboard). The boundary
+#: still refuses it -- no model reads HEIC -- but says how to get past it.
+_HEIC_HINT_EXT = frozenset({".heic", ".heif"})
 #: Media type :func:`_sniff_media_type` must report for the claimed video
 #: extension. The MP4 family (mp4/m4v/mov) all carry a ``ftyp`` box at offset 4
 #: and sniff as ``video/mp4``; QuickTime's brand differs but the box does not.

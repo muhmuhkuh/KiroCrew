@@ -9,13 +9,12 @@
  * One card, top to bottom: the look as its hero (a centred tile whose pencil
  * opens the avatar editor), the name under its label, Create, and a centred
  * "Advanced settings" toggle under it, so the primary action follows the name
- * directly. The way out is the header's X: the modal's own, or, in place, an
- * X beside the card's heading. Create builds the crewmate from the built-in `kirocrew` agent
- * unless told otherwise, and the template is not named until the user asks
- * for more. The "Advanced settings" toggle unfolds the rest of the form
- * inline, in the same card, directly under that line, and the unfolded
- * region ends with a second Create: what the crewmate is built from, what it
- * looks after in plain words,
+ * directly. The way out is the modal's header X. Every crewmate starts as Kiro Crew's
+ * own source-defined worker; abilities are added afterwards in its editor
+ * (Add abilities), so there is no template to pick here. The "Advanced
+ * settings" toggle unfolds the rest of the form inline, in the same card,
+ * directly under that line, and the unfolded region ends with a second
+ * Create: its goal in plain words,
  * and everything the crew manager's form also asks (workspace, model, routing
  * triggers, session colour), rendered by the SAME `Field` frame and field
  * components the editor mounts, so the two forms cannot drift. The disclosure
@@ -24,14 +23,7 @@
  * folding it hides those fields without clearing them: what was typed or
  * picked there is still sent.
  *
- * "Built from" lists the installed kiro agents (the templates a crew can
- * boot), never the configured default CREW: a crew named `default` is an
- * alias, and storing its name as `kiro_agent` would make the new crewmate run
- * a fallback instead of that crew's template. The built-in `kirocrew` agent
- * leads the list and is labelled as the default, and is offered even when the
- * installed read failed.
- *
- * "What it looks after" is stored as the crew record's `description`: the
+ * "Goal" is stored as the crew record's `description`: the
  * one free-text field the record already carries for a human-readable
  * account of the crew, and the line the crewmate's first greeting is seeded
  * from (see MembersPage). Memory is provisioned by the server on create
@@ -47,8 +39,8 @@
  * The crew manager's door does not ask, opens no chat, and shows no hint.
  *
  * `initialDraft` pre-fills an opening with a proposed name and goal (a
- * crewmate's create link, a guide): the name lands in Name, the goal in "What it
- * looks after", and Advanced settings opens with it so the goal is in view.
+ * crewmate's create link, a guide): the name lands in Name, the goal in "Goal",
+ * and Advanced settings opens with it so the goal is in view.
  * The draft is a starting point, not a change: an opening left as it was
  * proposed leaves without asking, like a blank one. `guided` marks the door
  * the `crewmate.create` guide walks: its Create carries the guide's anchor,
@@ -59,9 +51,9 @@
  * nothing while closed, and the form state below is reset on every open so a
  * dismissed draft does not reappear.
  */
-import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState, useMemo } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ChevronDown, Pencil, X } from 'lucide-react'
+import { ChevronDown, Pencil } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 
@@ -69,7 +61,6 @@ import Modal from '../../components/Modal'
 import CrewAvatar, { type CrewAvatarOverride } from '../../components/CrewAvatar'
 import { lookSeed, defaultLookFor } from '../../lib/avatarPoses'
 import CrewAvatarBuilder from '../../components/CrewAvatarBuilder'
-import SimpleSelect from '../../components/SimpleSelect'
 import ErrorNotice from '../../components/ErrorNotice'
 import { InstantTip, useInstantTip } from '../../components/InstantTip'
 import { Btn, Input } from '../../components/ui'
@@ -93,11 +84,11 @@ import {
   TriggersField,
   WorkspaceField,
   WorkspaceModal,
-} from '../KiroCrewAgentsPage'
+} from '../../components/crew/crewFields'
 
-/** The template a new crewmate is built from unless Advanced settings picks
- *  another: the built-in kiro agent every install ships, which leads the
- *  "Built from" list. The folded card never names it. */
+/** The binding a new crewmate starts on: the built-in kiro agent every install
+ *  ships. The server repoints it to the crewmate's own file at create and reads
+ *  nothing from it (`mate_config.adopt_own_file`). */
 export const DEFAULT_CREWMATE_TEMPLATE = 'kirocrew'
 /** The id the Advanced settings row's `aria-controls` points at. */
 const ADVANCED_ID = 'crewmate-create-advanced'
@@ -137,7 +128,7 @@ const ADVANCED_FOLD = {
 const ADVANCED_CUT = { duration: 0 } as const
 
 /**
- * The Advanced settings toggle: a quiet centred text button under Create,
+ * The Advanced settings toggle: a quiet centred text button under the name,
  * the chevron before the label. The fields it unfolds open directly below
  * it, so the chevron turns from pointing down to pointing up while they are
  * open. Under reduced motion the chevron turns without animating.
@@ -233,8 +224,8 @@ function LookTile({ seed, avatar, onEdit, label, disabled }: {
 }
 
 /**
- * The form's DOM id. Every control, both Create buttons included, lives
- * inside the form, so each Create is a submit button by nesting, and a form
+ * The form's DOM id. Every control, the one Create included, lives
+ * inside the form, so Create is a submit button by nesting, and a form
  * with a submit button is what gives Enter in the Name field its implicit
  * submission (with two text fields and no submit button, Enter does nothing).
  */
@@ -253,12 +244,12 @@ export const RECONCILE_BOUND_MS = 2500
 export interface CreatedCrewmate {
   /** Exact crew name — MembersPage's `?member=` resolves by name. */
   name: string
-  /** The "what it looks after" line as typed; '' when left blank. */
+  /** The goal line as typed; '' when left blank. */
   job: string
 }
 
 /** The `POST /api/agents` body — the crew manager's create payload plus the
- *  record's `description`, which carries "what it looks after". `model` is
+ *  record's `description`, which carries the goal. `model` is
  *  sent only when pinned: the inherit spelling is the server's default. */
 interface CreateBody {
   name: string
@@ -280,7 +271,7 @@ export interface CrewmateDraft {
 }
 
 export default function NewCrewmateDialog({
-  open, onClose, onCreated, existingNames, embedded = false, startExpanded = false, firstGreeting = false,
+  open, onClose, onCreated, existingNames, startExpanded = false, firstGreeting = false,
   initialDraft, guided = false, onDraftStateChange, onFailed,
 }: {
   open: boolean
@@ -302,13 +293,6 @@ export default function NewCrewmateDialog({
   /** Ask the server to open the new crewmate's first chat with its goal
    *  question (see the header comment). */
   firstGreeting?: boolean
-  /**
-   * Render the same complete form in place, inside the page region the host
-   * gives it, instead of as a modal: no portal, no scrim, no focus trap and no
-   * Escape/backdrop dismissal (the X beside the heading is the way out). State, validation, the
-   * create write, reset-on-open and the leave guard are identical.
-   */
-  embedded?: boolean
   onClose: () => void
   /** Fired once the server has the record; the page takes it from there. */
   onCreated: (created: CreatedCrewmate) => void
@@ -329,7 +313,6 @@ export default function NewCrewmateDialog({
   // name-seeded DEFAULT ICON (see defaultLookFor), never the trait ghost.
   const [look, setLook] = useState<CrewAvatarOverride | null>(null)
   const [lookOpen, setLookOpen] = useState(false)
-  const [builtFrom, setBuiltFrom] = useState('')
   const [job, setJob] = useState('')
   const [advanced, setAdvanced] = useState(startExpanded)
   // A workspace of its own unless Advanced names one to share.
@@ -394,7 +377,7 @@ export default function NewCrewmateDialog({
     const draftName = initialDraft?.name ?? ''
     const draftGoal = initialDraft?.goal ?? ''
     setLook(null); setLookOpen(false)
-    setName(draftName); setBuiltFrom(''); setJob(draftGoal); setAdvanced(startExpanded || draftGoal.trim() !== '')
+    setName(draftName); setJob(draftGoal); setAdvanced(startExpanded || draftGoal.trim() !== '')
     setWorkspace(OWN_WORKSPACE); setModel(INHERIT_MODEL); setTriggers(''); setSessionColor('')
     setHint(''); setError(''); setNameRefused(false); setUnconfirmed(false); setPendingWorkspace(null)
     // The nested workspace form too: a draft left in it belongs to the
@@ -429,48 +412,14 @@ export default function NewCrewmateDialog({
   // while the dialog is open. Each falls back to its built-in default when
   // the read fails, and the failure is SAID: one notice, first failure wins,
   // so a shortened list never passes for the whole set of choices.
-  // The same catalog the chat picker reads (`GET /api/agents/catalog`): its
-  // template rows already exclude the runtime's background-only spec, fork
-  // copies and masked names, so the dialog does not keep a second copy of
-  // that rule. No session key: this page has no chat slot, so the catalog is
-  // the global one — a crewmate is a global record and must not be built
-  // from a template only one project checkout can resolve.
-  // Re-read on every open. The app's queries never go stale on their own
-  // (queryClient.ts: freshness is WebSocket-driven), but no server event
-  // invalidates this key, so under the default a template installed or
-  // removed mid-session would stay frozen in the list from the first open
-  // until a reload. `staleTime: 0` makes each `enabled` flip (each open)
-  // fetch again: the list a user sees is the catalog as of opening the dialog.
-  const { data: catalog, error: installedError } = useQuery({
-    queryKey: ['agents-catalog', 'global'],
-    queryFn: () => api.agentCatalog(),
-    enabled: open,
-    staleTime: 0,
-  })
   const { data: workspacesData, refetch: refetchWorkspaces, error: workspacesError } = useQuery({
     queryKey: ['workspaces'],
     queryFn: () => api.workspaces(),
     enabled: open,
   })
   const { data: availableModels, error: modelsError } = useAvailableModelsQuery({ enabled: open })
-  const optionsError = installedError ?? workspacesError ?? modelsError
+  const optionsError = workspacesError ?? modelsError
 
-  // Installed kiro agents only (see the header comment). Private fork copies
-  // (one crew's own definition) are not offered — a copy named after crew A
-  // means nothing in crew B's list. The built-in agent leads, labelled as the
-  // default; it is offered even when the installed read failed, because it
-  // ships with every install.
-  const installed = Array.isArray(catalog?.agents)
-    ? catalog.agents
-      .filter((row) => row.selection_kind === 'template' && Boolean(row.name))
-      .map((row) => row.name)
-      .filter((n: string) => n !== DEFAULT_CREWMATE_TEMPLATE)
-    : []
-  const builtFromOptions = [DEFAULT_CREWMATE_TEMPLATE, ...installed]
-  const builtFromLabels = builtFromOptions.map((n) =>
-    n === DEFAULT_CREWMATE_TEMPLATE ? t('pages.membersPage.built_from_default', { agent: n }) : n,
-  )
-  const builtFromValue = builtFrom || DEFAULT_CREWMATE_TEMPLATE
   // The look shown and stored when the user has not picked one: a name-seeded
   // icon (pose + colour both follow the name). Never null, so the create flow
   // never shows or stores the trait ghost a missing avatar falls back to.
@@ -502,7 +451,7 @@ export default function NewCrewmateDialog({
   // left as proposed are still the proposal (it lives on where it came from),
   // not the user's work.
   const dirty = Boolean(
-    name !== (initialDraft?.name ?? '') || job !== (initialDraft?.goal ?? '') || builtFrom
+    name !== (initialDraft?.name ?? '') || job !== (initialDraft?.goal ?? '')
     || workspace !== OWN_WORKSPACE || model !== INHERIT_MODEL || triggers || sessionColor
     || look !== null || lookOpen,
   )
@@ -758,7 +707,7 @@ export default function NewCrewmateDialog({
   const atStake = open && (dirty || busy || (wsModalOpen && wsDirty))
   const mayLeave = () => {
     if (!atStake) return true
-    return window.confirm(busy ? t('pages.membersPage.create_leave_busy') : embedded ? t('components.meetCrewmatesFlow.leave_draft') : t('pages.membersPage.create_leave_draft'))
+    return window.confirm(busy ? t('pages.membersPage.create_leave_busy') : t('pages.membersPage.create_leave_draft'))
   }
   useSidePanelLeaveGuard(mayLeave, atStake, true)
   // A reload or tab close loses the draft too.
@@ -772,7 +721,6 @@ export default function NewCrewmateDialog({
     window.addEventListener('beforeunload', warn)
     return () => window.removeEventListener('beforeunload', warn)
   }, [atStake])
-  const titleId = useId()
   const title = t('pages.membersPage.add_member')
 
   const submit = () => {
@@ -782,8 +730,7 @@ export default function NewCrewmateDialog({
     // No grammar check on the name beyond the trim: a crewmate's name is
     // free-form display text (`members.validate_member_name` — spaces,
     // punctuation, any script, emoji), separate from the stable member id,
-    // slug and slot key the server derives for it and from the strict
-    // template identifier `Built from` carries. What the server refuses
+    // slug and slot key the server derives for it. What the server refuses
     // (a credential-shaped name, hidden characters, an over-long name) it
     // says in its own answer, which `onError` renders; the roster lists
     // every name the server accepts, so nothing created here reads as gone.
@@ -796,11 +743,11 @@ export default function NewCrewmateDialog({
     if (existingNames.includes(n)) { setHint(t('pages.membersPage.create_name_taken', { name: n })); return }
     // Every value is sent whether Advanced settings is unfolded or not:
     // folding hides those fields, it does not discard what was set in them,
-    // and untouched they hold the defaults (the built-in template, the
-    // default workspace, the inherited model).
+    // and untouched they hold the defaults (the default workspace, the
+    // inherited model).
     createMut.mutate({
       name: n,
-      kiro_agent: builtFromValue,
+      kiro_agent: DEFAULT_CREWMATE_TEMPLATE,
       workspace,
       memory_store: 'default',
       description: job.trim(),
@@ -821,7 +768,7 @@ export default function NewCrewmateDialog({
     >
       {/* One lock for the whole form while the POST is in flight: a
           disabled fieldset disables every control under it -- the look
-          tile, both Create buttons and the editor's own fields, which take
+          tile, Create and the editor's own fields, which take
           no `disabled` prop of their own -- so an edit cannot land after
           the body was sent and vanish when success closes the dialog. */}
       <fieldset
@@ -830,8 +777,8 @@ export default function NewCrewmateDialog({
         className="contents min-w-0 m-0 p-0 border-0"
         data-testid="crewmate-create-fieldset"
       >
-      {/* One column, top to bottom: the look, the name, Create,
-          the secondary line, then the Advanced fields. Spacing is each
+      {/* One column, top to bottom: the look, the name, the secondary
+          line, then the Advanced fields; Create follows in the footer. Spacing is each
           element's own margin, so the space above the unfolding region is
           its own padding and moves with it. */}
       <div className="flex flex-col">
@@ -878,8 +825,8 @@ export default function NewCrewmateDialog({
         {/* No hand-off on either notice: both sit over this unsaved form --
             the name, job and every Advanced pick live only in local state --
             and the hand-off navigates to the chat, unmounting the dialog
-            and the draft with it. Both sit right above Create, the press
-            they answer. */}
+            and the draft with it. Both sit under the name, above the
+            Advanced settings toggle. */}
         {/* A load that did not happen is a failure (errors-use-error-notice):
             the shared notice, inline, naming WHICH list fell back so the
             user knows what they are not being offered. The create still
@@ -888,9 +835,7 @@ export default function NewCrewmateDialog({
           <div className="mt-4">
             <ErrorNotice
               message={t('pages.membersPage.create_options_failed', {
-                list: installedError
-                  ? t('pages.membersPage.agent_template')
-                  : workspacesError
+                list: workspacesError
                     ? t('pages.kiroCrewAgentsPage.workspace_2')
                     : t('pages.kiroCrewAgentsPage.model'),
               })}
@@ -919,16 +864,9 @@ export default function NewCrewmateDialog({
             />
           </div>
         )}
-        {/* The primary action, right after the name: full width and 44px
-            tall on a phone. It is the form's first submit button, so Enter
-            in the Name field submits through it. */}
-        <Btn primary type="submit" disabled={busy || wsModalOpen} className="mt-5 min-h-11 w-full justify-center sm:min-h-9" data-testid="crewmate-create-submit" data-guide-anchor={guided ? GUIDE_ANCHORS.crewmateCreate : undefined}>
-          {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
-        </Btn>
-        {/* The secondary line, centred under Create: the Advanced settings
-            toggle alone. The way out is the header's close button (the
-            modal's own X, or the in-place card's X beside its heading). */}
-        <div className="mt-2 flex items-center justify-center" data-testid="crewmate-create-secondary">
+        {/* The secondary line, centred under the name: the Advanced settings
+            toggle alone. The way out is the modal's header X. */}
+        <div className="mt-3 flex items-center justify-center" data-testid="crewmate-create-secondary">
           <AdvancedSettingsToggle
             open={advanced}
             onToggle={() => setAdvanced((v) => !v)}
@@ -939,11 +877,7 @@ export default function NewCrewmateDialog({
             instead of appearing whole, so the reader sees where they came
             from (sequenced as `ADVANCED_OPEN` / `ADVANCED_FOLD` describe).
             Cut, not animated, under reduced motion. Folding unmounts the
-            fields, never their values: those live in this dialog's state.
-            The region ends with a second Create, so a user who scrolled
-            down through the fields does not scroll back up to finish. It
-            is a plain submit button of the same form: each press is one
-            submit event through the one `onSubmit`, with the same lock. */}
+            fields, never their values: those live in this dialog's state. */}
         <AnimatePresence initial={false}>
           {advanced && (
             <motion.div
@@ -954,17 +888,7 @@ export default function NewCrewmateDialog({
               exit={reduceMotion ? { ...ADVANCED_FOLD, transition: ADVANCED_CUT } : ADVANCED_FOLD}
               data-testid="crewmate-create-advanced"
             >
-              <div className="flex flex-col gap-5 pt-5">
-                <Field label={t('pages.membersPage.agent_template')} hint={t('pages.membersPage.built_from_hint', { agent: DEFAULT_CREWMATE_TEMPLATE })}>
-                  <SimpleSelect
-                    options={builtFromOptions}
-                    optionLabels={builtFromLabels}
-                    value={builtFromValue}
-                    onChange={setBuiltFrom}
-                    disabled={busy}
-                    aria-label={t('pages.membersPage.agent_template')}
-                  />
-                </Field>
+              <div className="flex flex-col gap-4 pt-4">
                 <Field
                   label={`${t('pages.membersPage.create_job')} · ${t('pages.membersPage.create_optional')}`}
                   hint={t('pages.membersPage.create_job_hint')}
@@ -994,13 +918,23 @@ export default function NewCrewmateDialog({
                 />
                 <TriggersField value={triggers} onChange={setTriggers} subject="member" />
                 <SessionColorField value={sessionColor} onChange={setSessionColor} subject="member" />
-                <Btn primary type="submit" disabled={busy || wsModalOpen} className="min-h-11 w-full justify-center sm:min-h-9" data-testid="crewmate-create-submit-end">
-                  {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
-                </Btn>
               </div>
             </motion.div>
           )}
         </AnimatePresence>
+      </div>
+      {/* The one primary action, in a footer that sticks to the bottom of
+          the modal's scrolling body: however far the Advanced fields run,
+          Create stays in view without a second copy of it. The band reaches
+          over the body's padding (`-mx-5 -mb-4`, and `-bottom-4` because a
+          sticky box stops at the scroller's padding edge) so the fields
+          scroll under it, never past it. It stays inside the form, so it is the form's
+          submit button (Enter in the Name field submits through it) and the
+          fieldset's lock covers it. 44px tall on a phone. */}
+      <div className="sticky -bottom-4 z-10 -mx-5 -mb-4 mt-4 border-t border-border bg-card px-5 py-3" data-testid="crewmate-create-footer">
+        <Btn primary type="submit" disabled={busy || wsModalOpen} className="min-h-11 w-full justify-center sm:min-h-9" data-testid="crewmate-create-submit" data-guide-anchor={guided ? GUIDE_ANCHORS.crewmateCreate : undefined}>
+          {busy ? t('pages.membersPage.create_submitting') : t('pages.membersPage.create_submit')}
+        </Btn>
       </div>
       </fieldset>
     </form>
@@ -1008,37 +942,6 @@ export default function NewCrewmateDialog({
 
   return (
     <>
-      {embedded ? (
-        /* In place: the SAME form under the same heading in a labelled page
-           region -- no portal, no scrim, no focus trap, no Escape. The X
-           beside the heading is the explicit way out, drawn like the
-           modal's own header X, and locked under the same conditions the
-           modal's X is (`dismissDisabled`). 44px on a phone, compact from
-           sm up. */
-        open && (
-          <div
-            role="region"
-            aria-labelledby={titleId}
-            className="flex w-full max-w-[560px] flex-col gap-5 self-start rounded-2xl border border-border bg-card p-5 sm:p-6"
-            data-testid="crewmate-create-embedded"
-          >
-            <div className="flex items-center justify-between gap-3" data-testid="crewmate-create-header">
-              <h2 id={titleId} className="m-0 min-w-0 truncate text-[15px] font-semibold text-text-strong">{title}</h2>
-              <Btn
-                type="button"
-                onClick={onClose}
-                disabled={busy || wsModalOpen}
-                aria-label={t('pages.membersPage.create_cancel')}
-                className="-mr-2 flex size-11 shrink-0 items-center justify-center rounded-md border-none bg-transparent text-muted cursor-pointer transition-colors hover:bg-bg-hover hover:text-text focus-ring disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted sm:size-8"
-                data-testid="crewmate-create-close"
-              >
-                <X size={16} aria-hidden="true" />
-              </Btn>
-            </div>
-            {formEl}
-          </div>
-        )
-      ) : (
       <Modal
         open={open}
         onClose={onClose}
@@ -1054,7 +957,6 @@ export default function NewCrewmateDialog({
       >
         {formEl}
       </Modal>
-      )}
       {/* The avatar editor, icon tier only: a crewmate that does not exist
           yet has no record for a picture or a pack. Saving pins the pick;
           resetting goes back to the name's own face. */}

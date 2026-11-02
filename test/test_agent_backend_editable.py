@@ -18,12 +18,14 @@ import pytest
 from kiro_crew.acp_backends import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_STRANDS,
 )
 from kiro_crew.agent_sdk import backends as acp_backends
 from kiro_crew.config.loader import KiroCrewConfig
@@ -35,10 +37,14 @@ FIELD = "agent.acp_backend"
 #: Known ids the public baseline deliberately does not offer, each entry carrying its
 #: reason in ``test_baseline_ships_every_known_backend``. An entry is a reasoned
 #: exclusion rather than a defect, and it earns its place by naming what the id fails.
-#: Vibe's routing is UNVERIFIED: its agent profile cannot force every native or MCP
-#: tool through Crew's host approval gate. Registration must remain refused until
-#: that routing contract is established.
-NOT_SHIPPED_SELECTABLE: frozenset = frozenset({acp_backends.ACP_BACKEND_VIBE})
+#: Empty today: no id is excluded. ``deepseek`` was the one member while it failed the
+#: ROUTING half of the selectability bar -- its sandbox decides its own tool calls and
+#: its ``session/request_permission`` carries only a model-initiated escalation, so
+#: Crew's PreToolUse gate never ran for what a session did. It left the set when Crew
+#: composed its own gate plugin into the harness and read the plugin's load marker
+#: back before the first prompt (``Routing.VERIFIED_GATE_EXTENSION``), which is the
+#: routing half met the way the exclusion said it had to be.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset()
 
 
 @pytest.fixture
@@ -194,6 +200,8 @@ def test_baseline_ships_every_known_backend():
             ACP_BACKEND_PI,
             ACP_BACKEND_GOOSE,
             ACP_BACKEND_DEEPSEEK,
+            ACP_BACKEND_COPILOT,
+            ACP_BACKEND_STRANDS,
         ]
     )
     assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

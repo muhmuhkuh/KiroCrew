@@ -27,6 +27,7 @@ if TYPE_CHECKING:
         _lineage_unverifiable_error,
         _model_pin_rejected,
         _name_would_be_masked,
+        _pin_entitlement_backend,
         _require_owner,
         _revalidate_crew_pin,
         _safe_avatar,
@@ -107,16 +108,9 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
     # Globs ~/.kiro/agents and may read the installed agent file — keep the
     # filesystem work off the event loop.
+    model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None, **app_kw)
     alias, kiro_agent, model_pin = await asyncio.to_thread(
         resolve_agent_identity, cfg, agent_name or None
-    )
-    from kiro_crew.acp_backends import resolve_selected_backend
-    from kiro_crew.agent_backend_selection import agent_backend_pin
-
-    pin = agent_backend_pin(cfg, kiro_agent, alias or "")
-    backend = pin if pin is not None else resolve_selected_backend(cfg.agent.member_acp_backend)
-    model = await asyncio.to_thread(
-        resolve_effective_model, cfg, agent_name or None, backend=backend, **app_kw
     )
     # Effort resolves through its own chain, served from the SAME resolver the
     # provider factory calls so the pane cannot disagree with what a session will
@@ -126,21 +120,122 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     # configured default crew rather than for no crew at all.
     crew_effort = cfg.crew_pinned_effort(None, alias)
     session_effort = cfg.resolve_session_effort(kiro_agent, alias)
-    return web.json_response(
-        {
-            "model": model,
-            "acp_backend": backend,
-            "agent": agent_name,
-            "kiro_agent": kiro_agent,
-            # Whether the agent itself pins the model, vs inheriting it.
-            "pinned": bool(model_pin),
-            # The effort a new session on this crew starts at, and whether the
-            # crew pinned it or inherited a default. "" means no tier pins one
-            # and the model's own default applies.
-            "reasoning_effort": session_effort,
-            "effort_pinned": bool(crew_effort),
-        }
+    body: dict[str, object] = {
+        "model": model,
+        "agent": agent_name,
+        "kiro_agent": kiro_agent,
+        # Whether the agent itself pins the model, vs inheriting it.
+        "pinned": bool(model_pin),
+        # The effort a new session on this crew starts at, and whether the
+        # crew pinned it or inherited a default. "" means no tier pins one
+        # and the model's own default applies.
+        "reasoning_effort": session_effort,
+        "effort_pinned": bool(crew_effort),
+    }
+
+    from kiro_crew.acp_backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+    from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
+    from kiro_crew.dashboard.handlers.agents_harness_effort import (
+        harness_effort,
+        own_models_backend,
     )
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+    try:
+        owner = is_owner_dashboard_request(request)
+    except (KeyError, AttributeError):
+        # No dashboard state to name an owner by: not an owner request.
+        owner = False
+    try:
+        # A crewmate's harness pin names the harness that judges its pins first. Only the
+        # owner reads the pin, so any other caller gets the member route's answer.
+        pin_backend: str | None = _pin_entitlement_backend(cfg, alias if owner else "")
+    except CrewmateHarnessUnavailable:
+        # The pinned harness cannot start: the harness readout below reports it.
+        pin_backend = None
+    if pin_backend is not None:
+        own = own_models_backend(pin_backend, cfg.agent.acp_backend)
+        # Only a pair-id harness (codex) answers for its build, which holds for any pick the
+        # editor makes; every other answer would be one model's, so the editor judges the pick.
+        effort = (
+            harness_effort(request.app.get("state"), pin_backend, None, alias, model_answers=False)
+            if pin_backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+            else {}
+        )
+        if "effort_levels" in effort:
+            # A pin saves through _crew_effort_rejected, which takes the shared vocabulary only.
+            effort["effort_levels"] = [
+                lvl for lvl in effort["effort_levels"] if lvl in EFFORT_VALUES
+            ]
+        # circular import: see _model_pin_rejected.
+        from kiro_crew.dashboard.handlers.core import _active_advertised_ids
+
+        advertised = (
+            _active_advertised_ids(request, backend=pin_backend)
+            if model_pin not in ("", "auto")
+            else None
+        )
+        # The backend whose list the editor offers, when the pin is judged by another
+        # harness's catalog than the configured one.
+        if own is not None:
+            body["models_backend"] = own
+        # The id that harness serves the crew's pin as ("" for none), off a live session's
+        # advertised list; absent while no session has advertised one.
+        if advertised is not None:
+            body["pin_served_as"] = resolve_pin_spelling_on(
+                model_pin, advertised, backend=pin_backend
+            )
+        # Whether and at which levels a pair-id harness's build takes an effort pin; null
+        # until a live session on it answers. Otherwise the editor judges the model.
+        body.update(effort)
+
+    # The crewmate's harness pin is read HERE and nowhere else on the dashboard
+    # (GET /api/agents and GET /api/members leave it out), and only by the owner.
+    def _crew_harness_readout(cfg: KiroCrewConfig, crew: str, app_kw: dict) -> dict[str, object]:
+        """The harness half of the resolved-model readout for crew *crew*. Blocking.
+
+        ``acp_backend`` is the stored pin (``""`` inherits); ``harness`` is what the
+        crewmate's chat runs on, in the same spelling, or ``""`` with ``harness_error``
+        when the pin cannot start; ``inherited_harness`` is what clearing the pin
+        would run; ``model`` is re-resolved for that harness, so an
+        inherited model reads as the one the pinned harness will get.
+        """
+        from kiro_crew.acp_backends import backend_to_stored, resolve_selected_backend
+        from kiro_crew.crewmate_harness import (
+            CrewmateHarnessUnavailable,
+            crewmate_pin_for,
+            selectable_harnesses,
+            worker_harnesses,
+        )
+
+        pin = crewmate_pin_for(cfg, crew)
+        out: dict[str, object] = {
+            "acp_backend": pin.display_stored if pin is not None else "",
+            # What Inherited gives, pinned or not, so the picker can always say it.
+            "inherited_harness": backend_to_stored(
+                resolve_selected_backend(cfg.agent.member_acp_backend)
+            ),
+            "harnesses": selectable_harnesses(),
+            "worker_harnesses": worker_harnesses(),
+        }
+        try:
+            runtime = (
+                pin.resolve()
+                if pin is not None
+                else resolve_selected_backend(cfg.agent.member_acp_backend)
+            )
+        except CrewmateHarnessUnavailable as exc:
+            out.update({"harness": "", "harness_error": str(exc)})
+            return out
+        out["harness"] = backend_to_stored(runtime)
+        if pin is not None:
+            out["model"] = resolve_effective_model(cfg, crew, backend=runtime, **app_kw)
+        return out
+
+    if alias and alias in cfg.agents and owner:
+        body.update(await asyncio.to_thread(_crew_harness_readout, cfg, alias, app_kw))
+    return web.json_response(body)
 
 
 async def _refresh_session_defaults(request: web.Request, crew: str) -> None:
@@ -351,14 +446,6 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
     # {"model": 123} into the literal "123", which normalizes to a string the
     # backend then rejects as an unknown model id.
     model = normalize_agent_model(body.get("model"))
-    from kiro_crew.agent_backend_selection import member_backend_for_write, validate_agent_backend
-
-    try:
-        backend_pin = validate_agent_backend(body.get("acp_backend"))
-    except ValueError:
-        return web.json_response(
-            {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
-        )
     _raw_color = body.get("session_color", "")
     session_color = _safe_color(_raw_color)
     if _raw_color not in ("", None) and not session_color:
@@ -472,7 +559,15 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "workspace must be a string", "code": "invalid_workspace"}, status=400
         )
     workspace = _raw_workspace.strip()
-    pending_reason = await _revalidate_crew_pin(model, request, backend_choice=body)
+    # Same rule as the update route: the loader reads these as strings, but
+    # only on the next load, so a wrong type is refused before it is stored.
+    for _text_field in ("description", "triggers", "source"):
+        if _text_field in body and not isinstance(body[_text_field], str):
+            return web.json_response(
+                {"error": f"{_text_field} must be a string", "code": f"invalid_{_text_field}"},
+                status=400,
+            )
+    pending_reason = await _revalidate_crew_pin(model, request)
     if pending_reason:
         return web.json_response({"error": pending_reason, "code": "invalid_model"}, status=400)
     async with _get_config_lock():
@@ -486,21 +581,36 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
                 status=409,
             )
         name, display_name = keyed.key, keyed.display_name
-        try:
-            selected_backend = member_backend_for_write(cfg, "", body)
-        except ValueError:
+        # Judged against the key, not the typed name: the key is what
+        # adopt_own_file compares the template with.
+        from kiro_crew.mate_config import start_template_refusal
+
+        template_refusal = start_template_refusal(kiro_agent, name)
+        if template_refusal:
             return web.json_response(
-                {"error": "backend is not selectable", "code": "invalid_backend"}, status=400
+                {"error": template_refusal, "code": "mate_template_unsupported"}, status=400
             )
+        # No avatar supplied -> the name-seeded default ICON the UI posts for the
+        # same name, rather than the trait ghost a missing override renders as.
+        # Seeded from the name the crew SHOWS (`display_name or name`), which is
+        # what the roster draws and what the UI preview seeds from. An explicitly
+        # supplied avatar is never overridden -- including an explicit ghost
+        # reset (`{"kind": "ghost"}` or all-empty traits), which `_safe_avatar`
+        # collapses to `{}` but `_is_ghost_shaped` marks as a deliberate choice of
+        # the name-derived ghost, so the icon default must not replace it.
+        if not avatar and not _is_ghost_shaped(_raw_avatar):
+            from kiro_crew.crew_avatar_seed import default_icon_avatar
+
+            avatar = default_icon_avatar(display_name or name)
         model_reason = _model_pin_rejected(
-            model, request, cfg.agent.provider, backend=selected_backend
+            model, request, cfg.agent.provider, backend=_pin_entitlement_backend(cfg)
         )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
         # Checked INSIDE the config lock, immediately before the binding is
         # added: a fork recording lineage after a pre-lock validation must not
-        # slip another crew's private copy into this new binding (GPT
-        # round-34, same shape as the locked rebind's in-mutate check).
+        # slip another crew's private copy into this new binding (same shape
+        # as the locked rebind's in-mutate check).
         try:
             owner = await asyncio.to_thread(_foreign_private_copy_owner, name, kiro_agent)
         except _UnverifiableLineage as exc:
@@ -544,7 +654,6 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
         # create and team the same name between the purge and the registration.
         # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
-            acp_backend=backend_pin,
             kiro_agent=kiro_agent,
             workspace=workspace,
             memory_store=memory_store,

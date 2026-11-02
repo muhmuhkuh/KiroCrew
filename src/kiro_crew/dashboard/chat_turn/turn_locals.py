@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from typing import Any
 
+    from kiro_crew.agent_sdk.spec_hooks import PostToolIdentity
     from kiro_crew.dashboard.chat_runner import (
         DashboardState,
         MonitorCompletionHook,
@@ -80,7 +81,9 @@ class _ChatTurn:
     _directive_self_wake: "bool"
     _directive_loop_id: "str"
     _directive_loop_gen: "int"
+    _skill_trigger_text: "str | None"
     _directive_channel_origin: "bool"
+    _directive_owner_origin: "bool"
     _commands_off: "bool"
     _turn_actor: "str"
     regenerate_hint: "str"
@@ -91,6 +94,10 @@ class _ChatTurn:
 
     # State those functions write, or read after the turn rebinds it.
     _acquired: "bool"
+    # The embed-pool admission reservation _turn_build_prompt opened for the
+    # context build, settled in _turn_settle_debts. None until (and unless) the
+    # context-builder branch takes one; set in __init__ so every exit can read it.
+    _admission_slot: "Any"
     _activity_after_terminal: "int"
     _allocation_kwargs: "dict[str, Any]"
     _answer_text: "str"
@@ -159,6 +166,7 @@ class _ChatTurn:
     _pending_dir_for_digest: "dict[str, str]"
     _pending_dir_tool: "dict[str, str]"
     _pending_input_digest: "dict[str, str]"
+    _pending_tool_ids: "dict[str, PostToolIdentity]"
     _pending_tools: "dict[str, str]"
     _person_steered_turn: "bool"
     _produced_visible_output: "bool"
@@ -190,6 +198,7 @@ class _ChatTurn:
     _shell_tool_calls: "set[str]"
     _span_base_len: "int"
     _span_probe: "str"
+    _prompt_segments: "tuple[Any, ...]"
     _spec_hooks: "list[Any]"
     _spec_hooks_cwd: "str | None"
     _spec_hooks_unreadable: "bool"
@@ -224,6 +233,7 @@ class _ChatTurn:
     _turn_elapsed_ms: "int"
     _turn_emitted: "bool"
     _turn_flushed_visible_text: "bool"
+    _turn_footer_attached: "bool"
     _turn_is_completion: "bool"
     _turn_landed: "bool"
     _turn_model: "str"
@@ -279,6 +289,7 @@ class _ChatTurn:
     sessions: "Any | None"
     slot_ctx_blocks: "dict[str, int]"
     slot_ctx_omitted: "dict[str, dict[str, Any]]"
+    slot_ctx_receipts: "dict[str, dict[str, Any]]"
     slot_ctx_phase: "str"
     user_typed_len: "int"
     user_typed_message: "str"
@@ -305,7 +316,9 @@ class _ChatTurn:
         _directive_self_wake: "bool",
         _directive_loop_id: "str",
         _directive_loop_gen: "int",
+        _skill_trigger_text: "str | None",
         _directive_channel_origin: "bool",
+        _directive_owner_origin: "bool",
         _commands_off: "bool",
         _turn_actor: "str",
         regenerate_hint: "str",
@@ -333,7 +346,9 @@ class _ChatTurn:
         self._directive_self_wake = _directive_self_wake
         self._directive_loop_id = _directive_loop_id
         self._directive_loop_gen = _directive_loop_gen
+        self._skill_trigger_text = _skill_trigger_text
         self._directive_channel_origin = _directive_channel_origin
+        self._directive_owner_origin = _directive_owner_origin
         self._commands_off = _commands_off
         self._turn_actor = _turn_actor
         self.regenerate_hint = regenerate_hint
@@ -341,6 +356,8 @@ class _ChatTurn:
         self._on_irreversibly_consumed = _on_irreversibly_consumed
         self.monitor_completion = monitor_completion
         self._current_message = _current_message
+        # No admission reservation until the context-builder branch opens one.
+        self._admission_slot = None
 
     if not TYPE_CHECKING:
 

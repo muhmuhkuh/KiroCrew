@@ -168,8 +168,8 @@ class TestMcpServersProjection:
     def test_a_relayed_reference_reaches_a_third_party_server(self, relayed_names):
         """KAS starts an MCP child with a minimal environment of its own, so a
         launcher's per-process value reaches the child only through a reference
-        to a name the edition relays. The literal beside it, and a reference
-        wrapped in literal text, do not."""
+        to a name the edition relays. The credential-keyed literal beside it, and
+        a reference wrapped in literal text, do not."""
         out = to_client_custom_agent(
             "a",
             _spec(
@@ -178,7 +178,7 @@ class TestMcpServersProjection:
                         "command": "vendor",
                         "env": {
                             "BROKER_URL": "${LAUNCHER_BROKER_URL}",
-                            "LAUNCH_NONCE": "n0nce",
+                            "LAUNCH_TOKEN": "n0nce",
                             "AUTH": "Bearer ${SECRET}",
                         },
                     }
@@ -284,7 +284,7 @@ class TestMcpServersProjection:
                     mcpServers={
                         "third-party": {
                             "command": "x",
-                            "env": {"REF": "${LAUNCHER_BROKER_URL}", "LIT": "sk-live"},
+                            "env": {"REF": "${LAUNCHER_BROKER_URL}", "LIT_TOKEN": "sk-live"},
                         }
                     }
                 ),
@@ -326,7 +326,11 @@ class TestMcpServersProjection:
         with caplog.at_level("INFO"):
             to_client_custom_agent(
                 "a",
-                _spec(mcpServers={"third-party": {"command": "x", "env": {"K": "sekrit"}}}),
+                _spec(
+                    mcpServers={
+                        "third-party": {"command": "x", "env": {"SERVICE_PASSWORD": "sekrit"}}
+                    }
+                ),
                 "p",
             )
         assert "third-party" in caplog.text
@@ -992,6 +996,7 @@ class TestRuntimeSuppliesTheStubbedSet:
             member_dispatch=False,
             crew_panel=False,
             session_key="",
+            skill_scope_rules=(),
         ):
             seen.append(stub_server_names)
             return [{"id": agent}]
@@ -1015,6 +1020,7 @@ class TestRuntimeSuppliesTheStubbedSet:
             member_dispatch,
             crew_panel=False,
             session_key,
+            skill_scope_rules=(),
         ):
             seen.append((session_key, member_dispatch))
             return [{"id": agent}]
@@ -1152,7 +1158,10 @@ class TestHoistManagedServers:
         spec = _spec(
             mcpServers={
                 "kirocrew-core": {"command": "kc", "args": ["mcp"], "env": {"SECRET": "s"}},
-                "third-party": {"command": "tp", "env": {"TOKEN": "t"}},
+                # No env of its own: a withheld value would route this entry
+                # through the local launcher (test_kas_env_launch), which is not
+                # what the hoist tests are about.
+                "third-party": {"command": "tp"},
                 **servers,
             },
             tools=["@kirocrew-core", "@third-party"],
@@ -1197,6 +1206,32 @@ class TestHoistManagedServers:
         monkeypatch.setattr(agent_mod, "managed_mcp_spec_entry", fake)
         monkeypatch.setattr(agent_mod, "_managed_mcp_env", lambda: {"KIROCREW_HOME": "/managed"})
         return calls
+
+    @staticmethod
+    def _stubs(*names):
+        return [{"name": n, "command": "stub", "args": [n], "env": []} for n in names]
+
+    def test_pooled_managed_stubs_lead_the_array(self):
+        # KAS starts servers in array order, a few at a time, and session start
+        # waits for Crew's own: a user server sorted ahead of them must not delay it.
+        pooled = self._stubs("alpha", "beta", "gamma", "kirocrew-core", "kirocrew-cron", "zz")
+        _, array = hoist_servers_for_session([self._projected()], "kirocrew", pooled)
+        assert [e["name"] for e in array] == [
+            "kirocrew-core",
+            "kirocrew-cron",
+            "alpha",
+            "beta",
+            "gamma",
+            "zz",
+        ]
+        assert pooled[0]["name"] == "alpha", "the caller's list is not reordered in place"
+
+    def test_hoisted_managed_servers_lead_the_caller_entries(self):
+        pooled = self._stubs("alpha", "beta", "zz")
+        _, array = hoist_servers_for_session([self._projected()], "kirocrew", pooled)
+        assert [e["name"] for e in array] == ["kirocrew-core", "alpha", "beta", "zz"]
+        assert array[0]["_meta"] == self._LEGACY["_meta"]
+        assert all("_meta" not in e for e in array[1:]), "user entries keep the host default"
 
     def test_hoisted_elements_carry_the_session_token(self, monkeypatch):
         # The runtime stamps the token before the hoist runs, so these elements
@@ -1264,6 +1299,52 @@ class TestHoistManagedServers:
         _, with_default = hoist_managed_servers([self._projected()], "kirocrew", [])
         _, with_empty = hoist_managed_servers([self._projected()], "kirocrew", [], session_token="")
         assert with_default == with_empty
+
+    def test_pre_resolved_entries_keep_the_hoist_free_of_launcher_lookups(self, monkeypatch):
+        # the launcher lookup probes the filesystem and PATH, so the
+        # runtime hands the hoist entries resolved off the loop and it must not
+        # look anything up itself.
+        from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+
+        calls = self._managed(monkeypatch, {"command": "/wrong", "args": []})
+        resolved = {"kirocrew-core": {"command": "/opt/kc", "args": ["mcp-core"]}}
+        _, array = hoist_servers_for_session(
+            [self._projected()],
+            "kirocrew",
+            [],
+            session_token="tok-1",
+            managed_entries=resolved,
+        )
+        assert calls == [], "no lookup when the entry was resolved off the loop"
+        (core,) = [e for e in array if e["name"] == "kirocrew-core"]
+        assert core["command"] == "/opt/kc"
+        assert core["args"] == ["mcp-core"]
+        assert {p["name"]: p["value"] for p in core["env"]}[STUB_SESSION_TOKEN_ENV] == "tok-1"
+
+    def test_a_pre_resolved_none_is_hoisted_without_the_token(self, monkeypatch):
+        from kiro_crew.mcp_gateway.claim import STUB_SESSION_TOKEN_ENV
+
+        calls = self._managed(monkeypatch, {"command": "/opt/kc", "args": ["mcp-core"]})
+        _, array = hoist_servers_for_session(
+            [self._projected()],
+            "kirocrew",
+            [],
+            session_token="tok-1",
+            managed_entries={"kirocrew-core": None},
+        )
+        assert calls == []
+        assert all(
+            pair["name"] != STUB_SESSION_TOKEN_ENV
+            for element in array
+            for pair in element.get("env", [])
+        )
+
+    def test_resolve_managed_entries_covers_only_the_active_agents_managed_names(self, monkeypatch):
+        calls = self._managed(monkeypatch, {"command": "/opt/kc", "args": ["mcp-core"]})
+        other = {"id": "other", "mcpServers": {"kirocrew-cron": {"command": "kc"}}}
+        resolved = kas_agents.resolve_managed_entries([self._projected(), other], "kirocrew")
+        assert resolved == {"kirocrew-core": {"command": "/opt/kc", "args": ["mcp-core"]}}
+        assert calls == [("kirocrew-core", True)], "third-party and inactive names are skipped"
 
     def test_block_key_is_removed_when_nothing_remains(self):
         spec = _spec(mcpServers={"kirocrew-core": {"command": "kc"}})

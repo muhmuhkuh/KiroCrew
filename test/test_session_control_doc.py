@@ -142,7 +142,7 @@ def test_the_page_matches_the_session_control_group_and_the_channel_block(
     from kiro_crew.channel import CHANNEL_AGENT_BLOCKED_TOOLS
     from kiro_crew.mcp_dashboard import SESSION_CONTROL_TOOLS
 
-    assert len(SESSION_CONTROL_TOOLS) == 22
+    assert len(SESSION_CONTROL_TOOLS) == 24
     for tool in SESSION_CONTROL_TOOLS:
         assert f"`{tool}`" in doc_text
         assert tool in CHANNEL_AGENT_BLOCKED_TOOLS, (
@@ -234,15 +234,18 @@ def test_the_queue_row_matches_what_each_verb_does_to_the_queue(
 
     from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
 
-    handlers = (
-        Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_handlers.py"
-    ).read_text(encoding="utf-8")
+    # The handlers facade and every ``chat_api`` owner it composes, read as one text.
+    dashboard = Path(__file__).parent.parent / "src" / "kiro_crew" / "dashboard"
+    handlers = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (dashboard / "chat_handlers.py", *sorted((dashboard / "chat_api").glob("*.py")))
+    )
 
     assert (
         "slot._queue.clear()" in handlers
     ), "the escalated stop no longer clears the queue; the row says it does"
     # The soft-stop branch is pinned by SHAPE: exactly one ``_queue.clear()`` exists in
-    # this module and it sits in the hard-kill branch, so "the first stop preserves the
+    # these files and it sits in the hard-kill branch, so "the first stop preserves the
     # queue" IS the absence of a second one. A comment string would go stale in both
     # directions -- outliving the behaviour, or reworded while the behaviour holds.
     assert (

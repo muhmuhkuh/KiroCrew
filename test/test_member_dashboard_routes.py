@@ -36,7 +36,6 @@ from kiro_crew.platform.context import redact_via_context
 _REAL_MEMBER_SLUG = members_mod.member_slug
 _REAL_CANONICAL_KEY = members_mod.canonical_member_key
 
-pytestmark = pytest.mark.asyncio
 
 MEMBER = "Fleet Conductor"
 SLUG = "fleet-conductor"
@@ -105,7 +104,7 @@ async def _none(*_a, **_k):
 
 
 @asynccontextmanager
-async def _client():
+async def _client(state=None):
     """A started client that always closes.
 
     An ``async with`` helper rather than an ``@pytest.fixture``, by this repo's
@@ -115,8 +114,13 @@ async def _client():
     Closing is not tidiness. A ``TestClient`` owns an aiohttp session AND a listening
     socket, so a returned-but-never-closed client leaks two descriptors per test and,
     on a loaded runner, fails UNRELATED tests with EMFILE.
+
+    *state* stands in for the gateway's ``DashboardState`` where a case needs one;
+    without it the app carries none, as every other case here reads it.
     """
     app = web.Application()
+    if state is not None:
+        app["state"] = state
     routes.register_member_dashboard_routes(app)
     c = TestClient(TestServer(app))
     await c.start_server()
@@ -138,6 +142,7 @@ def _q(path: str, **extra) -> str:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_a_crewmate_with_no_dashboard_answers_the_empty_state_not_a_404():
     async with _client() as client:
         resp = await client.get(_q(""))
@@ -149,6 +154,7 @@ async def test_a_crewmate_with_no_dashboard_answers_the_empty_state_not_a_404():
         assert body["instance_version"] == 0
 
 
+@pytest.mark.asyncio
 async def test_an_empty_record_with_no_default_is_not_composed(caplog):
     """Nothing to compose, so nothing is attempted -- and nothing is logged.
 
@@ -170,6 +176,7 @@ async def test_an_empty_record_with_no_default_is_not_composed(caplog):
     assert not [r for r in caplog.records if "could not fill" in r.getMessage()]
 
 
+@pytest.mark.asyncio
 async def test_the_body_is_the_shape_the_contract_fixes():
     async with _client() as client:
         # Adopted through the store: the adopt ROUTE is not part of this layer, and
@@ -182,6 +189,7 @@ async def test_the_body_is_the_shape_the_contract_fixes():
         assert body["state"] == "live"
 
 
+@pytest.mark.asyncio
 async def test_a_member_whose_name_does_not_derive_the_slug_is_refused(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(
@@ -192,6 +200,7 @@ async def test_a_member_whose_name_does_not_derive_the_slug_is_refused(monkeypat
         assert (await resp.json())["code"] == "member_slug_mismatch"
 
 
+@pytest.mark.asyncio
 async def test_a_name_not_in_config_is_a_404(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(
@@ -202,6 +211,7 @@ async def test_a_name_not_in_config_is_a_404(monkeypatch):
         assert (await resp.json())["code"] == "member_not_found"
 
 
+@pytest.mark.asyncio
 async def test_a_slug_two_crews_share_serves_neither(monkeypatch):
     async with _client() as client:
         monkeypatch.setattr(routes, "_member_names_for_slug", lambda cfg, slug: [MEMBER, "Other"])
@@ -210,6 +220,7 @@ async def test_a_slug_two_crews_share_serves_neither(monkeypatch):
         assert (await resp.json())["code"] == "dashboard_slug_ambiguous"
 
 
+@pytest.mark.asyncio
 async def test_a_request_with_no_member_is_refused():
     async with _client() as client:
         resp = await client.get(f"/api/members/{SLUG}/dashboard")
@@ -217,6 +228,7 @@ async def test_a_request_with_no_member_is_refused():
         assert (await resp.json())["code"] == "missing_member"
 
 
+@pytest.mark.asyncio
 async def test_the_preview_read_serves_the_staged_page_and_links_to_the_tab():
     """The read the Dashboard tab makes for a preview.
 
@@ -235,6 +247,7 @@ async def test_the_preview_read_serves_the_staged_page_and_links_to_the_tab():
     assert instance.read(SLUG).instance_version == 0
 
 
+@pytest.mark.asyncio
 async def test_a_preview_read_with_nothing_staged_is_a_404_the_tab_can_name():
     async with _client() as client:
         resp = await client.get(_q("", preview="1"))
@@ -256,6 +269,7 @@ def _template_at_the_ceiling() -> str:
     return page
 
 
+@pytest.mark.asyncio
 async def test_a_template_page_at_the_frames_ceiling_previews_applies_and_draws(monkeypatch):
     """The template-folder path at the ceiling, end to end, with the scrub off the loop.
 
@@ -290,6 +304,7 @@ async def test_a_template_page_at_the_frames_ceiling_previews_applies_and_draws(
     assert on_loop == [False, False]
 
 
+@pytest.mark.asyncio
 async def test_a_preview_read_the_store_refuses_answers_in_the_stores_words(monkeypatch):
     """A store refusal on the staged read (a linked session directory raises
     `InstanceError`) is the route's structured answer, not aiohttp's bare 500."""
@@ -310,6 +325,7 @@ async def test_a_preview_read_the_store_refuses_answers_in_the_stores_words(monk
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_a_live_dashboard_comes_back_with_its_values_filled_in(monkeypatch):
     """The frame renders ``rendered_html``: the page under the data island the host built.
 
@@ -332,6 +348,9 @@ async def test_a_live_dashboard_comes_back_with_its_values_filled_in(monkeypatch
             out.fields = {"credits": 1.5, "phase": agentic["fields"]["phase"]["value"]}
             out.seq = 7
             return out
+
+        def wait_for_primes(self):
+            pass
 
         def unsubscribe(self):
             pass
@@ -403,6 +422,63 @@ def test_no_worker_session_key_survives_the_render_mask():
     assert item["id"] == "it_1"
 
 
+class _Slots:
+    """A slot table with one running and one idle worker; any other key is gone."""
+
+    def __init__(self) -> None:
+        self.slots = {
+            "chat-run": SimpleNamespace(running=True),
+            "chat-idle": SimpleNamespace(running=False),
+        }
+
+    def get_slot(self, key):
+        return self.slots.get(key)
+
+    def slot_exists(self, key):
+        return key in self.slots
+
+
+def test_work_items_get_worker_facts_and_the_key_still_never_reaches_the_page():
+    """The goal-board tells working from waiting by whether the worker is mid-turn.
+
+    That fact needs the session key, which the page may not have, so it is derived
+    before the mask and only the words travel. A remote item and a value that is not
+    a work item list are left as they are.
+    """
+    long_ago = "2020-01-01T00:00:00+00:00"
+
+    def it(item_id, key, **over):
+        base = {"item_id": item_id, "state": "open", "status": "progress"}
+        base["worker_session_key"] = key
+        return {**base, "last_report_at": long_ago, "created_at": long_ago, **over}
+
+    value = [
+        it("a", "chat-run"),
+        it("b", "chat-idle", last_report_at="2999-01-01T00:00:00+00:00"),
+        it("c", "chat-idle"),
+        it("d", "chat-gone"),
+        it("e", None),
+        it("f", "chat-gone", state="accepted", status="done"),
+        it("g", "peer-key", worker_instance_id="peer-1"),
+    ]
+    out = routes.page_safe_for(_Slots())(value)
+    assert "chat-" not in json.dumps(out) and "peer-key" not in json.dumps(out)
+    facts = {row["item_id"]: (row.get("worker"), row.get("stale")) for row in out}
+    assert facts == {
+        "a": ("running", False),
+        "b": ("idle", False),
+        "c": ("idle", True),
+        "d": ("closed", True),
+        "e": ("closed", True),
+        "f": ("closed", False),
+        "g": (None, None),
+    }
+    # Not a work-item list: untouched apart from the mask, as before.
+    assert routes.page_safe_for(_Slots())({"worker_session_key": "chat-run", "x": 1}) == {"x": 1}
+    # No gateway state (the agent's own read): the plain mask.
+    assert routes.page_safe_for(None)(value) == routes._page_safe(value)
+
+
 def test_a_credential_in_a_fold_value_is_redacted_before_it_reaches_the_page():
     """Every string here is AGENT-AUTHORED and nothing before this read inspects it.
 
@@ -442,6 +518,7 @@ def test_a_credential_in_a_fold_value_is_redacted_before_it_reaches_the_page():
     assert "used" in out["items"][0]["summary"]
 
 
+@pytest.mark.asyncio
 async def test_a_stale_copy_is_still_composed_with_its_values(monkeypatch, tmp_path):
     """A STALE copy renders. It is the state where the copy cannot be compared
     against its source, not a state where it stopped working.
@@ -464,6 +541,9 @@ async def test_a_stale_copy_is_still_composed_with_its_values(monkeypatch, tmp_p
             out.fields = {"credits": 2.5}
             out.seq = 9
             return out
+
+        def wait_for_primes(self):
+            pass
 
         def unsubscribe(self):
             pass
@@ -490,6 +570,7 @@ async def test_a_stale_copy_is_still_composed_with_its_values(monkeypatch, tmp_p
     assert json.loads(island)["fields"] == {"credits": 2.5}
 
 
+@pytest.mark.asyncio
 async def test_a_page_whose_values_cannot_be_read_still_answers_without_them(monkeypatch):
     from kiro_crew import dashboard_feed
 
@@ -511,6 +592,7 @@ async def test_a_page_whose_values_cannot_be_read_still_answers_without_them(mon
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_every_route_denies_an_app_caller_and_gates_the_values_it_serves():
     """Read off the source, because a passing request proves only the open path.
 
@@ -566,6 +648,7 @@ _VALUE_SERVING_READS = frozenset({"api_member_dashboard", "api_session_dashboard
 _SESSION_READS = frozenset({"api_session_dashboard"})
 
 
+@pytest.mark.asyncio
 async def test_a_non_owner_cannot_read_a_crewmates_values():
     """The gate, exercised rather than read off the source.
 
@@ -596,6 +679,7 @@ async def test_a_non_owner_cannot_read_a_crewmates_values():
     )
 
 
+@pytest.mark.asyncio
 async def test_the_gateway_registers_exactly_these_paths_without_importing_us():
     """The boot path binds these routes DEFERRED, so the paths are written twice.
 
@@ -623,6 +707,7 @@ async def test_the_gateway_registers_exactly_these_paths_without_importing_us():
     )
 
 
+@pytest.mark.asyncio
 async def test_the_instance_store_and_the_route_agree_on_the_states():
     """The four state words the frame branches on are the store's own constants."""
     assert {
@@ -727,6 +812,7 @@ class TestTheSlugChecks:
     """A slug the member resolver REFUSES and one it merely disagrees with are
     different answers, and both arrive as an exception rather than as a comparison."""
 
+    @pytest.mark.asyncio
     async def test_an_invalid_slug_is_refused_before_the_member_is_read(self, monkeypatch):
         def _raise(_slug):
             raise routes.MemberSlugError("not a slug")
@@ -737,6 +823,7 @@ class TestTheSlugChecks:
             assert resp.status == 400, await resp.text()
             assert (await resp.json())["code"] == "invalid_member_slug"
 
+    @pytest.mark.asyncio
     async def test_a_member_whose_slug_cannot_be_derived_is_a_mismatch(self, monkeypatch):
         def _raise(_name, _config=None):
             raise routes.MemberSlugError("no slug for this name")
@@ -1185,6 +1272,7 @@ class TestOneCrewmateResolvesToOneSlug:
         assert _REAL_CANONICAL_KEY("oncall", cfg) == "oncall"
         assert _REAL_CANONICAL_KEY("ONCALL", cfg) == "ONCALL"
 
+    @pytest.mark.asyncio
     async def test_the_tab_opened_on_a_lowercase_name_reads_the_members_own_page(
         self, _floor_monkeypatch
     ) -> None:
@@ -1583,6 +1671,7 @@ class TestTheStagedComposedPage:
     older gateway left holding a package payload reads as nothing staged.
     """
 
+    @pytest.mark.asyncio
     async def test_a_package_left_staged_by_an_older_gateway_is_nothing_to_preview(
         self,
     ) -> None:
@@ -1607,6 +1696,7 @@ class TestTheStagedComposedPage:
         assert resp.status == 404, body
         assert body["code"] == "no_preview", body
 
+    @pytest.mark.asyncio
     async def test_a_staged_template_still_answers_its_own_preview(self) -> None:
         """Both readers answer None for the other's payload, so one page comes back."""
         instance.stage_preview(SLUG, template_id="fixture-board")
@@ -1615,3 +1705,229 @@ class TestTheStagedComposedPage:
         assert body["preview"] is True
         assert body["template"]["id"] == "fixture-board"
         assert "manifest" in body
+
+
+# --------------------------------------------------------------------------
+# when the person last spoke in the page's chat
+# --------------------------------------------------------------------------
+
+#: One instant: the person's reply. Every case states it in UTC and writes it the way
+#: a chat row or the stored stamp carries it.
+SPOKE = "2026-10-13T23:49:04+00:00"
+
+
+class _Window:
+    """The one member of a live chat slot the stamp is read from."""
+
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self._rows = list(rows or [])
+
+    def loaded_messages(self) -> list[dict]:
+        return list(self._rows)
+
+
+def _human(ts: str, **meta) -> dict:
+    """A row a human send path wrote, with the marker those paths set."""
+    from kiro_crew.history import HUMAN_TURN_META_KEY
+
+    return {
+        "role": "user",
+        "content": "reply",
+        "ts": ts,
+        "meta": {HUMAN_TURN_META_KEY: True, **meta},
+    }
+
+
+def _naive_local(utc: str, zone: str) -> str:
+    """*utc* as the naive local wall clock a row written in *zone* carries."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.fromisoformat(utc).astimezone(ZoneInfo(zone)).replace(tzinfo=None).isoformat()
+
+
+class _Log:
+    """A transcript store holding one metadata line per transcript key."""
+
+    def __init__(self, lines: dict[str, dict]) -> None:
+        self.lines = lines
+        self.asked: list[str] = []
+
+    def get_metadata(self, key: str) -> dict:
+        self.asked.append(key)
+        return dict(self.lines.get(key, {}))
+
+
+class _ChatState:
+    """The two things the read takes from ``DashboardState``: live slots and the log."""
+
+    def __init__(self, slots: dict | None = None, log: _Log | None = None) -> None:
+        self.slots = dict(slots or {})
+        self.conversation_log = log
+        self.asked: list[str] = []
+
+    def get_slot(self, name: str):
+        self.asked.append(name)
+        return self.slots.get(name)
+
+
+class TestThePageIsToldWhenThePersonLastSpoke:
+    """The stamp telling a page the person wrote in the chat after a card was written.
+
+    A reply typed in the chat, an option clicked there and a steer into a running turn
+    never pass through the page, and a steer writes no crew-log entry, so the only
+    record of one is the chat slot's own human-marked row.
+    """
+
+    def test_the_newest_row_a_person_wrote_is_the_stamp_a_steer_included(self) -> None:
+        rows = [
+            _human("2026-10-13T23:40:00+00:00"),
+            {"role": "assistant", "content": "two to decide", "ts": "2026-10-13T23:45:00+00:00"},
+            _human(SPOKE, steer=True),
+        ]
+        assert routes._last_user_at_of(_Window(rows)) == SPOKE
+
+    def test_a_user_row_no_person_wrote_is_not_a_reply(self) -> None:
+        """An app wake is a `user` row with no human marker; it must not fold a card."""
+        rows = [
+            _human(SPOKE),
+            {"role": "user", "content": "[wake]", "ts": "2026-10-13T23:55:00+00:00"},
+            {"role": "assistant", "content": "ok", "ts": "2026-10-13T23:56:00+00:00"},
+        ]
+        assert routes._last_user_at_of(_Window(rows)) == SPOKE
+
+    def test_with_no_human_row_in_memory_the_stored_stamp_answers(self) -> None:
+        """A restored row whose window was never loaded, or no live slot at all."""
+        assert routes._last_user_at_of(_Window([]), SPOKE) == SPOKE
+        assert routes._last_user_at_of(None, SPOKE) == SPOKE
+        assert routes._last_user_at_of(None, "") == ""
+        assert routes._last_user_at_of(None, None) == ""
+
+    @pytest.mark.parametrize("zone", ["UTC", "Pacific/Kiritimati", "America/St_Johns"])
+    def test_the_later_instant_wins_and_reaches_the_page_in_utc(self, local_tz, zone) -> None:
+        """A naive row is the writer's local clock. Compared as TEXT against an aware
+        stamp it is in another domain: under +14:00 the row reads a day ahead and wins
+        when it is the earlier instant, and under -03:30 it reads behind and loses when
+        it is the later one."""
+        local_tz(zone)
+        row = _Window([_human(_naive_local(SPOKE, zone))])
+        assert routes._last_user_at_of(row) == SPOKE
+        assert routes._last_user_at_of(row, "2026-10-13T23:48:00+00:00") == SPOKE
+        assert routes._last_user_at_of(row, "2026-10-13T23:50:00+00:00") == (
+            "2026-10-13T23:50:00+00:00"
+        )
+        # A stored stamp in another zone's offset is the same instant, said in UTC.
+        assert routes._last_user_at_of(None, "2026-10-14T13:49:04+14:00") == SPOKE
+
+    def test_the_stamp_is_whole_seconds_like_the_write_time_it_is_compared_with(self) -> None:
+        """A reply and a list the crewmate wrote later in the SAME second compare equal.
+
+        `written_at` is the fold's whole-second spelling of the write, so a stamp with a
+        fraction would read as the later of the two and fold a list written after the
+        reply. Equal is what the page reads as "not answered"."""
+        from datetime import datetime, timezone
+
+        from kiro_crew.crew_log.projection import _panel_iso
+
+        # SPOKE's own second, with the reply 0.3 s into it and the write 0.7 s into it.
+        reply_ms, write_ms = 1791935344300, 1791935344700
+        written = _panel_iso(write_ms)
+        reply = datetime.fromtimestamp(reply_ms / 1000, tz=timezone.utc).isoformat()
+        assert reply.endswith(".300000+00:00") and written == SPOKE
+        assert routes._last_user_at_of(_Window([_human(reply)])) == written
+        # A reply in a LATER second still reads as the later instant.
+        assert routes._last_user_at_of(_Window([_human("2026-10-13T23:49:05.001+00:00")])) == (
+            "2026-10-13T23:49:05+00:00"
+        )
+
+    def test_a_stamp_that_cannot_be_read_is_no_stamp(self, local_tz) -> None:
+        local_tz("Pacific/Kiritimati")
+        assert routes._last_user_at_of(_Window([_human("not a time")])) == ""
+        # Parses, and still cannot be resolved: year 1 at +14:00 is before year 1 UTC.
+        assert routes._last_user_at_of(None, "0001-01-01T00:00:00") == ""
+        # One bad candidate costs only itself.
+        assert routes._last_user_at_of(_Window([_human("not a time")]), SPOKE) == SPOKE
+
+    def test_a_crewmates_page_reads_its_dm_thread(self) -> None:
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        state = _ChatState({dm: _Window([_human(SPOKE, steer=True)])})
+        assert routes._person_last_spoke(state, SLUG, MEMBER, None) == SPOKE
+        assert state.asked == [dm]
+
+    def test_a_sessions_page_reads_its_own_slot_and_no_crewmates(self) -> None:
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        state = _ChatState(
+            {"chat-7": _Window([_human(SPOKE)]), dm: _Window([_human("2026-10-14T01:00:00+00:00")])}
+        )
+        assert routes._person_last_spoke(state, "session-key", "", "chat-7") == SPOKE
+        assert state.asked == ["chat-7"]
+
+    def test_a_thread_with_no_live_slot_reads_the_stored_stamp_from_its_file(self) -> None:
+        from kiro_crew.dashboard.chat_utils import slot_transcript_key
+
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        log = _Log({slot_transcript_key(dm): {"_type": "metadata", "last_user_at": SPOKE}})
+        state = _ChatState({}, log)
+        assert routes._person_last_spoke(state, SLUG, MEMBER, None) == SPOKE
+        assert log.asked == [slot_transcript_key(dm)]
+
+    def test_no_state_or_a_failed_read_is_no_stamp(self) -> None:
+        class _Broken(_Log):
+            def get_metadata(self, key: str) -> dict:
+                raise OSError("unreadable")
+
+        assert routes._person_last_spoke(None, SLUG, MEMBER, None) == ""
+        assert routes._person_last_spoke(_ChatState({}, _Broken({})), SLUG, MEMBER, None) == ""
+
+    @pytest.mark.asyncio
+    async def test_the_composed_page_carries_the_stamp(self, monkeypatch) -> None:
+        """Through the route: `_serve` reads it off the loop and hands it to the page."""
+        from kiro_crew import dashboard_feed
+
+        class FakeFeed:
+            def __init__(self, slot, unit="", panel_record=None):
+                pass
+
+            def subscribe(self, manifest):
+                return []
+
+            def read(self, manifest, agentic=None):
+                out = dashboard_feed.FieldRead()
+                out.fields = {"credits": 1.5}
+                return out
+
+            def wait_for_primes(self):
+                pass
+
+            def unsubscribe(self):
+                pass
+
+        from kiro_crew.crew_log import projection
+
+        monkeypatch.setattr(dashboard_feed, "DashboardFeed", FakeFeed)
+        monkeypatch.setattr(
+            projection, "read_slot_projection", lambda slot, name: SimpleNamespace(value={})
+        )
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        instance.adopt(SLUG, "fixture-board")
+        state = _ChatState({dm: _Window([_human(SPOKE, steer=True)])})
+        async with _client(state) as client:
+            body = await (await client.get(_q(""))).json()
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        read = json.loads(island.split("</script>", 1)[0])
+        assert read["last_user_at"] == SPOKE
+
+        # The STAGED page a person previews is composed by the same read, so it is told
+        # too: a preview that showed answered cards asking would preview another page.
+        instance.stage_preview(SLUG, template_id="fixture-board")
+        async with _client(state) as client:
+            body = await (await client.get(_q("", preview="1"))).json()
+        assert body["preview"] is True
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        assert json.loads(island.split("</script>", 1)[0])["last_user_at"] == SPOKE
+
+        # No gateway state at all is no stamp, and the page is served all the same.
+        async with _client() as client:
+            body = await (await client.get(_q(""))).json()
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        assert json.loads(island.split("</script>", 1)[0])["last_user_at"] == ""

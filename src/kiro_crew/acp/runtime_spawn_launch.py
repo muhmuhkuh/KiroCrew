@@ -11,7 +11,7 @@ of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_agent``, ``_agent_capabilities``, ``_agent_version``,
 ``_can_load_session``, ``_child_pids``, ``_derived_spec_snapshot``, ``_exit_watch_task``,
-``_initialized``, ``_kas_host_auth``, ``_last_activity``, ``_launch_copy_spec``,
+``_initialize_result``, ``_initialized``, ``_kas_host_auth``, ``_last_activity``, ``_launch_copy_spec``,
 ``_launch_cwd_roots``, ``_launch_process_cwd``, ``_max_age_secs``,
 ``_max_rss_depth``, ``_max_rss_mb``, ``_native_launch_resources``,
 ``_native_launch_sources``, ``_native_launch_view_alias``, ``_native_skill_projection``,
@@ -59,6 +59,7 @@ from kiro_crew.acp.runtime_tree_kill import _prune_dead_descendants
 from kiro_crew.acp.session_handle import AcpRequestTimeout, AcpRuntimeError, AcpRuntimeOverloaded
 from kiro_crew.acp.types import ACP_BACKEND_KIRO
 from kiro_crew.agent import ensure_agent_materialized
+from kiro_crew.agent_sdk.backends import spawn_delegates_to_internal_sandbox
 from kiro_crew.agent_sdk.drivers import acp as acp_driver
 from kiro_crew.agent_sdk.tool_search import (
     kas_client_meta_settings,
@@ -449,12 +450,6 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
             )
         except AppAgentLaunchError as exc:
             raise AcpRuntimeError(exc.detail) from exc
-    # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
-    # deny rules. Keep their workspace disjoint from the named voice-decoder
-    # runtime so verified executable bytes cannot be replaced before spawn.
-    if self._harness.internal_sandbox:
-        await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
-
     try:
         plan = await self._resolve_spawn_plan()
         self._max_rss_depth = plan.rss_depth
@@ -582,6 +577,17 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
                                     )
     except _KiroExecutableTrustError as exc:
         raise AcpRuntimeError(str(exc)) from exc
+    # Who confines this process, decided from the plan because the route is the
+    # plan's: KAS's relay runs kiro-cli and its internal sandbox, its bundle runs
+    # Node and does not. Every reader below takes this one answer.
+    internal_sandbox = spawn_delegates_to_internal_sandbox(
+        self._acp_backend, kiro_cli_internal_sandbox=plan.kiro_cli_internal_sandbox
+    )
+    # Delegated Kiro agents on macOS do not inherit Kiro Crew's Seatbelt
+    # deny rules. Keep their workspace disjoint from the named voice-decoder
+    # runtime so verified executable bytes cannot be replaced before spawn.
+    if internal_sandbox:
+        await asyncio.to_thread(assert_voice_runtime_outside_agent_workspace, self._work_dir)
     # The handshake declaration is the harness's constant. A host that takes
     # feature settings over the wire (``client_meta_settings``, a positive
     # membership answer) has its channel filled here -- BEFORE the process
@@ -600,12 +606,13 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
     # is_kiro_cli drives the reviewed Kiro internal-sandbox delegation: on macOS
     # wrap_argv skips its seatbelt because the two cannot nest; on Windows the
     # official Kiro backend delegates by default because Crew has no native OS
-    # sandbox there. The verdict is membership in ACP_BACKENDS_INTERNAL_SANDBOX
-    # (harness-parity H7) — never "not KAS": that test fails OPEN, so a harness
-    # inheriting a negative test would have Crew's seatbelt skipped in favour of
-    # an internal sandbox that never starts. KAS is a Node process with no
-    # internal sandbox, so it takes Crew's seatbelt directly, and so does every
-    # harness added later.
+    # sandbox there. The verdict is ``spawn_delegates_to_internal_sandbox``
+    # (harness-parity H7), two positive memberships -- never "not KAS": that test
+    # fails OPEN, so a harness inheriting a negative test would have Crew's
+    # seatbelt skipped in favour of an internal sandbox that never starts. KAS
+    # delegates on its kiro-cli relay route only; its bundle route is a Node
+    # process with no internal sandbox and takes Crew's seatbelt directly, and so
+    # does every harness added later.
     #
     # The incarnation this spawn is. Minted BEFORE the launch because two things
     # carry it: the scope's unit name, and the child's own environment. One token
@@ -715,7 +722,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
             # credential homes.
             extra_hidden_dirs=plan.extra_hidden_dirs,
             extra_expose_files=plan.extra_expose_files,
-            internal_sandbox=self._harness.internal_sandbox,
+            internal_sandbox=internal_sandbox,
             pod_home_remap=self._harness.pod_home_remap,
             guard_scratch_hops=True,
         ),
@@ -971,6 +978,7 @@ async def _spawn_admitted(self: AcpRuntime) -> None:
         # _INITIALIZE_TIMEOUT -- see _initialize_handshake. The capabilities
         # were resolved above, before the process existed.
         init_resp = await self._initialize_handshake(client_capabilities)
+        self._initialize_result = init_resp if isinstance(init_resp, dict) else {}
         _agent_caps = init_resp.get("agentCapabilities", {})
         self._agent_capabilities = _agent_caps if isinstance(_agent_caps, dict) else {}
         self._can_load_session = bool(self._agent_capabilities.get("loadSession", False))

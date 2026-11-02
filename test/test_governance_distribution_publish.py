@@ -669,7 +669,6 @@ class TestAllowedToolsIsReDerivedWhenTheCeilingTightens:
     """
 
     @pytest.fixture(autouse=True)
-    # nosemgrep: kirocrew.test-autouse-shared-monkeypatch -- the class's empty rebuild hold, moved verbatim; tracked for a de-flake pass
     def _no_hold_carried_in(self, _floor_monkeypatch):
         """``prime_ceiling_projection`` seeds nothing while the last real rebuild left a
         conductor spec unwritten; these tests pin the seeded baseline, so a hold a test

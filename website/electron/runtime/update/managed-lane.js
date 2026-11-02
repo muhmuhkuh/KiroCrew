@@ -57,6 +57,29 @@ function createManagedLane({
   // macOS/Windows/Linux.
   log.info(`[update] externally managed${managed.managedBy ? ` by ${managed.managedBy}` : ""} — managed auto-update (self-contained commands)`);
 
+  // Bring the app back after a successful apply. A bare app.relaunch() re-runs
+  // the command line this process was started with, and a macOS app opened
+  // from the Dock was started as its version's own payload path, so it comes
+  // back on the version the apply just replaced and offers Restart to update
+  // again (#22774). When the marker names a relaunchPath (the binary behind a
+  // packager's stable launch link), relaunch that with the same arguments. A
+  // relaunchPath that is not on disk would bring nothing back, so it falls back
+  // to the bare relaunch.
+  const relaunchAfterApply = () => {
+    const target = managed.relaunchPath || "";
+    if (target) {
+      let present = false;
+      try { present = require("fs").existsSync(target); } catch { present = false; }
+      if (present) {
+        log.info(`[update] managed relaunch through the marker's relaunchPath ${target}`);
+        app.relaunch({ execPath: target, args: process.argv.slice(1) });
+        return;
+      }
+      log.error(`[update] marker relaunchPath ${target} is not on disk — relaunching the path this app was started as`);
+    }
+    app.relaunch();
+  };
+
   let foundVersion = null; // last version discovered by the checkCommand, awaiting apply
   let stagedVersion = null; // version the user took Download for (the ready dialog's version)
   let managedQuitArmed = false; // is a before-quit auto-apply handler installed?
@@ -243,6 +266,22 @@ function createManagedLane({
   // Bounded by a ceiling timeout so a wedged package manager cannot hang quit.
   const runUpdateCommand = () => runManagedCommand(managed.updateCommand, { timeout: MANAGED_APPLY_TIMEOUT_MS });
 
+  // An update command that exits 0 but leaves the install as it was would
+  // relaunch into the same check and the same apply on every quit. So the
+  // check runs again after an apply: true only when it still offers the version
+  // the apply was for. A re-check that cannot run, finds nothing, or offers
+  // another version is not that loop, and the relaunch goes ahead.
+  const applyChangedNothing = async (appliedVersion) => {
+    if (!appliedVersion || !managed.checkCommand) return false;
+    const { code, stdout, failed } = await runManagedCommand(managed.checkCommand, {
+      timeout: MANAGED_CHECK_TIMEOUT_MS,
+    });
+    if (failed || code !== 0) return false;
+    return stdout.trim().slice(0, MANAGED_VERSION_CAP) === appliedVersion;
+  };
+  const unchangedMessage = (version) =>
+    `the update command finished, but the check still offers ${version}: the install did not change`;
+
   // Fresh-read the auto-download preference; a throwing reader fails toward
   // NOT auto-installing (same direction as the feed path's deferred handler).
   const autoDownloadOn = () => {
@@ -271,6 +310,7 @@ function createManagedLane({
       return;
     }
     event.preventDefault();
+    const appliedVersion = foundVersion;
     (async () => {
       managedInstalling = true;
       emit("installing", { version: foundVersion });
@@ -288,8 +328,13 @@ function createManagedLane({
       }
       log.info("[update] managed deferred install on quit — running update command");
       const { code } = await runUpdateCommand();
-      if (code === 0) {
-        app.relaunch();
+      if (code === 0 && await applyChangedNothing(appliedVersion)) {
+        // The user asked to quit, so honor that, WITHOUT relaunching into the
+        // same version and the same apply.
+        log.error(`[update] managed deferred install: ${unchangedMessage(appliedVersion)} — quitting without relaunch`);
+        try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+      } else if (code === 0) {
+        relaunchAfterApply();
       } else {
         // The apply failed; the user asked to quit, so honor that and exit
         // WITHOUT relaunching into a version that did not install.
@@ -440,6 +485,7 @@ function createManagedLane({
   }
 
   async function managedInstall() {
+    const appliedVersion = foundVersion;
     managedInstalling = true;
     emit("installing", { version: foundVersion });
     try { if (onInstallDispatched) onInstallDispatched(); } catch { /* advisory */ }
@@ -454,9 +500,17 @@ function createManagedLane({
       log.error("[update] managed stop before install errored", err);
     }
     const { code } = await runUpdateCommand();
+    if (code === 0 && await applyChangedNothing(appliedVersion)) {
+      const message = unchangedMessage(appliedVersion);
+      log.error(`[update] managed install: ${message} — not relaunching`);
+      managedInstalling = false;
+      try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+      emitManagedError("install", new Error(message));
+      return;
+    }
     if (code === 0) {
       log.info("[update] managed install succeeded — relaunching");
-      app.relaunch();
+      relaunchAfterApply();
       app.exit(0);
       return;
     }

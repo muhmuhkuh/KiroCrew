@@ -301,8 +301,10 @@ export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }:
       if (e.key !== 'Escape' || e.defaultPrevented) return
       removeNotes([pending[0].ts])
     }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
+    // Window bubble: it runs after every target and document handler, so a
+    // press any of them (or an Escape-stack layer) claimed arrives spent.
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
   }, [pending, removeNotes])
 
   // ---- actions ----------------------------------------------------------------

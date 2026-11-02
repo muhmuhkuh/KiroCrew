@@ -17,6 +17,7 @@ from typing import Any
 from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -24,7 +25,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKEND_LAUNCH,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
-    ACP_BACKEND_VIBE,
+    ACP_BACKEND_STRANDS,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_CLIENT_META_SETTINGS,
@@ -49,11 +50,13 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD,
+    ACP_BACKENDS_MCP_RELAUNCH_RELOAD,
     ACP_BACKENDS_MCP_WIRE_REINJECT,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_MEMBER_PANEL,
     ACP_BACKENDS_MEMBER_TOOL_LIMITS,
+    ACP_BACKENDS_MODEL_AT_LAUNCH,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
     ACP_BACKENDS_OPEN_EXTERNAL_URL,
@@ -70,6 +73,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
+    ACP_BACKENDS_STEER_RETRACT,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
@@ -81,6 +85,10 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     model_registry_namespace,
     overlay_project_scope,
     selectable_backends,
+)
+from kiro_crew.agent_sdk.backends import (  # noqa: F401 - re-exported for importers
+    escape_user_message_markup,
+    wrap_user_message,
 )
 
 # Declared per harness rather than listed as a capability set: whether a
@@ -138,6 +146,11 @@ EVENT_SUBAGENT_ACTIVITY = "subagent_activity"
 EVENT_STEER_QUEUED = "steer_queued"
 EVENT_STEER_CONSUMED = "steer_consumed"
 EVENT_STEER_CLEARED = "steer_cleared"
+#: kiro-cli dropped every steer it was still holding, unread, because
+#: ``_session/steer/clear`` asked it to (``AgentExecutionUserMessageCleared``).
+#: Not KAS's ``steering_cleared``, which arrives after a turn ends and names steers
+#: the turn already read (``EVENT_STEER_CLEARED``).
+EVENT_STEER_DROPPED = "steer_dropped"
 #: A typed :class:`StructuredStatus` from the EXECUTION LAYER (the versioned
 #: ``kirocrew/status`` extension on a routed ``session/update`` frame, or the
 #: watchdog's own post-stall classification). Never derived from model text —
@@ -178,6 +191,12 @@ MAX_STEERING_TEXT_CHARS = 64_000
 # (``SEND_ABORT_MS``), so an answer slower than this sends the steer down the
 # caller's queue path instead of leaving the request to time out.
 STEERING_ANSWER_WAIT_SECS = 8.0
+# kiro-cli's request to drop every steer it holds and has not yet handed to the
+# turn (``ACP_BACKENDS_STEER_RETRACT``), and how long its answer is waited for.
+# The answer comes from kiro-cli's request handler, not from the turn, so a
+# healthy session answers in milliseconds.
+METHOD_SESSION_STEER_CLEAR = "_session/steer/clear"
+STEER_CLEAR_ANSWER_WAIT_SECS = 5.0
 
 
 def steering_outcome(result: object) -> str:
@@ -190,6 +209,18 @@ def steering_outcome(result: object) -> str:
         return ""
     outcome = result.get("outcome")
     return outcome if isinstance(outcome, str) else ""
+
+
+def steering_advertised(init_resp: object) -> bool:
+    """Whether an ``initialize`` result advertises the ``_session/steering`` request.
+
+    The extension is advertised at the TOP level of the result, as
+    ``_meta.steering.supported``, a sibling of ``agentCapabilities``. Only a
+    literal ``true`` counts.
+    """
+    meta = init_resp.get("_meta") if isinstance(init_resp, dict) else None
+    steering = meta.get("steering") if isinstance(meta, dict) else None
+    return isinstance(steering, dict) and steering.get("supported") is True
 
 
 METHOD_SESSION_LOAD = "session/load"
@@ -208,11 +239,13 @@ METHOD_SESSION_FORK = "session/fork"
 # grows without bound as sessions accumulate. Handler: acp_agent.rs -> Session
 # ManagerRequestData::TerminateSession (self.sessions.remove + handle.shutdown).
 METHOD_SESSION_TERMINATE = "_kiro.dev/session/terminate"
-#: KAS's equivalent. Its extension namespace is ``_kiro/`` (no ``.dev``), and it
-#: has no evict-only verb: this disposes the resident session AND removes its
-#: persisted record. Both are wanted here — the disposal is the memory reclaim
-#: ``terminate`` exists for, and the record is what would otherwise accumulate.
-#: Takes the same ``{"sessionId": ...}`` params and is idempotent.
+#: KAS's equivalent. Its extension namespace is ``_kiro/`` (no ``.dev``). It
+#: disposes the resident session AND removes its persisted record. Both are wanted
+#: on an ordinary teardown — the disposal is the memory reclaim ``terminate``
+#: exists for, and the record is what would otherwise accumulate. Takes the same
+#: ``{"sessionId": ...}`` params and is idempotent: an unknown id answers success.
+#: An engine that advertises ``sessionCapabilities.close`` also has the evict-only
+#: ``session/close`` below, which keeps the record (``KasHarness.release``).
 METHOD_KAS_SESSION_DELETE = "_kiro/session/delete"
 #: KAS's manual compaction verb. A REQUEST with ``{"sessionId": ...}`` params,
 #: answered ``{"success": bool}`` once the summary is committed; a successful run
@@ -242,6 +275,12 @@ METHOD_KAS_CHECKPOINT_REVERT = "_kiro/checkpoint/revertMultiple"
 #: ``test_codex_session_mcp.py::test_real_codex_acp_session_close_evicts`` re-runs
 #: that measurement on every install that has the adapter, and the lane pins
 #: its release in ``test/real_adapters/package.json``.
+#:
+#: KAS serves it from an engine that advertises ``sessionCapabilities.close``: it
+#: disposes the session in memory and keeps the record, which a later
+#: ``session/load``, from a restarted process too, replays (KAS 0.66.22 and 0.66.26
+#: through kiro-cli 2.27.1 and 2.29.0; captured within one process, KAS 0.66.62
+#: through kiro-cli 2.34.0, in ``test/fixtures/acp_frames/kas/mcp-live-apply-live.jsonl``).
 METHOD_SESSION_CLOSE = "session/close"
 METHOD_COMPACTION_STATUS = "_kiro.dev/compaction/status"
 METHOD_CLEAR_STATUS = "_kiro.dev/clear/status"
@@ -406,7 +445,8 @@ PROVIDER_LABEL_OPENCODE = "opencode"
 PROVIDER_LABEL_PI = "pi"
 PROVIDER_LABEL_GOOSE = "goose"
 PROVIDER_LABEL_DEEPSEEK = "deepseek"
-PROVIDER_LABEL_VIBE = "vibe"
+PROVIDER_LABEL_COPILOT = "copilot"
+PROVIDER_LABEL_STRANDS = "strands"
 
 #: Backend id -> its label. The mapping is what ``provider_label`` resolves
 #: through, so a harness's label and the answer a session persists under are one
@@ -420,13 +460,14 @@ PROVIDER_LABEL_VIBE = "vibe"
 PROVIDER_LABEL_BY_BACKEND: dict = {
     ACP_BACKEND_KIRO: PROVIDER_LABEL_DEFAULT,
     ACP_BACKEND_KAS: PROVIDER_LABEL_KAS,
+    ACP_BACKEND_STRANDS: PROVIDER_LABEL_STRANDS,
     ACP_BACKEND_CLAUDE: PROVIDER_LABEL_CLAUDE,
     ACP_BACKEND_CODEX: PROVIDER_LABEL_CODEX,
     ACP_BACKEND_OPENCODE: PROVIDER_LABEL_OPENCODE,
     ACP_BACKEND_PI: PROVIDER_LABEL_PI,
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
     ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
-    ACP_BACKEND_VIBE: PROVIDER_LABEL_VIBE,
+    ACP_BACKEND_COPILOT: PROVIDER_LABEL_COPILOT,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
@@ -566,6 +607,12 @@ STOP_REASON_TOOL_STALL = "error: tool stall"
 # it deliberately triggers NO retry — the user-visible compaction notice
 # already explains what happened, and this only releases the slot.
 STOP_REASON_COMPACTION_FAILED = "error: compaction failed"
+# Signalled by the session handle when a session/cancel got no ack within the
+# cancel grace window and the runtime is still up: the caller is unblocked with
+# this completion and the runtime is kept for its other sessions. Kept in the
+# "error:" family, so it classifies as ``failed``; to the caller that sent the
+# cancel it is that cancel, left unanswered.
+STOP_REASON_CANCEL_UNACKED = "error: cancel unacked"
 
 # ── Stop-reason classes ──
 #
@@ -719,7 +766,7 @@ class JsonRpcMessage:
     fanout_no_owner: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> JsonRpcMessage:
+    def from_dict(cls, data: dict[str, Any]) -> "JsonRpcMessage":
         """Build a JsonRpcMessage from a parsed JSON-RPC frame."""
         return cls(
             id=data.get("id"),
@@ -928,7 +975,7 @@ class AcpEvent:
     #: dashboard has one branch, and the structured fields travel alongside.
     #: ``None`` on every other terminal, including a plain ``end_turn`` whose
     #: metadata said nothing about a refusal.
-    refusal: RefusalInfo | None = None
+    refusal: "RefusalInfo | None" = None
     #: True when Kiro Crew fabricated this terminal event because the provider
     #: omitted its result frame. Consumers must not treat it as raw completion
     #: evidence even when compatibility requires ``stop_reason=end_turn``.
@@ -1088,6 +1135,37 @@ class AcpEvent:
     #: maps to its kiro-cli policy name. False on every other harness, whose
     #: bare ids the gate reads under their own name only.
     kas_builtin_ids: bool = False
+    #: spec_granted_builtins: on a KAS session's OWN permission request (never a
+    #: sub-session's), the built-ins the active agent's spec grants that the KAS
+    #: policy keeps at ``ask`` (``AcpSessionHandle.kas_crew_answered``). Written by
+    #: the session handle from the projection it registered, never from the
+    #: frame. The gate's ``spec-builtin-grant`` tier reads it, after every deny
+    #: tier and governance, and approves only a host-identified built-in it names.
+    #: Empty everywhere else, which grants nothing.
+    spec_granted_builtins: frozenset[str] = frozenset()
+    #: spec_granted_commands: on the same requests, the agent's
+    #: ``toolsSettings.shell.allowedCommands`` as Python regexes
+    #: (``AcpSessionHandle.kas_crew_answered_commands``), written the same way. The
+    #: ``spec-builtin-grant`` tier approves a shell call whose recovered command
+    #: fullmatches one. Empty everywhere else, which grants nothing.
+    spec_granted_commands: tuple[str, ...] = ()
+    #: spec_shell_allowlist: on the same requests, the only shell commands the
+    #: agent's spec lets run when it sets ``toolsSettings.shell.denyByDefault``
+    #: (``AcpSessionHandle.kas_spec_shell_allowlist``); ``None`` when it does not.
+    #: A restriction: the gate's ``spec-shell-allowlist`` tier refuses every other
+    #: shell call.
+    spec_shell_allowlist: tuple[str, ...] | None = None
+    #: spec_write_allowlist: on the same requests, the only paths the agent's write
+    #: tool may touch when its spec sets ``toolsSettings.fs_write.fallbackAction:
+    #: "deny"``, as absolute globs (``AcpSessionHandle.kas_spec_write_allowlist``);
+    #: ``None`` when it does not. A restriction: the gate's ``spec-write-allowlist``
+    #: tier refuses every other file write.
+    spec_write_allowlist: tuple[str, ...] | None = None
+    #: spec_write_cwd: on the same requests, the session's own directory
+    #: (``AcpSessionHandle._bound_cwd``), which a relative write target names a path
+    #: under, as KAS resolves it against its workspace root. ``""`` elsewhere: a
+    #: relative target is then not covered.
+    spec_write_cwd: str = ""
     # Canonical, NON-model-authored tool identity from adapter-authored
     # ``_meta.kiro`` or ``_meta.goose`` (see ``_dispatch._kiro_tool_name``).
     # ``title`` is LLM-authored prose — for shell tools ``select_tool_title``
@@ -1120,6 +1198,10 @@ class AcpEvent:
     #: launch did not prove stock dsh registers the read tools. Set only on a
     #: deepseek permission event; empty once proved and on every other backend.
     deepseek_read_only_issue: str = ""
+    #: Why a Side Chat READ_ONLY turn refuses this request before any gate tier
+    #: could approve it. Set only on a Strands side session's event, for every call
+    #: that is not the harness's own proven file read; empty everywhere else.
+    side_read_only_refusal: str = ""
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the
@@ -1134,7 +1216,7 @@ class AcpEvent:
     #: every other event. Populated ONLY by the execution layer — never from a
     #: text chunk — so a consumer may trust ``wait_reason`` without re-checking
     #: provenance.
-    status: StructuredStatus | None = None
+    status: "StructuredStatus | None" = None
 
     @property
     def shell_command(self) -> str | None:
@@ -1214,7 +1296,9 @@ class AcpEvent:
             return True
         if not self.shell_classified:
             return True
-        return bool(self.is_shell and not self.shell_command)
+        if self.is_shell and not self.shell_command:
+            return True
+        return False
 
     @property
     def child_mcp_identity_trusted(self) -> bool:
@@ -1387,7 +1471,7 @@ class AcpPromptStats:
     # PER-TURN like ``credits``.
     metered_calls: int = 0
 
-    def carry_over(self) -> AcpPromptStats:
+    def carry_over(self) -> "AcpPromptStats":
         """Return fresh per-turn stats carrying this turn's context state.
 
         Event/tool/credit counters are per-turn and start at zero; the context
@@ -1447,7 +1531,7 @@ class AcpPromptStats:
         """
         self.context_pct_unknown = False
 
-    def terminal_refusal(self, stop_reason: str) -> tuple[str, RefusalInfo | None]:
+    def terminal_refusal(self, stop_reason: str) -> tuple[str, "RefusalInfo | None"]:
         """Fold this turn's refusal evidence onto a terminal's stop reason.
 
         A structured refusal recorded from metadata wins: the terminal's own
@@ -1841,7 +1925,7 @@ class StructuredStatus:
         return self.phase == STATUS_PHASE_WAITING and bool(self.wait_reason)
 
     @classmethod
-    def from_meta(cls, meta: object) -> tuple[StructuredStatus | None, str]:
+    def from_meta(cls, meta: object) -> "tuple[StructuredStatus | None, str]":
         """Parse ``params._meta`` into a status, or explain why not.
 
         Returns ``(status, "")`` on success and ``(None, reason)`` otherwise.

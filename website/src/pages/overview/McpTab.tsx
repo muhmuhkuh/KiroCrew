@@ -292,6 +292,11 @@ function mcpStatusLabel(status: string, auth: McpAuthState): string {
     // the gateway cannot read, so there is nothing local to verify.
     case 'registry':
       return i18nT('pages.overview.mcpTab.not_verified')
+    // A `secret://` server the running gateway starts: it runs there, where the
+    // reference resolves, and the dashboard does not probe it, so the label
+    // says where it runs and makes no health claim.
+    case 'routed':
+      return i18nT('pages.overview.mcpTab.routed')
     default:
       return i18nT('pages.overview.mcpTab.unknown')
   }
@@ -366,6 +371,9 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
   // Muted, not amber: no local action changes a registry row, and on a governed
   // host every governed server would otherwise sit in the "act now" colour.
   if (status === 'registry') return 'muted'
+  // Muted for the same reason: routing is already on, so there is nothing to
+  // act on, and green would claim a health check that did not run.
+  if (status === 'routed') return 'muted'
   return auth === 'signed_in' ? 'muted' : 'warn'
 }
 
@@ -420,6 +428,7 @@ function mcpStatusHint(
     return probeFailing || reasonOnRow ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
   }
   if (status === 'registry') return i18nT('pages.overview.mcpTab.registry_help', { provider: serverName })
+  if (status === 'routed') return i18nT('pages.overview.mcpTab.routed_help')
   if (status !== 'needs_auth') return undefined
   if (auth === 'sign_in_required') return i18nT('pages.overview.mcpTab.sign_in_required_next')
   if (auth === 'signed_in') return i18nT('pages.overview.mcpTab.signed_in_help', { provider: serverName })
@@ -1099,10 +1108,14 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       </span>
                     )
                   ) : mcpAuthState(s) === 'signed_in' && signInTarget && !s.tools?.length ? (
-                    /* A held grant the probe cannot verify. The control checks it
-                       first and asks for consent only when it no longer works, and
-                       the line beside it says so: a bare button on a row that reads
-                       Signed in looks like it would undo the sign-in. */
+                    /* A held grant the probe cannot verify. The probe never uses the
+                       session's grant, so it cannot list this server's tools; the
+                       line says so, plus that a tool call in chat is the real check,
+                       so an empty tools cell does not read as a broken install. The
+                       control checks the grant first and asks for consent only when
+                       it no longer works, and the line says that too: a bare button
+                       on a row that reads Signed in looks like it would undo the
+                       sign-in. */
                     <div className="flex flex-col items-start gap-1">
                       <McpRowSignIn target={signInTarget} serverName={s.name} again />
                       <span className="text-muted text-[12px]">{i18nT('pages.overview.mcpTab.sign_in_again_no_tools_hint')}</span>

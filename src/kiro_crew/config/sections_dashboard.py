@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import overload
 
 from kiro_crew.config.fields import _meta
+from kiro_crew.config.sections_shared_crew import SharedCrewConfig
 from kiro_crew.config.sections_tailnet import TailscaleConfig
 
 # The terminal apps the desktop shell can open in a project directory
@@ -24,6 +25,24 @@ EXTERNAL_TERMINAL_APPS: tuple[str, ...] = (
     "konsole",
     "wezterm",
     "xfce4-terminal",
+)
+
+# The dashboard's feature-preview switches (Settings > Developer > Feature
+# previews) stored under ``dashboard.feature_previews``, by name. Each name is a
+# ``mc-preview-<name>`` key in ``website/src/utils/previewFlags.ts`` with its
+# hyphens written as underscores (config paths are snake_case); that file keeps
+# the browser's copy as a cache of this section, and
+# test_feature_previews_config.py pins the two lists equal.
+FEATURE_PREVIEW_FLAGS: tuple[str, ...] = (
+    "artifact_deploy",
+    "crew_mode",
+    "crewmate_harness",
+    "explore",
+    "folder_conductor",
+    "layout_harness",
+    "remote_crew_chat",
+    "session_environments",
+    "webhooks",
 )
 
 
@@ -166,6 +185,16 @@ class DashboardConfig:
             "Reach the dashboard over your tailnet via `tailscale serve`.",
         ),
     )
+    shared_crew: SharedCrewConfig = field(
+        default_factory=SharedCrewConfig,
+        metadata=_meta(
+            "Shared Crew",
+            "Fair admission, per-person limits and the direct tailnet link for a "
+            "shared Crew. Read only while Shared Crew is turned on in Feature "
+            "Previews; otherwise every value reads as its default.",
+            restart=True,
+        ),
+    )
     restore_sessions: bool = field(
         default=False,
         metadata=_meta(
@@ -205,6 +234,28 @@ class DashboardConfig:
             "template already covers; the default agent stays even when covered, "
             "unless a template shares its name. Takes effect when the dashboard is "
             "reloaded; no gateway restart.",
+        ),
+    )
+    feature_previews: dict = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Feature previews",
+            "Which unreleased dashboard features are turned on under Settings > "
+            "Developer > Feature previews, by name, each true or false. Kept here "
+            "so a switch stays as set on every browser, device and dashboard "
+            "address of this gateway. A name that is absent reads as off. Takes "
+            "effect on the next dashboard read; no restart.",
+            properties={
+                name: {
+                    "type": "boolean",
+                    "default": False,
+                    "x-meta": {
+                        "label": f"Feature preview: {name}",
+                        "help": f"Turn on the '{name}' feature preview.",
+                    },
+                }
+                for name in FEATURE_PREVIEW_FLAGS
+            },
         ),
     )
     qr_session_until_restart: bool = field(
@@ -654,7 +705,23 @@ class DashboardConfig:
                         "help": (
                             "Ceiling on concurrent terminal sessions across every chat, "
                             "server-wide. Each chat's activity bar caps its own terminals "
-                            "below this; a session beyond the ceiling is refused."
+                            "below this. At the ceiling, opening a terminal ends the shell "
+                            "that has had no browser attached the longest (at least a "
+                            "minute) and posts a notice; with none, the open is refused."
+                        ),
+                    },
+                },
+                "orphan_timeout_s": {
+                    "type": "integer",
+                    "default": 43200,
+                    "x-meta": {
+                        "label": "Detached terminal timeout (seconds)",
+                        "help": (
+                            "How long a terminal's shell keeps running with no browser "
+                            "attached, for example while your laptop sleeps, before it and "
+                            "everything running in it are ended. Default 43200 (12 hours); "
+                            "values below 60 count as 60. Run jobs that must outlive this "
+                            "inside tmux."
                         ),
                     },
                 },
@@ -830,6 +897,15 @@ class DashboardConfig:
             "graded accent stripe (0-10; 0 = off).",
         ),
     )
+    show_unread_dot: bool = field(
+        default=True,
+        metadata=_meta(
+            "Show Unread Dot on Session Cards",
+            "Show the unread dot on a sidebar session card when the agent finished "
+            "and you have not read the result. Folder and aggregate unread counts "
+            "are not affected.",
+        ),
+    )
     # Literal enum rather than FOLDER_SORT_MODES: that constant lives in
     # sections_limits with the other write/load bounds, and this field spells the
     # same list. test_config_patch.py::TestFolderSortRoundTrip::
@@ -972,6 +1048,15 @@ class DashboardConfig:
             "Feature Videos Cache Size (MB)",
             "Disk budget for downloaded clips. Whole release folders are evicted "
             "oldest-first to fit; the running release is never evicted. 0 = no cap.",
+        ),
+    )
+    milestones_enabled: bool = field(
+        default=True,
+        metadata=_meta(
+            "Milestones Enabled",
+            "Show the milestones indicator, panel, new-chat feature cards and quiet "
+            "notices. Off hides them; counting continues, so turning it back on shows "
+            "true progress.",
         ),
     )
     folder_suggestions_enabled: bool = field(

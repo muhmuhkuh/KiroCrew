@@ -37,8 +37,11 @@ test("module has no top-level Electron dependency and its factory accepts fakes"
     "stopOnQuit",
     "reopenTunnel",
     "syncTunnel",
+    "canSwitchToRemoteCrew",
+    "switchToRemoteCrew",
     "onInstallDispatched",
     "onInstallFailed",
+    "isInstallingUpdate",
   ]);
 });
 
@@ -57,6 +60,7 @@ test("runtime gateway owners take every host dependency from the supervisor", ()
     "port-holders.js",
     "reconnect.js",
     "remote-crew-prompt.js",
+    "remote-switch.js",
     "shutdown.js",
     "successor-handoff.js",
     "token-sources.js",
@@ -451,8 +455,12 @@ test("unexpected child exits are visible but quit exits stay file-only", async (
     unexpected.errors.some((line) => line.includes("gateway child exited code=1")),
   );
 
-  const quitting = harness({ isQuitting: () => true });
+  // The quit begins after the spawn, as in the app: a start made once quitting
+  // has begun spawns nothing.
+  let appQuitting = false;
+  const quitting = harness({ isQuitting: () => appQuitting });
   assert.strictEqual(await quitting.supervisor.start(), true);
+  appQuitting = true;
   quitting.spawnCalls[0].child.emit("exit", 0, "SIGTERM");
   assert.strictEqual(quitting.errors.length, 0);
   assert.ok(

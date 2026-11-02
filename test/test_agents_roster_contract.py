@@ -36,7 +36,8 @@ from kiro_crew.dashboard.handlers.agents import (
 )
 
 # The EXACT key set every row carries, from BOTH sources (the ``cfg.agents``
-# rows and the project-scope rows). ``name`` and ``scope`` are handler-added;
+# rows and the project-scope rows). ``name``, ``scope`` and ``owns_mate_file``
+# are handler-added;
 # the rest are allowlisted record fields. Changing this set is a
 # network-boundary contract change: check the frontend consumers first
 # (``website/src/components/AgentSelector.tsx`` declares the ``KiroCrewAgent``
@@ -45,11 +46,11 @@ ROSTER_ROW_KEYS = frozenset(
     {
         "name",
         "scope",
+        "owns_mate_file",
         "kiro_agent",
         "workspace",
         "memory_store",
         "model",
-        "acp_backend",
         "reasoning_effort",
         "display_name",
         "description",
@@ -59,6 +60,9 @@ ROSTER_ROW_KEYS = frozenset(
         "avatar",
     }
 )
+
+# The keys the handler writes rather than copies off the record.
+HANDLER_ADDED_KEYS = frozenset({"name", "scope", "owns_mate_file"})
 
 # Record fields deliberately withheld, each verified to have no consumer in
 # ``website/src``: the two watchdog windows and the compaction default are
@@ -70,6 +74,9 @@ ROSTER_ROW_KEYS = frozenset(
 WITHHELD_RECORD_FIELDS = frozenset(
     {
         "member_id",
+        # A crewmate's harness pin: read only by the owner, through
+        # GET /api/agents/resolved-model, never on this roster.
+        "acp_backend",
         "watchdog_tool_stall_suspect_secs",
         "watchdog_tool_stall_hard_cap_secs",
         # Per-agent compaction default: read by the session manager and shown
@@ -263,7 +270,7 @@ class TestRosterRowIsAnAllowlistNotASpread:
         # stop classifying anything and let the next added field through.
         assert WITHHELD_RECORD_FIELDS <= record_fields
         # And the allowlist must not claim a record field that does not exist.
-        assert ROSTER_ROW_KEYS - {"name", "scope"} <= record_fields
+        assert ROSTER_ROW_KEYS - HANDLER_ADDED_KEYS <= record_fields
 
     def test_an_attribute_the_allowlist_does_not_name_is_dropped(self) -> None:
         """Behavioral proof, not just a literal comparison.
@@ -310,14 +317,7 @@ class TestUnshowableValuesAreMasked:
     # their default on a non-string (``_safe_str``), so the mask below is
     # defence in depth for a record built some other way, which is why the
     # test plants the object with ``object.__setattr__`` rather than a load.
-    MASKED_STR_FIELDS = (
-        "kiro_agent",
-        "workspace",
-        "memory_store",
-        "description",
-        "source",
-        "acp_backend",
-    )
+    MASKED_STR_FIELDS = ("kiro_agent", "workspace", "memory_store", "description", "source")
     # ``avatar`` is the ONE structured value a row ships, so the uniform
     # string sweeps below do not apply to it: it is shape-allowlisted by
     # ``_safe_avatar`` with masking confined to user-authored ``traits``
@@ -325,7 +325,7 @@ class TestUnshowableValuesAreMasked:
     # ``TestAvatarIsShapeAllowlistedNotMasked``. Excluded here rather than
     # softening these assertions, so the rule for every other field stays
     # "the sentinel, exactly".
-    RECORD_FIELDS_SHIPPED = tuple(sorted(ROSTER_ROW_KEYS - {"name", "scope", "avatar"}))
+    RECORD_FIELDS_SHIPPED = tuple(sorted(ROSTER_ROW_KEYS - HANDLER_ADDED_KEYS - {"avatar"}))
 
     def _full(self) -> KiroCrewAgentConfig:
         return KiroCrewAgentConfig(
@@ -334,7 +334,6 @@ class TestUnshowableValuesAreMasked:
             memory_store=f"ms-{self.PROBE}",
             triggers=f"use when {self.PROBE}",
             model=self.PROBE,
-            acp_backend=self.PROBE,
             reasoning_effort=self.PROBE,
             session_color=self.PROBE,
             display_name=f"label {self.PROBE}",
@@ -370,20 +369,22 @@ class TestUnshowableValuesAreMasked:
     def test_every_value_is_a_string_except_the_one_structured_field(self) -> None:
         """`dict[str, object]` is honest about exactly one field, not a loophole.
 
-        Only avatar is structured. The optional backend is null when inherited;
-        naming that exception also prevents another field from leaking an object.
+        Every value is a `str` but `avatar`, which is a `dict` the dashboard needs
+        verbatim, and `owns_mate_file`, a handler-computed `bool`. Asserting the
+        exceptions BY NAME means another non-string field cannot appear without
+        this test failing.
         """
         cfg = KiroCrewAgentConfig()
         object.__setattr__(cfg, "description", {"nested": "object"})
         for redact in (False, True):
             row = _agent_roster_row("probe", "global", cfg, redact=redact)
             assert isinstance(row["avatar"], dict)
-            assert row["acp_backend"] is None
+            assert row["owns_mate_file"] is False
             non_str = {k for k, v in row.items() if not isinstance(v, str)}
             assert non_str == {
                 "avatar",
-                "acp_backend",
-            }, f"unexpected structured value(s): {non_str}"
+                "owns_mate_file",
+            }, f"unexpected non-string value(s): {non_str}"
 
     def test_owner_keeps_name_addressable_but_app_token_does_not_need_it(self) -> None:
         """``name`` survives only where something can actually address it.

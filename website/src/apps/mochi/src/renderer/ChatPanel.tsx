@@ -962,7 +962,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
               }
             }} style={{
               marginLeft: 'auto', background: 'var(--accent)', border: 'none', borderRadius: 6,
-              padding: '3px 10px', color: '#fff', fontSize: 11, fontWeight: 600,
+              padding: '3px 10px', color: 'var(--accent-text)', fontSize: 11, fontWeight: 600,
               cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0,
             }}>{i18nT('apps.mochi.gateway.start_btn')}</button>
           )}
@@ -1003,7 +1003,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                 try { await api?.resetMochi?.(); setMessages([]); setAllHistory([]) } finally { setActionLoading(false); setShowResetConfirm(false) }
               }} style={{
                 background: 'var(--danger)', border: 'none', borderRadius: 6,
-                padding: '5px 12px', color: '#fff', fontSize: 12, fontWeight: 600,
+                padding: '5px 12px', color: 'var(--danger-fg, #fff)', fontSize: 12, fontWeight: 600,
                 cursor: actionLoading ? 'wait' : 'pointer', opacity: actionLoading ? 0.6 : 1,
               }}>{actionLoading ? '...' : i18nT('apps.mochi.reset.confirm')}</button>
             </div>
@@ -1070,7 +1070,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
                 try { await api?.deleteHistory?.(); setMessages([]); setAllHistory([]) } finally { setActionLoading(false); setShowClearConfirm(false) }
               }} style={{
                 background: 'var(--danger)', border: 'none', borderRadius: 6,
-                padding: '5px 12px', color: '#fff', fontSize: 12, fontWeight: 600,
+                padding: '5px 12px', color: 'var(--danger-fg, #fff)', fontSize: 12, fontWeight: 600,
                 cursor: actionLoading ? 'wait' : 'pointer', opacity: actionLoading ? 0.6 : 1,
               }}>{actionLoading ? '...' : i18nT('apps.mochi.deleteHistory.confirm')}</button>
             </div>
@@ -1183,7 +1183,7 @@ export const ChatPanel: React.FC<ChatPanelProps> = ({ onToggleWatch, watchPanelV
           }} style={{
             background: 'var(--danger)', border: 'none',
             borderRadius: 14, padding: '4px 10px', fontSize: 10, fontWeight: 600,
-            color: '#fff', cursor: 'pointer', pointerEvents: 'auto',
+            color: 'var(--danger-fg, #fff)', cursor: 'pointer', pointerEvents: 'auto',
             display: 'flex', alignItems: 'center', gap: 4,
             boxShadow: '0 2px 8px var(--shadow)',
             transition: 'opacity 0.15s',

@@ -8,6 +8,7 @@ import type { SubagentQueuedReason } from '../../pages/chat/subagentQueuedReason
 import type { McpAppRenderPayload } from '../../lib/mcpAppSrcdoc'
 import type { AutomationRecord } from '../../monitoring/automation'
 import type { ErrorReport } from '../../utils/errorReport'
+import type { AgentSwitchNotice } from '../../utils/agentSwitchFeedback'
 import type { HistoryDeleteRefusal } from '../../utils/historyDeleteRefusal'
 import type { ParkedThinking } from './thinking'
 
@@ -397,6 +398,13 @@ export interface ChatState {
    *  for ErrorNotice's agent hand-off. Cleared on dismiss or on the next attempt. */
   undeletableHistory: HistoryDeleteRefusal | null
   pendingInput: string | null
+  /** True when `pendingInput` was staged to be SENT (`stagePendingSend`), not
+   *  just seeded. An in-window caller stages the text and then navigates to
+   *  `/chat?autoSend=1`, but the router commits that navigation in a transition,
+   *  so a mounted ChatPage sees the text a render before the query and would
+   *  seed it instead. The flag carries the send with the text. Only app code can
+   *  set it, so a URL alone still only seeds. */
+  pendingInputSend: boolean
   /** Text staged from the Side Chat into the main composer, keyed by the slot
    *  it belongs to. Kept apart from `pendingInput` because it APPENDS to the
    *  live composer rather than replacing it, and keyed by `slot` because a Side
@@ -410,7 +418,7 @@ export interface ChatState {
   /** Transient feedback for agent-rebind failures shared by the picker and
    *  global cycle shortcuts, and for a new chat that could not get its own
    *  session folder. The App shell owns rendering and expiry. */
-  agentSwitchNotice: { message: string } | null
+  agentSwitchNotice: AgentSwitchNotice | null
   // True while a createSlot POST is in flight. Lets every New Chat entry
   // point show a pending state so the UI never looks dead on click.
   creatingSlot: boolean
@@ -434,7 +442,7 @@ export interface ChatState {
    *  knows the window but not a measured used-count, and both consumers render
    *  an absent `used` as an approximation (a `~` prefix, derived from pct)
    *  rather than asserting a precise figure. */
-  slotContextTokens: Record<string, { used?: number; window: number }>
+  slotContextTokens: Record<string, { used?: number; window?: number }>
   voicePlaying: boolean
   /** A speech request for the active slot is waiting for its first audio. */
   voicePreparing: boolean
@@ -451,6 +459,10 @@ export interface ChatState {
    *  gateway, or nothing labelled), and the chips then keep their default
    *  "queued behind the concurrency limit" text. Cleared with the count. */
   subagentQueuedReason: Record<string, SubagentQueuedReason>
+  /** Ids of the cards held when a subagent replay began that the replay has
+   *  not named yet. `subagentReplayDone` drops what is left. Null outside a
+   *  replay. No surface reads it. */
+  subagentReplayUnconfirmed?: Record<string, true> | null
   /** The authoritative automation record for each bare slot key.
    *
    * Structured monitors remain here after reaching a terminal outcome so the
@@ -759,6 +771,7 @@ export const initialState: ChatState = {
   pendingResumes: {},
   undeletableHistory: null,
   pendingInput: null,
+  pendingInputSend: false,
   mainComposerAppend: null,
   agentSwitchNotice: null,
   creatingSlot: false,
@@ -773,6 +786,7 @@ export const initialState: ChatState = {
   subagents: {},
   subagentQueued: {},
   subagentQueuedReason: {},
+  subagentReplayUnconfirmed: null,
   automations: {},
   selectedSubagentId: null,
   toolLog: [],
