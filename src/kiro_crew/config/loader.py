@@ -4377,6 +4377,16 @@ class KiroCrewConfig:
                         # internals are reached through the module, not
                         # re-exported from here.
                         avatar=_sections._safe_avatar(entry.get("avatar")),
+                        # Profile-level backend override. Empty string means "inherit
+                        # the global agent.acp_backend" — only a non-empty, known
+                        # value is kept; anything unrecognised or non-string collapses
+                        # to "" so a typo never silently bakes in the Kiro default.
+                        backend=(
+                            _raw_backend
+                            if isinstance(_raw_backend := entry.get("backend", ""), str)
+                            and _raw_backend
+                            else ""
+                        ),
                     )
 
         # Migrate workspaces from flat or structured format

@@ -41,6 +41,10 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  /** Profile-level ACP backend override for this crew member's sessions.
+   *  Empty string or absent means the member inherits the global backend.
+   *  Changed via POST /api/members/{slug}/backend. */
+  backend?: string
   /** Optional presentation label shown in place of `name`. `name` stays the
    *  identity every per-member route and binding is keyed on. */
   display_name?: string
@@ -236,6 +240,14 @@ export function createAgentsEndpoints({ post, put, del, j, sessionKeyHeader: _sk
          *  notes. */
         truncated: boolean
       }>,
+    // Persist a profile-level ACP backend for a crew member. Pass null to
+    // clear the override (the member then inherits the global acp_backend).
+    // 400 when the value is not selectable; 404 when the slug has no owner.
+    memberBackend: (slug: string, backend: string | null) =>
+      post(
+        '/api/members/' + encodeURIComponent(slug) + '/backend',
+        { backend },
+      ).then(j) as Promise<{ slug: string; member: string; backend: string | null }>,
     // Crewmate teams: a name plus an ordered member list, stored by the gateway
     // in the data home's crew-teams directory. Dashboard-only like the members routes; the three
     // writes are owner actions. `remove` rather than `delete`: a reserved word

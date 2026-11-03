@@ -448,6 +448,10 @@ async def api_members(request: web.Request) -> web.Response:
                 "memory_version": version,
                 "memory_owner": _roster_mask(owner),
                 "model": _roster_mask(agent_cfg.model),
+                # Profile-level backend override. Empty string means the member
+                # inherits the global acp_backend; a non-empty value is the id
+                # the member's sessions default to (still overridable per-chat).
+                "backend": getattr(agent_cfg, "backend", "") or "",
                 # Presentation-only, but `_safe_avatar` pins only the SHAPE:
                 # its `traits` and `expressions` values are free text, so the
                 # avatar is masked leaf-by-leaf (`_roster_avatar`) rather than
@@ -1973,3 +1977,94 @@ async def api_member_rules_put(request: web.Request) -> web.Response:
         # cold session picks the new rules up at its next start regardless.
         logger.debug("could not flag member session for reinjection", exc_info=True)
     return web.json_response({"slug": slug, "ok": True})
+
+
+async def api_member_backend(request: web.Request) -> web.Response:
+    """POST /api/members/{slug}/backend — persist a profile-level ACP backend for a crew member.
+
+    Accepts ``{"backend": "<id>" | null}`` where ``null`` clears the override
+    (the member then inherits the global ``agent.acp_backend``). The value is
+    validated against the selectable-backend registry; an unknown id is refused
+    with 400. Owner-only, same posture as ``api_member_rules_put``.
+    """
+    denied = await _deny_app_caller(request, "members.backend")
+    if denied is not None:
+        return denied
+    owner_denied = await require_owner_dashboard_request(request, "members.backend.write")
+    if owner_denied is not None:
+        return owner_denied
+    slug = request.match_info["slug"]
+    try:
+        members_mod.validate_slug(slug)
+    except MemberSlugError:
+        return web.json_response(
+            {"error": "invalid member slug", "code": "invalid_member_slug"}, status=400
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict) or "backend" not in body:
+        return web.json_response(
+            {"error": "backend field required (string or null)", "code": "missing_backend"},
+            status=400,
+        )
+    raw_backend = body["backend"]
+    if raw_backend is not None and not isinstance(raw_backend, str):
+        return web.json_response(
+            {"error": "backend must be a string or null", "code": "invalid_backend"}, status=400
+        )
+
+    # Validate against the selectable-backend registry (lazy import — same
+    # precedent as acp_backend_override in chat_backend.py).
+    if raw_backend is not None:
+        from kiro_crew.agent_sdk.backends import selectable_backends
+
+        if raw_backend not in selectable_backends():
+            return web.json_response(
+                {
+                    "error": f"backend {raw_backend!r} is not selectable in this build",
+                    "code": "backend_not_selectable",
+                },
+                status=400,
+            )
+
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    slug_owners = _member_names_for_slug(cfg, slug)
+    if not slug_owners:
+        return web.json_response(
+            {"error": "no crew member for this slug", "code": "member_not_found"}, status=404
+        )
+    if len(slug_owners) > 1:
+        return web.json_response(
+            {
+                "error": "multiple crews share this slug; backend write would be ambiguous",
+                "code": "member_slug_shared",
+            },
+            status=409,
+        )
+    member = slug_owners[0]
+
+    # Write via update_config_locked so the delta is serialized with every
+    # other config writer and cannot race a concurrent settings save.
+    from kiro_crew.config.loader import coerce_dict_section, update_config_locked
+    from kiro_crew.dashboard.chat_utils import run_config_write
+
+    def _apply(data: dict) -> dict | None:
+        agents_section = coerce_dict_section(data, "agents")
+        entry = coerce_dict_section(agents_section, member)
+        if raw_backend is None:
+            entry.pop("backend", None)
+        else:
+            entry["backend"] = raw_backend
+        return data
+
+    try:
+        await run_config_write(update_config_locked, mutate=_apply)
+    except Exception:
+        logger.warning("member backend write failed for %r", slug, exc_info=True)
+        return web.json_response(
+            {"error": "could not persist backend", "code": "backend_write_failed"}, status=500
+        )
+
+    return web.json_response({"slug": slug, "member": member, "backend": raw_backend})

@@ -3343,6 +3343,16 @@ class KiroCrewAgentConfig:
             "endpoint.",
         ),
     )
+    backend: str = field(
+        default="",
+        metadata=_meta(
+            "Backend",
+            "ACP backend override for sessions on this crew member. Empty "
+            "inherits the global agent.acp_backend. A per-session backend "
+            "pick (via the chat header's backend selector) still takes "
+            "precedence over this profile-level default.",
+        ),
+    )
 
 
 @dataclass

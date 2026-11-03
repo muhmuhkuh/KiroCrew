@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { AlarmClock, Brain, ChevronLeft, ChevronRight, Cpu, FolderOpen, Goal, IdCard, NotebookPen, Pencil, Route, Shield, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+import { api } from '../../api/client'
 import type { MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
 import CrewStateAvatar from '../../components/CrewStateAvatar'
+import SimpleSelect from '../../components/SimpleSelect'
 import Tablist, { type TablistTab } from '../../components/Tablist'
 import type { CronJob } from '../../types'
 import CrewScheduleList from './CrewScheduleList'
@@ -60,6 +63,51 @@ const TONE: Record<'accent' | 'ok' | 'warn' | 'info', string> = {
   ok: 'bg-ok-subtle text-ok',
   warn: 'bg-warn-subtle text-warn',
   info: 'bg-info-subtle text-info',
+}
+
+const INHERIT = '__inherit__'
+
+/** Compact backend selector for a crew member's profile. Saves via
+ *  POST /api/members/{slug}/backend; ``null`` clears the override. */
+function MemberBackendSelect({ member, onUpdated }: { member: MemberRosterRow; onUpdated?: () => void }) {
+  const { t } = useTranslation()
+  const qc = useQueryClient()
+  const probes = useQuery({
+    queryKey: ['acpBackends'],
+    queryFn: () => api.acpBackends(),
+    staleTime: 30_000,
+    retry: false,
+  })
+  const change = useMutation({
+    mutationFn: (backend: string | null) => api.memberBackend(member.slug, backend),
+    onSuccess: () => {
+      // Invalidate the roster so the updated backend value is reflected
+      // on the next roster refresh (roster is polled via the members page).
+      qc.invalidateQueries({ queryKey: ['members'] })
+      onUpdated?.()
+    },
+  })
+
+  const backends = probes.data?.backends.filter(row => row.selectable) ?? []
+  const currentBackend = member.backend || INHERIT
+
+  return (
+    <div className="flex flex-col gap-1">
+      <SimpleSelect
+        aria-label={t('chatBackend.label')}
+        options={[INHERIT, ...backends.map(row => row.id)]}
+        optionLabels={[t('chatBackend.inherit'), ...backends.map(row => row.policy_id)]}
+        value={currentBackend}
+        triggerFallback={currentBackend === INHERIT ? t('chatBackend.inherit') : (member.backend ?? t('chatBackend.inherit'))}
+        onChange={value => change.mutate(value === INHERIT ? null : value)}
+        disabled={change.isPending || !probes.data}
+        className="h-8 max-w-full text-[12px]"
+      />
+      {change.error && (
+        <ErrorNotice variant="inline" message={change.error instanceof Error ? change.error.message : String(change.error)} />
+      )}
+    </div>
+  )
 }
 
 function Row({ icon, tone = 'accent', label, sub, onClick, testId }: {
@@ -319,6 +367,20 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
                   <Row icon={<NotebookPen size={16} />} tone="warn" label={t('pages.membersPage.notes_tab')} sub={t('pages.membersPage.profile_notes_sub')} onClick={() => push('notes')} testId="crew-profile-notes" />
                   <Row icon={<Shield size={16} />} tone="ok" label={t('pages.membersPage.profile_permissions')} sub={t('pages.membersPage.profile_permissions_sub')} onClick={p.onEdit} testId="crew-profile-permissions" />
                   <Row icon={<Cpu size={16} />} tone="info" label={t('pages.membersPage.profile_model')} sub={p.member.model || t('pages.membersPage.profile_model_auto')} onClick={p.onEdit} testId="crew-profile-model" />
+                  {/* Backend selector — shown only when more than one backend is
+                      selectable so the row does not appear on a standard install. */}
+                  <div
+                    className="flex items-start gap-3 w-full px-3.5 py-3 border-t border-border"
+                    data-testid="crew-profile-backend"
+                  >
+                    <span className="w-8 h-8 rounded-[9px] grid place-items-center shrink-0 bg-info-subtle text-info" aria-hidden="true">
+                      <Cpu size={16} />
+                    </span>
+                    <div className="flex-1 min-w-0 leading-tight">
+                      <span className="block text-[13px] font-semibold truncate mb-1.5">{t('chatBackend.label')}</span>
+                      <MemberBackendSelect member={p.member} />
+                    </div>
+                  </div>
                 </div>
               </div>
             )}
