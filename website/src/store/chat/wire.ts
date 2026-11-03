@@ -6,6 +6,7 @@
 import { api } from '../../api/client'
 import type { ChatMessage, ToolPayloadCut } from '../../types'
 import { readMessageQuote, type MessageQuote } from '../../chat-core/composer/messageQuote'
+import { findTokenRanges, readStoredPaste, type PasteBlock } from '../../utils/pasteTokens'
 
 const SKIP_ROLES = new Set(['chunk', 'done'])
 export const filterMessages = (msgs: ChatMessage[]) => msgs.filter(m => !SKIP_ROLES.has(m.role))
@@ -110,6 +111,24 @@ export function queueEntryQuote(meta: unknown): { quote?: MessageQuote } {
 export function queueEntrySendId(meta: unknown): { sendId?: string } {
   const id = meta && typeof meta === 'object' ? (meta as Record<string, unknown>).sendId : undefined
   return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id) ? { sendId: id } : {}
+}
+
+/** The paste blocks behind a queue entry's text, when THIS browser sent it.
+ *  The entry holds the wire text, in which every `[ Paste #N ]` token is
+ *  already expanded, and the gateway carries no blocks on it (it stores
+ *  `meta.pastes` on no row). The sending tab recorded the send in the paste
+ *  side table under that wire text (`saveStoredPaste`), which is the source
+ *  the sent bubble re-collapses from on a reload (`mergePreservedPastes`), so
+ *  the queue card and the bubble it becomes agree. Another browser, or an
+ *  evicted entry, finds nothing and the card shows the text as sent. */
+export function queueEntryPastes(content: string): { pastes?: PasteBlock[] } {
+  if (!content) return {}
+  const stored = readStoredPaste(content.trimEnd())
+  if (!stored || !Array.isArray(stored.pastes) || !stored.pastes.length) return {}
+  const ordered = findTokenRanges(typeof stored.displayTxt === 'string' ? stored.displayTxt : '', stored.pastes)
+    .sort((a, b) => a.start - b.start)
+    .map(r => r.block)
+  return { pastes: ordered.length ? ordered : stored.pastes }
 }
 
 export function queueEntryAttachments(meta: unknown): QueueEntryAttachments {

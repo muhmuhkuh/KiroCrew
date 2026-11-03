@@ -32,6 +32,8 @@ export interface TermTab {
   cwd?: string
   /** User label; absent means follow the shell's live title. */
   name?: string
+  /** The chat slot this terminal is associated with (fork-only). */
+  chatSlot?: string
 }
 
 export const MAX_TERMINAL_NAME_LENGTH = 120

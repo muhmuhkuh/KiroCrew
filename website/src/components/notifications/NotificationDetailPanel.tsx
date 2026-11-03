@@ -50,7 +50,7 @@ function memberThreadPage(
  * renders identically whether hosted in the full page (right column) or the
  * topbar bell popover (slide-out).
  */
-export default function NotificationDetailPanel({ n, onClose }: { n: Notification; onClose: () => void }) {
+export default function NotificationDetailPanel({ n, onClose, onLeave: _onLeave }: { n: Notification; onClose: () => void; onLeave?: () => void }) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   // Every jump below runs inside this gate, and the gate asks BEFORE the

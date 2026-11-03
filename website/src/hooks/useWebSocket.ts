@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback } from 'react'
 import { isLookPreviewFrame } from '../utils/lookPreview'
 import { useQueryClient } from '@tanstack/react-query'
 import { useAppDispatch } from '../store'
-import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, triggerCronRefresh, fetchSlots, remoteSlotRead } from '../store/dashboardSlice'
+import { sseTodoUpdate, sseMcpReportUpdate, sseSlotTitle, triggerRefresh, fetchSlots, remoteSlotRead } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, clearAllNotifications } from '../store/notificationsSlice'
 import { dispatchMcNotification, dispatchLiveNotification } from './notificationEvent'
 import {
@@ -128,7 +128,6 @@ export const WS_SILENCE_CHECK_MS = 5_000
 export const WS_SILENCE_MAX_MS = 300_000
 
 /** Single multiplexed WebSocket replacing all SSE + polling connections. */
-const getDashboardState = () => store.getState().dashboard
 
 export function useWebSocket() {
   const dispatch = useAppDispatch()
@@ -152,7 +151,7 @@ export function useWebSocket() {
   const syncWorkflowRuns = useWorkflowRunReconcile(dispatch, queryClient)
   const buffers = useStreamBuffers({ dispatch, socket, onActiveSlotFlushed: voice.speakStreamedDelta })
   const slotList = useSlotListSync(dispatch, queryClient, buffers)
-  const bundle = useBundleReload(dispatch, getDashboardState)
+  const bundle = useBundleReload(dispatch)
   const chatStream = useChatStream({ dispatch, buffers, voice, reconnectingRef })
   const turnCompletion = useTurnCompletion({ dispatch, queryClient, reconnectingRef })
   // Which work boards this tab shows, sent as `fold_watch` once a gateway that
@@ -475,7 +474,7 @@ export function useWebSocket() {
           case 'refresh': {
             const kinds: string[] = Array.isArray(data.kinds) ? data.kinds.filter((k: unknown): k is string => typeof k === 'string') : []
             dispatch(triggerRefresh())
-            invalidateRefreshQueries(queryClient, kinds, () => dispatch(triggerCronRefresh()))
+            invalidateRefreshQueries(queryClient, kinds)
             if (kinds.includes('history')) dispatch(fetchHistory(false))
             break
           }
@@ -1006,7 +1005,7 @@ export function useWebSocket() {
           case 'sessions_restarting':
             // Backend pushed session restart status (restarting/ready)
             dispatch(triggerRefresh())
-            invalidateRefreshQueries(queryClient, undefined, () => dispatch(triggerCronRefresh()))
+            invalidateRefreshQueries(queryClient, undefined)
             break
           case 'update_progress':
             handleUpdateProgress(dispatch, data)
@@ -1014,7 +1013,7 @@ export function useWebSocket() {
           case 'refine':
             // Handled by ProjectsPage via Redux
             dispatch(triggerRefresh())
-            invalidateRefreshQueries(queryClient, undefined, () => dispatch(triggerCronRefresh()))
+            invalidateRefreshQueries(queryClient, undefined)
             break
           case 'channel_message':
           case 'channel_agent_status':

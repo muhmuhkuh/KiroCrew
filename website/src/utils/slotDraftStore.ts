@@ -56,8 +56,10 @@ export interface SlotDraftStoreOpts<T> {
 
 export interface SlotDraftStore<T> {
   load(): Record<string, T>
-  save(drafts: Record<string, T>): void
+  save(drafts: Record<string, T>): boolean | void
   set(drafts: Record<string, T>, slot: string, value: T): void
+  /** Read the current draft map without loading from storage. Fork-only. */
+  peek(): Record<string, T>
   /** @internal test-only: reset module state between tests. `undefined` in the
    *  prod bundle (gated on `!import.meta.env.PROD`). */
   __resetForTests: () => void
@@ -238,5 +240,5 @@ export function createSlotDraftStore<T>(opts: SlotDraftStoreOpts<T>): SlotDraftS
         timestampsLoaded = false
       }
 
-  return { load, save, set, __resetForTests }
+  return { load, save, set, peek: load, __resetForTests }
 }

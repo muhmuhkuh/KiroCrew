@@ -383,7 +383,12 @@ export interface IssueRadarContextValue {
    * Deliberately NOT persisted, unlike `selectedIssue`: a restored open detail
    * would put a phone on the detail pane before the user picked anything, with
    * the list unreachable behind it. */
-  listDetail: ListDetailView}
+  listDetail: ListDetailView
+  // Fork-only: Jira status filters
+  sortedIssueStatuses?: { name: string; count: number }[]
+  selectedStatuses?: Set<string>
+  toggleStatus?: (name: string) => void
+}
 
 const Ctx = createContext<IssueRadarContextValue | null>(null)
 

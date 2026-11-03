@@ -364,3 +364,7 @@ export function useSettingHighlight(owns: boolean = true): void {
     // detail nothing pins.
   }, [owns, highlightId, directConfigKey, setParams, location.key])
 }
+
+/** Settings highlight id for the Crew Members preview toggle. Used by the
+ *  sidebar create flow to jump to the feature flag when the crew preview is off. */
+export const SETTINGS_CREW_MEMBERS_PREVIEW_ID = 'crew-members-preview'

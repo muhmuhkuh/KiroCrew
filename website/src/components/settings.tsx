@@ -57,6 +57,8 @@ interface SettingsToggleProps {
    * update switches), so a deep link can only land on the panel's row.
    */
   anchor?: boolean
+  /** Settings registry id for deep-link highlighting. Fork-only. */
+  settingId?: string
 }
 
 export function SettingsToggle({ label, description, hint, checked, onChange, disabled, configKey, describedBy, anchor = true }: SettingsToggleProps) {

@@ -145,7 +145,7 @@ export const LOCATIONS = {
     label: { from: 'text', key: 'components.chatInput.command' },
     aliasKeys: ['components.chatInput.slash_commands'],
     terms: {
-      en: ['slash command', 'chat commands', 'quick commands', 'commands menu'],
+      en: ['chat commands', 'quick commands', 'commands menu'],
       'zh-CN': ['斜杠', '快捷命令', '命令菜单', '聊天命令'],
     },
     placements: [{ surface: 'chat', parent: 'composer.add-menu', entry: 'menu' }],

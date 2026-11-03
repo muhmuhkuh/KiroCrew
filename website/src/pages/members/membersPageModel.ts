@@ -9,7 +9,7 @@
  * owner reads lives with that owner, not here.
  */
 import { type CreatedCrewmate, type CrewmateDraft } from './NewCrewmateDialog'
-import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
 import { type MemberRosterRow } from '../../api/client'
 import { isAssistantMember, pendingMate } from '../../lib/assistantMember'
 import { type ProfileTab } from './CrewProfilePanel'
@@ -185,7 +185,7 @@ export const loadRosterWidth = () => loadColumnWidth(ROSTER_WIDTH_KEY, ROSTER_MI
 
 /** i18n translate function, taken from the hook so the row need not re-derive
  *  its type. */
-export type TFn = ReturnType<typeof useTranslation>['t']
+export type TFn = TFunction<'translation', undefined>
 
 /** A same-origin `/members?create=1` link's draft, or null for anything else
  *  -- including an href the URL parser refuses, which must never throw. */

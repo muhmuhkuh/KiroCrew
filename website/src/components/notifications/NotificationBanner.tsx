@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type RefObject } from 'react'
+import { useCallback, useEffect, useRef, useState, type RefObject, type ReactNode } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { AnimatePresence, motion, useReducedMotion, type TargetAndTransition } from 'framer-motion'
 import { i18nT } from '../../i18n/t'
@@ -77,12 +77,14 @@ type ExitDeltas = Record<string, ExitDelta | undefined>
  * The host (the bell button) lends its `bellRef` for the exit vector and its
  * open-on-note mechanics; the banner owns no selection state of its own.
  */
-export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote }: {
-  bellRef: RefObject<HTMLButtonElement | null>
+export default function NotificationBanner({ bellRef, popoverOpen, onOpenNote, after: _after }: {
+  bellRef: RefObject<HTMLButtonElement | null> | RefObject<HTMLButtonElement>
   /** The bell popover is on screen (open or animating shut). */
   popoverOpen: boolean
   /** Open the bell popover with this note selected (the host acks it). */
   onOpenNote: (ts: string) => void
+  /** Extra content rendered after the banner (fork-only). */
+  after?: ReactNode
 }) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()

@@ -731,6 +731,9 @@ export interface ChatState {
   // server's "still saving" refusal; anything else is a plain failed close.
   /** `title` is null for a found, untitled session; the notice localizes it at render. */
   closeRefused: { key: string; title: string | null; reason: 'historyWrite' | 'failed' } | null
+  /** The most recently user-opened slot, with a sequence number for change detection.
+   *  Used to trigger cron-note acknowledgment when the user opens a chat. Fork-only. */
+  userOpen?: { key: string; seq: number }
 }
 
 export const initialState: ChatState = {

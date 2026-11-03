@@ -16,7 +16,7 @@ import type { useMarkdownPanelFind } from './useMarkdownPanelFind'
  */
 
 /** Comment hint banner — shown once per session for markdown files */
-export function CommentHint({ onDismiss }: { onDismiss: () => void }) {
+export function CommentHint({ onDismiss, image: _image, isNew: _isNew }: { onDismiss: () => void; image?: boolean; isNew?: boolean }) {
   return (
     <div
       className="flex items-center gap-2.5 px-3 py-2.5 bg-bg-elevated border rounded-lg text-[12px] animate-scale-in mx-1 mb-2"
@@ -125,9 +125,11 @@ export function DiffViewBlock({ diffMode, fileName, originalContent, content, gi
 
 /** Shared comment overlay — the pending-comment list. (The input itself lives
  *  in `SelectionToolbar`'s composer, which opens on selection.) */
-export const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true, onEditingChange }: {
-  onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; connected?: boolean
+export const CommentOverlayBlock = memo(function CommentOverlayBlock({ onSubmitComments, comments, editComment, removeComment, submitAllComments, connected = true, onEditingChange, draftKey: _draftKey }: {
+  onSubmitComments?: ((message: string, count?: number) => boolean | void | Promise<boolean | void>) | undefined; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; connected?: boolean
   onEditingChange?: (id: string, editing: boolean) => void
+  /** Per-tab draft key for the extra-prompt field. Fork-only. */
+  draftKey?: string | undefined
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   if (!onSubmitComments) return null

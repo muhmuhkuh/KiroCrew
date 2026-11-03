@@ -1,5 +1,6 @@
 /** The sidebar shell's interface: the props `ChatSidebar` takes, and the scope it
  *  hands the render owners it composes. */
+import type React from 'react'
 import type { useConnected } from '../../hooks/useConnected'
 import type { useDndSensors } from '../../hooks/useDndSensors'
 import type { useImeGuard } from '../../hooks/useImeGuard'
@@ -238,7 +239,7 @@ export interface SidebarScope {
   activeDrag: { type: string; id: string } | null
   derivedHintCol: string | null
   setDerivedHintCol: SetState<string | null>
-  renameCommit: (id: string, name: string) => void
+  renameCommit: (id: string, name: string) => boolean | void
   closeRefused: RootState['chat']['closeRefused']
   rowActions: React.ComponentProps<typeof SessionRow>['actions']
   tintAgents: AgentInfo[]
@@ -366,6 +367,9 @@ export interface SidebarScope {
   editScope: ReturnType<typeof useFolderRename>['editScope']
   setEditScope: ReturnType<typeof useFolderRename>['setEditScope']
   editName: ReturnType<typeof useFolderRename>['editName']
+  /** Ref set to `true` when a folder rename is cancelled by Escape, so the blur
+   *  handler can distinguish a cancel from an implicit commit. Fork-only. */
+  folderCancelEscapeRef: React.MutableRefObject<boolean>
   setEditName: ReturnType<typeof useFolderRename>['setEditName']
 
   // From `useSidebarTags`

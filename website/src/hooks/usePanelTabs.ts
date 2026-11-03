@@ -185,6 +185,8 @@ export interface PanelTab {
   sessionId?: string
   /** Working directory the shell spawns in (the chat's project dir, if any). */
   cwd?: string
+  /** Remote slot key for a terminal tab opened against a remote environment. Fork-only. */
+  remoteSlot?: string
 }
 
 /**
@@ -1348,7 +1350,7 @@ export function usePanelTabs(
    *  per-slot bucketing makes those sessions chat-specific automatically. At
    *  the per-chat cap we focus (reuse) the most-recent terminal instead of
    *  spawning another. Returns the session id to connect / run against. */
-  const openTerminal = useCallback((opts?: { cwd?: string }): string => {
+  const openTerminal = useCallback((opts?: { cwd?: string; remoteSlot?: string; title?: string }): string => {
     const terms = tabs.filter(t => t.kind === 'terminal')
     if (terms.length >= MAX_TERMINALS_PER_CHAT) {
       const last = terms[terms.length - 1]

@@ -744,6 +744,7 @@ function ChatSidebar({
 
   const {
     remoteCrewChatPreview,
+    crewPreview, openCrewMembers,
     createChatMutation, createRemoteChatMutation, createEphemeralChatMutation,
   } = useSessionCreate({ setNewChatError, dispatch, mode, onOpenSlotInNewTab, onSelectSlot, setRemoteCrewError, setNewChatMenuOpen, onOpenPeerSession })
   // A conductor-lane member anchor opens on the Members page (see renderSessionRow).
@@ -922,7 +923,7 @@ function ChatSidebar({
     tagsQueryFailed, tintAgents, toggleCollapse, toggleColumnCollapse, toggleCrewCollapsed, toggleFilter,
     toggleFolderFilter, toggleFoldersShelved, toggleHideFilter, toggleModelFilter, toggleReveal,
     toggleSaveFailed, toggleSpaceCollapsed, toggleTagFilter, ungroupedSlots, unreadSet, updateColumnMutation,
-    updateFolderMutation, visibleRootFolders, warmCrews }
+    updateFolderMutation, visibleRootFolders, warmCrews, crewPreview, openCrewMembers }
   const laneRows = createLaneRows(scope)
   const folderBlocks = createFolderBlocks({ ...scope, ...laneRows })
   const lanes = createListLanes({ ...scope, ...laneRows, ...folderBlocks })

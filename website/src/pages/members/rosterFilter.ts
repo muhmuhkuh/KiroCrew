@@ -45,6 +45,8 @@ export interface MemberSignals {
   unread: boolean
   /** An auto-nudge loop is armed on the member's slot and active. */
   patrolling: boolean
+  /** The member has a goal set (shows the goal mark icon). Fork-only. */
+  goal?: boolean
 }
 
 export type MemberStatusFilter = 'working' | 'needs_you' | 'unread' | 'patrolling'

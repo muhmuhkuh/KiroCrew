@@ -176,6 +176,7 @@ export const PREVIEW_CREWMATE_HARNESS = `${PREVIEW_FLAG_PREFIX}crewmate-harness`
  * the flag is off, and its crew members are ordinary rows of the list.
  */
 export const PREVIEW_CREW_MODE = `${PREVIEW_FLAG_PREFIX}crew-mode`
+export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
 
 /**
  * Explore: the top-bar "Explore N/7" pill and its phone twins (the bar ring and

@@ -273,7 +273,7 @@ function EditInput({ initial, onCommit, onCancel }: {
   )
 }
 
-function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, fuseBelow = true, pendingIds }: {
+function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, fuseBelow = true, pendingIds, onEditDraft: _onEditDraft }: {
   messages: ChatMessage[]
   onCancel?: (queueId: string) => void
   onInterrupt?: (queueId: string) => void
@@ -293,6 +293,8 @@ function QueueStackInner({ messages, onCancel, onInterrupt, onEdit, onReorder, f
    *  margin off and renders as a complete rounded card cleanly above that element instead
    *  of overlapping it. */
   fuseBelow?: boolean
+  /** Called when the user edits the queued draft text (fork-only). */
+  onEditDraft?: (queueId: string, content: string | undefined) => void
 }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [_expanded, setExpanded] = useState(false)

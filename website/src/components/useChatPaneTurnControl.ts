@@ -38,7 +38,7 @@ export function useChatPaneStop({ slotKey, busy, paneSlot, dispatch }: {
   }, [dispatch, slotKey])
   const { stopState: paneStopState, onStop, stopError, dismissStopError } =
     useStopPress({ slotKey, busy, serverStopState: paneSlot?.stop_state, sendStop })
-  return { stopError, dismissStopError, paneStopState, onStop }
+  return { stopError, stopErrorDetail: undefined as string | undefined, dismissStopError, paneStopState, onStop }
 }
 
 export function useChatPaneRunSync({ slotKey, paneSlot, dispatch }: {

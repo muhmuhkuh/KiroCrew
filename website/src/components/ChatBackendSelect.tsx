@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api } from '../api/client'
 import { runtimeAcpBackendId } from '../api/acpBackend'
 import { useAppDispatch } from '../store'
-import { triggerRefresh, updateSlot } from '../store/dashboardSlice'
+import { triggerRefresh } from '../store/dashboardSlice'
 import type { ChatSlot } from '../types'
 import ErrorNotice from './ErrorNotice'
 import SimpleSelect from './SimpleSelect'
@@ -23,9 +23,9 @@ export default function ChatBackendSelect({ slot }: { slot?: ChatSlot }) {
     staleTime: 30_000,
   })
   const change = useMutation({
-    mutationFn: ({ key, backend }: { key: string; backend: string | null }) => api.chatSlotBackend(key, backend),
-    onSuccess: (result, { key }) => {
-      dispatch(updateSlot({ key, acp_backend: result.acp_backend, model: result.model, served_model: '', model_withheld: null }))
+    mutationFn: ({ key, backend }: { key: string; backend: string | null }) =>
+      api.chatSlotAgent(key, backend ?? '', undefined, undefined),
+    onSuccess: () => {
       dispatch(triggerRefresh())
     },
     onError: () => { dispatch(triggerRefresh()) },

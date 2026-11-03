@@ -84,6 +84,8 @@ export interface AppNavTarget {
   iconName: string
   /** Page-relative icon file (installed apps), resolved against `/apps/<name>/ui/`. */
   pageIconUrl: string
+  /** Inactive-state icon URL (for the nav bar state indicator), when the manifest ships one. */
+  inactiveIconUrl: string
 }
 
 /**
@@ -162,6 +164,7 @@ export function appNavTarget(app: AppNavRecord): AppNavTarget | null {
     ),
     iconName: page.icon || '',
     pageIconUrl: page.iconUrl || '',
+    inactiveIconUrl: '',
   }
 }
 

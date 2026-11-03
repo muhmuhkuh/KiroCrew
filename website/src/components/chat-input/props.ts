@@ -558,4 +558,7 @@ export interface ChatInputProps {
    *  otherwise carry the pre-optimize text and send the rewrite to the
    *  session it then deletes. */
   onOptimizingChange?: (optimizing: boolean) => void
+  /** When set, shows a SessionEnvironmentChip for the given slot key so the user
+   *  can see / change the environment the session runs in. Fork-only. */
+  environmentSlot?: string | null
 }

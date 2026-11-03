@@ -65,4 +65,4 @@ const withoutNoSlot = (map: Record<string, FileTokenMap>): Record<string, FileTo
 }
 
 export const loadFileTokenDrafts = (): Record<string, FileTokenMap> => withoutNoSlot(store.load())
-export const saveFileTokenDrafts = (map: Record<string, FileTokenMap>): boolean => store.save(withoutNoSlot(map))
+export const saveFileTokenDrafts = (map: Record<string, FileTokenMap>): boolean => !!store.save(withoutNoSlot(map))

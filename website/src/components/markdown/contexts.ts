@@ -18,6 +18,19 @@ import { createContext } from 'react'
 export const BasePathCtx = createContext<string | null>(null)
 
 /**
+ * The project folder of the chat whose transcript is being rendered.
+ *
+ * A relative path the agent writes (`run/checkin.sh`) is relative to the chat's
+ * own project, but the backend's `resolve=1` joins it to the gateway-wide
+ * project directory, which in the desktop app is the app bundle. A chat
+ * transcript provides its slot's project here, so path chips and links join
+ * the relative text to it before they probe or open. `null` (the default, and
+ * a chat with no project or one that runs on another machine) keeps the
+ * backend's resolution.
+ */
+export const ChatProjectDirCtx = createContext<string | null>(null)
+
+/**
  * When true, markdown images render as small previews (a compact thumbnail the
  * user can still click to open the full-size lightbox) instead of the default
  * large inline size. User-message ("sent prompt") rendering turns this on so
@@ -59,6 +72,13 @@ export const ImageVersionCtx = createContext<string | null>(null)
  *  alone cannot distinguish producer-encoded content from a legacy raw path
  *  that happens to contain `%XX` (which must be preserved verbatim). */
 export const MdSourceCtx = createContext<string | null>(null)
+
+/** The document line the block handed to ReactMarkdown starts on. The renderer
+ *  splits a document into blocks at code fences and parses each on its own, so
+ *  a node's `position.start.line` counts from its block. Text comments add this
+ *  offset through `data-block-start`; ImgWithFallback adds it from here, so an
+ *  image below a fence gets its document line. */
+export const MdBlockStartCtx = createContext(1)
 
 /**
  * Per-consumer override for rendered markdown LINKS.

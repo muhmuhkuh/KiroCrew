@@ -277,7 +277,11 @@ export function useStreamIdle(tick: number, active: boolean, ms: number = STREAM
  *  (ChatEmbed) passes a window wider than its poll interval, because its tick
  *  only advances once per poll and a shorter window would flash the indicator
  *  between every two reads of a reply that is still arriving. */
-const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole, regenerating, stopState, streamTick = 0, sendUnconfirmed = false, streamIdleMs = STREAM_IDLE_MS }: { running: boolean; stopping: boolean; state: string; lastRole: string; regenerating?: boolean; stopState?: StopState; streamTick?: number; sendUnconfirmed?: boolean; streamIdleMs?: number }) {
+const ChatFooter = memo(function ChatFooter({ running, stopping, state, lastRole, regenerating, stopState, streamTick = 0, sendUnconfirmed = false, streamIdleMs = STREAM_IDLE_MS, statusLabel: _statusLabel }: {
+  running: boolean; stopping: boolean; state: string; lastRole: string; regenerating?: boolean; stopState?: StopState; streamTick?: number; sendUnconfirmed?: boolean; streamIdleMs?: number
+  /** Replaces \"Thinking…\" while the turn is not yet thinking (fork: unused but accepted). */
+  statusLabel?: unknown
+}) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const slug = useThemeSlug()
   const themeState = useOptionalTheme()

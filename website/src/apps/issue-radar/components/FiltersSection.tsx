@@ -160,21 +160,21 @@ export default function FiltersSection({
             onToggle={toggleCreatedByMember}
           />
         </div>
-        {active.provider === "jira" && sortedIssueStatuses.length > 0 && (
+        {active.provider === "jira" && sortedIssueStatuses && sortedIssueStatuses.length > 0 && (
           <div className="mt-4">
             <div className="flex items-center gap-1.5 mb-1.5 text-[12px] font-semibold text-muted uppercase tracking-[.05em]">
               <CircleDot size={12} />{" "}
               {i18nT("apps.issueRadar.components.filtersSection.status")}
             </div>
             <div className="flex flex-col gap-0.5">
-              {sortedIssueStatuses.map(({ name, count }) => {
-                const selected = selectedStatuses.has(name);
+              {sortedIssueStatuses.map(({ name, count }: { name: string; count: number }) => {
+                const selected = selectedStatuses!.has(name);
                 return (
                   <button
                     key={name}
                     type="button"
                     aria-pressed={selected}
-                    onClick={() => toggleStatus(name)}
+                    onClick={() => toggleStatus!(name)}
                     className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[13px] text-left transition-colors cursor-pointer ${
                       selected
                         ? "bg-accent-subtle text-text font-medium"

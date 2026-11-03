@@ -27,6 +27,27 @@ export interface InlineComment {
   inCode?: boolean
   /** For an `inCode` anchor: its block, source line and column, packed by `codePassagePosition`. Absent when it could not be packed. */
   codePosition?: number
+  /** Set when the comment is on a box drawn over an image rather than on text.
+   *  `line`/`column` then locate the image in the source and `anchor` carries
+   *  the image destination (src). */
+  image?: InlineCommentImage
+}
+
+/** The box on an image a comment is about, as fractions (0..1) of the rendered
+ *  image: `x`/`y` its top-left corner, `w`/`h` its size. Independent of display
+ *  size — the comment stays in the right place when the image is resized. */
+export interface InlineCommentImage {
+  /** The image destination exactly as written in the markdown, e.g. `states/a.png`. */
+  src: string
+  x: number; y: number; w: number; h: number
+  /** Which use of the file the box was drawn on: the `nth` (0-based) of `uses`
+   *  uses of a file find the same use again after an edit moves both. */
+  nth?: number
+  uses?: number
+}
+
+export function instructionDraftKeyFor(tabKey: string | undefined, filePath: string): string | undefined {
+  return tabKey ? `local:${tabKey}:${filePath}` : undefined
 }
 
 /** Single comment row with inline edit support. */

@@ -63,7 +63,7 @@ export function MemberRow({
   slotKeyOf: (m: MemberRosterRow) => string
   /** The page's one per-row reading (running / needs-you / unread / on watch /
    *  goal), the same the status filters count and the switcher's rows draw. */
-  signalsOf: (m: MemberRosterRow) => MemberSignals
+  signalsOf?: (m: MemberRosterRow) => MemberSignals
   /** The normalized automation record for this crewmate's own slot. */
   automationOf: (m: MemberRosterRow) => AutomationRecord | null
   reduceMotion: boolean | null
@@ -74,6 +74,10 @@ export function MemberRow({
   /** This crewmate's face is centre stage in the first Mate's entrance (#23207):
    *  the row keeps its box and holds the face unpainted until it lands. */
   faceOnStage: boolean
+  // Fork-only convenience props: individual signal accessors instead of signalsOf
+  isRunning?: (m: MemberRosterRow) => boolean
+  isUnread?: (m: MemberRosterRow) => boolean
+  isNeedsYou?: (m: MemberRosterRow) => boolean
 }) {
   // Withheld for a colliding slug, exactly as the page's merged list and drawer
   // do: this row shares its slug with another member, so a slug-keyed frame
@@ -161,7 +165,7 @@ export function MemberRow({
               the switcher's row too: CrewmateRowBody. */}
           <CrewmateRowBody
             m={view}
-            signals={signalsOf(view)}
+            signals={signalsOf ? signalsOf(view) : { running: false, needsYou: false, unread: false, patrolling: false }}
             automation={automationOf(view)}
             slotKey={slotKeyOf(view)}
             size={36}

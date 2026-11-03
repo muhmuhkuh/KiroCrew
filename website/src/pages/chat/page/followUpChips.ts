@@ -11,6 +11,8 @@ interface FollowUpChipsOptions {
   isStreaming: boolean
   /** A pending question card suppresses the chips: only the card can answer it. */
   pendingQuestion: ReturnType<typeof pendingQuestionFor>
+  /** When true, the turn is still running — used to filter irrelevant chips. */
+  turnRunning?: boolean
   activeSlot: string | null
   inputRef: MutableRefObject<string>
   setInput: ComposerDraftStore['set']

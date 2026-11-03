@@ -30,6 +30,7 @@ const KIND_ICON: Record<BuiltinTabKind, ReactNode> = {
   pins: <Pin size={16} />,
   file: <FileText size={16} />, diff: <GitCompare size={16} />, wtdiff: <FileDiff size={16} />, artifact: <Component size={16} />, folder: <Folder size={16} />,
   app: <PanelRight size={16} />, git: <GitBranch size={16} />,
+  workers: <Bot size={16} />,
 }
 
 /** The strip/menu glyph for a tab kind. A built-in reads `KIND_ICON`; an
@@ -104,7 +105,7 @@ function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onC
   )
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, badge, testId }: {
+function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, badge, testId, chipId: _chipId }: {
   /** A stored tab, or — for the host's leading tab — just a title: that chip has
    *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
   tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId' | 'path'>>
@@ -117,6 +118,8 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
   /** Count / status pill rendered after the label. */
   badge?: ReactNode
   testId?: string
+  /** Stable chip id for drag-reorder (fork-only). */
+  chipId?: string
 }) {
   // App-tab glyphs come from the manifest descriptor (resolved by name); a built-in
   // reads KIND_ICON. Reuses the shared ['apps'] query, so no extra fetch.

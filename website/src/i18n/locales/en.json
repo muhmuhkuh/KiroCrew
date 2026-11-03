@@ -10132,7 +10132,8 @@
         "redaction_revoke_failed": "Couldn't revoke that host. It is still allowed.",
         "redaction_no_allowed_hosts": "No hosts are allowed. Every link goes through every check.",
         "redaction_workspace": "Workspace: {{workspace}}",
-        "redaction_revoke": "Revoke"
+        "redaction_revoke": "Revoke",
+        "file_delivery_section": "File delivery"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",

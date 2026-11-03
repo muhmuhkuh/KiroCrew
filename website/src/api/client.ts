@@ -120,6 +120,8 @@ export type {
   TrustedRegistriesData,
   ManagedSecret,
   SecretsListResponse,
+  ArmedFileDeliveryConsent,
+  FileDeliveryConsentStatus,
 } from './client/security'
 export type {
   TailnetStatusData,

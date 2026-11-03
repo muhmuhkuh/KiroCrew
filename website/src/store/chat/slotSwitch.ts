@@ -65,7 +65,7 @@ import { walkWindowBackTo } from './windowWalk'
  *    The move counts in `activeSlotRequestMoves`, so a request clicked after
  *    the fork still opens, and one clicked before it does not take the view
  *    back (see `forkMayOpen`). */
-export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean; announceOnMissing?: boolean; automatic?: boolean; requestSeq?: number }
+export type SwitchSlotArg = string | { key: string; keepTargetOnMissing?: boolean; announceOnMissing?: boolean; automatic?: boolean; requestSeq?: number; gesture?: boolean }
 
 /** The slot key of a `switchSlot` argument, in either spelling. Non-object
  *  values pass through untouched: a hand-rolled test dispatch can omit

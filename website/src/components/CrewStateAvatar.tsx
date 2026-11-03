@@ -33,6 +33,8 @@ export interface CrewStateAvatarProps {
   working?: WorkingIntensity
   onImageError?: () => void
   className?: string
+  /** True when this crew member is being watched/patrolled. Fork-only. */
+  watch?: boolean
 }
 
 export default function CrewStateAvatar({
