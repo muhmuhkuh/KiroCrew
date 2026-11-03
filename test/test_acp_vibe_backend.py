@@ -1,16 +1,20 @@
 """The Mistral Vibe backend: vocabulary, the launch record, and the routing state.
 
-Vibe is onboarded with ``Routing.UNVERIFIED``: its ACP surface's ``session/set_mode``
-support and the exact mechanism to force the ``ask`` agent profile over ACP are not
-yet verified. Until routing is established, ``register_selectable_backend`` refuses
-the backend, which is the correct fail-closed behaviour -- a selectable harness
-starts sessions, and for an UNVERIFIED one nothing establishes that its tool calls
-reach the host permission gate.
+Vibe is selectable with ``Routing.VERIFIED_SEEDED_SETTINGS``: Crew seeds
+``VIBE_DEFAULT_AGENT=ask`` plus the auto-approve clamp variables
+(``VIBE_ENABLE_AUTO_APPROVE``, ``VIBE_BYPASS_TOOL_PERMISSIONS``,
+``VIBE_DISABLED_AGENTS``) into the child's environment -- a config layer Vibe
+resolves ABOVE its user and project TOML files -- and reads the profile Vibe
+resolved back off the ``modes`` block of the session-opening response before the
+first prompt, refusing unless the current mode is ``ask`` AND the advertised mode
+list is exactly ``ask``. Live captures on mistral-vibe 3.0.3
+(``test/fixtures/acp_frames/vibe/routing-live.jsonl``) show a write asking and a
+rejected write leaving no file even with ``bypass_tool_permissions = true`` in the
+config file, while the same file without the seed auto-approved.
 
-This file pins the vocabulary that IS established: the backend id, its membership in
-``ACP_BACKENDS_KNOWN`` and ``ACP_BACKENDS_INDEPENDENT_SETUP``, its
-``SelfServedLaunch`` record (binary ``vibe-acp``, no adapter package), and its
-absence from the capability sets it has no evidence for.
+This file pins the vocabulary: the backend id, its memberships, its
+``SelfServedLaunch`` record (binary ``vibe-acp``, no adapter package), its
+selectability, and its absence from the capability sets it has no evidence for.
 """
 
 from __future__ import annotations
@@ -18,16 +22,64 @@ from __future__ import annotations
 import pytest
 
 from kiro_crew import acp_backends
-from kiro_crew.acp.harness import VibeLaunch, process_adapter_for
+from kiro_crew.acp.harness import process_adapter_for
+from kiro_crew.acp.harness.vibe import VibeLaunch
 from kiro_crew.agent_sdk import backends as sdk_backends
 from kiro_crew.agent_sdk import tool_gate as gate
+from kiro_crew.agent_sdk.backends_launch import (
+    ACP_BACKEND_NODE_ADAPTER_PACKAGES,
+    ACP_BACKEND_PROCESS_NAMES,
+    ACP_BACKENDS_INTERNAL_SANDBOX,
+    ACP_BACKENDS_SELF_SERVED_ACP,
+    launch_for,
+)
+from kiro_crew.agent_sdk.backends_mcp import (
+    ACP_BACKENDS_MARKDOWN_AGENT_SPECS,
+    ACP_BACKENDS_SESSION_MCP_ARRAY,
+    ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
+    ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY,
+)
+from kiro_crew.agent_sdk.backends_members import (
+    ACP_BACKENDS_MEMBER_CAPABILITIES,
+    ACP_BACKENDS_MEMBER_DISPATCH,
+    ACP_BACKENDS_MEMBER_PANEL,
+)
+from kiro_crew.agent_sdk.backends_models import (
+    ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION,
+    effort_config_option_id,
+)
+from kiro_crew.agent_sdk.backends_routing import (
+    ACP_BACKEND_ROUTING,
+    ACP_BACKENDS_META_IDENTITY,
+    Routing,
+    permission_config_for,
+    permission_setting_for,
+    routing_for,
+)
+from kiro_crew.agent_sdk.backends_sessions import (
+    ACP_BACKENDS_ACP_CLIENT_SPAWNABLE,
+    ACP_BACKENDS_ACP_RUNTIME,
+    ACP_BACKENDS_SESSION_EVICTION,
+    ACP_BACKENDS_SESSION_SHARING,
+)
+from kiro_crew.agent_sdk.backends_turns import (
+    ACP_BACKENDS_COMPACT,
+    ACP_BACKENDS_CONTEXT_RECYCLE,
+    ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
+    ACP_BACKENDS_INLINE_COMPACTION,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
+    ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEERING_REQUEST,
+)
 
 VIBE = acp_backends.ACP_BACKEND_VIBE
 
 #: This harness's launch record. The override variable, the binary and the argv
 #: tail are read from here rather than from module constants, because the record is
 #: where they are declared and a second spelling could drift from it.
-_VIBE_LAUNCH = sdk_backends.launch_for(sdk_backends.ACP_BACKEND_VIBE)
+_VIBE_LAUNCH = launch_for(sdk_backends.ACP_BACKEND_VIBE)
 
 
 # ── Vocabulary ──
@@ -39,21 +91,23 @@ def test_vibe_is_a_known_backend() -> None:
     assert VIBE in sdk_backends.ACP_BACKENDS_KNOWN
 
 
-def test_vibe_is_not_yet_selectable_because_routing_is_unverified() -> None:
-    """UNVERIFIED refuses registration; this is the fail-closed state.
+def test_vibe_is_selectable_because_routing_is_verified() -> None:
+    """VERIFIED_SEEDED_SETTINGS puts Vibe in the baseline selectable set.
 
-    ``register_selectable_backend`` refuses UNVERIFIED with no opt-out, so Vibe is
-    NOT in ``BASELINE_SELECTABLE_BACKENDS`` until routing is established. This test
-    pins that absence as a decision, not an oversight.
+    Selectability is a claim that a session's tool calls reach the host permission
+    gate; the seed plus the session-response read-back establish it, so Vibe is in
+    ``BASELINE_SELECTABLE_BACKENDS`` and survives a config load.
     """
-    assert sdk_backends.routing_for(VIBE) is sdk_backends.Routing.UNVERIFIED
-    assert VIBE not in sdk_backends.BASELINE_SELECTABLE_BACKENDS
+    assert routing_for(VIBE) is Routing.VERIFIED_SEEDED_SETTINGS
+    assert VIBE in sdk_backends.BASELINE_SELECTABLE_BACKENDS
+    assert VIBE in sdk_backends.selectable_backends()
 
 
-def test_register_selectable_backend_refuses_vibe() -> None:
-    """The one gate that makes a backend selectable refuses UNVERIFIED."""
-    with pytest.raises(ValueError, match="unverified"):
-        sdk_backends.register_selectable_backend(VIBE)
+def test_register_selectable_backend_accepts_vibe_idempotently() -> None:
+    """The one gate that makes a backend selectable accepts a verified routing."""
+    before = sdk_backends.selectable_backends()
+    sdk_backends.register_selectable_backend(VIBE)
+    assert sdk_backends.selectable_backends() == before
 
 
 def test_vibe_is_in_independent_setup() -> None:
@@ -64,17 +118,27 @@ def test_vibe_is_in_independent_setup() -> None:
 def test_vibe_carries_its_mcp_servers_on_the_session_array() -> None:
     """Membership here is what gives a Vibe session Crew's own tools.
 
-    Vibe supports MCP servers (stdio, http, streamable-http) configured via
-    ``mcp_servers`` in ``config.toml`` or added via ``vibe mcp add``. The ACP
-    ``session/new`` array is the channel Crew has to mount its own servers on the
-    session.
+    vibe-acp consumes the ``session/new`` ``mcpServers`` array itself (captured
+    live on mistral-vibe 3.0.3: a stdio element was spawned and asked
+    ``initialize``/``tools/list`` -- ``test/fixtures/acp_frames/vibe/routing-live.jsonl``),
+    so the array is the channel and carries Crew's pooled broker stubs
+    (``broker-only`` projection in ``providers/mirrors/registry.py``).
     """
-    assert VIBE in sdk_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert VIBE in ACP_BACKENDS_SESSION_MCP_ARRAY
+
+
+def test_vibe_model_and_effort_ride_config_options() -> None:
+    """The ``model`` and ``thinking`` selects advertised on ``session/new`` are the
+    channels a model or effort switch travels down (captured on 3.0.3)."""
+    assert VIBE in ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
+    assert VIBE in ACP_BACKENDS_ADVERTISED_MODEL_SELECTION
+    assert VIBE in ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
+    assert effort_config_option_id(VIBE) == "thinking"
 
 
 def test_vibe_is_acp_client_spawnable() -> None:
     """Vibe is launched one process per session by ``AcpClient``."""
-    assert VIBE in sdk_backends.ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
+    assert VIBE in ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
 
 
 def test_vibe_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
@@ -84,26 +148,24 @@ def test_vibe_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
     a steer method, an internal sandbox that would displace the credential mask,
     session sharing, or an effort channel.
     """
-    assert VIBE not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
-    assert VIBE not in sdk_backends.ACP_BACKENDS_STEER
-    assert VIBE not in sdk_backends.ACP_BACKENDS_STEERING_REQUEST
-    assert VIBE not in sdk_backends.ACP_BACKENDS_INTERNAL_SANDBOX
-    assert VIBE not in sdk_backends.ACP_BACKENDS_SESSION_SHARING
-    assert VIBE not in sdk_backends.ACP_BACKENDS_SESSION_EVICTION
-    assert VIBE not in sdk_backends.ACP_BACKENDS_COMPACT
-    assert VIBE not in sdk_backends.ACP_BACKENDS_INLINE_COMPACTION
-    assert VIBE not in sdk_backends.ACP_BACKENDS_HARNESS_MANAGED_COMPACTION
-    assert VIBE not in sdk_backends.ACP_BACKENDS_CONTEXT_RECYCLE
-    assert VIBE not in sdk_backends.ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION
-    assert VIBE not in sdk_backends.ACP_BACKENDS_MODEL_VIA_CONFIG_OPTION
-    assert VIBE not in sdk_backends.ACP_BACKENDS_KIRO_SLASH_COMMANDS
-    assert VIBE not in sdk_backends.ACP_BACKENDS_MARKDOWN_AGENT_SPECS
-    assert VIBE not in sdk_backends.ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY
-    assert VIBE not in sdk_backends.ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
-    assert VIBE not in sdk_backends.ACP_BACKENDS_MEMBER_CAPABILITIES
-    assert VIBE not in sdk_backends.ACP_BACKENDS_MEMBER_DISPATCH
-    assert VIBE not in sdk_backends.ACP_BACKENDS_MEMBER_PANEL
-    assert VIBE not in sdk_backends.ACP_BACKENDS_META_IDENTITY
+    assert VIBE not in ACP_BACKENDS_ACP_RUNTIME
+    assert VIBE not in ACP_BACKENDS_STEER
+    assert VIBE not in ACP_BACKENDS_STEERING_REQUEST
+    assert VIBE not in ACP_BACKENDS_INTERNAL_SANDBOX
+    assert VIBE not in ACP_BACKENDS_SESSION_SHARING
+    assert VIBE not in ACP_BACKENDS_SESSION_EVICTION
+    assert VIBE not in ACP_BACKENDS_COMPACT
+    assert VIBE not in ACP_BACKENDS_INLINE_COMPACTION
+    assert VIBE not in ACP_BACKENDS_HARNESS_MANAGED_COMPACTION
+    assert VIBE not in ACP_BACKENDS_CONTEXT_RECYCLE
+    assert VIBE not in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+    assert VIBE not in ACP_BACKENDS_MARKDOWN_AGENT_SPECS
+    assert VIBE not in ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY
+    assert VIBE not in ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
+    assert VIBE not in ACP_BACKENDS_MEMBER_CAPABILITIES
+    assert VIBE not in ACP_BACKENDS_MEMBER_DISPATCH
+    assert VIBE not in ACP_BACKENDS_MEMBER_PANEL
+    assert VIBE not in ACP_BACKENDS_META_IDENTITY
 
 
 # ── The launch record ──
@@ -141,17 +203,17 @@ def test_vibe_missing_hint_names_the_python_install() -> None:
 
 def test_vibe_is_self_served_acp() -> None:
     """Vibe serves ACP from its own binary; its whole launch is in the table."""
-    assert VIBE in sdk_backends.ACP_BACKENDS_SELF_SERVED_ACP
+    assert VIBE in ACP_BACKENDS_SELF_SERVED_ACP
 
 
 def test_vibe_process_name_is_the_binary() -> None:
     """The PID-file reclaim recognises a vibe-acp child by its argv0 basename."""
-    assert sdk_backends.ACP_BACKEND_PROCESS_NAMES[VIBE] == "vibe-acp"
+    assert ACP_BACKEND_PROCESS_NAMES[VIBE] == "vibe-acp"
 
 
 def test_vibe_is_not_a_node_adapter() -> None:
     """Vibe is a Python binary, not a Node entry script."""
-    assert VIBE not in sdk_backends.ACP_BACKEND_NODE_ADAPTER_PACKAGES
+    assert VIBE not in ACP_BACKEND_NODE_ADAPTER_PACKAGES
 
 
 # ── The harness adapter ──
@@ -173,32 +235,124 @@ def test_vibe_launch_backend_id_matches() -> None:
 # ── The routing state ──
 
 
-def test_vibe_routing_is_unverified_not_absent() -> None:
-    """UNVERIFIED is a declared state, not a missing row.
+def test_vibe_routing_is_verified_seeded_settings_not_absent() -> None:
+    """The routing table names Vibe with the seeded-settings mechanism.
 
     A ``.get(backend, Routing.UNVERIFIED)`` read is deliberate: an id the table
     does not name fails closed rather than inheriting a neighbour's mechanism.
-    Vibe IS named, with UNVERIFIED, so the refusal message names the routing state
-    rather than reading as "unknown backend".
+    Vibe IS named, with ``VERIFIED_SEEDED_SETTINGS``, so the session-response
+    read-back runs for it.
     """
-    assert VIBE in sdk_backends.ACP_BACKEND_ROUTING
-    assert sdk_backends.ACP_BACKEND_ROUTING[VIBE] is sdk_backends.Routing.UNVERIFIED
+    assert VIBE in ACP_BACKEND_ROUTING
+    assert ACP_BACKEND_ROUTING[VIBE] is Routing.VERIFIED_SEEDED_SETTINGS
 
 
-def test_vibe_has_no_permission_setting_or_config() -> None:
-    """No seeded setting or config option is declared for Vibe.
-
-    Until routing is verified, there is no ``(setting_key, value)`` pair or
-    ``(option_id, value)`` pair to seed. Declaring one would be a claim the wire
-    does not support.
-    """
-    assert sdk_backends.permission_setting_for(VIBE) == ("", "")
-    assert sdk_backends.permission_config_for(VIBE) == ("", "")
+def test_vibe_seeded_permission_setting_is_the_env_pair() -> None:
+    """The primary seed is ``VIBE_DEFAULT_AGENT=ask``, an env var Vibe resolves above
+    its config files; the read-back compares ``modes.currentModeId`` against it."""
+    assert permission_setting_for(VIBE) == ("VIBE_DEFAULT_AGENT", "ask")
+    assert permission_config_for(VIBE) == ("", "")
 
 
-def test_vibe_is_not_in_enforced_routings() -> None:
-    """UNVERIFIED is not in ENFORCED_ROUTINGS; the tool gate does not enforce it."""
-    assert sdk_backends.routing_for(VIBE) not in gate.ENFORCED_ROUTINGS
+def test_vibe_is_in_enforced_routings() -> None:
+    """VERIFIED_SEEDED_SETTINGS is in ENFORCED_ROUTINGS: a session whose read-back
+    fails is refused, and the OS credential mask applies to the child."""
+    assert routing_for(VIBE) in gate.ENFORCED_ROUTINGS
+    assert gate.is_enforced(VIBE)
+
+
+# ── The spawn seed ──
+
+
+def test_vibe_spawn_seed_carries_the_clamp_variables() -> None:
+    """The seed is four ``VIBE_*`` variables, the primary read from the routing
+    table so the seed, the read-back and the refusal cannot drift apart."""
+    from kiro_crew.acp.harness import vibe as vibe_mod
+
+    seed = dict(vibe_mod._VIBE_ROUTING_SEED_ENV)
+    assert seed["VIBE_DEFAULT_AGENT"] == permission_setting_for(VIBE)[1]
+    assert seed["VIBE_ENABLE_AUTO_APPROVE"] == "false"
+    assert seed["VIBE_BYPASS_TOOL_PERMISSIONS"] == "false"
+    assert "auto-approve" in seed["VIBE_DISABLED_AGENTS"]
+    assert "accept-edits" in seed["VIBE_DISABLED_AGENTS"]
+    assert sorted(vibe_mod.VIBE_REQUIRED_MODE_IDS) == ["ask"]
+
+
+# ── The read-back ──
+
+
+def _vibe_client(backend: str = VIBE):
+    """A minimal stand-in exposing the two attributes the verifier reads."""
+    from unittest.mock import MagicMock
+
+    client = MagicMock()
+    client.backend = backend
+    return client
+
+
+def _session_resp(modes: object) -> dict:
+    return {"sessionId": "s", "modes": modes}
+
+
+def test_verify_vibe_routing_accepts_exactly_ask() -> None:
+    """currentModeId=ask with availableModes exactly [ask] passes."""
+    from kiro_crew.acp import client_permissions
+
+    resp = _session_resp({"currentModeId": "ask", "availableModes": [{"id": "ask"}]})
+    client_permissions._verify_vibe_routing(_vibe_client(), resp)
+
+
+def test_verify_vibe_routing_refuses_a_non_ask_current_mode() -> None:
+    """A restored/created session in auto-approve is refused before the first prompt."""
+    from kiro_crew.acp import client_permissions
+    from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
+
+    resp = _session_resp(
+        {
+            "currentModeId": "auto-approve",
+            "availableModes": [{"id": "ask"}, {"id": "auto-approve"}],
+        }
+    )
+    with pytest.raises(AcpToolGateUnroutable):
+        client_permissions._verify_vibe_routing(_vibe_client(), resp)
+
+
+def test_verify_vibe_routing_refuses_when_a_bypass_mode_is_still_advertised() -> None:
+    """currentModeId=ask but accept-edits still available: the clamp did not take
+    effect (a config source outranked the seed), so the session is refused."""
+    from kiro_crew.acp import client_permissions
+    from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
+
+    resp = _session_resp(
+        {
+            "currentModeId": "ask",
+            "availableModes": [{"id": "ask"}, {"id": "accept-edits"}],
+        }
+    )
+    with pytest.raises(AcpToolGateUnroutable):
+        client_permissions._verify_vibe_routing(_vibe_client(), resp)
+
+
+def test_verify_vibe_routing_refuses_an_omitted_modes_block() -> None:
+    """No modes block at all is INDETERMINATE, not a pass."""
+    from kiro_crew.acp import client_permissions
+    from kiro_crew.acp.transport_errors import AcpToolGateUnroutable
+
+    with pytest.raises(AcpToolGateUnroutable):
+        client_permissions._verify_vibe_routing(_vibe_client(), {"sessionId": "s"})
+
+
+def test_verify_vibe_routing_ignores_other_backends() -> None:
+    """The verifier is a no-op for any backend but vibe (harness-parity H13)."""
+    from kiro_crew.acp import client_permissions
+
+    resp = _session_resp(
+        {
+            "currentModeId": "auto-approve",
+            "availableModes": [{"id": "auto-approve"}],
+        }
+    )
+    client_permissions._verify_vibe_routing(_vibe_client("goose"), resp)
 
 
 # ── Capability set containment ──
@@ -217,14 +371,14 @@ def test_every_capability_set_is_a_subset_of_known_backends() -> None:
 
 def test_vibe_in_session_mcp_array_is_a_subset_of_known() -> None:
     """The session MCP array set contains Vibe and stays within known backends."""
-    assert VIBE in sdk_backends.ACP_BACKENDS_SESSION_MCP_ARRAY
-    assert sdk_backends.ACP_BACKENDS_SESSION_MCP_ARRAY <= sdk_backends.ACP_BACKENDS_KNOWN
+    assert VIBE in ACP_BACKENDS_SESSION_MCP_ARRAY
+    assert ACP_BACKENDS_SESSION_MCP_ARRAY <= sdk_backends.ACP_BACKENDS_KNOWN
 
 
 def test_vibe_in_acp_client_spawnable_is_a_subset_of_known() -> None:
     """The client-spawnable set contains Vibe and stays within known backends."""
-    assert VIBE in sdk_backends.ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
-    assert sdk_backends.ACP_BACKENDS_ACP_CLIENT_SPAWNABLE <= sdk_backends.ACP_BACKENDS_KNOWN
+    assert VIBE in ACP_BACKENDS_ACP_CLIENT_SPAWNABLE
+    assert ACP_BACKENDS_ACP_CLIENT_SPAWNABLE <= sdk_backends.ACP_BACKENDS_KNOWN
 
 
 def test_vibe_in_independent_setup_is_a_subset_of_known() -> None:
@@ -243,6 +397,6 @@ def test_vibe_is_reexported_from_acp_backends_shim() -> None:
 
 def test_vibe_is_reexported_from_acp_types() -> None:
     """``acp.types`` re-exports the vocabulary for existing importers."""
-    from kiro_crew.acp.types import ACP_BACKEND_VIBE as VIBE_FROM_TYPES
+    import kiro_crew.acp.types as acp_types
 
-    assert VIBE_FROM_TYPES == "vibe"
+    assert "ACP_BACKEND_VIBE" in vars(acp_types)
