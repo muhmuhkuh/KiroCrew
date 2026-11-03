@@ -734,7 +734,9 @@ mate and its own children inherit nothing (an id-less member's worker keeps
 or a mate with nothing set, leaves the slot on the agent's or the global
 default, exactly as before. Nor does a child that is itself a mate inherit:
 an explicit `agent` that selects a member runs that member's own profile through
-the crew-pin tier, and a copied pin would outrank it as a per-session pick. An
+the crew-pin tier, and a copied pin would outrank it as a per-session pick. Its
+explicit model is checked against that member's profile backend, inheriting the
+member backend when the profile has no harness pin. An
 explicit argument always wins. An inherited model runs the same guard an
 explicit one does (`_model_pin_refusal`, the picker's own), but a refusal there
 is DROPPED rather than raised: a profile pin goes stale (delisted, display-only,

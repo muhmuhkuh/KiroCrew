@@ -1442,7 +1442,11 @@ class KiroCrewConfig:
                 self.agent.acp_backend,
                 backend_override=backend_override,
                 crew_backend=(
-                    crewmate_backend_pin(self, session_key) if backend_override is None else None
+                    crewmate_backend_pin(
+                        self, session_key, crew=crew_agent, enabled=acp_backend_override is None
+                    )
+                    if backend_override is None
+                    else None
                 ),
             )
             if acp_backend_override is not None:

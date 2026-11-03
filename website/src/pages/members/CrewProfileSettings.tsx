@@ -11,8 +11,6 @@ import { Btn, Toggle } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { INHERIT_MODEL } from '../../components/crew/useCrewEditor'
 import { useAvailableModelsQuery } from '../../hooks/useAvailableModels'
-import { usePreviewFlag } from '../../hooks/usePreviewFlag'
-import { PREVIEW_CREWMATE_HARNESS } from '../../utils/previewFlags'
 import { acpBackendName } from '../../api/acpBackend'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { crewDisplayName } from '../../components/AgentSelector'
@@ -112,10 +110,6 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
     queryKey: ['agent-resolved-model', member.name],
     queryFn: () => api.agentResolvedModel(member.name),
   })
-  // A developer preview (Settings > Developer > Feature Previews): the Harness row.
-  // The pin itself is read from the owner-only readout above whatever the flag
-  // says, so a saved pin always scopes the model lists below.
-  const harnessRowOn = usePreviewFlag(PREVIEW_CREWMATE_HARNESS)
   const stored = {
     approval_mode: String(member.approval_mode || 'trust'),
     acp_backend: String(resolved?.acp_backend || INHERIT_HARNESS),
@@ -318,10 +312,10 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
             : t('pages.membersPage.profile_mode_trust_desc', { name }),
       })),
     },
-    ...(harnessRowOn ? [{
-      key: 'acp_backend' as const,
+    {
+      key: 'acp_backend',
       label: t('pages.membersPage.profile_harness'),
-      icon: <Cpu size={16} />, tone: 'accent' as const,
+      icon: <Cpu size={16} />, tone: 'accent',
       // "Agent harness" alone does not say what it is: the row says so under
       // its label, and an Inherited value names the harness it resolves to.
       sub: t('pages.membersPage.profile_harness_sub', { name }),
@@ -342,7 +336,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
             : workerHarnesses && !workerHarnesses.includes(h) ? t('pages.membersPage.profile_harness_no_workers', { name }) : undefined,
       })),
       caption: t('pages.membersPage.profile_harness_hint', { name }),
-    }] : []),
+    },
     {
       key: 'model',
       label: t('pages.kiroCrewAgentsPage.model'),
@@ -479,7 +473,7 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
           ? t('pages.membersPage.profile_harness_unavailable', { name, harness: acpBackendName({ id: resolved.acp_backend }) })
           : null}
         testId="crew-profile-settings-harness-error"
-        footer={harnessRowOn && page !== 'acp_backend' ? (
+        footer={page !== 'acp_backend' ? (
           <Btn type="button" onClick={() => openPage('acp_backend')} data-testid="crew-profile-settings-harness-fix">
             {t('pages.membersPage.profile_harness_choose')}
           </Btn>

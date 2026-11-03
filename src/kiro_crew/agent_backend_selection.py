@@ -1,5 +1,3 @@
-# DEPRECATED: Replaced by crewmate_harness.crewmate_backend_pin (upstream sync Nov 2026).
-# Kept to avoid breakage of any callers not yet updated. Do not add new usages.
 """Member defaults feed the existing harness gate; explicit session choices win."""
 
 from __future__ import annotations
@@ -66,7 +64,7 @@ def agent_backend_pin(
         from kiro_crew.members import is_crewmate_worker_session
 
         if is_crewmate_worker_session(session_key) and any(
-            member.acp_backend is not None for member in cfg.agents.values()
+            member.acp_backend not in (None, "") for member in cfg.agents.values()
         ):
             from kiro_crew.execution_context import member_config_for_id, read_session_execution
             from kiro_crew.mate_worker import MATE_WORKER_AGENT
@@ -78,7 +76,9 @@ def agent_backend_pin(
                 and execution.member_id
             ):
                 _, record = member_config_for_id(cfg, execution.member_id)
-    return validate_agent_backend(record.acp_backend) if record is not None else None
+    if record is None or record.acp_backend in (None, ""):
+        return None
+    return validate_agent_backend(record.acp_backend)
 
 
 def session_backend(
@@ -89,7 +89,7 @@ def session_backend(
     session_key: str | None = None,
     backend_override: str | None = None,
 ) -> str:
-    # DEPRECATED: use crewmate_harness.crewmate_backend_pin + members.select_provider_backend directly.
+    from kiro_crew.config.loader_agents import resolve_crew_identity
     from kiro_crew.crewmate_harness import crewmate_backend_pin
     from kiro_crew.members import select_provider_backend
 
@@ -99,6 +99,10 @@ def session_backend(
         cfg.agent.acp_backend,
         backend_override=backend_override,
         crew_backend=(
-            crewmate_backend_pin(cfg, session_key) if backend_override is None else None
+            crewmate_backend_pin(
+                cfg, session_key, crew=resolve_crew_identity(cfg, agent, crew_agent)
+            )
+            if backend_override is None
+            else None
         ),
     )

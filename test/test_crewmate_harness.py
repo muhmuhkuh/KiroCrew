@@ -70,6 +70,16 @@ def _startable(stored: str):
 
 
 class TestSelectionGate:
+    def test_chat_override_can_replace_an_unavailable_profile_pin(self):
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        cfg = KiroCrewConfig()
+        cfg.agents["atlas"] = KiroCrewAgentConfig(acp_backend="no-such-harness")
+        provider = cfg.create_provider_factory()(
+            "dashboard:explicit", agent="atlas", acp_backend_override="kas"
+        )
+        assert provider.client.backend == "kas"
+
     def test_the_pin_outranks_the_member_route(self):
         from kiro_crew.members import select_provider_backend
 
@@ -119,6 +129,13 @@ class TestSelectionGate:
 
 class TestThePreGateCheck:
     """H17: an unstartable pin refuses BEFORE the gate, and never falls back."""
+
+    def test_unpinned_member_does_not_inherit_another_profiles_pin(self):
+        from kiro_crew.crewmate_harness import crewmate_backend_pin
+
+        cfg = _cfg()
+        cfg.agents["other"].acp_backend = "claude"
+        assert crewmate_backend_pin(cfg, DM_KEY, crew="other") is None
 
     @pytest.mark.parametrize("stored", ["codex", "no-such-harness"])
     def test_an_unstartable_pin_refuses_instead_of_falling_back(self, stored):
@@ -551,7 +568,7 @@ class TestSave:
             )
         assert KiroCrewConfig.load().agents[seeded].acp_backend == ""
 
-    @pytest.mark.parametrize("bad", ["codex", "nope", 3, None])
+    @pytest.mark.parametrize("bad", ["codex", "nope", 3])
     @pytest.mark.asyncio
     async def test_a_harness_that_cannot_start_is_refused_and_nothing_is_written(self, seeded, bad):
         async with TestClient(TestServer(_app())) as client:
@@ -1199,6 +1216,7 @@ class TestModelsRoute:
         [
             ("claude", True, "kas", ("kas", True)),
             ("kas", True, "kiro", ("", False)),
+            ("kas", True, "", ("", False)),
             ("kas", False, "kas", ("kas", False)),
             ("kas", True, "claude", ("claude", False)),
         ],
@@ -1208,7 +1226,7 @@ class TestModelsRoute:
 
         assert models_route(self._config(installed, bundle), {"backend": asked}) == expected
 
-    @pytest.mark.parametrize("asked", ["codex", ""])
+    @pytest.mark.parametrize("asked", ["codex"])
     def test_an_unselectable_harness_is_refused(self, asked):
         from kiro_crew.crewmate_harness import models_route
 

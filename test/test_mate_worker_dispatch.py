@@ -149,7 +149,7 @@ def test_profile_backend_routes_worker_without_pinning_chat_override(crewmate, b
     assert chat_session_selection(child, cfg, "auto")["acp_backend_override"] == "kas"
 
 
-@pytest.mark.parametrize("backend", ["codex", "pi", ""])
+@pytest.mark.parametrize("backend", ["codex", "pi", "kiro"])
 def test_profile_cannot_bypass_worker_kit_boundary(crewmate, backend):
     from kiro_crew.config.loader import KiroCrewConfig
 

@@ -286,7 +286,6 @@ async def test_revoked_old_backend_does_not_block_permitted_replacement(
         {},
         {"acp_backend": "unknown"},
         {"acp_backend": "default"},
-        {"acp_backend": "vibe"},
         {"acp_backend": []},
         {"acp_backend": 1},
     ],

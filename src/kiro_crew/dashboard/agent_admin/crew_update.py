@@ -325,12 +325,15 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
     if "acp_backend" in body:
         from kiro_crew.crewmate_harness import harness_pin_rejected
 
-        backend_reason = harness_pin_rejected(body["acp_backend"])
+        backend_value = body["acp_backend"]
+        if backend_value is None:
+            backend_value = ""
+        backend_reason = harness_pin_rejected(backend_value)
         if backend_reason:
             return web.json_response(
                 {"error": backend_reason, "code": "invalid_acp_backend"}, status=400
             )
-        pending_backend = body["acp_backend"].strip()
+        pending_backend = backend_value.strip()
     from kiro_crew.crewmate_harness import judges_a_model_edit
 
     # A re-sent stored value is not judged unless the harness moves; the locked

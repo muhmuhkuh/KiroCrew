@@ -154,7 +154,11 @@ def crewmate_pin_for(config: Any, crew: str | None) -> CrewBackendPin | None:
     """Crew *crew*'s harness pin, or ``None`` when it pins none (or is no crew)."""
     record = config.agents.get(crew) if crew else None
     stored = getattr(record, "acp_backend", "") if record is not None else ""
-    if not isinstance(stored, str) or not stored.strip():
+    if stored is None or stored == "":
+        return None
+    if not isinstance(stored, str):
+        return CrewBackendPin(str(crew), "<invalid>", _kas_bundle(config))
+    if not stored.strip():
         return None
     return CrewBackendPin(str(crew), stored.strip(), _kas_bundle(config))
 
@@ -219,7 +223,9 @@ def crewmate_stored_pin(config: Any, session_key: str | None) -> CrewBackendPin 
     return crewmate_pin_for(config, crewmate_for_session(config, session_key))
 
 
-def crewmate_backend_pin(config: Any, session_key: str | None) -> StartableCrewPin | None:
+def crewmate_backend_pin(
+    config: Any, session_key: str | None, *, crew: str = "", enabled: bool = True
+) -> StartableCrewPin | None:
     """The pre-gate check (H17): *session_key*'s crewmate pin, confirmed startable.
 
     What every caller of ``members.select_provider_backend`` passes as its
@@ -229,7 +235,9 @@ def crewmate_backend_pin(config: Any, session_key: str | None) -> StartableCrewP
     crewmate's session is refused before the gate and never falls back to another
     harness, while the gate keeps its never-raises contract (H3).
     """
-    pin = crewmate_stored_pin(config, session_key)
+    if not enabled:
+        return None
+    pin = crewmate_pin_for(config, crewmate_for_session(config, session_key) or crew)
     return pin.checked() if pin is not None else None
 
 
@@ -339,6 +347,8 @@ def kiro_spelling_applies(backend: str | None, harness_pinned: bool) -> bool:
 def harness_for_query(value: str) -> str | None:
     """The runtime backend a ``?backend=`` value names, or ``None`` when not selectable."""
     asked = value.strip()
+    if not asked:
+        return "" if _backends.ACP_BACKEND_KIRO in _backends.selectable_backends() else None
     if asked not in selectable_harnesses():
         return None
     return str(_backends.backend_from_stored(asked) or "")
