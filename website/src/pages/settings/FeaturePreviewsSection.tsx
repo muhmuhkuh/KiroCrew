@@ -152,7 +152,6 @@ export function FeaturePreviewsSection() {
   const remoteCrewChat = useRemoteCrewChat()
   const layoutHarness = usePreviewFlag(PREVIEW_LAYOUT_HARNESS)
   const folderConductor = usePreviewFlag(PREVIEW_FOLDER_CONDUCTOR)
-  const crewmateHarness = usePreviewFlag(PREVIEW_CREWMATE_HARNESS)
   const sessionEnvironments = usePreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
   const crewMode = usePreviewFlag(PREVIEW_CREW_MODE)
   const explore = usePreviewFlag(PREVIEW_EXPLORE)
@@ -420,17 +419,6 @@ export function FeaturePreviewsSection() {
           description={i18nT('pages.developer.featurePreviewsTab.folder_conductor_desc')}
           checked={folderConductor}
           onChange={v => setPreviewFlag(PREVIEW_FOLDER_CONDUCTOR, v)}
-        />
-      </SettingsCard>
-      {/* A crewmate's own harness: the Harness row on each crewmate's profile
-          Settings page. NO ingress button: the row appears on a profile the reader
-          already opens, and there is no one page to link to. */}
-      <SettingsCard>
-        <SettingsToggle
-          label={i18nT('pages.developer.featurePreviewsTab.crewmate_harness')}
-          description={i18nT('pages.developer.featurePreviewsTab.crewmate_harness_desc')}
-          checked={crewmateHarness}
-          onChange={v => setPreviewFlag(PREVIEW_CREWMATE_HARNESS, v)}
         />
       </SettingsCard>
       {/* The built-in KAS engine (`agent.kas_bundle`), the whole card: its switch

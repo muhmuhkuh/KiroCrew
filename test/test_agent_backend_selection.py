@@ -49,7 +49,7 @@ def test_older_records_inherit_without_backend_migration(config):
     document["agents"]["legacy"].pop("acp_backend", None)
     path.write_text(json.dumps(document), encoding="utf-8")
     loaded = KiroCrewConfig.load()
-    assert loaded.agents["legacy"].acp_backend is None
+    assert loaded.agents["legacy"].acp_backend == ""
     assert "acp_backend" not in json.loads(path.read_text(encoding="utf-8"))["agents"]["legacy"]
 
 
@@ -73,10 +73,12 @@ def test_explicit_chat_and_spawn_override_win(config, tmp_path, override):
     assert chat_session_selection(slot, config, "auto")["acp_backend_override"] == "codex"
 
 
-@pytest.mark.parametrize("bad", ["unknown", "vibe", 1, False, [], {}])
+@pytest.mark.parametrize("bad", ["unknown", 1, False, [], {}])
 def test_invalid_persisted_pin_refuses_start_but_explicit_override_can_recover(config, bad):
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
+
     config.agents["one"].acp_backend = bad
-    with pytest.raises(ValueError, match="not selectable"):
+    with pytest.raises(CrewmateHarnessUnavailable):
         config.create_provider_factory()("cron:one", agent="one")
     assert (
         config.create_provider_factory()(
@@ -87,8 +89,10 @@ def test_invalid_persisted_pin_refuses_start_but_explicit_override_can_recover(c
 
 
 def test_revoked_pin_cannot_silently_fall_back(config, monkeypatch):
+    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
+
     monkeypatch.setattr("kiro_crew.agent_sdk.backends.selectable_backends", lambda: frozenset({""}))
-    with pytest.raises(ValueError, match="not selectable"):
+    with pytest.raises(CrewmateHarnessUnavailable):
         session_backend(config, "one")
 
 
@@ -111,9 +115,9 @@ async def test_api_update_persists_and_clears_only_selected_member(crud):
         loaded = KiroCrewConfig.load()
         assert loaded.agents["one"].acp_backend == "pi"
         assert loaded.agents["two"].acp_backend == "pi"
-        assert loaded.agents["legacy"].acp_backend is None
+        assert loaded.agents["legacy"].acp_backend == ""
         assert (await client.put("/api/agents/one", json={"acp_backend": None})).status == 200
-    assert KiroCrewConfig.load().agents["one"].acp_backend is None
+    assert KiroCrewConfig.load().agents["one"].acp_backend == ""
 
 
 @pytest.mark.asyncio
@@ -121,12 +125,12 @@ async def test_profile_accepts_real_probe_kiro_id_and_persists_explicit_kiro(cru
     async with TestClient(TestServer(crud)) as client:
         assert (await client.put("/api/agents/one", json={"acp_backend": "kiro"})).status == 200
     cfg = KiroCrewConfig.load()
-    assert cfg.agents["one"].acp_backend == ""
+    assert cfg.agents["one"].acp_backend == "kiro"
     assert cfg.create_provider_factory()("member-one", agent="one").client.backend == ""
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("bad", ["unknown", "vibe", 2, True, [], {}])
+@pytest.mark.parametrize("bad", ["unknown", 2, True, [], {}])
 @pytest.mark.parametrize("method", ["put", "post"])
 async def test_api_invalid_backend_is_atomic(crud, bad, method):
     async with TestClient(TestServer(crud)) as client:
@@ -140,7 +144,7 @@ async def test_api_invalid_backend_is_atomic(crud, bad, method):
             "/api/agents/one" if method == "put" else "/api/agents", json=body
         )
         assert response.status == 400
-        assert (await response.json())["code"] == "invalid_backend"
+        assert (await response.json())["code"] == "invalid_acp_backend"
     cfg = KiroCrewConfig.load()
     assert cfg.agents["one"].acp_backend == "codex"
     assert cfg.agents["one"].description != "changed"

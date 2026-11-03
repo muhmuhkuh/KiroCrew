@@ -607,10 +607,14 @@ async def create_session(
     # so. An explicit pin is the caller's own and stays a refusal.
     inherited_model_dropped = ""
     # The harness the child runs on: a crewmate's own worker runs on its
-    # crewmate's backend (``members.select_provider_backend``), every other child
-    # on the configured default. A worker on a backend that cannot carry its kit
-    # is refused here, before anything is allocated.
-    from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable, crew_for_member_id
+    # crewmate's backend, an explicitly selected member on its profile backend,
+    # and other children on the configured default. Refuse an unsupported
+    # worker backend before allocating anything.
+    from kiro_crew.crewmate_harness import (
+        CrewmateHarnessUnavailable,
+        crew_for_member_id,
+        pinned_backend,
+    )
     from kiro_crew.mate_worker import crewmate_worker_backend, worker_kit_backend_refusal
 
     try:
@@ -620,7 +624,11 @@ async def create_session(
                 crew_for_member_id(cfg, getattr(caller_execution, "member_id", None) or ""),
             )
             if own_worker
-            else cfg.agent.acp_backend
+            else (
+                pinned_backend(cfg, agent_name, cfg.agent.member_acp_backend)
+                if child_is_crewmate
+                else cfg.agent.acp_backend
+            )
         )
     except CrewmateHarnessUnavailable as exc:
         # The crewmate's pinned harness cannot start, so neither can its worker.

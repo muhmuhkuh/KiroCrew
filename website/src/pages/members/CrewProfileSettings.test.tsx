@@ -38,6 +38,7 @@ const modelsState = vi.hoisted(() => ({ isDegraded: false }))
 vi.mock('../../hooks/useAvailableModels', () => ({
   useAvailableModelsQuery: () => ({ data: [{ name: 'auto' }, { name: 'claude-opus-5' }, { name: 'claude-haiku-4' }], isDegraded: modelsState.isDegraded, error: null }),
 }))
+vi.mock('../../hooks/useWebSocket', () => ({ MEMBER_DASHBOARD_QUERY_PREFIX: 'member-dashboard' }))
 
 import CrewProfileSettings from './CrewProfileSettings'
 import { ProfilePagePushContext, type ProfilePagePush } from './CrewProfilePanel'
@@ -118,22 +119,24 @@ afterEach(() => { cleanup(); hosts?.forEach((h) => h.remove()); localStorage.rem
 
 describe('CrewProfileSettings row and group', () => {
   it('maps the real Kiro probe id to an explicit runtime pin rather than inheritance', async () => {
+    mockApi.agentResolvedModel.mockResolvedValue({ acp_backend: '', harnesses: ['codex', 'kiro'] })
     setup(member())
     open('acp_backend')
-    await waitFor(() => expect(within(page('acp_backend')).getByRole('radio', { name: 'kiro-cli' })).toBeInTheDocument())
-    fireEvent.click(within(page('acp_backend')).getByRole('radio', { name: 'kiro-cli' }))
-    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: '' }))
+    await waitFor(() => expect(within(page('acp_backend')).getByRole('radio', { name: 'Kiro CLI' })).toBeInTheDocument())
+    fireEvent.click(within(page('acp_backend')).getByRole('radio', { name: 'Kiro CLI' }))
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: 'kiro' }))
   })
   it('saves the member backend and clears it to inherit without changing the chat override', async () => {
+    mockApi.agentResolvedModel.mockResolvedValue({ acp_backend: '', harnesses: ['codex', 'kiro'] })
     setup(member(), 'member-oncall')
     open('acp_backend')
-    await waitFor(() => expect(within(page('acp_backend')).getByRole('radio', { name: 'codex' })).toBeInTheDocument())
+    await waitFor(() => expect(within(page('acp_backend')).getByRole('radio', { name: 'OpenAI Codex' })).toBeInTheDocument())
     expect(within(page('acp_backend')).queryByRole('radio', { name: 'vibe' })).toBeNull()
-    fireEvent.click(within(page('acp_backend')).getByRole('radio', { name: 'codex' }))
+    fireEvent.click(within(page('acp_backend')).getByRole('radio', { name: 'OpenAI Codex' }))
     await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: 'codex' }))
     await waitFor(() => expect(within(page('acp_backend')).getByRole('radio', { name: 'Inherited' })).not.toBeDisabled())
     fireEvent.click(within(page('acp_backend')).getByRole('radio', { name: 'Inherited' }))
-    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: null }))
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith('oncall', { acp_backend: '' }))
     expect(mockApi.chatSlotModel).not.toHaveBeenCalled()
   })
   it('shows one Settings row on the card, reading the ceiling and the model', () => {
@@ -715,7 +718,7 @@ describe('CrewProfileSettings Dynamic capabilities preview', () => {
   })
 })
 
-/* The crewmate's own harness (`agents.<name>.acp_backend`): a developer preview row.
+/* The crewmate's own harness (`agents.<name>.acp_backend`) on its Settings page.
  * Its stored value and the harnesses on offer come from the owner-only readout,
  * never the roster row; the model list follows the picked harness. */
 describe('CrewProfileSettings harness', () => {
@@ -724,15 +727,14 @@ describe('CrewProfileSettings harness', () => {
     harnesses: ['claude', 'kas', 'kiro'], worker_harnesses: ['claude', 'kas'], ...over,
   })
 
-  it('is not offered while the preview is off', async () => {
+  it.each([null, '0', '1'])('offers the harness without a developer preview (stored flag %s)', async (flag) => {
+    if (flag !== null) localStorage.setItem(PREVIEW_CREWMATE_HARNESS, flag)
     readout()
     setup(member())
-    await waitFor(() => expect(mockApi.agentResolvedModel).toHaveBeenCalled())
-    expect(within(group()).queryByTestId('crew-profile-setting-acp_backend')).toBeNull()
+    await waitFor(() => expect(rowValue('acp_backend')).toHaveTextContent('Inherited (Kiro Agent)'))
   })
 
-  it('reads Inherited and names what that runs on, with the preview on', async () => {
-    localStorage.setItem(PREVIEW_CREWMATE_HARNESS, '1')
+  it('reads Inherited and names what that runs on', async () => {
     readout()
     setup(member())
     // The row itself says what it controls, and Inherited names what runs.

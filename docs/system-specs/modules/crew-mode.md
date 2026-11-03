@@ -4455,8 +4455,13 @@ call regardless.
 spelled as `agent.acp_backend` is (`kiro`, `kas`, `claude`, ...). Empty, the
 default, inherits `agent.member_acp_backend` exactly as before the field existed.
 
+The Harness row is available on every crewmate's Profile → Settings page without
+a developer preview. A Kiro CLI choice stores `kiro`; Inherited stores an empty
+string. Both the crewmate's chat and new worker sessions use the saved choice.
+An older saved `crewmate-harness` preview preference does not hide the row.
+
 - **One gate, one more tier.** `members.select_provider_backend` takes the pin as
-  `crew_backend`: an explicit `spawn_run(backend=...)` still wins, then the pin,
+  `crew_backend`: an explicit chat or `spawn_run(backend=...)` choice still wins, then the pin,
   then the member route, then the configured default. Every caller passes the
   argument (`None` included); `test_crewmate_harness.py` fails on a call that
   omits it.
@@ -4464,7 +4469,11 @@ default, inherits `agent.member_acp_backend` exactly as before the field existed
   from the session key alone: its `member-<slug>` DM thread, or its own worker,
   whose `member_id` `mate_worker.note_worker_session` records beside the worker
   key. No other session (a template chat, a sub-agent, a cron turn not on the
-  worker) takes the pin.
+  worker) takes the pin through that session-key route. A session that explicitly
+  selects a crewmate also uses that selected profile's pin, including dashboard
+  chats and scheduled jobs; an explicitly selected template does not.
+- **Model-list compatibility.** A present, empty `backend` query value means
+  Kiro CLI's runtime ID; an absent query inherits the configured backend.
 - **Fails closed, before the gate.** A pin this gateway cannot start (not
   registered, denied by policy, unservable on this host, including one that was
   selectable when it was saved) raises `CrewmateHarnessUnavailable`
@@ -4479,8 +4488,8 @@ default, inherits `agent.member_acp_backend` exactly as before the field existed
   `kiro_cli_pick_backend()` when `agent.kas_bundle` is off), for the DM chat and
   the workers alike, while the stored value still reads `kiro`
   (`docs/decisions/2026-10-28-a-kiro-cli-choice-runs-on-kas.md`).
-- **Save time.** `PUT /api/agents/{name}` accepts `acp_backend` only as `""` or a
-  selectable harness, and judges `model` and `worker_model` against the harness
+- **Save time.** `PUT /api/agents/{name}` accepts `acp_backend` as `null`, `""` or a
+  selectable harness; both empty values clear the pin. It judges `model` and `worker_model` against the harness
   the record will hold, re-judging the stored pins when the harness changes.
   Without a harness change, an inherit value and a value equal to the stored
   one judge nothing (`crewmate_harness.judges_a_model_edit`), both in the
