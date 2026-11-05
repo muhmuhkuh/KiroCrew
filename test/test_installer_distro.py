@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 from installer_test_helpers import run_bounded
 
+from kiro_crew.testing.wait import wait_until
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI_SH = REPO_ROOT / "cli.sh"
 INSTALL_SH = REPO_ROOT / "install.sh"

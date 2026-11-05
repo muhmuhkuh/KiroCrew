@@ -811,6 +811,9 @@ async def _bootstrap(key: str) -> None | web.Response:
     ``depth_exceeded`` (409) at the moment the child tries to open a ledger,
     rather than later when it tries to create an item.
     """
+    existing = await asyncio.to_thread(work_ledger.read_conductor, key)
+    if existing is not None:
+        return None
     depth = 0
     parent_item: str | None = None
     binding = await asyncio.to_thread(work_ledger.read_binding, key)

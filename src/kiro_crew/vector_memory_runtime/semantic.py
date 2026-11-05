@@ -456,7 +456,12 @@ def log_reject_event(
 
 
 def get_all_semantic(
-    store: VectorMemoryStore, limit: int | None = None, offset: int = 0, *, q: str = ""
+    store: VectorMemoryStore,
+    limit: int | None = None,
+    offset: int = 0,
+    *,
+    q: str = "",
+    after_key: str | None = None,
 ) -> list[dict]:
     """Get active semantic memory entries.
 
@@ -479,6 +484,9 @@ def get_all_semantic(
     if query:
         sql += " AND (memory_text_contains(key, ?, 0) OR memory_text_contains(value_json, ?, 1))"
         params = (query, query)
+    if after_key is not None:
+        sql += " AND key > ?"
+        params += (after_key,)
     sql += " ORDER BY key"
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"

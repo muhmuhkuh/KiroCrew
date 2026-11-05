@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp import kas_env_launch
 from kiro_crew.acp._dispatch import attach_kas_custom_agents, parse_session_modes
-from kiro_crew.acp.kas_agents import hoist_servers_for_session
+from kiro_crew.acp.kas_agents import hoist_managed_servers
 from kiro_crew.acp.mcp_session_report import (
     active_custom_agent,
     required_managed_servers,
@@ -316,7 +316,7 @@ async def load_session(
         # Read BEFORE the hoist: it moves launcher entries out of the batch, and
         # the recorded batch then lacks the snapshots this projection wrote.
         launch_snapshots = kas_env_launch.batch_snapshot_names(kas_agents)
-        kas_agents, mcp_servers = hoist_servers_for_session(
+        kas_agents, mcp_servers = hoist_managed_servers(
             kas_agents,
             active_agent,
             mcp_servers,

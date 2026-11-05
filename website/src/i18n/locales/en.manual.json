@@ -1,4 +1,9 @@
 {
+  "chatBackend": {
+    "label": "Backend",
+    "inherit": "Use global default",
+    "managed": "Backend managed by this chat’s owner"
+  },
   "commandCenter": {
     "automatic_cards": "Automatic cards for all sessions",
     "card_limits": "Off by default. Uses the background model, one call at a time. At most one attempt per session every {{minutes}} minutes and {{hourly}} attempts per hour shared by all sessions, including failures. Live status and decisions do not use the model.",
@@ -1025,7 +1030,8 @@
           "number": "Number",
           "crew_sort_status": "Status",
           "crew_sort_name": "Name",
-          "crew_sort_created": "Created"
+          "crew_sort_created": "Created",
+          "priority": "Priority"
         },
         "links": {
           "read_only_here_apply_in_provider": "Read-only here — {{provider}} repositories can't be changed from {{productName}}; apply the change in {{provider}}",
@@ -1914,7 +1920,11 @@
       "yolo_desc": "In every chat, {{productName}} works without asking you first",
       "configure_duration": "Configure duration",
       "yolo_expiration_until_shutdown": "Stays on until {{productName}} restarts — no timed expiry.",
-      "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again."
+      "yolo_expiration_timed": "Turns itself off after {{duration}}, then asks again.",
+      "normal_tooltip": "{{productName}} asks you before doing anything",
+      "reads_tooltip": "{{productName}} runs read-only shell commands on its own, but asks for everything else",
+      "trust_tooltip": "In this chat, {{productName}} works without asking you first",
+      "yolo_tooltip": "In every chat, {{productName}} works without asking you first"
     },
     "appstore": {
       "categoryRail": {
@@ -3075,7 +3085,8 @@
         "open_notification": "Open notification: {{title}}",
         "show_less": "Show less",
         "show_muted_count": "Show muted ({{count}})",
-        "try_a_different_search": "Try a different search"
+        "try_a_different_search": "Try a different search",
+        "activity_will_appear_here": "Activity will appear here"
       },
       "notificationPermissionHint": {
         "get_alerted_when_you_re_away": "Get alerted when you're away",
@@ -3962,7 +3973,8 @@
       "capture_n_of_m": "Capture {{n}} of {{m}}",
       "turn_on": "Turn this preview on",
       "screenshot_badge": "Screenshot",
-      "is_on": "This preview is on — turning it off only hides it; nothing you made is lost"
+      "is_on": "This preview is on — turning it off only hides it; nothing you made is lost",
+      "where_to_find": "Where you’ll see it"
     },
     "sessionAutomationPopover": {
       "snapshot_failed": "Couldn't load this session's monitor state. Retry loading before starting a monitor.",
@@ -4605,6 +4617,11 @@
     },
     "sendToInstanceSubmenu": {
       "default_badge": "default"
+    },
+    "unscannedDownload": {
+      "body": "{{name}} is {{size}}. Files over {{limit}} are not checked for secrets before download.",
+      "download_anyway": "Download anyway",
+      "title": "Too large to scan"
     }
   },
   "hooks": {
@@ -6103,7 +6120,8 @@
       "comments_refused": "{{name}} didn’t receive these comments — send them again from the document. They’re still there.",
       "comments_refused_overlay": "{{name}} didn’t receive these comments — reopen the side panel and send them again. They’re still in the document.",
       "comments_sent_other": "{{count}} comments sent",
-      "your_crewmate": "Your mate"
+      "your_crewmate": "Your mate",
+      "mcp_session_source_note": "The list is this agent's configuration; the status beside each name is what this session reported."
     },
     "chatSidebar": {
       "no_sessions_match_folders": "No sessions match — only a folder name did",
@@ -7832,7 +7850,8 @@
       "group_today": "Today",
       "group_yesterday": "Yesterday",
       "group_earlier": "Earlier",
-      "empty_title": "No sessions"
+      "empty_title": "No sessions",
+      "empty_subtitle": "Create one to get started."
     },
     "settings": {
       "mobileLoginCard": {
@@ -8286,7 +8305,8 @@
         "follow_default_done_one": "{{count}} chat now follows the Default Model setting.",
         "follow_default_done_other": "{{count}} chats now follow the Default Model setting.",
         "follow_default_changed": "Nothing was changed. Some chats changed after the count. Press the button again to see the new count.",
-        "follow_default_failed": "Couldn't update the chats. Try again."
+        "follow_default_failed": "Couldn't update the chats. Try again.",
+        "model_for_spawned_sub_agents": "Model for spawned subagents."
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -8743,7 +8763,29 @@
         "credential_redaction_owner_only": "Only the dashboard owner can read or change this setting. The 'Open a chat with the agent' link shares only this error message.",
         "credential_redaction_still_on": "Redaction is still on.",
         "credential_redaction_still_off": "Redaction is still off.",
-        "credential_redaction_ask_agent": "Open a chat with the agent about this error"
+        "credential_redaction_ask_agent": "Open a chat with the agent about this error",
+        "file_delivery_arm_status_failed": "Could not check whether an approval is in progress.",
+        "file_delivery_armed_expired": "That request expired before it was approved. Allow delivery again to start over.",
+        "file_delivery_armed_expires": "This request expires in about {{duration}}.",
+        "file_delivery_armed_help": "One more step, on this machine: run this command in a terminal on the computer running {{productName}} to finish allowing delivery. This confirms a person is at the machine — a browser session alone cannot allow it.",
+        "file_delivery_confirm": "Allow delivery",
+        "file_delivery_confirm_help": "This starts a request you finish in a terminal on this machine — nothing is delivered until then, and you can withdraw it at any time.",
+        "file_delivery_copied": "Copied",
+        "file_delivery_copy": "Copy",
+        "file_delivery_copy_command": "Copy the approval command",
+        "file_delivery_copy_failed": "Could not copy the command. Select it and copy by hand.",
+        "file_delivery_desc": "{{productName}} refuses to deliver a file whose contents the credential scanner flags. Use this when a file of your own — like a VPN key {{productName}} generated for you — was blocked on its way to you. Allowing delivery here lets it hand such a file to this computer and your dashboard's Files view. No detector is relaxed, and every delivery made under it is recorded in the security event log.",
+        "file_delivery_destination_help": "That means the file lands in the outbox folder on this computer and shows in your dashboard's Files view — nowhere a third party can see. It is never sent to Slack or a chat channel.",
+        "file_delivery_load_failed": "Could not read which destinations are allowed.",
+        "file_delivery_never_grantable": "Uploads to Slack or a chat channel can never be allowed here, and are not offered: an allowance can never cover a destination a third party can see.",
+        "file_delivery_save_failed": "Could not save that change.",
+        "file_delivery_since": "Since {{time}}",
+        "file_delivery_state_armed": "Waiting for approval",
+        "file_delivery_state_confirmed": "Allowed",
+        "file_delivery_state_not_confirmed": "Not allowed",
+        "file_delivery_title": "Where flagged files may be delivered",
+        "file_delivery_waiting": "Waiting on this machine",
+        "file_delivery_withdraw": "Withdraw"
       },
       "skillsPanel": {
         "failed_to_save_skills_setting": "Failed to save skills setting",

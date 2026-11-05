@@ -8,7 +8,7 @@ conflict resolution, injection detection, and event logging.
 Episodic: conversation fragments with embeddings, importance scoring,
 time-decay retrieval via FAISS (falls back to FTS5 without embeddings).
 
-:class:`VectorMemoryStore` owns the one SQLite connection and its ``_db_lock``: the
+:class:`VectorMemoryStore` owns the SQLite writer, pooled readers and its ``_db_lock``: the
 instance state every collaborator reads (built in ``__init__``), the lineage binding,
 the properties (``algorithm_version``, ``policy_revision``, ``db``,
 ``space_generation``), the locked fetch helpers and read counters, ``get_semantic``,
@@ -36,7 +36,7 @@ import time  # noqa: F401 -- patch seam: runtime modules read time through this 
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from sqlite3 import Error as StdlibSQLiteError
@@ -454,6 +454,11 @@ def _sanitize_decay_rates(raw: Mapping[str, object] | None) -> dict[str, float]:
 _ScanSurface = Literal["semantic", "episodic"]
 
 
+# What ``VectorMemoryStore._read_pooled`` returns when a read must run on the
+# shared connection under ``_db_lock`` instead of on a pooled read connection.
+_ON_SHARED_CONNECTION = object()
+
+
 @dataclass
 class _ReadCounters:
     """How much this store READ, as monotonic per-instance totals.
@@ -467,10 +472,10 @@ class _ReadCounters:
     episodic side.
 
     Cost is a method call and a few integer adds per SELECT, so counting is
-    always on; only the EXPOSURE is a surface decision. Every increment happens
-    under ``_db_lock`` (the fetch helpers hold it, and the one direct caller
-    increments inside its own locked block), so a snapshot taken under the same
-    lock is never torn and no count is lost to a concurrent reader.
+    always on; only the EXPOSURE is a surface decision. Every increment and
+    every snapshot takes the counters' own lock: reads on the pooled read
+    connections run outside ``_db_lock``, so that lock does not cover them. A
+    snapshot is never torn and no count is lost to a concurrent reader.
     """
 
     statements_executed: int = 0
@@ -479,6 +484,9 @@ class _ReadCounters:
     semantic_full_scans: int = 0
     episodic_rows_read: int = 0
     episodic_full_scans: int = 0
+    _guard: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def record(self, rows: int, scan: _ScanSurface | None = None) -> None:
         """Credit one materialized SELECT of *rows* rows.
@@ -487,18 +495,74 @@ class _ReadCounters:
         surface; leaving it None still credits the all-tables totals, which is
         the right answer for a bounded or keyed read.
         """
-        self.statements_executed += 1
-        self.rows_read += rows
-        if scan == "semantic":
-            self.semantic_rows_read += rows
-            self.semantic_full_scans += 1
-        elif scan == "episodic":
-            self.episodic_rows_read += rows
-            self.episodic_full_scans += 1
+        with self._guard:
+            self.statements_executed += 1
+            self.rows_read += rows
+            if scan == "semantic":
+                self.semantic_rows_read += rows
+                self.semantic_full_scans += 1
+            elif scan == "episodic":
+                self.episodic_rows_read += rows
+                self.episodic_full_scans += 1
 
     def snapshot(self) -> dict[str, int]:
         """Return the totals as a plain JSON-serializable dict."""
-        return asdict(self)
+        with self._guard:
+            return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "_guard"}
+
+
+def _read_pooled(store: "VectorMemoryStore", sql: str, params: Sequence[object], *, one: bool):
+    """Run one SELECT on a pooled read-only connection, outside ``_db_lock``.
+
+    Returns ``_ON_SHARED_CONNECTION`` when the read must run on the shared
+    connection under the lock instead:
+
+    - this thread already holds the lock, so the read belongs to a locked
+      section and must see that section's own uncommitted writes;
+    - the pool is off (before ``init()`` finished, after ``close()``, or a
+      file not in WAL mode);
+    - the shared connection has a transaction open that no thread is
+      inside (a failed write left it open), whose rows only that
+      connection can see;
+    - the pooled connection failed; the shared one reports the real error.
+
+    A read that runs while another thread is writing sees the last
+    committed state, the same rows it would have read just before that
+    write took the lock.
+    """
+    db = store.db  # readiness and "not initialized" errors, unchanged
+    lock = store._db_lock
+    held = getattr(lock, "held_by_current_thread", None)
+    if held is None or held() or not store._readers.enabled:
+        return _ON_SHARED_CONNECTION
+    if db.in_transaction and lock.acquire(blocking=False):
+        try:
+            if db.in_transaction:
+                return _ON_SHARED_CONNECTION
+        finally:
+            lock.release()
+    conn = store._readers.checkout()
+    if conn is None:
+        return _ON_SHARED_CONNECTION
+    broken = True
+    try:
+        cursor = conn.execute(sql, params)
+        try:
+            result = cursor.fetchone() if one else cursor.fetchall()
+        finally:
+            cursor.close()
+        broken = False
+        return result
+    except sqlite3.OperationalError:
+        # A statement this connection cannot run (a function only the shared
+        # connection registers, an interrupt from close()). The connection
+        # itself is fine; close() discards it through the generation check.
+        broken = False
+        return _ON_SHARED_CONNECTION
+    except sqlite3.Error:
+        return _ON_SHARED_CONNECTION
+    finally:
+        store._readers.checkin(conn, broken=broken)
 
 
 class VectorMemoryStore:
@@ -564,10 +628,10 @@ class VectorMemoryStore:
         # locked write sections call helpers (save_faiss_index) that re-acquire.
         # NOTE: never hold this across a blocking embed call — embeds happen
         # before the locked region so the lock only guards local db/FAISS work.
-        self._db_lock = threading.RLock()
-        # Read-volume totals. Guarded by _db_lock (see _ReadCounters) rather than
-        # a lock of their own: every increment already sits inside a locked fetch,
-        # so the counting adds no synchronization to the read path.
+        self._db_lock = _lifecycle.StoreDbLock()
+        self._readers = _lifecycle.ReaderPool()
+        # Read-volume totals have their own lock because pooled reads run outside
+        # the writer lock (see _ReadCounters).
         self._reads = _ReadCounters()
         # FAISS state
         self._faiss_index: object | None = None  # faiss.IndexFlatIP (untyped)
@@ -835,24 +899,32 @@ class VectorMemoryStore:
         *,
         scan: _ScanSurface | None = None,
     ) -> list[sqlite3.Row]:
-        """Run a SELECT serialized on ``_db_lock``; return materialized rows.
+        """Run a SELECT; return materialized rows (see ``_read_pooled`` for where).
 
         Pass *scan* at the few call sites that read a whole population, so the
         read-volume counters can attribute it to that surface (see
         :class:`_ReadCounters`). The default leaves the read in the all-tables
         totals only, which is correct for a bounded or keyed fetch.
         """
-        with self._db_lock:
-            rows = self.db.execute(sql, params).fetchall()
-            self._reads.record(len(rows), scan)
-            return rows
+        pooled = _read_pooled(self, sql, params, one=False)
+        if pooled is _ON_SHARED_CONNECTION:
+            with self._db_lock:
+                rows = self.db.execute(sql, params).fetchall()
+        else:
+            rows = pooled
+        self._reads.record(len(rows), scan)
+        return rows
 
     def _fetch_one_locked(self, sql: str, params: Sequence[object] = ()) -> sqlite3.Row | None:
-        """Run a SELECT serialized on ``_db_lock``; return the first row or None."""
-        with self._db_lock:
-            row = self.db.execute(sql, params).fetchone()
-            self._reads.record(1 if row is not None else 0)
-            return row
+        """Run a SELECT; return the first row or None (see ``_read_pooled``)."""
+        pooled = _read_pooled(self, sql, params, one=True)
+        if pooled is _ON_SHARED_CONNECTION:
+            with self._db_lock:
+                row = self.db.execute(sql, params).fetchone()
+        else:
+            row = pooled
+        self._reads.record(1 if row is not None else 0)
+        return row
 
     def read_counters(self) -> dict[str, int]:
         """Return this store's monotonic read-volume totals.
@@ -862,8 +934,7 @@ class VectorMemoryStore:
         over one database file report their own reads independently. See
         :class:`_ReadCounters` for what each key counts.
         """
-        with self._db_lock:
-            return self._reads.snapshot()
+        return self._reads.snapshot()
 
     # ── Key Validation ──
 
@@ -918,10 +989,15 @@ class VectorMemoryStore:
         return dict(row) if row else None
 
     def get_all_semantic(
-        self, limit: int | None = None, offset: int = 0, *, q: str = ""
+        self,
+        limit: int | None = None,
+        offset: int = 0,
+        *,
+        q: str = "",
+        after_key: str | None = None,
     ) -> list[dict]:
         """Get active semantic memory entries."""
-        return _semantic.get_all_semantic(self, limit, offset, q=q)
+        return _semantic.get_all_semantic(self, limit, offset, q=q, after_key=after_key)
 
     def _stamp_facets(self, item_id: str, facets: "memory_schema.MemoryFacets | None") -> None:
         """Stamp the carve axes on a crew row. A no-op on the v1 lineage."""
@@ -1316,10 +1392,17 @@ class VectorMemoryStore:
         return _lessons.has_any_decodable_lesson(self)
 
     def delete_lesson(
-        self, rule_substring: str, repo_scope: str | None = None, *, exact: bool = False
+        self,
+        rule_substring: str,
+        repo_scope: str | None = None,
+        *,
+        exact: bool = False,
+        keep_one: bool = False,
     ) -> bool:
         """Delete lessons whose value contains rule_substring."""
-        return _lessons.delete_lesson(self, rule_substring, repo_scope, exact=exact)
+        return _lessons.delete_lesson(
+            self, rule_substring, repo_scope, exact=exact, keep_one=keep_one
+        )
 
     def get_lessons_context(
         self,

@@ -24,7 +24,7 @@ are seeded here, and together they make the harness ask per tool call:
   profile with the YOLO safety level is removed from the picker.
 * ``VIBE_BYPASS_TOOL_PERMISSIONS=false`` -- the config-file path of the same
   bypass, overridden directly.
-* ``VIBE_DISABLED_AGENTS=["accept-edits", "smart-approve", "auto-approve"]`` --
+* ``VIBE_DISABLED_AGENTS`` excludes every agent profile except ``ask`` --
   removes the remaining auto-approving profiles, so the mode list the session
   advertises is exactly ``ask`` and a ``session/set_mode`` /
   ``session/set_config_option mode=...`` to anything else is refused by the
@@ -96,7 +96,10 @@ _VIBE_ROUTING_SEED_ENV: tuple[tuple[str, str], ...] = (
     ("VIBE_DEFAULT_AGENT", acp_tool_gate.permission_setting_for(ACP_BACKEND_VIBE)[1]),
     ("VIBE_ENABLE_AUTO_APPROVE", "false"),
     ("VIBE_BYPASS_TOOL_PERMISSIONS", "false"),
-    ("VIBE_DISABLED_AGENTS", '["accept-edits", "smart-approve", "auto-approve"]'),
+    (
+        "VIBE_DISABLED_AGENTS",
+        '["accept-edits", "smart-approve", "auto-approve", "re:(?!ask$).*"]',
+    ),
 )
 
 #: The mode list a seeded session must advertise -- exactly the ``ask`` profile, so

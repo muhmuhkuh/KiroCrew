@@ -9,12 +9,13 @@ class binds it by name, so it reads and writes the session's own state on the in
 and a patch of the method on the class or on an instance reaches every caller.
 
 Instance fields written: ``_jsonl_pos``, ``_stale_eligible``, ``_tool_call_diff_path``,
-``_tool_call_identity_unreadable``, ``_tool_call_input_redacted``,
-``_tool_call_inputs``, ``_tool_call_is_shell``, ``_tool_call_mcp_server``,
-``_tool_call_params``, ``_tool_call_tool_name``, ``_tool_dispatched``.
+``_tool_call_identity_unreadable``, ``_tool_call_input_redacted``, ``_tool_call_inputs``,
+``_tool_call_is_shell``, ``_tool_call_mcp_server``, ``_tool_call_params``,
+``_tool_call_tool_name``, ``_tool_dispatched``.
 
 Instance fields read: ``_active_tool_calls``, ``_agent``, ``_audit_source``,
-``_observed_tool_calls``, ``_session_id``, ``_session_key``,
+``_copilot_ambiguous_mcp_calls``, ``_copilot_unmatched_titles``, ``_observed_tool_calls``,
+``_permission_mode``, ``_sel_settled_tool_calls``, ``_session_id``, ``_session_key``,
 ``_tool_call_harness_tool_name``, ``_tool_call_unclassified``, ``last_prompt_stats``.
 """
 
@@ -42,8 +43,16 @@ from kiro_crew.acp._dispatch import (
     tool_call_content_text,
 )
 from kiro_crew.acp.client_timeouts import _SEL_AUDIT_TIMEOUT_SECONDS
+from kiro_crew.acp.harness.copilot import (
+    COPILOT_IDENTITY_OVERFLOW,
+    COPILOT_IDENTITY_RECORDS_MAX,
+    COPILOT_TITLE_MAX_CHARS,
+    TOOL_CALL_CACHE_MAX_KEY_CHARS,
+    note_copilot_identity_record,
+)
 from kiro_crew.acp.types import (
     ACP_BACKEND_DEEPSEEK,
+    CC_PERMISSION_MODE_AUTO,
     EVENT_TOOL_CALL,
     EVENT_TOOL_CALL_UPDATE,
     EVENT_TOOL_RESULT,
@@ -918,3 +927,141 @@ def _jsonl_tool_results(line: bytes) -> list[AcpEvent]:
                 )
             )
     return results
+
+
+async def _maybe_audit_unasked_tool_call(self: AcpClient, tool_result_event: "AcpEvent") -> None:
+    """Write the SEL record for a claude ``auto`` call that never asked the host.
+
+    In ``auto`` mode Claude's own classifier approves a call, so the call sends no
+    ``session/request_permission``: no consumer gate runs and no consumer writes a
+    decision row for it. This writes that row once the call reaches a terminal
+    status, so every tool call of an ``auto`` session has an SEL record. A call that
+    did ask is skipped, because the consumer that answered it owns its record.
+
+    Scope: only a session whose seeded mode is ``auto``, and never an
+    ``audit_source`` client (``_maybe_audit_tool_call`` already records each of its
+    calls). ``_sel_settled_tool_calls`` holds this turn's asked or recorded ids, so a
+    call gets one row. Best-effort and bounded like ``_maybe_audit_tool_call``: an
+    SEL failure or hang is logged and never breaks dispatch.
+    """
+    if getattr(self, "_permission_mode", None) != CC_PERMISSION_MODE_AUTO:
+        return
+    if getattr(self, "_audit_source", None):
+        return
+    settled = getattr(self, "_sel_settled_tool_calls", None)
+    if settled is None:
+        return
+    status = tool_result_event.tool_status or ""
+    call_id = tool_result_event.tool_call_id or ""
+    if status not in TERMINAL_TOOL_STATUSES or not call_id:
+        return
+    if call_id in settled:
+        return
+    settled.add(call_id)
+    title, kind = self._observed_tool_calls.get(call_id, ("unknown", ""))
+    session_key = self._session_key or ""
+    agent = self._agent
+    tool_name = redact_text(title or "unknown")
+    try:
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(),
+                lambda: sel().log_tool_invocation(
+                    session_key=session_key,
+                    agent=agent,
+                    source="acp",
+                    tool_name=tool_name,
+                    tool_kind=kind or "",
+                    outcome="auto_approved" if status == "completed" else status,
+                    request_id=call_id,
+                    metadata={
+                        "reason": "claude_auto_mode",
+                        "decided_by": "claude_classifier",
+                        "tool_status": status,
+                    },
+                ),
+            ),
+            timeout=_SEL_AUDIT_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.warning("ACP-layer SEL audit of an unasked claude call failed", exc_info=True)
+
+
+def _note_asked_tool_call(self: AcpClient, msg: JsonRpcMessage) -> None:
+    """Mark the tool call a ``session/request_permission`` names as asked.
+
+    The consumer that answers the request writes that call's SEL record, so
+    ``_maybe_audit_unasked_tool_call`` skips it.
+    """
+    params = msg.params if isinstance(msg.params, dict) else {}
+    tool_call = params.get("toolCall")
+    call_id = tool_call.get("toolCallId") if isinstance(tool_call, dict) else None
+    settled = getattr(self, "_sel_settled_tool_calls", None)
+    if settled is not None and isinstance(call_id, str) and call_id:
+        settled.add(call_id)
+
+
+def _recover_copilot_mcp_identity(self: AcpClient, tool_call_id: str, update: dict) -> None:
+    """Recover a Copilot CLI MCP call's server and tool from its ``tool_call`` title.
+
+    Copilot CLI 1.0.100 carries no ``_meta`` identity: its ``tool_call`` frame titles a
+    served tool ``<server>-<tool>`` (``probe-marker``, measured in
+    ``mcp-stdio-mount-live.jsonl``) and its permission frame names the bare tool
+    (``marker``). Without the server, the gate judged the call by its title and never
+    asked the ``mcp`` scope, so a ceiling denying ``@probe/marker`` permitted it. The
+    title is matched against the names Crew itself placed on this session's array --
+    the whole server universe Copilot was handed, its built-in MCP servers being off
+    (``--disable-builtin-mcps``) -- and a unique match is cached as the trusted identity
+    the permission event inherits, exactly as a ``_meta`` channel would fill it. A
+    title two placed names could both have produced (``a`` serving ``b-c`` and ``a-b``
+    serving ``c``) is recorded as ambiguous, and its permission request is refused
+    (:func:`~kiro_crew.acp.client_permissions._refuse_identity_drift`): judging it as
+    either server could permit what the other's rule denies. A title matching no
+    placed name is not an MCP call and keeps the shared reading.
+    """
+    title = update.get("title")
+    if update.get("kind") != "other" or not isinstance(title, str) or not title:
+        return
+    ambiguous = getattr(self, "_copilot_ambiguous_mcp_calls", None)
+    if ambiguous is None:
+        return
+    try:
+        elements = self._session_mcp_servers()
+    except Exception:  # noqa: BLE001 - a missing array means nothing to match
+        elements = []
+    placed: set[str] = set()
+    for element in elements:
+        name = element.get("name") if isinstance(element, dict) else None
+        if isinstance(name, str) and name:
+            placed.add(name)
+    matches = sorted(
+        name for name in placed if title.startswith(f"{name}-") and len(title) > len(name) + 1
+    )
+    if len(matches) > 1:
+        note_copilot_identity_record(ambiguous, ambiguous, tool_call_id)
+        return
+    ambiguous.discard(tool_call_id)
+    unmatched = getattr(self, "_copilot_unmatched_titles", None)
+    if not matches:
+        # Kept so the permission frame can show this was a served tool after all
+        # (``<anything>-<its bare name>``) whose server no placed name matched.
+        if unmatched is not None and "-" in title:
+            if len(title) > COPILOT_TITLE_MAX_CHARS:
+                # Too long to keep whole, and a cut title could not be matched
+                # against the permission frame: refused rather than judged blind.
+                note_copilot_identity_record(ambiguous, ambiguous, tool_call_id)
+            elif len(tool_call_id) > TOOL_CALL_CACHE_MAX_KEY_CHARS or (
+                len(unmatched) >= COPILOT_IDENTITY_RECORDS_MAX and tool_call_id not in unmatched
+            ):
+                ambiguous.add(COPILOT_IDENTITY_OVERFLOW)
+            else:
+                unmatched[tool_call_id] = title
+        return
+    if unmatched is not None:
+        unmatched.pop(tool_call_id, None)
+    server = matches[0]
+    self._tool_call_mcp_server[tool_call_id] = server
+    self._tool_call_tool_name[tool_call_id] = title[len(server) + 1 :]
+    unclassified = getattr(self, "_tool_call_unclassified", None)
+    if unclassified is not None:
+        unclassified[tool_call_id] = False

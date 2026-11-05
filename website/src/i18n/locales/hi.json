@@ -1,4 +1,9 @@
 {
+  "chatBackend": {
+    "label": "बैकएंड",
+    "inherit": "वैश्विक डिफ़ॉल्ट उपयोग करें",
+    "managed": "बैकएंड इस चैट के मालिक द्वारा प्रबंधित है"
+  },
   "commandCenter": {
     "automatic_cards": "सभी सत्रों के लिए स्वचालित कार्ड",
     "card_limits": "डिफ़ॉल्ट रूप से बंद। बैकग्राउंड मॉडल एक बार में एक कॉल करता है। प्रति सत्र हर {{minutes}} मिनट में अधिकतम एक प्रयास और सभी सत्रों को मिलाकर प्रति घंटे {{hourly}} प्रयास, विफल प्रयासों सहित। लाइव स्थिति और निर्णय मॉडल का उपयोग नहीं करते।",
@@ -2024,7 +2029,8 @@
           "no_repo_members_found_among_these_issues": "इन इश्यू में कोई रिपो सदस्य नहीं मिला",
           "open": "खुले",
           "requested_by_me": "मेरे द्वारा अनुरोधित",
-          "sort": "क्रमबद्ध करें"
+          "sort": "क्रमबद्ध करें",
+          "status": "स्थिति"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "मौजूदा जाँच की पड़ताल नहीं हो सकी — रिफ़्रेश पर फिर कोशिश होगी",
@@ -2490,7 +2496,12 @@
         "gitlab_instances_unavailable_dashboard_settings_didn_t_load": "तुम्हारी डैशबोर्ड सेटिंग लोड नहीं हुईं, इसलिए GitLab इंस्टेंस सूचीबद्ध नहीं किए जा सकते।",
         "selection_cleared_those_projects_are_on_the_previous_instance": "चयन साफ़ किया गया: वे प्रोजेक्ट पिछले GitLab इंस्टेंस पर हैं।",
         "selection_cleared_those_repos_belong_to_the_previous_provider": "चयन साफ़ किया गया: वे रिपॉज़िटरी पिछले प्रदाता से संबंधित हैं।",
-        "try_again": "फिर से कोशिश करो"
+        "try_again": "फिर से कोशिश करो",
+        "jira_env_hint": "Jira गेटवे पर JIRA_EMAIL और JIRA_API_TOKEN पर्यावरण क्रेडेंशियल से जुड़ता है। कनेक्ट करने से पहले इन्हें सेट करें; इनके बिना सत्यापन सेटअप त्रुटि देगा।",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "रिपॉजिटरी मैपिंग (वैकल्पिक)",
+        "repo_mapping_hint": "वैकल्पिक: इस Jira प्रोजेक्ट को Git रिपॉजिटरी स्लग (owner/repo) से जोड़ें। केवल इश्यू कनेक्ट करने के लिए खाली छोड़ें।",
+        "repo_mapping_placeholder": "owner/repo"
       },
       "connectRepoModal": {
         "close": "बंद करें",
@@ -2507,7 +2518,8 @@
           "number": "नंबर",
           "crew_sort_status": "स्थिति",
           "crew_sort_name": "नाम",
-          "crew_sort_created": "बनाया गया"
+          "crew_sort_created": "बनाया गया",
+          "priority": "प्राथमिकता"
         },
         "links": {
           "read_only_here_apply_in_provider": "यहाँ केवल-पढ़ने योग्य — {{provider}} रिपॉज़िटरी को {{productName}} से नहीं बदला जा सकता; परिवर्तन {{provider}} में करो",
@@ -2524,7 +2536,7 @@
         }
       },
       "manifest": {
-        "description": "याद रखने वाला इशू ट्रायाज सहायक। GitHub इशू, GitLab इशू और Azure DevOps वर्क आइटम को AI-सुझाए लेबल और हर आइटम के जाँच नोट्स के साथ ब्राउज़ करो, फ़िल्टर करो और ट्रायाज करो — नतीजे लोकल लेजर में रखे जाते हैं ताकि किसी की दोबारा जाँच न हो।",
+        "description": "याद रखने वाला इशू ट्रायाज सहायक। GitHub, GitLab, Azure DevOps और Jira इशू को AI-सुझाए लेबल और हर आइटम के जाँच नोट्स के साथ ब्राउज़ करो, फ़िल्टर करो और ट्रायाज करो — नतीजे लोकल लेजर में रखे जाते हैं ताकि किसी की दोबारा जाँच न हो।",
         "display_name": "Issue Radar",
         "use_case_1": "कनेक्ट किए गए provider के issue और pull request का ट्रायाज करें और सारांश, सुझाए गए label व जाँच का इतिहास बनाए रखें।",
         "configuration_1": "रिपॉज़िटरी कनेक्ट करें और गेटवे होस्ट पर provider CLI प्रमाणित करें: GitHub के लिए gh, GitLab के लिए glab, या macOS, Linux अथवा WSL पर Azure DevOps extension सहित az।",
@@ -2536,7 +2548,7 @@
         "highlight_6": "हर राइट के लिए रिपो पर ट्रायाज या पुश ऐक्सेस चाहिए; रीड-ओनली कनेक्शन सिर्फ़ सुझाव तक सीमित रहता है",
         "highlight_7": "जिन रिपॉज़िटरी में तुमने हाल में योगदान दिया है उन्हें सामने रखता है, ताकि जोड़ना एक क्लिक भर हो",
         "highlight_8": "इशू, लेबल और मेंबर लोकल में कैश करता है, ज़रूरत पर ताज़ा हो जाते हैं",
-        "highlight_9": "GitHub, GitLab और Azure DevOps के साथ काम करता है; गेटवे होस्ट पर उस प्रोवाइडर के लिए प्रमाणित CLI (`gh`, `glab` या `az`) चाहिए जिसे तुम जोड़ते हो — इंस्टॉल करने के लिए किसी एक प्रोवाइडर की CLI ज़रूरी नहीं है",
+        "highlight_9": "GitHub, GitLab, Azure DevOps और Jira के साथ काम करता है; गेटवे होस्ट पर जुड़े प्रोवाइडर का प्रमाणित CLI या गेटवे क्रेडेंशियल (`gh`, `glab`, `az` या JIRA_EMAIL + JIRA_API_TOKEN) चाहिए — इंस्टॉल करने के लिए किसी एक प्रोवाइडर की CLI ज़रूरी नहीं है",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -6071,7 +6083,8 @@
       "not_installed": "\"{{name}}\" इंस्टॉल नहीं है",
       "retry": "फिर कोशिश करें",
       "this_app_is_disabled": "यह ऐप अक्षम है",
-      "this_app_provides_agents_and_skills_but_no_visua": "यह ऐप एजेंट और स्किल देता है, लेकिन कोई विज़ुअल इंटरफ़ेस नहीं।\n            इसके एजेंट चैट से उपयोग करें।"
+      "this_app_provides_agents_and_skills_but_no_visua": "यह ऐप एजेंट और स्किल देता है, लेकिन कोई विज़ुअल इंटरफ़ेस नहीं।\n            इसके एजेंट चैट से उपयोग करें।",
+      "app_not_found": "ऐप नहीं मिला"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "ऐप को अपनी अलग विंडो में पॉप आउट करो",
@@ -6122,7 +6135,11 @@
       "yolo_expiration_until_shutdown": "यह {{productName}} के रीस्टार्ट होने तक चालू रहता है — समय के साथ समाप्त नहीं होता।",
       "yolo_label": "YOLO",
       "mode_disabled_by_policy": "संगठन की सुरक्षा नीति द्वारा अक्षम",
-      "yolo_mode_is_an_app_wide_setting": "YOLO मोड एक ऐप-व्यापी सेटिंग है"
+      "yolo_mode_is_an_app_wide_setting": "YOLO मोड एक ऐप-व्यापी सेटिंग है",
+      "normal_tooltip": "{{productName}} कुछ भी करने से पहले तुमसे पूछता है",
+      "reads_tooltip": "{{productName}} खुद केवल-पठन शेल कमांड चलाता है, लेकिन बाकी हर चीज़ के लिए पूछता है",
+      "trust_tooltip": "इस चैट में, {{productName}} तुमसे पूछे बिना काम करता है",
+      "yolo_tooltip": "हर चैट में, {{productName}} तुमसे पूछे बिना काम करता है"
     },
     "appstore": {
       "appListRow": {
@@ -6589,7 +6606,10 @@
       "attachment_removed": "{{file}} अनुलग्नकों से हटाया गया",
       "attachment_restored": "{{file}} संलग्न किया गया",
       "trusted_command_until": "«{{cmd}}» पर {{time}} तक भरोसा, उसके बाद फिर से पूछा जाएगा",
-      "trusted_base_until": "किसी भी «{{base}}» कमांड पर {{time}} तक भरोसा, उसके बाद फिर से पूछा जाएगा"
+      "trusted_base_until": "किसी भी «{{base}}» कमांड पर {{time}} तक भरोसा, उसके बाद फिर से पूछा जाएगा",
+      "apply_a_ready_made_set_of_instructions": "निर्देशों का तैयार सेट लागू करें",
+      "let_the_agent_read_one_of_your_files": "एजेंट को अपनी कोई फ़ाइल पढ़ने दें",
+      "quick_actions_like_clearing_the_chat_or_checking": "चैट साफ़ करने या उपयोग जाँचने जैसी त्वरित क्रियाएँ"
     },
     "chatPane": {
       "agent_list": "एजेंट सूची",
@@ -6614,7 +6634,8 @@
       "type_to_filter": "फ़िल्टर करने के लिए टाइप करें…",
       "earlier_conversation_show": "{{time}} पर नई शुरुआत · पिछले मैसेज दिखाओ ({{count}})",
       "earlier_conversation_hide": "{{time}} पर नई शुरुआत · पिछले मैसेज छिपाओ (अब याद नहीं)",
-      "preparing_catch_up": "तुम्हारे लिए सार तैयार हो रहा है…"
+      "preparing_catch_up": "तुम्हारे लिए सार तैयार हो रहा है…",
+      "session_ready_type_a_message_to_start": "सेशन तैयार है। शुरू करने के लिए कोई संदेश टाइप करें।"
     },
     "cliPanel": {
       "copied": "कॉपी हो गया",
@@ -8057,7 +8078,8 @@
         "search": "खोजें…",
         "show_less": "कम दिखाएँ",
         "show_muted_count": "म्यूट दिखाओ ({{count}})",
-        "try_a_different_search": "कोई दूसरी खोज आज़माएँ"
+        "try_a_different_search": "कोई दूसरी खोज आज़माएँ",
+        "activity_will_appear_here": "गतिविधि यहाँ दिखेगी"
       },
       "notificationPermissionHint": {
         "get_alerted_when_you_re_away": "दूर रहने पर भी अलर्ट पाओ",
@@ -9768,7 +9790,8 @@
       "capture_n_of_m": "स्क्रीनशॉट {{n}} / {{m}}",
       "turn_on": "यह प्रीव्यू चालू करो",
       "screenshot_badge": "स्क्रीनशॉट",
-      "is_on": "यह प्रीव्यू चालू है — बंद करने पर यह बस छिप जाता है, तुम्हारा बनाया कुछ भी नहीं खोता"
+      "is_on": "यह प्रीव्यू चालू है — बंद करने पर यह बस छिप जाता है, तुम्हारा बनाया कुछ भी नहीं खोता",
+      "where_to_find": "यह तुम्हें कहाँ दिखेगा"
     },
     "sessionAutomationPopover": {
       "snapshot_failed": "इस सत्र की मॉनिटर स्थिति लोड नहीं हो सकी। मॉनिटर शुरू करने से पहले फिर से लोड करें।",
@@ -10543,6 +10566,11 @@
       "reason": "मैं इसे नहीं चला सकता, पर तुम चला सकते हो।",
       "run_unanswered": "टर्मिनल ने जवाब नहीं दिया, इसलिए इसे अपने कंप्यूटर के टर्मिनल ऐप में कॉपी करो।",
       "title": "इसे खुद चलाओ"
+    },
+    "unscannedDownload": {
+      "body": "{{name}} का आकार {{size}} है। {{limit}} से बड़ी फ़ाइलों को डाउनलोड से पहले गोपनीय जानकारी के लिए जाँचा नहीं जाता।",
+      "download_anyway": "फिर भी डाउनलोड करो",
+      "title": "स्कैन करने के लिए बहुत बड़ी"
     }
   },
   "hooks": {
@@ -13022,7 +13050,8 @@
       "your_crewmate": "तुम्हारा क्रूमेट",
       "jump_to_new_one": "{{count}} नया · नवीनतम पर जाओ",
       "jump_to_new_other": "{{count}} नए · नवीनतम पर जाओ",
-      "could_not_repair_images": "छवियाँ ठीक नहीं की जा सकीं"
+      "could_not_repair_images": "छवियाँ ठीक नहीं की जा सकीं",
+      "mcp_session_source_note": "सूची इस एजेंट का कॉन्फ़िगरेशन है; प्रत्येक नाम के आगे की स्थिति वही है जो इस सत्र ने रिपोर्ट की।"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 छोड़ा गया — अभी चुना हुआ)",
@@ -13466,7 +13495,8 @@
       "kind_section_crew": "Ultra Mode",
       "kind_section_normal": "सामान्य",
       "kind_section_mate": "साथियों से",
-      "filter_crew_description": "केवल Ultra Mode चैट दिखाओ"
+      "filter_crew_description": "केवल Ultra Mode चैट दिखाओ",
+      "broadcast_crewmates_hint": "तुम्हारे क्रूमेट, यानी क्रू के AI एजेंट, द्वारा चलाई गई चैट"
     },
     "connectionsPage": {
       "action_failed": "कार्रवाई विफल: {{error}}",
@@ -13675,7 +13705,21 @@
       "start_row_show": "दिखाओ",
       "start_row_shown": "ऊपर दिख रहा है",
       "picked_gone": "टर्न {{n}} चार्ट से हट गया, इसलिए नवीनतम टर्न दिखाया गया है।",
-      "turn_start_latest": "टर्न {{n}} · सेशन की शुरुआत · नवीनतम"
+      "turn_start_latest": "टर्न {{n}} · सेशन की शुरुआत · नवीनतम",
+      "delta_down": "पिछले से −{{n}}",
+      "delta_same": "पिछले के समान",
+      "delta_up": "पिछले से +{{n}}",
+      "engine_calls": "इस टर्न में मॉडल अनुरोध: {{n}}।",
+      "engine_heading": "एजेंट लूप द्वारा मापा गया",
+      "engine_hist_all": "बातचीत का इतिहास",
+      "engine_hist_crew": "{{productName}} प्रॉम्प्ट, संदर्भ में मौजूद हर टर्न",
+      "engine_not_measured": "एजेंट लूप ने इस टर्न को नहीं मापा।",
+      "engine_note": "वर्ण, जैसे एजेंट लूप ने टर्न के आख़िरी मॉडल अनुरोध में गिने। {{productName}} प्रॉम्प्ट के लिए {{productName}} की अपनी गिनती है।",
+      "engine_total": "इस टर्न के आख़िरी मॉडल अनुरोध में कुल {{chars}} वर्ण थे। नीचे \"{{productName}} प्रॉम्प्ट\" वह हिस्सा है जो {{productName}} ने लिखा, संदर्भ में मौजूद हर टर्न के लिए।",
+      "engine_ttft_detail": "पहला आउटपुट {{total}} बाद (मॉडल का पहला टोकन {{model}} बाद)।",
+      "footer": "केवल वही गिना जाता है जो {{productName}} ने इस टर्न में भेजा, तुम्हारे संदेश सहित। यह अब तक भेजा गया कुल नहीं है, और मॉडल का पूरा कॉन्टेक्स्ट भी नहीं।",
+      "rebuild_row": "टर्न {{n}} · संदर्भ फिर से बनाया गया",
+      "start_note": "सेशन की शुरुआत वाले और रीबिल्ड वाले टर्न चार्ट के ऊपर अलग दिखाए गए हैं, ताकि बाद के टर्न पढ़ने में आसान रहें।"
     },
     "crewBoard": {
       "title": "कार्य आइटम",
@@ -16670,7 +16714,8 @@
       "group_today": "आज",
       "group_yesterday": "बीता कल",
       "group_earlier": "पहले",
-      "empty_title": "कोई सत्र नहीं"
+      "empty_title": "कोई सत्र नहीं",
+      "empty_subtitle": "शुरू करने के लिए एक बनाओ।"
     },
     "sessionsTab": {
       "agent": "एजेंट",
@@ -17410,7 +17455,8 @@
         "default_session_folder_none": "कोई नहीं (बिना फ़ोल्डर)",
         "default_session_folder_deleted": "हटाया गया फ़ोल्डर",
         "default_session_folder_save_failed": "डिफ़ॉल्ट फ़ोल्डर सहेजा नहीं जा सका। फिर से कोशिश करो।",
-        "default_session_folder_load_failed": "तुम्हारे साइडबार फ़ोल्डर लोड नहीं हो सके, इसलिए वे यहाँ नहीं दिख रहे हैं।"
+        "default_session_folder_load_failed": "तुम्हारे साइडबार फ़ोल्डर लोड नहीं हो सके, इसलिए वे यहाँ नहीं दिख रहे हैं।",
+        "model_for_spawned_sub_agents": "स्पॉन किए गए सब-एजेंट के लिए मॉडल।"
       },
       "computerUsePanel": {
         "accessibility": "सुगम्यता",
@@ -18261,7 +18307,30 @@
         "redaction_revoke_failed": "वह होस्ट रद्द नहीं हो सका। वह अब भी अनुमत है।",
         "redaction_no_allowed_hosts": "कोई होस्ट अनुमत नहीं है। हर लिंक हर जाँच से गुज़रता है।",
         "redaction_workspace": "वर्कस्पेस: {{workspace}}",
-        "redaction_revoke": "रद्द करो"
+        "redaction_revoke": "रद्द करो",
+        "file_delivery_arm_status_failed": "यह जाँचा नहीं जा सका कि कोई अनुमति प्रक्रिया में है या नहीं।",
+        "file_delivery_armed_expired": "वह अनुरोध मंज़ूरी से पहले ही समाप्त हो गया। दोबारा शुरू करने के लिए डिलीवरी फिर से अनुमति दें।",
+        "file_delivery_armed_expires": "यह अनुरोध लगभग {{duration}} में समाप्त हो जाता है।",
+        "file_delivery_armed_help": "इस मशीन पर एक और चरण: वितरण की अनुमति पूरी करने के लिए {{productName}} चला रहे कंप्यूटर के टर्मिनल में यह कमांड चलाओ। यह पुष्टि करता है कि कोई व्यक्ति मशीन के पास है — केवल ब्राउज़र सत्र इसकी अनुमति नहीं दे सकता।",
+        "file_delivery_confirm": "पुष्टि करें",
+        "file_delivery_confirm_help": "यह एक अनुरोध शुरू करता है जिसे तुम इस मशीन के टर्मिनल में पूरा करते हो। तब तक कुछ भी नहीं भेजा जाता, और तुम इसे कभी भी वापस ले सकते हो।",
+        "file_delivery_copied": "कॉपी हो गया",
+        "file_delivery_copy": "कॉपी करें",
+        "file_delivery_copy_command": "मंज़ूरी की कमांड कॉपी करें",
+        "file_delivery_copy_failed": "कमांड कॉपी नहीं हो सकी। इसे चुनकर हाथ से कॉपी करें।",
+        "file_delivery_desc": "जब क्रेडेंशियल स्कैनर किसी फ़ाइल की सामग्री को फ़्लैग करता है, तो {{productName}} उसे भेजने से इनकार कर देता है। यहाँ पुष्टि करने पर वह ऐसी फ़ाइल को इस मशीन के आउटबॉक्स और तुम्हारे अपने डैशबोर्ड तक भेज सकता है। कोई भी डिटेक्टर ढीला नहीं किया जाता, और पुष्टि के तहत की गई हर डिलीवरी सुरक्षा इवेंट लॉग में दर्ज होती है। इसका उपयोग तब करो जब तुम्हारी अपनी कोई फ़ाइल — जैसे {{productName}} द्वारा तुम्हारे लिए बनाई गई VPN कुंजी — तुम तक पहुँचते समय रोक दी गई हो।",
+        "file_delivery_destination_help": "इसका मतलब है कि फ़ाइल इस कंप्यूटर के आउटबॉक्स फ़ोल्डर में जाती है और तुम्हारे डैशबोर्ड के फ़ाइलें दृश्य में दिखती है — कहीं भी नहीं जहाँ कोई तीसरा पक्ष उसे देख सके। इसे कभी Slack या किसी चैट चैनल पर नहीं भेजा जाता।",
+        "file_delivery_load_failed": "यह नहीं पढ़ा जा सका कि कौन-से गंतव्य पुष्ट हैं।",
+        "file_delivery_never_grantable": "Slack या किसी चैट चैनल पर अपलोड यहाँ कभी अनुमत नहीं किए जा सकते और पेश नहीं किए जाते: कोई अनुमति कभी ऐसे गंतव्य को कवर नहीं कर सकती जिसे कोई तीसरा पक्ष देख सके।",
+        "file_delivery_save_failed": "वह बदलाव सहेजा नहीं जा सका।",
+        "file_delivery_since": "{{time}} से",
+        "file_delivery_state_armed": "मंज़ूरी का इंतज़ार",
+        "file_delivery_state_confirmed": "पुष्टि हो गई",
+        "file_delivery_state_not_confirmed": "पुष्टि नहीं हुई",
+        "file_delivery_title": "फ़्लैग की गई फ़ाइलें कहाँ भेजी जा सकती हैं",
+        "file_delivery_waiting": "इस मशीन पर इंतज़ार",
+        "file_delivery_withdraw": "वापस लें",
+        "file_delivery_section": "फ़्लैग की गई फ़ाइलों की डिलीवरी"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "चैट-टैब स्विचिंग को Option+अंक के बजाय Ctrl+अंक से बाइंड करें। जब किसी टेक्स्ट फ़ील्ड पर फ़ोकस हो, तब Option+अंक चैट नहीं बदलता।",
@@ -18567,7 +18636,8 @@
         "decode_threads_desc": "स्थानीय मॉडल वाणी पहचानने के लिए जितने CPU थ्रेड उपयोग करता है। ऑटो इस मशीन के आधे कोर उपयोग करता है, अधिकतम 16। खाली कोर वाली बड़ी मशीन पर अधिक थ्रेड हर डिक्टेशन को जल्दी पूरा करते हैं। बदलाव अगले डिक्टेशन से लागू होता है, जो मॉडल को एक बार फिर से लोड करता है।",
         "decode_threads_auto": "ऑटो",
         "decode_threads_auto_count": "ऑटो ({{n}})",
-        "decode_threads_env_override": "यह गेटवे {{value}} थ्रेड उपयोग करता है, जो KIROCREW_STT_THREADS तय करता है। इस विकल्प का उपयोग करने के लिए वह वैरिएबल हटाएँ।"
+        "decode_threads_env_override": "यह गेटवे {{value}} थ्रेड उपयोग करता है, जो KIROCREW_STT_THREADS तय करता है। इस विकल्प का उपयोग करने के लिए वह वैरिएबल हटाएँ।",
+        "aws_region_for_transcribe": "Transcribe के लिए AWS रीजन"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "ऊपर। Slack के विपरीत, Bot Framework में कोई\n              केवल-आउटबाउंड मोड नहीं है।",
@@ -19285,7 +19355,8 @@
       "range_to": "अंतिम तारीख",
       "no_telemetry_in_window": "इस अवधि ({{period}}) में कोई टेलीमेट्री दर्ज नहीं हुई।",
       "otel_retention_cap": "टर्न, लेटेंसी और स्टार्टअप के आँकड़े केवल पिछले {{days}} दिन के हैं; पुराने मेट्रिक हटा दिए जाते हैं (<settingRef/>)।",
-      "window_footer": "OTEL अनुभाग · अवधि: {{period}} ·"
+      "window_footer": "OTEL अनुभाग · अवधि: {{period}} ·",
+      "top_spenders_link_to_chat": "नाम वाले डैशबोर्ड सेशन चैट से लिंक हैं"
     },
     "terminalPopoutFrame": {
       "return": "डॉक पर वापस जाएँ",
@@ -19956,7 +20027,32 @@
       "profile_harness_cannot_start": "यहाँ शुरू नहीं हो सकता।",
       "profile_harness_saved": "सेव हो गया। अगले संदेश से {{name}} इसी हार्नेस पर चलेगा।",
       "profile_harness_unavailable": "{{name}} को {{harness}} पर चलने के लिए सेट किया गया है, जो यहाँ शुरू नहीं हो सकता, इसलिए उसकी चैट और वर्कर भी शुरू नहीं होते। कोई दूसरा एजेंट हार्नेस चुनो, या विरासत में मिला।",
-      "profile_harness_choose": "एजेंट हार्नेस चुनो"
+      "profile_harness_choose": "एजेंट हार्नेस चुनो",
+      "switcher_unread": "अपठित",
+      "profile_monitor": "मॉनिटर",
+      "profile_monitor_active": "सक्रिय",
+      "profile_monitor_cycle": "जाँचें",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "हर",
+      "profile_monitor_inactive": "रुका हुआ",
+      "profile_monitor_loading": "मॉनिटर की स्थिति जाँची जा रही है…",
+      "profile_monitor_next": "अगली जाँच",
+      "profile_monitor_no_limit": "कोई सीमा नहीं",
+      "profile_monitor_none": "किसी चीज़ की निगरानी नहीं हो रही है",
+      "profile_monitor_reason_unknown": "रुका हुआ",
+      "profile_monitor_runtime": "बीता समय",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "चलने का समय शुरू",
+      "profile_monitor_state": "स्थिति",
+      "profile_monitor_stopped": "रुकने का कारण",
+      "profile_monitor_subject": "निगरानी",
+      "profile_monitor_subject_goal": "लक्ष्य लूप",
+      "profile_monitor_subject_ledger": "कार्य सूची",
+      "profile_monitor_subject_pull_request": "पुल रिक्वेस्ट",
+      "profile_monitor_type": "प्रकार",
+      "profile_monitor_type_bounded": "मॉनिटर",
+      "profile_monitor_unavailable": "मॉनिटर की स्थिति उपलब्ध नहीं",
+      "profile_monitor_unknown": "अज्ञात"
     },
     "tasksCapacityCard": {
       "title": "कार्य और क्षमता",
@@ -20018,7 +20114,8 @@
       "state_stalled": "रुका हुआ",
       "next_retry_in": "{{age}} में अगला पुनः प्रयास",
       "age_for": "{{age}} से",
-      "open_chat": "चैट खोलो"
+      "open_chat": "चैट खोलो",
+      "age_tip": "बैज वाली स्थिति में बीता समय।"
     },
     "layoutEditorHarness": {
       "title": "लेआउट एडिटर हार्नेस",

@@ -18,6 +18,7 @@ import kiro_crew.subagent as subagent_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.subagent import QUEUED_REASON_LOW_MEMORY, SubagentManager
 from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 

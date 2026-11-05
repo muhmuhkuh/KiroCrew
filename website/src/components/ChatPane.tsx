@@ -11,6 +11,7 @@ import type { VirtualTranscriptHandle } from '../app-sdk/ChatMessageList'
 import { EdgeFade, JumpToBottomButton } from '../app-sdk/ChatScrollChrome'
 import { createTranscriptVersioner } from '../chat-core/transcript/transcriptVersion'
 import { DOCK_CLEARANCE_PX, useComposerDockMetrics } from '../pages/chat/composerDockMetrics'
+import ChatBackendSelect from './ChatBackendSelect'
 import ChatInput from './ChatInput'
 import { DeliveryWarningStrip } from './DeliveryWarningStrip'
 import { useDeliveryWarningStrip } from './useDeliveryWarningStrip'
@@ -1130,6 +1131,7 @@ export default function ChatPane({
           voice={composerVoiceOptions}
           pastes={composerPastes}
         >
+        <ChatBackendSelect slot={paneSlot} />
         <ComposerInput
           value={input}
           onChange={handleUserInput}

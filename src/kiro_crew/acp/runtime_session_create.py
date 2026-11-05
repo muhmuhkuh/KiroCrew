@@ -35,7 +35,7 @@ from kiro_crew.acp._dispatch import (
     build_session_new_params,
     parse_session_modes,
 )
-from kiro_crew.acp.kas_agents import hoist_servers_for_session
+from kiro_crew.acp.kas_agents import hoist_managed_servers
 from kiro_crew.acp.runtime_session_setup import (
     _disable_check_scope,
     _pooled_session_servers_and_ref_spec,
@@ -334,7 +334,7 @@ async def create_session(
     # global/workspace entry and 2.20.0 reports as the client's own (see
     # ``hoist_servers_for_session``). The kiro path returns None here and is
     # untouched.
-    kas_agents, mcp_servers = hoist_servers_for_session(
+    kas_agents, mcp_servers = hoist_managed_servers(
         kas_agents,
         active_agent,
         mcp_servers,

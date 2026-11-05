@@ -2,6 +2,14 @@
 
 ## Overview
 
+Terminal completion resolves, vets and lists paths in
+`handlers/terminal_complete.py`; remote terminal placement is owned by
+`handlers/terminal_placement.py`. Terminal session records carry their
+`remote` flag and owning `chat_slot` for these placement checks. State's websocket methods delegate fold
+capability and watch changes through `state_parts/slots_push.py` to the hub.
+`ws_side_frames.py` supplies side-conversation frames, and
+`members_roster_goals.py` supplies the roster's goal projection.
+
 This module covers self-learning from corrections, scheduled cron jobs, and the web dashboard.
 Member roster and rules validation reuse one off-loop configuration snapshot
 for stable slug resolution and collision checks; per-member lookups do not reload
@@ -467,6 +475,8 @@ Interval descriptions preserve the exact duration, using whole hours, whole minu
 The editor and week grid prefer `every_secs`; their fallback schedule parsers accept `s`, `m`, and `h` suffixes when the numeric interval is unavailable.
 
 The Schedule table defaults to Next Run ascending, ordering upcoming jobs by timestamp before jobs without a next run.
+
+The Schedule page reloads its job and folder lists on cron refreshes. Turn-end history frames coalesce cron refreshes into a 15-second window; explicit cron changes refresh immediately.
 
 **Building and reloading the list.** `GET /api/crons` (`handlers/cron_board.api_crons`) reads the loop-owned state on the loop (each job's run claim, `running_since`, and its `cron-{id}` slot) and takes a copy of each job there (`_job_snapshot`: shallow, with fresh lists, dicts and schedule). It then builds the rows, with every free-text field through the exfiltration-URL pass and the credential pass as before, and encodes the body, in `asyncio.to_thread`. The worker inherits the request's context, so a redaction scope the caller opened (owner view) still applies there. The Schedule page reloads its list on `dashboard.cronRefreshTrigger`, not on the kind-blind `refreshTrigger`. `invalidateRefreshQueries` bumps it through its `onCronsStale` callback whenever it re-reads the cron caches. That happens at once for a `crons` or `cron_history` frame or any broad frame. A frame that names only `history` (the end of every turn) re-reads them at most once per `TURN_END_CRON_REFRESH_MS` (15 s), and that covers the cron caches the nav rail and the crew panes share. The window is trailing, and later frames join it without restarting it, so a job an agent's shell wrote through the CLI, which pushes no `crons`, still appears. A cron cache whose last read failed is re-read at once. Pinned by `test/test_cron_list_build_off_loop.py`, `website/src/hooks/websocket/serverState.refreshKinds.test.ts` and `website/src/test/SchedulePage.cronRefresh.test.tsx`.
 

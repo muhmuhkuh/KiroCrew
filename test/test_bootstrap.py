@@ -3,19 +3,23 @@
 The bootstrap closes the git-pull gap for editable installs: a commit that
 adds a runtime dependency must not leave ``kirocrew`` dying on a raw
 ``ModuleNotFoundError`` when one ``pip install -e .`` fixes it. These tests
-stub the import and the pip spawn — no real installs, no network.
+stub the import and the pip spawn; a fresh-process smoke test imports the real
+startup graph with an isolated data home. No real installs or network calls.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
+import sys
 from configparser import ConfigParser
 from pathlib import Path
 
 import pytest
 
 from kiro_crew import _bootstrap
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 # ── Helpers ──
 
@@ -51,12 +55,50 @@ def _fail_then_succeed(calls: list[str], sentinel):
 # ── main() flow ──
 
 
+def test_startup_imports_in_a_fresh_process(tmp_path):
+    code = """
+import importlib
+from kiro_crew._bootstrap import _import_cli
+from kiro_crew.config import KiroCrewConfig
+
+assert callable(_import_cli())
+for name in (
+    "kiro_crew.dashboard.server",
+    "kiro_crew.mcp_core",
+    "kiro_crew.mcp_dashboard",
+    "kiro_crew.crew_log.projection",
+    "kiro_crew.apps.registry_pipeline.install",
+    "kiro_crew.dashboard.handlers.work_ledger",
+):
+    importlib.import_module(name)
+config = KiroCrewConfig.load()
+assert config.work_ledger.max_depth == 2
+assert config.agent.crew_mode_agent
+from kiro_crew.slack.gateway import GatewayOrchestrator
+gateway = GatewayOrchestrator(
+    config, no_dashboard=True, no_crons=True, no_open=True, test_mode=True, credentials={}
+)
+assert gateway._cfg is config
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "KIROCREW_HOME": str(tmp_path / "crew"),
+            "PYTHONIOENCODING": "utf-8",
+        },
+        capture_output=True,
+        timeout=60,
+        **UTF8_TEXT,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_happy_path_never_spawns_pip(monkeypatch):
     ran: list[str] = []
     monkeypatch.setattr(_bootstrap, "_import_cli", lambda: lambda: ran.append("cli"))
-    monkeypatch.setattr(
-        _bootstrap, "_self_heal", lambda missing: pytest.fail("heal must not run")
-    )
+    monkeypatch.setattr(_bootstrap, "_self_heal", lambda missing: pytest.fail("heal must not run"))
     _bootstrap.main()
     assert ran == ["cli"]
 
@@ -154,9 +196,7 @@ def test_non_mcp_argv_takes_the_cli_path(monkeypatch):
 
 def test_self_heal_refuses_outside_source_checkout(monkeypatch):
     monkeypatch.setattr(_bootstrap, "_source_checkout_root", lambda: None)
-    monkeypatch.setattr(
-        subprocess, "run", lambda *a, **k: pytest.fail("pip must not run")
-    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("pip must not run"))
     assert _bootstrap._self_heal("defusedxml") is False
 
 
@@ -335,4 +375,6 @@ def test_every_console_script_target_resolves():
             spec = importlib.util.find_spec(module)
         except ModuleNotFoundError:
             spec = None
-        assert spec is not None, f"console script {script.strip()!r} names missing module {module!r}"
+        assert (
+            spec is not None
+        ), f"console script {script.strip()!r} names missing module {module!r}"

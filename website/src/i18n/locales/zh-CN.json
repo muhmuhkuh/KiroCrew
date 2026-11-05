@@ -1,4 +1,9 @@
 {
+  "chatBackend": {
+    "label": "后端",
+    "inherit": "使用全局默认值",
+    "managed": "后端由此聊天的所有者管理"
+  },
   "commandCenter": {
     "automatic_cards": "为所有会话自动生成卡片",
     "card_limits": "默认关闭。后台模型一次处理一个调用。每个会话每 {{minutes}} 分钟最多尝试一次，所有会话合计每小时最多尝试 {{hourly}} 次，包含失败的尝试。实时状态和决策不调用模型。",
@@ -1975,7 +1980,8 @@
           "no_repo_members_found_among_these_issues": "这些 issue 中未找到仓库成员",
           "open": "待处理",
           "requested_by_me": "由我请求",
-          "sort": "排序"
+          "sort": "排序",
+          "status": "状态"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "无法检查是否已有调查 — 刷新时会重试",
@@ -2427,7 +2433,12 @@
         "gitlab_instances_unavailable_dashboard_settings_didn_t_load": "未能加载仪表板设置，因此无法列出 GitLab 实例。",
         "selection_cleared_those_projects_are_on_the_previous_instance": "已清除选择：这些项目位于之前的 GitLab 实例上。",
         "selection_cleared_those_repos_belong_to_the_previous_provider": "已清除选择：这些仓库属于之前的提供方。",
-        "try_again": "重试"
+        "try_again": "重试",
+        "jira_env_hint": "Jira 使用网关上的 JIRA_EMAIL 和 JIRA_API_TOKEN 环境凭据连接。请在连接前设置，否则验证将因配置错误而失败。",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "仓库映射（可选）",
+        "repo_mapping_hint": "可选：将此 Jira 项目映射到 Git 仓库标识（owner/repo）。留空则仅连接问题。",
+        "repo_mapping_placeholder": "owner/repo"
       },
       "connectRepoModal": {
         "close": "关闭",
@@ -2444,7 +2455,8 @@
           "number": "编号",
           "crew_sort_status": "状态",
           "crew_sort_name": "名称",
-          "crew_sort_created": "已创建"
+          "crew_sort_created": "已创建",
+          "priority": "优先级"
         },
         "links": {
           "read_only_here_apply_in_provider": "此处为只读 — {{provider}} 仓库无法从 {{productName}} 修改；请在 {{provider}} 中进行更改",
@@ -2463,7 +2475,7 @@
       "manifest": {
         "use_case_1": "对已连接服务商中的 issue 和拉取请求进行分类，同时保留摘要、建议标签和调查历史。",
         "configuration_1": "连接仓库，并在网关主机上认证服务商 CLI：GitHub 使用 gh，GitLab 使用 glab，Azure DevOps 在 macOS、Linux 或 WSL 上使用带扩展的 az。",
-        "description": "一个记得住事的 issue 分类助手。浏览、筛选并分类 GitHub 与 GitLab 的 issue，以及 Azure DevOps 工作项，用 AI 建议标签，为每个条目留调查笔记 — 发现都记在本地账本里，同一件事不会被重复调查。",
+        "description": "一个会记住信息的 issue 分类助手。浏览、筛选并分类 GitHub、GitLab、Azure DevOps 和 Jira issue，使用 AI 建议的标签和逐项调查笔记 — 发现保存在本地账本中，避免重复调查。",
         "display_name": "Issue Radar",
         "highlight_1": "为 issue 和拉取请求生成 AI 摘要与建议标签，每条都附上理由",
         "highlight_2": "每个 issue 的调查笔记都存在本地账本里，同一件事不会被重复调查",
@@ -2473,7 +2485,7 @@
         "highlight_6": "任何写操作都需要仓库的 triage 或 push 权限；只读连接只能给建议",
         "highlight_7": "列出你最近贡献过的仓库，连接一个只需点一下",
         "highlight_8": "在本地缓存 issue、标签和成员，按需刷新",
-        "highlight_9": "支持 GitHub、GitLab 和 Azure DevOps；需要网关主机上有所连接服务商的已认证 CLI（`gh`、`glab` 或 `az`）— 安装时并不要求某一家服务商的 CLI",
+        "highlight_9": "支持 GitHub、GitLab、Azure DevOps 和 Jira；网关主机需提供已连接服务商的认证 CLI 或网关凭据（`gh`、`glab`、`az` 或 JIRA_EMAIL + JIRA_API_TOKEN）— 安装时不要求某个特定服务商的 CLI",
         "page_label": "Issue Radar"
       },
       "views": {
@@ -5960,7 +5972,8 @@
       "not_installed": "“{{name}}”未安装",
       "retry": "重试",
       "this_app_is_disabled": "此应用已停用",
-      "this_app_provides_agents_and_skills_but_no_visua": "此应用提供代理和技能，但没有可视界面。\n            请在聊天中使用它的代理。"
+      "this_app_provides_agents_and_skills_but_no_visua": "此应用提供代理和技能，但没有可视界面。\n            请在聊天中使用它的代理。",
+      "app_not_found": "未找到应用"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "把应用弹出到独立窗口",
@@ -6011,7 +6024,11 @@
       "yolo_expiration_until_shutdown": "在 {{productName}} 重启前保持开启 — 不会按时间过期。",
       "yolo_label": "YOLO",
       "mode_disabled_by_policy": "已被组织的安全策略禁用",
-      "yolo_mode_is_an_app_wide_setting": "YOLO 模式是全应用级设置"
+      "yolo_mode_is_an_app_wide_setting": "YOLO 模式是全应用级设置",
+      "normal_tooltip": "{{productName}} 在执行任何操作前都会先询问你",
+      "reads_tooltip": "{{productName}} 会自行运行只读 shell 命令，但其他任何操作都会先询问",
+      "trust_tooltip": "在此对话中，{{productName}} 无需先询问即可工作",
+      "yolo_tooltip": "在每个对话中，{{productName}} 无需先询问即可工作"
     },
     "appstore": {
       "appListRow": {
@@ -6468,7 +6485,10 @@
       "attachment_removed": "已从附件中移除 {{file}}",
       "attachment_restored": "已附加 {{file}}",
       "trusted_command_until": "已信任“{{cmd}}”至 {{time}}，之后会再次询问",
-      "trusted_base_until": "已信任任意“{{base}}”命令至 {{time}}，之后会再次询问"
+      "trusted_base_until": "已信任任意“{{base}}”命令至 {{time}}，之后会再次询问",
+      "apply_a_ready_made_set_of_instructions": "套用现成的指令集",
+      "let_the_agent_read_one_of_your_files": "让代理读取你的某个文件",
+      "quick_actions_like_clearing_the_chat_or_checking": "清空聊天、查看用量等快捷操作"
     },
     "chatPane": {
       "agent_list": "代理列表",
@@ -6493,7 +6513,8 @@
       "type_to_filter": "输入以筛选…",
       "earlier_conversation_show": "{{time}} 重新开始 · 显示之前的消息（{{count}}）",
       "earlier_conversation_hide": "{{time}} 重新开始 · 隐藏之前的消息（已不再记得）",
-      "preparing_catch_up": "正在整理你的进展摘要…"
+      "preparing_catch_up": "正在整理你的进展摘要…",
+      "session_ready_type_a_message_to_start": "会话就绪。输入消息即可开始。"
     },
     "cliPanel": {
       "copied": "已复制",
@@ -7923,7 +7944,8 @@
         "search": "搜索…",
         "show_less": "收起",
         "show_muted_count": "显示已静音（{{count}}）",
-        "try_a_different_search": "换个搜索词试试"
+        "try_a_different_search": "换个搜索词试试",
+        "activity_will_appear_here": "动态会显示在这里"
       },
       "notificationPermissionHint": {
         "get_alerted_when_you_re_away": "离开时也能收到提醒",
@@ -9617,7 +9639,8 @@
       "capture_n_of_m": "第 {{n}} 张，共 {{m}} 张",
       "turn_on": "开启此预览",
       "screenshot_badge": "截图",
-      "is_on": "此预览已开启。关闭只会把它隐藏起来，你创建的内容不会丢失"
+      "is_on": "此预览已开启。关闭只会把它隐藏起来，你创建的内容不会丢失",
+      "where_to_find": "你会在哪看到它"
     },
     "sessionAutomationPopover": {
       "snapshot_failed": "无法加载此会话的监控状态。请重试加载后再启动监控。",
@@ -10379,6 +10402,11 @@
       "reason": "我不能运行这条命令，但你可以。",
       "run_unanswered": "终端没有响应，请把它复制到你电脑上的终端应用里。",
       "title": "请你自己运行"
+    },
+    "unscannedDownload": {
+      "body": "{{name}} 大小为 {{size}}。超过 {{limit}} 的文件在下载前不会检查其中是否含有密钥等机密信息。",
+      "download_anyway": "仍要下载",
+      "title": "文件太大，无法扫描"
     }
   },
   "hooks": {
@@ -12797,7 +12825,8 @@
       "comments_sent_other": "{{count}} 条评论已发送",
       "your_crewmate": "你的队员",
       "jump_to_new_other": "{{count}} 条新 · 跳到最新",
-      "could_not_repair_images": "无法修复图片"
+      "could_not_repair_images": "无法修复图片",
+      "mcp_session_source_note": "列表是该 agent 的配置；每个名称旁的状态来自本会话的上报。"
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "（跳过 1 个 — 当前已选中）",
@@ -13210,7 +13239,8 @@
       "kind_section_crew": "Ultra Mode",
       "kind_section_normal": "普通",
       "kind_section_mate": "来自队友",
-      "filter_crew_description": "只显示 Ultra Mode 对话"
+      "filter_crew_description": "只显示 Ultra Mode 对话",
+      "broadcast_crewmates_hint": "由 AI 队友（crew 里的 agent）运行的会话"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",
@@ -13411,7 +13441,21 @@
       "start_row_show": "显示",
       "start_row_shown": "已在上方显示",
       "picked_gone": "第 {{n}} 轮已移出图表，所以显示最近一轮。",
-      "turn_start_latest": "第 {{n}} 轮 · 会话开始 · 最近一次"
+      "turn_start_latest": "第 {{n}} 轮 · 会话开始 · 最近一次",
+      "delta_down": "比上一轮 −{{n}}",
+      "delta_same": "与上一轮相同",
+      "delta_up": "比上一轮 +{{n}}",
+      "engine_calls": "本轮次模型请求次数：{{n}}。",
+      "engine_heading": "由智能体循环测量",
+      "engine_hist_all": "对话历史",
+      "engine_hist_crew": "{{productName}} 的提示（仍在上下文中的每个轮次）",
+      "engine_not_measured": "智能体循环没有测量这个轮次。",
+      "engine_note": "按智能体循环在本轮次最后一次模型请求中统计的字符数。{{productName}} 的提示使用 {{productName}} 自己的统计。",
+      "engine_total": "本轮次最后一次模型请求共 {{chars}} 个字符。下方“{{productName}} 的提示”为 {{productName}} 写入部分，覆盖仍在上下文中每个轮次。",
+      "engine_ttft_detail": "{{total}} 后出现首个输出（模型首个 token 在 {{model}} 后）。",
+      "footer": "只统计 {{productName}} 本轮发送的内容，含你的消息。不是累计发送量，也不是 AI 的全部上下文。",
+      "rebuild_row": "第 {{n}} 轮 · 上下文重建",
+      "start_note": "会话开始和重建的轮次单独列在图表上方，这样后面的轮次才看得清。"
     },
     "crewBoard": {
       "title": "工作项",
@@ -16347,7 +16391,8 @@
       "group_today": "今天",
       "group_yesterday": "昨天",
       "group_earlier": "更早",
-      "empty_title": "暂无会话"
+      "empty_title": "暂无会话",
+      "empty_subtitle": "新建一个开始吧。"
     },
     "sessionsTab": {
       "agent": "代理",
@@ -17076,7 +17121,8 @@
         "default_session_folder_none": "无（不归档）",
         "default_session_folder_deleted": "已删除的文件夹",
         "default_session_folder_save_failed": "无法保存默认文件夹。请重试。",
-        "default_session_folder_load_failed": "无法加载侧边栏文件夹，因此这里没有列出它们。"
+        "default_session_folder_load_failed": "无法加载侧边栏文件夹，因此这里没有列出它们。",
+        "model_for_spawned_sub_agents": "用于派生子代理的模型。"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",
@@ -17917,7 +17963,30 @@
         "redaction_revoke_failed": "无法撤销该主机。它仍处于允许状态。",
         "redaction_no_allowed_hosts": "没有被允许的主机。每个链接都会经过全部检查。",
         "redaction_workspace": "工作区：{{workspace}}",
-        "redaction_revoke": "撤销"
+        "redaction_revoke": "撤销",
+        "file_delivery_arm_status_failed": "无法确认是否有审批正在进行。",
+        "file_delivery_armed_expired": "该请求在获批前已过期。请再次允许传送以重新开始。",
+        "file_delivery_armed_expires": "此请求将在约 {{duration}} 后过期。",
+        "file_delivery_armed_help": "在这台机器上还差一步：在运行 {{productName}} 的计算机的终端中运行此命令，以完成允许投递。这可确认有人在机器旁——仅凭浏览器会话无法允许。",
+        "file_delivery_confirm": "确认",
+        "file_delivery_confirm_help": "此操作会发起一个请求，需要你在本机的终端中完成；在那之前不会交付任何内容，你也可以随时撤销。",
+        "file_delivery_copied": "已复制",
+        "file_delivery_copy": "复制",
+        "file_delivery_copy_command": "复制批准命令",
+        "file_delivery_copy_failed": "无法复制命令。请手动选中并复制。",
+        "file_delivery_desc": "当凭据扫描器标记出文件内容时，{{productName}} 会拒绝投递该文件。在此确认后，它可以将这类文件投递到本机的发件箱和你自己的仪表板。任何检测器都不会被放宽，并且在确认之下完成的每一次投递都会记录到安全事件日志中。当你自己的文件（例如 {{productName}} 为你生成的 VPN 密钥）在送达你时被拦截，可使用此功能。",
+        "file_delivery_destination_help": "也就是说，文件会保存到本机发件箱文件夹，并显示在你仪表板的文件视图中——不会到达任何第三方可见的位置。它绝不会发送到 Slack 或聊天频道。",
+        "file_delivery_load_failed": "无法读取哪些目标已确认。",
+        "file_delivery_never_grantable": "向 Slack 或聊天频道的上传在此永远无法被允许，也不会提供：允许永远不能覆盖第三方可见的目标。",
+        "file_delivery_save_failed": "无法保存该更改。",
+        "file_delivery_since": "自 {{time}} 起",
+        "file_delivery_state_armed": "等待批准",
+        "file_delivery_state_confirmed": "已确认",
+        "file_delivery_state_not_confirmed": "未确认",
+        "file_delivery_title": "被标记文件可以投递到哪里",
+        "file_delivery_waiting": "正在此设备上等待",
+        "file_delivery_withdraw": "撤回",
+        "file_delivery_section": "被标记文件的投递"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "将聊天标签切换绑定到 Ctrl+数字，而不是 Option+数字。文本框获得焦点时，Option+数字不会切换聊天。",
@@ -18223,7 +18292,8 @@
         "decode_threads_desc": "本地模型识别语音时在 CPU 上使用的解码并发数。自动会使用本机一半的核心，最多 16 个。在有空闲核心的大型机器上，提高并发数能让每次听写更快完成。更改会在下一次听写时生效，届时会重新加载一次模型。",
         "decode_threads_auto": "自动",
         "decode_threads_auto_count": "自动（{{n}}）",
-        "decode_threads_env_override": "此网关使用的解码并发数为 {{value}}，由 KIROCREW_STT_THREADS 设定。删除该变量后才会使用此选择。"
+        "decode_threads_env_override": "此网关使用的解码并发数为 {{value}}，由 KIROCREW_STT_THREADS 设定。删除该变量后才会使用此选择。",
+        "aws_region_for_transcribe": "Transcribe 使用的 AWS 区域"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "。与 Slack 不同，Bot Framework 没有\n              仅出站模式。",
@@ -18936,7 +19006,8 @@
       "range_to": "结束日期",
       "no_telemetry_in_window": "此时间范围内（{{period}}）没有记录遥测数据。",
       "otel_retention_cap": "轮次、延迟和启动数据仅涵盖最近 {{days}} 天；更早的指标会被删除（<settingRef/>）。",
-      "window_footer": "OTEL 部分 · 时间范围：{{period}} ·"
+      "window_footer": "OTEL 部分 · 时间范围：{{period}} ·",
+      "top_spenders_link_to_chat": "有标题的仪表板会话可点击跳转"
     },
     "terminalPopoutFrame": {
       "return": "返回停靠面板",
@@ -19589,7 +19660,32 @@
       "profile_harness_cannot_start": "无法在此启动。",
       "profile_harness_saved": "已保存。从下一条消息起，{{name}} 在此运行框架上运行。",
       "profile_harness_unavailable": "{{name}} 设置为使用 {{harness}}，但它在这里无法启动，因此其聊天和工作会话也不会启动。请选择其他代理运行框架，或选择“继承”。",
-      "profile_harness_choose": "选择代理运行框架"
+      "profile_harness_choose": "选择代理运行框架",
+      "switcher_unread": "未读",
+      "profile_monitor": "监视器",
+      "profile_monitor_active": "运行中",
+      "profile_monitor_cycle": "检查次数",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "间隔",
+      "profile_monitor_inactive": "已停止",
+      "profile_monitor_loading": "正在检查监视器状态…",
+      "profile_monitor_next": "下次检查",
+      "profile_monitor_no_limit": "无限制",
+      "profile_monitor_none": "未监视任何内容",
+      "profile_monitor_reason_unknown": "已停止",
+      "profile_monitor_runtime": "已用时间",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "运行计时开始",
+      "profile_monitor_state": "状态",
+      "profile_monitor_stopped": "停止原因",
+      "profile_monitor_subject": "监视对象",
+      "profile_monitor_subject_goal": "目标循环",
+      "profile_monitor_subject_ledger": "任务列表",
+      "profile_monitor_subject_pull_request": "拉取请求",
+      "profile_monitor_type": "类型",
+      "profile_monitor_type_bounded": "监视器",
+      "profile_monitor_unavailable": "无法获取监视器状态",
+      "profile_monitor_unknown": "未知"
     },
     "tasksCapacityCard": {
       "title": "任务与容量",
@@ -19651,7 +19747,8 @@
       "state_stalled": "停滞",
       "next_retry_in": "{{age}} 后重试",
       "age_for": "已 {{age}}",
-      "open_chat": "打开聊天"
+      "open_chat": "打开聊天",
+      "age_tip": "处于徽标所示状态的时长。"
     },
     "layoutEditorHarness": {
       "title": "布局编辑器测试台",

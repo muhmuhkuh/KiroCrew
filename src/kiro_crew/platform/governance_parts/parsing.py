@@ -26,7 +26,7 @@ from kiro_crew.platform.governance_parts.archetypes import (
     ScopedRuleset,
     _compose_controls,
 )
-from kiro_crew.platform.governance_parts.baseline import BASELINE_CONTROLS
+from kiro_crew.platform.governance_parts.baseline import BASELINE_CONTROLS, BASELINE_INNER_LISTS
 from kiro_crew.platform.governance_parts.carriers import (
     SIGNATURE_UNCHECKED,
     Bind,
@@ -258,6 +258,7 @@ _STRUCTURAL_KEYS = frozenset(
         "updates",
         "distribution",
         "fallback",
+        "yolo_max_seconds",
     }
 )
 
@@ -506,6 +507,29 @@ def baseline_controls() -> Mapping[str, object]:
     }
 
 
+@lru_cache(maxsize=1)
+def baseline_inner_lists() -> Mapping[str, Mapping[str, ScopedRuleset]]:
+    """Parse inner-list defaults with each capability's catalog matchers."""
+    return {
+        scope: {
+            name: ScopedRuleset.from_dict(raw, matcher=SCOPE_CATALOG[scope].scope_matchers[name])
+            for name, raw in lists.items()
+        }
+        for scope, lists in BASELINE_INNER_LISTS.items()
+    }
+
+
+def with_inner_baseline(scope: str, control: object) -> object:
+    """Fill omitted capability lists from this build's baseline registry."""
+    lists = baseline_inner_lists().get(scope)
+    if not lists or not isinstance(control, CapabilityGate):
+        return control
+    missing = {name: rs for name, rs in lists.items() if name not in control.scopes}
+    if not missing:
+        return control
+    return CapabilityGate(enabled=control.enabled, scopes={**control.scopes, **missing})
+
+
 def parse_policy(
     data: Mapping[str, object], *, signature_state: str = SIGNATURE_UNCHECKED
 ) -> GovernanceCeiling:
@@ -587,6 +611,7 @@ def parse_policy(
         agentcore_identity_posture=composed_posture,
         agentcore_gateway_url=composed_gateway_url,
         agentcore_workload_name=composed_workload_name,
+        yolo_max_seconds=_parse_yolo_max_seconds(data.get("yolo_max_seconds")),
     )
 
 
@@ -610,6 +635,10 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
     # profile's copy silently inert — so reject it loudly here instead. A profile
     # is narrow-only and there is no narrower version of pointing somewhere else:
     # a per-app profile redirecting the update source would be escalation.
+    if "yolo_max_seconds" in data:
+        raise PlatformCompositionError(
+            "profiles may not set 'yolo_max_seconds' — the auto-approve cap is policy-only"
+        )
     if "updates" in data:
         raise PlatformCompositionError(
             "profiles may not set 'updates' — update pins are policy-only "
@@ -670,3 +699,18 @@ def _read_json_file(path: Path) -> Dict[str, object]:
     if not isinstance(data, dict):
         raise PlatformCompositionError(f"governance file {path} is not a JSON object")
     return data
+
+
+def _parse_yolo_max_seconds(raw: object) -> int:
+    """The policy's ``yolo_max_seconds``: a positive whole number, or absent (0).
+
+    Fails closed on any other value: a ``false``, a string or ``0`` that read as
+    "no cap" would silently lift the bound the policy meant to set.
+    """
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise PlatformCompositionError(
+            f"security policy 'yolo_max_seconds' must be a positive integer, got {raw!r}"
+        )
+    return raw

@@ -9,7 +9,7 @@ import pytest
 from kiro_crew import cli_chat
 from kiro_crew.acp.client import AcpTimeoutError
 from kiro_crew.acp.types import STOP_REASON_STALE_RECOVER
-from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config import KiroCrewConfig, loader
 from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_TEXT_CHUNK, LLMEvent
 from kiro_crew.shell_audit_log import SHELL_AUDIT_LOG_MAX_BYTES, SHELL_AUDIT_LOG_NAME
 

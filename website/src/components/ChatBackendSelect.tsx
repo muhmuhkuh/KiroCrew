@@ -24,7 +24,7 @@ export default function ChatBackendSelect({ slot }: { slot?: ChatSlot }) {
   })
   const change = useMutation({
     mutationFn: ({ key, backend }: { key: string; backend: string | null }) =>
-      api.chatSlotAgent(key, backend ?? '', undefined, undefined),
+      api.chatSlotBackend(key, backend),
     onSuccess: () => {
       dispatch(triggerRefresh())
     },

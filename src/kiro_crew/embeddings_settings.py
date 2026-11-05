@@ -437,3 +437,36 @@ def bulk_pace_delay(elapsed: float) -> float:
     if duty >= 1.0:
         return 0.0
     return min(elapsed * (1.0 - duty) / duty, _MAX_BULK_PACE_SLEEP)
+
+
+_CHILD_NICE = 10
+
+
+_CHILD_CALL_BASE_SECS = 60.0
+
+
+_CHILD_CALL_SECS_PER_TEXT = 30.0
+
+
+_CHILD_LOAD_TIMEOUT_SECS = 300.0
+
+
+_CHILD_RESPAWN_BASE_SECS = 1.0
+
+
+_CHILD_RESPAWN_CAP_SECS = 300.0
+
+
+_CHILD_STABLE_SECS = 60.0
+
+
+def embedding_child_process_enabled() -> bool:
+    """Whether model load and inference run in a child process (``memory``).
+
+    ``memory.embedding_child_process``, default off: the model runs in-process on
+    the inference thread exactly as before. ``true`` moves it to a child. Read
+    raw like the other knobs here; anything but a literal ``true`` keeps the
+    default. Read at each model load, so the switch takes effect at the next
+    load (gateway restart, or the next load after an idle unload).
+    """
+    return _read_memory_config().get("embedding_child_process") is True

@@ -72,6 +72,7 @@ from typing import Any
 
 from kiro_crew.acp import kas_env_launch
 from kiro_crew.acp.kas_auto_approve import auto_approve_refs
+from kiro_crew.acp.kas_hoist_compat import hoist_managed_servers  # noqa: F401
 from kiro_crew.acp.kas_permissions import (
     AUTO_APPROVABLE_CAPABILITIES,
     CREW_ANSWERED_BUILTINS_KEY,

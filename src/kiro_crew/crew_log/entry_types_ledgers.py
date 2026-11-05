@@ -60,6 +60,7 @@ RADAR_ENTRY_TYPE = "radar/recorded"
 #: set that is narrower than the truth drops a real change with nothing raised -- so
 #: the type the fold matches on and the type the registry declares are one value.
 WORK_ENTRY_TYPE = "work/recorded"
+WORK_CHARGE_ENTRY_TYPE = "work/charged"
 
 #: Work-item phases. Two classifications hang off this enum and do not coincide:
 #: the TTL-active phases age toward the claim TTL, and the editing phases are the
@@ -696,6 +697,49 @@ TYPES: tuple[EntryType, ...] = (
             "units, so the ledger's files are a cache of the crew log rather than a "
             "record beside it. The work ledger therefore DEPENDS on this log: with the "
             "emitter off the tools refuse rather than keeping a document of their own."
+        ),
+    ),
+    EntryType(
+        WORK_CHARGE_ENTRY_TYPE,
+        "One bound worker's charge, relayed by the gateway into the board's own log.",
+        (
+            Field(
+                "slot",
+                JSON_STRING,
+                required=True,
+                note="The board whose log this copy lands in: the conductor slot.",
+            ),
+            Field(
+                "by",
+                JSON_STRING,
+                required=True,
+                note="The worker session key that incurred the charge.",
+            ),
+            Field(
+                "source",
+                JSON_STRING,
+                required=True,
+                enum=("turn", "subagent", "background"),
+                enum_closed=True,
+                note="Which kind of closer in the worker's log carried the charge.",
+            ),
+            Field(
+                "closer",
+                JSON_STRING,
+                required=True,
+                note=(
+                    "The closer this charge copies, as '<unit>:<seq>' of the worker's log. "
+                    "A reader counts one closer once however many copies it meets."
+                ),
+            ),
+            Field("credits", JSON_FLOAT, note="What the closer billed. Absent is not zero."),
+            Field("duration_ms", JSON_INT, note="How long the closer's work ran."),
+        ),
+        note=(
+            "Written when a turn, subagent or background closer lands in a session bound "
+            "to a work item, into the newest unit of the board that bound it; a board "
+            "bound to a parent board relays it up again. The project-report fold costs "
+            "tasks from these, so it reads only the board's own units."
         ),
     ),
 )

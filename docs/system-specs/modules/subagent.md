@@ -2,6 +2,13 @@
 
 ## Overview
 
+`subagent_wait_reasons.stopped_before_start` identifies a queued, completed,
+user-stopped placeholder with no error. Callers do not report that placeholder
+as a started run; no child or completion card follows it.
+The manager accepts `hold_orphan_notices` and releases its notice event through
+`release_orphan_notices` after the gateway restores its tabs. The existing
+monitor bounds that wait; orphan cleanup itself does not wait for tab restore.
+
 The subagent module (`kiro_crew/subagent.py`) spawns isolated background agents for parallel task execution. Each subagent gets its own LLM session via `SessionManager`, runs a focused task, and announces the result via callback.
 
 Supports `on_tool_approval` callback for interactive tool approval (routed through gateway's approval system in Normal/Trust modes).

@@ -74,6 +74,8 @@ export function createChatSlotSettingsEndpoints({ get, post, put, j, jfetch: fet
      *  than answered by the default agent. `announce` asks the gateway to
      *  append the "Switched to agent" transcript line, as the typed `/agent`
      *  command does; the picker leaves it off. */
+    chatSlotBackend: (slot: string, acp_backend: string | null) =>
+      post('/api/chat/slots/' + encodeURIComponent(slot) + '/backend', { acp_backend }).then(j) as Promise<{ ok: boolean; acp_backend: string | null; model: string }>,
     chatSlotAgent: (slot: string, agent: string, kind?: 'member' | 'template', opts?: { announce?: boolean }) =>
       post('/api/chat/slots/' + encodeURIComponent(slot) + '/agent', {
         agent,

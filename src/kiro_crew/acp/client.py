@@ -931,6 +931,8 @@ _CLIENT_OWNERS: tuple[str, ...] = (
     "kiro_crew.acp.client_model_selection",
     "kiro_crew.acp.client_mcp_array",
     "kiro_crew.acp.client_tool_events",
+    "kiro_crew.acp.client_copilot",
+    "kiro_crew.acp.client_native_children",
     "kiro_crew.acp.client_usage",
     "kiro_crew.acp.client_transport",
     "kiro_crew.acp.client_lifecycle",

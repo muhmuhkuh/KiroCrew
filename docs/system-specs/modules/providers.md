@@ -12,7 +12,18 @@ and `BASELINE_SELECTABLE_BACKENDS` decides which ids an operator may choose.
 Several are selectable on a plain public build, so "one provider" never meant
 "one backend".
 
+Mistral Vibe is selectable through `vibe-acp`. Its launch seeds the verified
+asking profile and checks the advertised modes before allowing a session; its
+model and thinking options come from the session's ACP configuration options.
+The launch excludes every profile except `ask`, including locally installed
+custom profiles; if Vibe still advertises another profile, startup is refused.
+
 ## Architecture
+
+`providers/mirrors/copilot.py` projects Copilot's session MCP array, with its
+stdio launch configuration supplied by `acp/harness/copilot.py`. Shared
+control-plane identity composition includes the resolved Slack workspace id
+beside its channel id when the channel's home workspace is known.
 
 Member execution carries one immutable member/store selection into provider
 allocation. `member_context` controls native instruction deduplication; it is not

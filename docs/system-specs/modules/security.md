@@ -1123,7 +1123,10 @@ backend confines, the SSH agent-forward verdict and the cron-child audit refusal
 and `wrap_argv`; `sandbox_cgroup` the per-spawn scope probe and its sizing;
 `sandbox_slice` the agents-slice ceilings and pressure and `cgroup_scope_argv`;
 `sandbox_rlimit` the rlimit-applying spawn wrappers; and `sandbox_spawn` the entry
-points callers spawn through (`sandboxed_spawn_argv`). `sandbox.py` itself keeps only
+points callers spawn through (`sandboxed_spawn_argv`). The cgroup owner exposes
+`_read_resource_limits` so the scope builder shares its parsed block between the
+hard limits and `_scope_memory_high_mb` (90% by default, 0 disables the soft limit).
+`sandbox.py` itself keeps only
 its BASE imports, the `sandbox_plan` aliases and the facade. A new mask
 rule goes in `sandbox_plan`, a new launcher step in
 `sandbox_launcher_parts/mask_stages.py` (or `exec_lockdown.py` when it runs after the

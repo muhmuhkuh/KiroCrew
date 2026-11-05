@@ -731,6 +731,20 @@ async def _route_message(
                 error="channels governance policy",
             )
             return
+        from kiro_crew.slack.channel_policy import channel_refusal
+
+        channel_refused = channel_refusal(channel, audit=False)
+        if channel_refused:
+            logger.info("slack inbound dropped: %s", channel_refused)
+            sel().log_api_access(
+                caller=sender_id,
+                operation="slack.message",
+                outcome="denied",
+                source="slack",
+                resources=channel,
+                error="channel_not_allowed_by_policy",
+            )
+            return
 
     # Resolve sender's Slack display name so the LLM uses the actual
     # profile name instead of guessing from memory. Cached on channel
@@ -1008,7 +1022,9 @@ async def _route_message(
                 metadata={"user": sender_id, "channel": channel},
             )
             return
-        note_user_stop(orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key)
+        note_user_stop(
+            orch.sessions, orch.sessions.get_session_for_thread(session_key) or session_key
+        )
         has_session = orch.sessions.has_session(session_key)
         # READ, not popped: the task is removed only once the cancel is known
         # to have gone through, below.
@@ -1195,6 +1211,7 @@ async def _route_message(
     #    (_handle_restart) which owns owner-check + supervisor guard, keeping
     #    a single source of truth for the restart logic. ──
     if clean_text.strip().lower() == "!restart":
+
         async def _restart_respond(text: str, **_kw: Any) -> None:
             if orch.slack:
                 await orch.slack.post_message(channel, text, thread_ts or msg_ts)
@@ -1492,6 +1509,7 @@ async def _route_message(
 
     orch._handler_tasks.add(t)
     t.add_done_callback(_on_done)
+
 
 # The Socket Mode wiring (``init_socket_mode``) and the message router
 # (``_route_message``) stay here; the rest lives in the ``events_*`` owner modules beside

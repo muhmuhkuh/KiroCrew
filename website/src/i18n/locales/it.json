@@ -1,4 +1,9 @@
 {
+  "chatBackend": {
+    "label": "Backend",
+    "inherit": "Usa predefinito globale",
+    "managed": "Backend gestito dal proprietario di questa chat"
+  },
   "commandCenter": {
     "automatic_cards": "Schede automatiche per tutte le sessioni",
     "card_limits": "Disattivate per impostazione predefinita. Il modello in background esegue una chiamata alla volta. Al massimo un tentativo per sessione ogni {{minutes}} minuti e {{hourly}} tentativi all’ora condivisi tra tutte le sessioni, inclusi quelli falliti. Stato in tempo reale e decisioni non usano il modello.",
@@ -2073,7 +2078,8 @@
           "no_repo_members_found_among_these_issues": "Nessun membro del repo trovato tra queste issue",
           "open": "Aperte",
           "requested_by_me": "Richieste da me",
-          "sort": "Ordina"
+          "sort": "Ordina",
+          "status": "Stato"
         },
         "investigateButton": {
           "could_not_check_for_an_existing_investigation_re": "Impossibile verificare se esiste già un'indagine — nuovo tentativo al prossimo aggiornamento",
@@ -2553,7 +2559,12 @@
         "gitlab_instances_unavailable_dashboard_settings_didn_t_load": "Le impostazioni della dashboard non sono state caricate, quindi non è possibile elencare le istanze GitLab.",
         "selection_cleared_those_projects_are_on_the_previous_instance": "Selezione annullata: quei progetti si trovano sull'istanza GitLab precedente.",
         "selection_cleared_those_repos_belong_to_the_previous_provider": "Selezione annullata: quei repository appartengono al provider precedente.",
-        "try_again": "Riprova"
+        "try_again": "Riprova",
+        "jira_env_hint": "Jira si connette tramite le credenziali di ambiente JIRA_EMAIL e JIRA_API_TOKEN sul gateway. Impostale prima della connessione, altrimenti la verifica restituirà un errore di configurazione.",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Facoltativo: associa questo progetto Jira a uno slug di repository Git (owner/repo). Lascia vuoto per collegare solo le issue.",
+        "repo_mapping_placeholder": "owner/repo"
       },
       "connectRepoModal": {
         "close": "Chiudi",
@@ -2570,7 +2581,8 @@
           "number": "Numero",
           "crew_sort_status": "Stato",
           "crew_sort_name": "Nome",
-          "crew_sort_created": "Creato"
+          "crew_sort_created": "Creato",
+          "priority": "Priorità"
         },
         "links": {
           "read_only_here_apply_in_provider": "Sola lettura qui — i repository {{provider}} non possono essere modificati da {{productName}}; applica la modifica in {{provider}}",
@@ -2587,7 +2599,7 @@
         }
       },
       "manifest": {
-        "description": "Un assistente per il triage delle issue che si ricorda le cose. Sfoglia, filtra e smista le issue di GitHub, le issue di GitLab e i work item di Azure DevOps con etichette suggerite dall’AI e note di indagine per ogni elemento — i risultati restano in un registro locale, così nulla viene indagato due volte.",
+        "description": "Un assistente per il triage delle issue che si ricorda le cose. Sfoglia, filtra e smista le issue di GitHub, GitLab, Azure DevOps e Jira con etichette suggerite dall’AI e note di indagine per ogni elemento — i risultati restano in un registro locale, così nulla viene indagato due volte.",
         "display_name": "Issue Radar",
         "highlight_1": "Riepiloghi AI ed etichette suggerite per issue e pull request, ognuno con il proprio ragionamento",
         "highlight_2": "Note di indagine per ogni issue conservate in un registro locale, così nulla viene indagato due volte",
@@ -2597,7 +2609,7 @@
         "highlight_6": "Ogni scrittura richiede accesso di triage o di push sul repo; una connessione di sola lettura resta limitata ai suggerimenti",
         "highlight_7": "Mette in evidenza i repository a cui hai contribuito di recente, così collegarne uno è questione di un clic",
         "highlight_8": "Mette in cache in locale issue, etichette e membri, aggiornandoli su richiesta",
-        "highlight_9": "Funziona con GitHub, GitLab e Azure DevOps; richiede sull’host del gateway una CLI autenticata per il provider che colleghi (`gh`, `glab` o `az`) — per l’installazione non serve la CLI di un provider specifico",
+        "highlight_9": "Funziona con GitHub, GitLab, Azure DevOps e Jira; richiede sull’host la CLI autenticata del provider o credenziali del gateway (`gh`, `glab`, `az` o JIRA_EMAIL + JIRA_API_TOKEN) — per l’installazione non serve la CLI di un provider specifico",
         "page_label": "Issue Radar",
         "use_case_1": "Classifica issue e pull request tra provider collegati conservando riepiloghi, etichette suggerite e cronologia delle indagini.",
         "configuration_1": "Collega un repository e autentica la CLI del provider sull'host del gateway: gh per GitHub, glab per GitLab oppure az con l'estensione Azure DevOps su macOS, Linux o WSL."
@@ -6182,7 +6194,8 @@
       "not_installed": "\"{{name}}\" non è installato",
       "retry": "Riprova",
       "this_app_is_disabled": "Questa app è disattivata",
-      "this_app_provides_agents_and_skills_but_no_visua": "Questa app fornisce agenti e skill ma nessuna interfaccia visiva.\n            Usa i suoi agenti dalla chat."
+      "this_app_provides_agents_and_skills_but_no_visua": "Questa app fornisce agenti e skill ma nessuna interfaccia visiva.\n            Usa i suoi agenti dalla chat.",
+      "app_not_found": "App non trovata"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "Apri l'app in una finestra separata",
@@ -6233,7 +6246,11 @@
       "yolo_expiration_until_shutdown": "Resta attivo finché {{productName}} non si riavvia — nessuna scadenza a tempo.",
       "yolo_label": "YOLO",
       "mode_disabled_by_policy": "Disattivato dalla policy di sicurezza della tua organizzazione",
-      "yolo_mode_is_an_app_wide_setting": "La modalità YOLO è un'impostazione valida per tutta l'app"
+      "yolo_mode_is_an_app_wide_setting": "La modalità YOLO è un'impostazione valida per tutta l'app",
+      "normal_tooltip": "{{productName}} ti chiede prima di fare qualsiasi cosa",
+      "reads_tooltip": "{{productName}} esegue da solo i comandi shell di sola lettura, ma chiede per tutto il resto",
+      "trust_tooltip": "In questa chat, {{productName}} lavora senza chiederti prima",
+      "yolo_tooltip": "In ogni chat, {{productName}} lavora senza chiederti prima"
     },
     "appstore": {
       "appListRow": {
@@ -6710,7 +6727,10 @@
       "attachment_removed": "{{file}} rimosso dagli allegati",
       "attachment_restored": "{{file}} allegato",
       "trusted_command_until": "«{{cmd}}» è attendibile fino alle {{time}}, poi verrà chiesto di nuovo",
-      "trusted_base_until": "Qualsiasi comando «{{base}}» è attendibile fino alle {{time}}, poi verrà chiesto di nuovo"
+      "trusted_base_until": "Qualsiasi comando «{{base}}» è attendibile fino alle {{time}}, poi verrà chiesto di nuovo",
+      "apply_a_ready_made_set_of_instructions": "Applica un set di istruzioni predefinito",
+      "let_the_agent_read_one_of_your_files": "Consenti all'agente di leggere uno dei tuoi file",
+      "quick_actions_like_clearing_the_chat_or_checking": "Azioni rapide come svuotare la chat o controllare l'utilizzo"
     },
     "chatPane": {
       "agent_list": "Elenco degli agenti",
@@ -6735,7 +6755,8 @@
       "type_to_filter": "Digita per filtrare…",
       "earlier_conversation_show": "Ricomincia da capo alle {{time}} · Mostra i messaggi precedenti ({{count}})",
       "earlier_conversation_hide": "Ricomincia da capo alle {{time}} · Nascondi i messaggi precedenti (non più ricordati)",
-      "preparing_catch_up": "Preparo il tuo riepilogo…"
+      "preparing_catch_up": "Preparo il tuo riepilogo…",
+      "session_ready_type_a_message_to_start": "Sessione pronta. Digita un messaggio per iniziare."
     },
     "cliPanel": {
       "copied": "Copiato",
@@ -8191,7 +8212,8 @@
         "search": "Cerca…",
         "show_less": "Mostra meno",
         "show_muted_count": "Mostra silenziate ({{count}})",
-        "try_a_different_search": "Prova una ricerca diversa"
+        "try_a_different_search": "Prova una ricerca diversa",
+        "activity_will_appear_here": "L'attività comparirà qui"
       },
       "notificationPermissionHint": {
         "get_alerted_when_you_re_away": "Ricevi avvisi quando non ci sei",
@@ -9919,7 +9941,8 @@
       "capture_n_of_m": "Cattura {{n}} di {{m}}",
       "turn_on": "Attiva questa anteprima",
       "screenshot_badge": "Screenshot",
-      "is_on": "Questa anteprima è attiva: disattivarla la nasconde soltanto, nulla di ciò che hai creato va perso"
+      "is_on": "Questa anteprima è attiva: disattivarla la nasconde soltanto, nulla di ciò che hai creato va perso",
+      "where_to_find": "Dove lo vedrai"
     },
     "sessionAutomationPopover": {
       "snapshot_failed": "Impossibile caricare lo stato del monitor di questa sessione. Riprova a caricarlo prima di avviare un monitor.",
@@ -10707,6 +10730,11 @@
       "reason": "Io non posso eseguirlo, ma tu sì.",
       "run_unanswered": "Il terminale non ha risposto, quindi copialo nell'app Terminale del tuo computer.",
       "title": "Eseguilo tu"
+    },
+    "unscannedDownload": {
+      "body": "{{name}} pesa {{size}}. I file oltre {{limit}} non vengono controllati alla ricerca di segreti prima del download.",
+      "download_anyway": "Scarica comunque",
+      "title": "Troppo grande per essere analizzato"
     }
   },
   "hooks": {
@@ -13247,7 +13275,8 @@
       "jump_to_new_one": "{{count}} nuovo · Vai in fondo",
       "jump_to_new_other": "{{count}} nuovi · Vai in fondo",
       "jump_to_new_many": "{{count}} nuovi · Vai in fondo",
-      "could_not_repair_images": "Impossibile riparare le immagini"
+      "could_not_repair_images": "Impossibile riparare le immagini",
+      "mcp_session_source_note": "L'elenco è la configurazione di questo agente; lo stato accanto a ogni nome è ciò che questa sessione ha segnalato."
     },
     "chatSidebar": {
       "1_skipped_currently_selected": "(1 saltata — attualmente selezionata)",
@@ -13722,7 +13751,8 @@
       "kind_section_crew": "Ultra Mode",
       "kind_section_normal": "Normale",
       "kind_section_mate": "Dai compagni",
-      "filter_crew_description": "Mostra solo le chat Ultra Mode"
+      "filter_crew_description": "Mostra solo le chat Ultra Mode",
+      "broadcast_crewmates_hint": "Chat gestite dai tuoi compagni, gli agenti IA della tua crew"
     },
     "connectionsPage": {
       "action_failed": "Azione non riuscita: {{error}}",
@@ -13939,7 +13969,21 @@
       "start_row_show": "Mostra",
       "start_row_shown": "Mostrato sopra",
       "picked_gone": "Il turno {{n}} è uscito dal grafico, quindi è mostrato il più recente.",
-      "turn_start_latest": "Turno {{n}} · inizio sessione · più recente"
+      "turn_start_latest": "Turno {{n}} · inizio sessione · più recente",
+      "delta_down": "−{{n}} rispetto al precedente",
+      "delta_same": "uguale al precedente",
+      "delta_up": "+{{n}} rispetto al precedente",
+      "engine_calls": "Richieste al modello in questo turno: {{n}}.",
+      "engine_heading": "Misurato dal ciclo dell'agente",
+      "engine_hist_all": "Cronologia della conversazione",
+      "engine_hist_crew": "Prompt di {{productName}}, ogni turno ancora nel contesto",
+      "engine_not_measured": "Il ciclo dell'agente non ha misurato questo turno.",
+      "engine_note": "Caratteri, come li ha contati il ciclo dell'agente nell'ultima richiesta al modello del turno. I prompt di {{productName}} usano il conteggio di {{productName}}.",
+      "engine_total": "L'ultima richiesta al modello di questo turno conteneva {{chars}} caratteri in totale. \"Prompt di {{productName}}\" qui sotto è la parte scritta da {{productName}}, per ogni turno ancora nel contesto.",
+      "engine_ttft_detail": "Primo output dopo {{total}} (primo token del modello dopo {{model}}).",
+      "footer": "Conta solo ciò che {{productName}} ha inviato in questo turno, incluso il tuo messaggio. Non il totale inviato finora, né l'intero contesto del modello.",
+      "rebuild_row": "Turno {{n}} · contesto ricostruito",
+      "start_note": "I turni di inizio sessione e di ricostruzione sono mostrati sopra il grafico, così i turni successivi restano leggibili."
     },
     "crewBoard": {
       "title": "Elementi di lavoro",
@@ -16993,7 +17037,8 @@
       "group_today": "Oggi",
       "group_yesterday": "Ieri",
       "group_earlier": "Precedenti",
-      "empty_title": "Nessuna sessione"
+      "empty_title": "Nessuna sessione",
+      "empty_subtitle": "Creane una per iniziare."
     },
     "sessionsTab": {
       "agent": "Agente",
@@ -17744,7 +17789,8 @@
         "default_session_folder_none": "Nessuna (senza cartella)",
         "default_session_folder_deleted": "Cartella eliminata",
         "default_session_folder_save_failed": "Impossibile salvare la cartella predefinita. Riprova.",
-        "default_session_folder_load_failed": "Non è stato possibile caricare le tue cartelle della barra laterale, quindi non sono elencate qui."
+        "default_session_folder_load_failed": "Non è stato possibile caricare le tue cartelle della barra laterale, quindi non sono elencate qui.",
+        "model_for_spawned_sub_agents": "Modello per i subagent generati."
       },
       "computerUsePanel": {
         "accessibility": "Accessibilità",
@@ -18605,7 +18651,30 @@
         "redaction_revoke_failed": "Impossibile revocare quell'host. È ancora consentito.",
         "redaction_no_allowed_hosts": "Nessun host è consentito. Ogni link passa attraverso ogni controllo.",
         "redaction_workspace": "Workspace: {{workspace}}",
-        "redaction_revoke": "Revoca"
+        "redaction_revoke": "Revoca",
+        "file_delivery_arm_status_failed": "Impossibile verificare se un'approvazione è in corso.",
+        "file_delivery_armed_expired": "Questa richiesta è scaduta prima dell’approvazione. Consenti di nuovo la consegna per ricominciare.",
+        "file_delivery_armed_expires": "Questa richiesta scade tra circa {{duration}}.",
+        "file_delivery_armed_help": "Ancora un passaggio, su questa macchina: esegui questo comando in un terminale sul computer che esegue {{productName}} per completare l'autorizzazione alla consegna. Questo conferma che una persona è alla macchina — una sola sessione del browser non può autorizzarla.",
+        "file_delivery_confirm": "Conferma",
+        "file_delivery_confirm_help": "Questo avvia una richiesta che completi in un terminale su questo computer: fino a quel momento non viene consegnato nulla e puoi ritirarla in qualsiasi momento.",
+        "file_delivery_copied": "Copiato",
+        "file_delivery_copy": "Copia",
+        "file_delivery_copy_command": "Copia il comando di approvazione",
+        "file_delivery_copy_failed": "Impossibile copiare il comando. Selezionalo e copialo a mano.",
+        "file_delivery_desc": "{{productName}} rifiuta di consegnare un file il cui contenuto viene segnalato dallo scanner delle credenziali. Confermando qui, potrà consegnare tale file nella posta in uscita di questa macchina e nella tua dashboard. Nessun rilevatore viene allentato e ogni consegna effettuata in base a una conferma viene registrata nel log degli eventi di sicurezza. Usalo quando un file tuo — come una chiave VPN che {{productName}} ha generato per te — è stato bloccato mentre veniva consegnato a te.",
+        "file_delivery_destination_help": "Significa che il file finisce nella cartella posta in uscita di questo computer e compare nella vista File della tua dashboard — in nessun luogo visibile a terzi. Non viene mai inviato a Slack o a un canale di chat.",
+        "file_delivery_load_failed": "Non è stato possibile leggere quali destinazioni sono confermate.",
+        "file_delivery_never_grantable": "I caricamenti su Slack o su un canale di chat non possono mai essere consentiti qui e non vengono proposti: un consenso non può mai coprire una destinazione visibile a terzi.",
+        "file_delivery_save_failed": "Non è stato possibile salvare la modifica.",
+        "file_delivery_since": "Dal {{time}}",
+        "file_delivery_state_armed": "In attesa di approvazione",
+        "file_delivery_state_confirmed": "Confermato",
+        "file_delivery_state_not_confirmed": "Non confermato",
+        "file_delivery_title": "Dove possono essere consegnati i file segnalati",
+        "file_delivery_waiting": "In attesa su questo computer",
+        "file_delivery_withdraw": "Revoca",
+        "file_delivery_section": "Consegna dei file segnalati"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Associa il cambio di scheda chat a Ctrl+cifra invece di Option+cifra. Option+cifra non cambia chat mentre un campo di testo ha il focus.",
@@ -18911,7 +18980,8 @@
         "decode_threads_desc": "Thread della CPU usati dal modello locale per riconoscere la voce. Automatico usa metà dei core di questa macchina, al massimo 16. Su una macchina grande con core liberi, più thread completano prima ogni dettatura. Una modifica vale dalla dettatura successiva, che ricarica il modello una volta.",
         "decode_threads_auto": "Automatico",
         "decode_threads_auto_count": "Automatico ({{n}})",
-        "decode_threads_env_override": "Questo gateway usa {{value}} thread, impostati da KIROCREW_STT_THREADS. Rimuovi la variabile per usare questa scelta."
+        "decode_threads_env_override": "Questo gateway usa {{value}} thread, impostati da KIROCREW_STT_THREADS. Rimuovi la variabile per usare questa scelta.",
+        "aws_region_for_transcribe": "Regione AWS per Transcribe"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "sopra. A differenza di Slack, il Bot Framework non ha\n              una modalità solo in uscita.",
@@ -19634,7 +19704,8 @@
       "range_to": "Data di fine",
       "no_telemetry_in_window": "Nessuna telemetria registrata in questo periodo ({{period}}).",
       "otel_retention_cap": "I dati su turni, latenza e avvio coprono solo gli ultimi {{days}} g; le metriche più vecchie vengono eliminate (<settingRef/>).",
-      "window_footer": "Sezioni OTEL · periodo: {{period}} ·"
+      "window_footer": "Sezioni OTEL · periodo: {{period}} ·",
+      "top_spenders_link_to_chat": "Le sessioni della dashboard con un nome rimandano alla chat"
     },
     "terminalPopoutFrame": {
       "return": "Torna al dock",
@@ -20323,7 +20394,32 @@
       "profile_harness_cannot_start": "Non può avviarsi qui.",
       "profile_harness_saved": "Salvato. Dal prossimo messaggio {{name}} gira su questo harness.",
       "profile_harness_unavailable": "{{name}} è impostato per usare {{harness}}, che qui non può avviarsi, quindi non si avviano nemmeno le sue chat e i suoi worker. Scegli un altro harness dell’agente, oppure Ereditato.",
-      "profile_harness_choose": "Scegli un harness dell’agente"
+      "profile_harness_choose": "Scegli un harness dell’agente",
+      "switcher_unread": "Non letto",
+      "profile_monitor": "Monitor",
+      "profile_monitor_active": "Attivo",
+      "profile_monitor_cycle": "Controlli",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "Ogni",
+      "profile_monitor_inactive": "Fermato",
+      "profile_monitor_loading": "Controllo dello stato del monitor…",
+      "profile_monitor_next": "Prossimo controllo",
+      "profile_monitor_no_limit": "Nessun limite",
+      "profile_monitor_none": "Nessun elemento monitorato",
+      "profile_monitor_reason_unknown": "Interrotto",
+      "profile_monitor_runtime": "Tempo utilizzato",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "Inizio durata",
+      "profile_monitor_state": "Stato",
+      "profile_monitor_stopped": "Fermato perché",
+      "profile_monitor_subject": "Osserva",
+      "profile_monitor_subject_goal": "Ciclo obiettivo",
+      "profile_monitor_subject_ledger": "Elenco attività",
+      "profile_monitor_subject_pull_request": "Pull request",
+      "profile_monitor_type": "Tipo",
+      "profile_monitor_type_bounded": "Monitor",
+      "profile_monitor_unavailable": "Stato del monitor non disponibile",
+      "profile_monitor_unknown": "Sconosciuto"
     },
     "tasksCapacityCard": {
       "title": "Attività e capacità",
@@ -20385,7 +20481,8 @@
       "state_stalled": "Bloccata",
       "next_retry_in": "prossimo tentativo tra {{age}}",
       "age_for": "da {{age}}",
-      "open_chat": "Apri la chat"
+      "open_chat": "Apri la chat",
+      "age_tip": "Tempo nello stato indicato dal badge."
     },
     "layoutEditorHarness": {
       "title": "Banco di prova dell’editor di layout",

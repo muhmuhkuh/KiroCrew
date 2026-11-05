@@ -79,6 +79,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_LOCAL_CLEAR,
+    ACP_BACKENDS_LOCAL_HARNESS_COMMANDS,
     Routing,
     routing_for,
 )

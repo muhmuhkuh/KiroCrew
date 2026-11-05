@@ -2,6 +2,14 @@
 
 ## Overview
 
+SessionManager supplies the staging-temp sweep in its cleanup dependencies,
+using the sessions directory under the data home captured at construction.
+The existing sweep retains its age and path checks. Chat slots initialize
+`acp_backend` and `model_backend` to `None`; the metadata codec preserves these
+nullable selections on both save forms and every hydration path. The main chat
+composer and split panes expose the backend picker when a slot exists; it writes
+the slot's backend endpoint, and managed chats keep that picker disabled.
+
 Maps thread keys to LLMProvider instances (`session.py`). Each thread gets
 its own kiro-cli session with idle expiry, context compaction, circuit
 breaker, per-session semaphore, and persistent background session.

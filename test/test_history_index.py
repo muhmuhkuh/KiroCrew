@@ -581,5 +581,5 @@ def test_a_lone_surrogate_is_stored_and_its_raw_text_round_trips(tmp_path, opene
     doc_chars, folded = index.document(rowid, "a")
     assert doc_chars == len(LONE_SURROGATE_TEXT)
     assert folded == LONE_SURROGATE_TEXT.casefold().replace("\ud83d", "\ufffd")
-    assert _raw_texts(index, "a", st) == [LONE_SURROGATE_TEXT]
+    assert index.raw_texts("a", st) == [LONE_SURROGATE_TEXT]
     assert _candidates(index, "contention") == {"a"}

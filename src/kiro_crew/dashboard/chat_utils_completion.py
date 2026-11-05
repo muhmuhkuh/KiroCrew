@@ -12,6 +12,7 @@ import logging
 import uuid
 from typing import Any
 
+from kiro_crew.dashboard.chat_utils_injected_rows import SUBAGENT_DELIVERY_KINDS
 from kiro_crew.dashboard.chat_utils_slots import dashboard_slot_key, effective_session_key
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
@@ -178,6 +179,14 @@ async def synthesis_fire_verdict(state: DashboardState, slot: _ChatSlot) -> str:
     if queued is None:
         return SYNTHESIS_UNKNOWN
     return SYNTHESIS_HELD if int(queued) > 0 else SYNTHESIS_CLEAR
+
+
+def _slot_holds_delivery(slot: _ChatSlot) -> bool:
+    """Whether a subagent result is being delivered or waiting in the queue."""
+    return bool(getattr(slot, "_subagent_deliveries_inflight", 0)) or any(
+        entry.get("kind") in SUBAGENT_DELIVERY_KINDS
+        for entry in getattr(slot, "_queue", None) or ()
+    )
 
 
 async def _queued_depth_off_loop(subs: Any, session_key: str) -> int:

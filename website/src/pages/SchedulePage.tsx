@@ -447,7 +447,7 @@ export default function SchedulePage() {
 
   // Auto-reload when backend pushes a 'crons' refresh (e.g. job starts/ends,
   // or a run is cancelled) — supersedes interval polling for is_running state.
-  const refreshTrigger = useAppSelector(s => s.dashboard.refreshTrigger)
+  const refreshTrigger = useAppSelector(s => s.dashboard.cronRefreshTrigger)
   useEffect(() => { if (refreshTrigger > 0) { load(); refreshFolders() } }, [refreshTrigger, load, refreshFolders])
 
   const { running, actionError, setActionError, runNow, openInChat, cancelling, cancelRun } = useCronActions(load)

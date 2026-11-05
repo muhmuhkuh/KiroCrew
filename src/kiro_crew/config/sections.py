@@ -328,6 +328,7 @@ from kiro_crew.config.sections_limits import (  # noqa: F401
     TITLE_REFRESH_EVERY_TURNS_MIN,
     TOOL_APPROVAL_TIMEOUT_MAX,
     TOOL_APPROVAL_TIMEOUT_MIN,
+    TRANSLUCENT_PANELS_VALUES,
     UPLOAD_MAX_MB_MAX,
     UPLOAD_MAX_MB_MIN,
     AutocompactPctError,
@@ -441,8 +442,10 @@ from kiro_crew.config.service_sections import (  # noqa: F401
     HeartbeatConfig,
     MessagingConfig,
     MonitoringConfig,
+    PowerConfig,
     TaskRunnerConfig,
     WatchdogConfig,
+    WorkLedgerConfig,
 )
 from kiro_crew.constants import DEFAULT_SPAWN_MIN_MEMORY_GB as _DEFAULT_SPAWN_MIN_MEMORY_GB
 from kiro_crew.constants import DEFAULT_SUBAGENT_COST_GB as _DEFAULT_SUBAGENT_COST_GB

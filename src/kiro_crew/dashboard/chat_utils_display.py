@@ -1138,3 +1138,6 @@ def _prepare_messages_scoped(messages: list[dict], running: bool, *, live_child:
             )
         out.append(msg_out)
     return out
+
+
+BLOCKED_LINKS_ORDERED_KEY = "blocked_links_ordered"

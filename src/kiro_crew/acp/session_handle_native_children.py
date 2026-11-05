@@ -23,6 +23,7 @@ from kiro_crew.acp.types import EVENT_SUBAGENT_ACTIVITY, EVENT_SUBAGENT_LIST, Ac
 from kiro_crew.validation import MAX_ACP_SESSION_ID_LEN
 
 if TYPE_CHECKING:
+    from kiro_crew.acp.client import AcpClient
     from kiro_crew.acp.session_handle import AcpSessionHandle
 
 
@@ -224,7 +225,7 @@ def _build_child_tool_activity_prefix(self: AcpSessionHandle, update: dict) -> l
     ]
 
 
-def _note_native_child(self: AcpSessionHandle, child_sid: object) -> bool:
+def _note_native_child(self: AcpSessionHandle | AcpClient, child_sid: object) -> bool:
     """Count one native child id on this handle (bounded, type-checked).
 
     Ids are backend-controlled: non-strings, empties, over-long values and

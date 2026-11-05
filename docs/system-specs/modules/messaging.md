@@ -2,6 +2,10 @@
 
 ## Overview
 
+Tool-less turns read their authored spec before provider allocation and confirm
+the effective spec after allocation. `dispatch_tools` owns both checks and
+refuses a spec that mounts tools, grants, MCP servers or hooks.
+
 `kiro_crew.messaging` is the channel-neutral transport abstraction used by the shipped Slack, Discord, Telegram, Webex, WeCom, Microsoft Teams, Weixin, iMessage, WhatsApp, and Feishu integrations; its conservative contract also leaves room for a further channel. It avoids re-implementing streaming, tool approval, session identity, or rendering for each integration. It holds the channel-neutral core of the Slack turn loop (`slack/handler.py::handle_message`) so a new channel implements only two small interfaces (a `MessagingTransport` + a `Renderer`) and inherits everything else.
 
 **Dependency direction is one-way:** `slack` / `dashboard` → `messaging`, never the reverse. The `kiro_crew.messaging` package imports nothing from `kiro_crew.slack` or `kiro_crew.dashboard`; its only first-party dependencies are the shared lower-level helpers — `acp.types` event constants, the `security` redactors (`redact_credentials` / `redact_exfiltration_urls`), `sel` for audit, and, function-locally from `privacy_mode`, `session_map` (the durable flag) and `history` (the transcript header the mode is stamped into). The one pinned exception: `messaging/dispatch.py` imports `kiro_crew.dashboard.session_directive_apply` function-locally, allowlisted in `test_messaging_import_purity.py`.

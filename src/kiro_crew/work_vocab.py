@@ -21,6 +21,12 @@ from typing import Any, NotRequired, TypedDict
 #: make every such read answer "no board" instead of failing.
 WORK_FOLD_NAME: str = "work"
 
+#: Conducting depth defaults and bounds shared by config and ledger guards.
+WORK_MAX_DEPTH_DEFAULT: int = 2
+WORK_MAX_DEPTH_MIN: int = 2
+WORK_MAX_DEPTH_MAX: int = 10
+WORK_MAX_DEPTH_SETTING: str = "work_ledger.max_depth"
+
 #: ``person`` is the dashboard owner steering a worker from a Crew Mode chat's side
 #: panel: it writes one ``steer`` event on the worker's item and sets no field.
 WORK_ACTORS: tuple[str, ...] = ("conductor", "worker", "person")

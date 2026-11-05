@@ -81,6 +81,8 @@ interface AgentUpdatePayload {
   triggers: string
   display_name: string
   model: string
+  acp_backend?: string
+  worker_model?: string
   reasoning_effort: string
   session_color: string
   avatar: CrewAvatarOverride | Record<string, unknown> | null
@@ -164,6 +166,10 @@ export interface CrewEditorController {
   setSessionColor: (v: string) => void
   editModel: string
   setEditModel: (v: string) => void
+  editBackend: string
+  setEditBackend: (v: string) => void
+  backendOptions: string[]
+  backendLoading: boolean
   editEffort: string
   setEditEffort: (v: string) => void
   editAvatar: CrewAvatarOverride | null
@@ -380,6 +386,9 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     queryFn: () => api.agentResolvedModel(editing),
     enabled: !!editing,
   })
+  const [backendDraft, setBackendDraft] = useState<string | null>(null)
+  const editBackend = backendDraft ?? resolved?.acp_backend ?? ''
+  const backendChanged = backendDraft !== null && backendDraft !== (resolved?.acp_backend ?? '')
 
   // The model list surfaces a transport failure as `isDegraded` (the adapter
   // resolves with an auto-only/cached list rather than rejecting). A genuine
@@ -393,7 +402,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
   const availableModels = modelsQuery.data
   // The pin's list is the harness's that judges it, when that is not the configured one. The
   // template pane keeps the configured list: other crews run the same template file.
-  const pinModelsQuery = useAvailableModelsQuery({ enabled: open, backend: resolved?.models_backend })
+  const pinModelsQuery = useAvailableModelsQuery({ enabled: open, backend: backendChanged ? (editBackend || resolved?.inherited_harness) : resolved?.models_backend })
   const modelsDegraded = !pinModelsQuery.error && pinModelsQuery.isDegraded
   const editorOptionsError = installedError ?? workspacesError ?? cfgError ?? modelsQuery.error ?? pinModelsQuery.error
 
@@ -474,6 +483,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     setDisplayName(a.display_name || '')
     setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
+    setBackendDraft(null)
     setEditEffort(a.reasoning_effort || '')
     // Normalized through the same coercion the renderer applies, so the dirty
     // check compares like with like (a junk stored value reads as "no
@@ -707,7 +717,8 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
         memory_store: memoryStore,
         triggers,
         display_name: displayName,
-        model: editModel,
+        model: backendChanged && editModel === INHERIT_MODEL ? '' : editModel,
+        ...(backendChanged ? { acp_backend: editBackend, worker_model: '' } : {}),
         reasoning_effort: editEffort,
         session_color: sessionColor,
       }
@@ -832,6 +843,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
       out.add('place')
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
+    if (backendChanged) out.add('model')
     if (editEffort !== (editingAgent.reasoning_effort || '')) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
     if (displayName.trim() !== (editingAgent.display_name || '').trim()) out.add('routing')
@@ -861,7 +873,7 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     if (schedDraft) out.add('schedules')
     if (capabilityDirty) out.add('capabilities')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, displayName, sessionColor, schedDraft, editAvatar, capabilityDirty])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, displayName, sessionColor, schedDraft, editAvatar, capabilityDirty, backendChanged])
 
   const requestPane = useCallback((key: CrewPaneKey) => {
     if (schedDraft && key !== pane) { setDiscardAsk(key); return }
@@ -1035,6 +1047,10 @@ export function useCrewEditor(args: UseCrewEditorArgs): CrewEditorController {
     displayName, setDisplayName,
     sessionColor, setSessionColor,
     editModel, setEditModel,
+    editBackend,
+    setEditBackend: (value) => { setBackendDraft(value); setEditModel(INHERIT_MODEL) },
+    backendOptions: resolved?.harnesses ?? [],
+    backendLoading: !resolved?.harnesses,
     editEffort, setEditEffort,
     editAvatar,
     kiroAgentOptions,

@@ -28,6 +28,10 @@ from typing import Dict, Mapping
 _OFF: Mapping[str, object] = {"mode": "allow", "allow": []}
 _CAPABILITY_OFF: Mapping[str, object] = {"enabled": False}
 
+ENTERPRISE_UPDATE_CHANNEL: str = "stable"
+ENTERPRISE_YOLO_MAX_SECONDS: int = 1800
+ENTERPRISE_SLACK_CHANNELS: Mapping[str, object] = _OFF
+
 # Crew's default workspace root: ``config.paths._default_workspace_base()`` joined
 # with ``_WORKSPACE_DIR_NAME``. The base is ``~/workplace`` everywhere, or
 # ``/Volumes/workplace`` on macOS when that volume exists. Fixed here on purpose:
@@ -93,3 +97,6 @@ BASELINE_UNGATED: Dict[str, str] = {
     "approval_mode": "ordinal; never item-queried, so Crew's own approval default applies",
     "sandbox.min_level": "ordinal; the RFC appendix keeps Crew's current sandbox default",
 }
+
+#: Optional inner-list defaults for capabilities supported by this build.
+BASELINE_INNER_LISTS: Dict[str, Mapping[str, Mapping[str, object]]] = {}

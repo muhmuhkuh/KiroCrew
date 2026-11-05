@@ -1011,6 +1011,10 @@ _COMPACTION_FAILED_RETRIES = 2
 # conversation away instead of explaining it.
 _COMPACT_FAIL_REASON_MAX_CHARS = 300
 
+COMPACT_FRESH_SESSION_NOTICE = (
+    "Nothing to compact yet: the agent's session starts with your next message."
+)
+
 
 # The answer to a /compact that reached a fresh provider session still owing the
 # Kiro Crew conversation replay. The replay rides the next context-bearing

@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         _is_declared_builtin_mcp_server,
         _is_deepseek_read_only_builtin,
         _is_first_party_app,
+        _is_first_party_read_only_mcp_tool,
         _is_harness_read_only_builtin,
         _is_host_read_only_builtin,
         _is_host_search_builtin_call,
@@ -99,6 +100,7 @@ class GateFacts:
         agent: str,
         app: str,
         classifier_only: bool,
+        trust_reads: bool = False,
     ) -> None:
         self.manager = manager
         self.call = call
@@ -106,6 +108,7 @@ class GateFacts:
         self.agent = agent
         self.app = app
         self.classifier_only = classifier_only
+        self.trust_reads = trust_reads
         self._memo: dict[str, Any] = {}
 
     def _once(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -1423,6 +1426,11 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
             return ToolHookResult.auto_approve(read_only=True)
         return None
     from kiro_crew.slack.gateway import _is_read_only_tool
+
+    if facts.trust_reads and _is_first_party_read_only_mcp_tool(
+        call.mcp_tool, call.mcp_server, mcp_identity_trusted=call.identity_trusted
+    ):
+        return ToolHookResult.auto_approve(read_only=True)
 
     kind = (call.kind or "").strip().lower()
     if facts.classifier_only:

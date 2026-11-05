@@ -116,7 +116,7 @@
         "highlight_1": "Proves its own metric first — a run refuses to start on an untrustworthy ruler",
         "highlight_2": "Every candidate is measured A/B, or RED/GREEN for bug fixes, never just 'looks right'",
         "highlight_3": "Keeps a change only when the win clears the measured noise band",
-        "highlight_4": "Drafts GitHub pull requests — draft-only, never published or merged for you",
+        "highlight_4": "Drafts pull requests / merge requests — draft-only, never published or merged for you",
         "highlight_5": "Works on a push-disabled clone, so nothing escapes the sandbox unreviewed",
         "highlight_6": "One resumable chat session per pull request, finding, and run",
         "page_label": "Auto-Improve",
@@ -1168,7 +1168,8 @@
           "filters": "Filters",
           "open": "Open",
           "requested_by_me": "Requested by me",
-          "sort": "Sort"
+          "sort": "Sort",
+          "status": "Status"
         },
         "investigateButton": {
           "investigate": "Investigate"
@@ -1528,7 +1529,12 @@
         "then": ", then",
         "through_your_own": "through your own",
         "you_contributed_to": "You contributed to",
-        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>"
+        "https_dev_azure_com_org_project_git_repo": "https://dev.azure.com/<org>/<project>/_git/<repo>",
+        "jira_env_hint": "Jira connects through JIRA_EMAIL and JIRA_API_TOKEN environment credentials on the gateway. Set them before connecting — without them, verification fails with a setup error.",
+        "jira_url_example": "https://your-domain.atlassian.net/browse/PROJ-123",
+        "optional_repo_mapping": "Repo mapping (optional)",
+        "repo_mapping_hint": "Optional: map this Jira project to a Git repo slug (owner/repo) so it behaves like one. Leave empty to connect issues only.",
+        "repo_mapping_placeholder": "owner/repo"
       },
       "connectRepoModal": {
         "close": "Close",
@@ -1539,7 +1545,7 @@
         "loading": "Loading…"
       },
       "manifest": {
-        "description": "An issue triage assistant that remembers. Browse, filter, and triage GitHub issues, GitLab issues, and Azure DevOps work items with AI-suggested labels and per-item investigation notes — with findings kept in a local ledger so nothing gets re-investigated.",
+        "description": "An issue triage assistant that remembers. Browse, filter, and triage GitHub, GitLab, Azure DevOps, and Jira issues with AI-suggested labels and per-item investigation notes — with findings kept in a local ledger so nothing gets re-investigated.",
         "display_name": "Issue Radar",
         "highlight_1": "AI summaries and suggested labels for issues and pull requests, each with its reasoning",
         "highlight_2": "Per-issue investigation notes kept in a local ledger so nothing gets re-investigated",
@@ -1549,7 +1555,7 @@
         "highlight_6": "Every write needs triage or push access on the repo; a read-only connection stays suggest-only",
         "highlight_7": "Surfaces repositories you have recently contributed to, so connecting one is a click",
         "highlight_8": "Caches issues, labels, and members locally, refreshed on demand",
-        "highlight_9": "Works with GitHub, GitLab, and Azure DevOps; needs an authenticated CLI for the provider you connect (`gh`, `glab`, or `az`) on the gateway host — no single provider's CLI is required to install",
+        "highlight_9": "Works with GitHub, GitLab, Azure DevOps, and Jira; needs the provider's authenticated CLI or gateway credentials on the host (`gh`, `glab`, `az`, or JIRA_EMAIL + JIRA_API_TOKEN) — no single provider's CLI is required to install",
         "page_label": "Issue Radar",
         "use_case_1": "Triage issues and pull requests across connected providers while retaining summaries, suggested labels, and investigation history.",
         "configuration_1": "Connect a repository and authenticate its provider CLI on the gateway host: gh for GitHub, glab for GitLab, or az with the Azure DevOps extension on macOS, Linux, or WSL."
@@ -4311,7 +4317,8 @@
       "loading": "Loading",
       "retry": "Retry",
       "this_app_is_disabled": "This app is disabled",
-      "this_app_provides_agents_and_skills_but_no_visua": "This app provides agents and skills but no visual interface.\n            Use its agents from chat."
+      "this_app_provides_agents_and_skills_but_no_visua": "This app provides agents and skills but no visual interface.\n            Use its agents from chat.",
+      "app_not_found": "App Not Found"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "Pop out app to its own window",
@@ -4515,7 +4522,10 @@
       "used": "Used",
       "sketch": "Sketch",
       "sketch_desc": "Draw on a whiteboard, send it as an image",
-      "more_actions": "More actions"
+      "more_actions": "More actions",
+      "apply_a_ready_made_set_of_instructions": "Apply a ready-made set of instructions",
+      "let_the_agent_read_one_of_your_files": "Let the agent read one of your files",
+      "quick_actions_like_clearing_the_chat_or_checking": "Quick actions like clearing the chat or checking usage"
     },
     "chatPane": {
       "agent_list": "Agent list",
@@ -4525,7 +4535,8 @@
       "split_right": "Split right",
       "split_right_d": "Split right (⌘D)",
       "type_to_filter": "Type to filter…",
-      "preparing_catch_up": "Preparing your catch-up…"
+      "preparing_catch_up": "Preparing your catch-up…",
+      "session_ready_type_a_message_to_start": "Session ready. Type a message to start."
     },
     "cliPanel": {
       "copy_selection": "Copy selection"
@@ -7445,7 +7456,8 @@
       "broadcast_open_unknown": "Not confirmed · open",
       "broadcast_delivery_hint": "No running work is interrupted: a running turn reads it after its current tool call; an idle session starts a new turn.",
       "broadcast_retry": "Retry {{n}} failed",
-      "folder_renamed_to": "Folder renamed to {{name}}"
+      "folder_renamed_to": "Folder renamed to {{name}}",
+      "broadcast_crewmates_hint": "Chats run by your mates, the AI agents in your crew"
     },
     "contextBreakdown": {
       "axis_turn_n": "Turn {{n}}",
@@ -7566,7 +7578,21 @@
       "start_row_show": "Show",
       "start_row_shown": "Shown above",
       "picked_gone": "Turn {{n}} has left the chart, so the newest turn is shown.",
-      "turn_start_latest": "Turn {{n}} · session start · latest"
+      "turn_start_latest": "Turn {{n}} · session start · latest",
+      "delta_down": "−{{n}} vs previous",
+      "delta_same": "same as previous",
+      "delta_up": "+{{n}} vs previous",
+      "engine_calls": "Model requests this turn: {{n}}.",
+      "engine_heading": "Measured by the agent loop",
+      "engine_hist_all": "Conversation history",
+      "engine_hist_crew": "{{productName}} prompts, every turn still in context",
+      "engine_not_measured": "The agent loop did not measure this turn.",
+      "engine_note": "Characters, as the agent loop counted them in the turn's last model request. {{productName}} prompts use {{productName}}'s own count.",
+      "engine_total": "This turn's last model request held {{chars}} characters in total. \"{{productName}} prompts\" below is the part {{productName}} wrote, for every turn still in context.",
+      "engine_ttft_detail": "First output after {{total}} (first model token after {{model}}).",
+      "footer": "Counts only what {{productName}} sent this turn, including your message. Not the total sent so far, and not the model's whole context.",
+      "rebuild_row": "Turn {{n}} · context rebuilt",
+      "start_note": "Session-start and rebuild turns are listed above the chart so later turns stay readable."
     },
     "devFleetPage": {
       "actions": "Actions",
@@ -8585,7 +8611,32 @@
       "export_discard_lessons": "Discard the lessons written for this file?",
       "export_discard_lessons_body": "The mate's memory is not changed.",
       "export_discard_lessons_confirm": "Discard text",
-      "export_reason_first_goal_only": "Only the first goal fits in this file"
+      "export_reason_first_goal_only": "Only the first goal fits in this file",
+      "switcher_unread": "Unread",
+      "profile_monitor": "Monitor",
+      "profile_monitor_active": "Active",
+      "profile_monitor_cycle": "Checks",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "Every",
+      "profile_monitor_inactive": "Stopped",
+      "profile_monitor_loading": "Checking monitor status…",
+      "profile_monitor_next": "Next check",
+      "profile_monitor_no_limit": "No limit",
+      "profile_monitor_none": "Not watching anything",
+      "profile_monitor_reason_unknown": "Stopped",
+      "profile_monitor_runtime": "Time used",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "Runtime started",
+      "profile_monitor_state": "State",
+      "profile_monitor_stopped": "Stopped because",
+      "profile_monitor_subject": "Subject",
+      "profile_monitor_subject_goal": "Goal loop",
+      "profile_monitor_subject_ledger": "Task list",
+      "profile_monitor_subject_pull_request": "Pull request",
+      "profile_monitor_type": "Type",
+      "profile_monitor_type_bounded": "Monitor",
+      "profile_monitor_unavailable": "Monitor status unavailable",
+      "profile_monitor_unknown": "Unknown"
     },
     "migrationPage": {
       "app_migration": "App Migration",
@@ -10256,7 +10307,8 @@
         "ptt_try_desc": "Press your shortcut key to check that this keyboard sends it properly.",
         "ptt_heading_desc_other": "Press a key to start talking instead of clicking the microphone button. Alt + Shift + Space works out of the box — you can leave everything here as it is.",
         "ptt_key_desc_other": "Pick a key that doesn't type anything on its own, so it won't interfere with what you're writing. Right Alt is left out because most layouts use it to compose characters.",
-        "ptt_save_refused": "Not saved: the browser's storage is full. Free some space and try again."
+        "ptt_save_refused": "Not saved: the browser's storage is full. Free some space and try again.",
+        "aws_region_for_transcribe": "AWS region for Transcribe"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "above. Unlike Slack, the Bot Framework has no\n              outbound-only mode.",
@@ -10672,7 +10724,8 @@
       "state_waiting_infra": "Waiting for infrastructure",
       "state_retry_wait": "Waiting to retry",
       "state_recovering": "Retrying now",
-      "state_stalled": "Stalled"
+      "state_stalled": "Stalled",
+      "age_tip": "Time spent in the state the badge names."
     },
     "telemetryPanel": {
       "agent_col": "Agent",
@@ -10800,7 +10853,8 @@
       "range_to": "End date",
       "no_telemetry_in_window": "No telemetry recorded in this period ({{period}}).",
       "otel_retention_cap": "Turn, latency and startup figures cover only the last {{days}}d; older metrics are deleted (<settingRef/>).",
-      "window_footer": "OTEL sections · period: {{period}} ·"
+      "window_footer": "OTEL sections · period: {{period}} ·",
+      "top_spenders_link_to_chat": "Named dashboard sessions link to the chat"
     },
     "terminalPopoutFrame": {
       "return": "Return to dock",

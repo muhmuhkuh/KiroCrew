@@ -43,7 +43,7 @@ from kiro_crew.apps.builtins.auto_improvement.spine import agent_discovery as di
 from kiro_crew.apps.builtins.auto_improvement.spine import agent_runner as agent_runner_mod
 from kiro_crew.apps.builtins.auto_improvement.spine import driver as driver_mod
 from kiro_crew.apps.builtins.auto_improvement.spine.crew_runner import CrewRunner
-from kiro_crew.testing.wait import await_until, wait_until
+from kiro_crew.testing.wait import wait_until
 
 WAIT_S = 10.0
 

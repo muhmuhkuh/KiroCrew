@@ -274,6 +274,19 @@ async function openNew(opts?: { memberId?: string; openCrew?: string }) {
 }
 
 describe('CrewEditorModal — single editing experience', () => {
+  it('offers Vibe for a crewmate and saves its backend with model pins cleared', async () => {
+    mockApi.agentResolvedModel.mockResolvedValue({
+      model: '', acp_backend: '', inherited_harness: 'kas', harnesses: ['kas', 'vibe'],
+    })
+    const dialog = await openNew()
+    await within(dialog).findByRole('option', { name: 'vibe' })
+    fireEvent.click(within(dialog).getByRole('option', { name: 'vibe' }))
+    fireEvent.click(screen.getByTestId('ctl-save'))
+    await waitFor(() => expect(mockApi.updateKirocrewAgent).toHaveBeenCalledWith(
+      'oncall', expect.objectContaining({ acp_backend: 'vibe', model: '', worker_model: '' }),
+    ))
+  })
+
   it('mounts the New dialog directly, with no Classic dialog or experience toggle', async () => {
     renderHost()
     fireEvent.click(screen.getByTestId('open-editor'))

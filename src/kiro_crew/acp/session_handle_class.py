@@ -151,6 +151,8 @@ class AcpSessionHandle:
     _push_model_config_option = _sh_models._push_model_config_option
     set_config_option = _sh_models.set_config_option
     _advertised_model_ids = _sh_models._advertised_model_ids
+    _feed_advertised_model_cache = _sh_models._feed_advertised_model_cache
+    _persist_advertised_models_if_changed = _sh_models._persist_advertised_models_if_changed
     supports_config_option = _sh_models.supports_config_option
     get_valid_effort_levels = _sh_models.get_valid_effort_levels
     _crew_agent_name = _sh_models._crew_agent_name
@@ -243,6 +245,7 @@ class AcpSessionHandle:
         bound_cwd: str = "",
     ) -> None:
         self._session_id = session_id
+        self.request_vault_identity: str = ""
         # The Kiro Crew session that OWNS this ACP session, threaded from the
         # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
         # warm-pool claim. The hooks execute path keys its listed-id record and
@@ -715,6 +718,7 @@ class AcpSessionHandle:
         self.model_pin_partial: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
+        self._advertised_models_changed = False
         # Read by KAS only: the listed id a session born on an unlisted ``auto`` moves to,
         # or "". One answer read from the ``model`` select, never the list itself:
         # nobody has shown that list to be the account's complete served set, so
