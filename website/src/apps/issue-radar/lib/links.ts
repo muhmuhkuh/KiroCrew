@@ -33,16 +33,16 @@ import { type ItemKind, type RepoRef } from '../api'
  * below — `providerKeyOf` maps anything else (an absent provider on a legacy
  * record, a corrupted config entry) onto `github`, which is what such a record
  * actually is. */
-type ProviderKey = 'github' | 'gitlab' | 'azure' | 'jira'
+type ProviderKey = 'github' | 'gitlab' | 'azure'
 
 /** Which provider's grammar a ref follows.
  *
- * Exported because `refLinks` PARSES the same provider grammars and must dispatch
- * on exactly the same answer this module builds with — two independent notions of
- * a provider would let a link be built in one shape and parsed in another. */
+ * Exported because `refLinks` PARSES the same three grammars and must dispatch on
+ * exactly the same answer this module builds with — two independent notions of
+ * "is this Azure" would let a link be built in one shape and parsed in another. */
 export function providerKeyOf(ref?: Pick<RepoRef, 'provider'>): ProviderKey {
   const p = ref?.provider
-  return p === 'gitlab' || p === 'azure' || p === 'jira' ? p : 'github'
+  return p === 'gitlab' || p === 'azure' ? p : 'github'
 }
 
 /** Where a page hangs off: the repository's own path, or the account/project
@@ -84,7 +84,9 @@ interface ProviderDescriptor {
 }
 
 export interface ProviderTerms {
-  /** "pull request" / "merge request" — mid-sentence. */
+  /** "pull request" / "merge request" — mid-sentence. The four change-request
+   * nouns are translated: `providerTerms()` resolves them through the catalog on
+   * every call, in the active language. */
   changeRequest: string
   /** "Pull Request" / "Merge Request" — a title or a label. */
   changeRequestTitle: string
@@ -121,10 +123,8 @@ export interface ProviderTerms {
   /** Catalog KEY for "Issues" / "Work Items" — a heading, a search placeholder,
    * or an empty state.
    *
-   * A key rather than a literal, unlike the changeRequest family above: that
-   * family is frozen debt the i18n ceilings already account for, and adding to
-   * it would ship a fourth English-only noun. Resolved with `i18nT()` where it
-   * renders, the same shape as `FILTER_LABEL_KEY` in ChatSidebar. */
+   * Resolved with `i18nT()` where it renders, the same shape as
+   * `FILTER_LABEL_KEY` in chat-sidebar/SearchDock.tsx. */
   trackedItemPluralTitleKey: string
   /** "GitHub" / "GitLab" / "Azure DevOps". */
   providerName: string
@@ -190,20 +190,6 @@ const PROVIDERS: Record<ProviderKey, ProviderDescriptor> = {
     membersScope: 'project',
     cliChangeNoun: 'pr',
   },
-  jira: {
-    // Jira has no public default tenant. A connected ref always carries its
-    // allowlisted host, and the connect panel does not build Jira shorthand URLs.
-    defaultHost: '',
-    repoPath: 'browse/{owner}',
-    pageNest: null,
-    changeSegment: 'browse',
-    issuesSegment: 'browse',
-    issuesScope: 'project',
-    itemSegment: null,
-    membersPath: 'browse/{owner}',
-    membersScope: 'project',
-    cliChangeNoun: '',
-  },
 }
 
 /** The table row for a ref's provider.
@@ -230,11 +216,6 @@ function descriptorOf(ref?: Pick<RepoRef, 'provider'>): ProviderDescriptor {
  * wrong link, which is worse than a type error. */
 export function isGitlab(ref?: Pick<RepoRef, 'provider'>): boolean {
   return providerKeyOf(ref) === 'gitlab'
-}
-
-/** True when a ref points at a Jira project (which has no pull requests). */
-export function isJira(ref?: Pick<RepoRef, 'provider'>): boolean {
-  return providerKeyOf(ref) === 'jira'
 }
 
 /** The ref's host, defaulting to the provider's public host for legacy records. */
@@ -270,7 +251,6 @@ function azureProject(ref: RepoRef): string {
 
 /** The repo's landing page on its own host. */
 export function repoWebUrl(ref: RepoRef): string {
-  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${ref.owner}`
   const path = descriptorOf(ref).repoPath
     .replace('{owner}', ref.owner)
     .replace('{repo}', ref.repo)
@@ -311,7 +291,6 @@ export function commitUrlFor(ref: RepoRef, sha: string): string {
  * segment (`_workitems/edit/<id>`), so both the scope and the path shape come
  * from the table rather than from a suffix appended to the repo URL. */
 export function issueUrlFor(ref: RepoRef, number: number): string {
-  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${number}`
   const d = descriptorOf(ref)
   const tail = d.itemSegment ? `${d.itemSegment}/${number}` : `${number}`
   return scopedPath(ref, d.issuesScope, `${d.issuesSegment}/${tail}`)
@@ -319,7 +298,6 @@ export function issueUrlFor(ref: RepoRef, number: number): string {
 
 /** Link to the repo's issue / work-item list. */
 export function issuesUrlFor(ref: RepoRef): string {
-  if (isJira(ref)) return repoWebUrl(ref)
   const d = descriptorOf(ref)
   return scopedPath(ref, d.issuesScope, d.issuesSegment)
 }
@@ -329,7 +307,6 @@ export function issuesUrlFor(ref: RepoRef): string {
  * The path noun differs, not just the host: GitHub serves `/pull/<n>`, GitLab
  * `/-/merge_requests/<n>`, Azure DevOps `/_git/<repo>/pullrequest/<n>`. */
 export function changeUrlFor(ref: RepoRef, number: number): string {
-  if (isJira(ref)) return issueUrlFor(ref, number)
   return repoPagePath(ref, `${descriptorOf(ref).changeSegment}/${number}`)
 }
 
@@ -344,7 +321,6 @@ export function userUrlFor(ref: RepoRef, login: string): string {
 
 /** Link to the page where repo access is administered. */
 export function membersUrlFor(ref: RepoRef): string {
-  if (isJira(ref)) return `https://${hostOf(ref)}/plugins/servlet/project-config/${ref.owner}/summary`
   const d = descriptorOf(ref)
   return scopedPath(ref, d.membersScope, d.membersPath)
 }
@@ -382,8 +358,10 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
 
 /** Display vocabulary for a ref's provider.
  *
- * Mirrors `backend/provider.py:_TERMS`, so the UI, the notifications, and the AI
- * prompts all call a merge request the same thing.
+ * Mirrors `backend/provider.py:_TERMS`, so the UI and the notifications call a
+ * merge request the same thing. The four change-request nouns are UI copy and
+ * resolve through the catalog in the active language, so an AI prompt must not
+ * read them: `review.prompt.ts` keeps its own English noun for that reason.
  *
  * Azure DevOps SPREADS the GitHub vocabulary rather than restating it: it calls a
  * change request a pull request in exactly the words GitHub does, and only the
@@ -392,19 +370,6 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * "Pull request" and "Pull Request" end up on adjacent screens.
  */
 export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
-  if (isJira(ref)) {
-    return {
-      ...providerTerms(),
-      changeRequest: 'issue',
-      changeRequestTitle: 'Issue',
-      changeRequestPlural: 'issues',
-      changeRequestPluralTitle: 'Issues',
-      changeRequestShort: 'issue',
-      sigil: '',
-      providerName: 'Jira',
-      cli: '',
-    }
-  }
   if (providerKeyOf(ref) === 'azure') {
     return {
       ...providerTerms(),
@@ -426,10 +391,10 @@ export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
   }
   return isGitlab(ref)
     ? {
-        changeRequest: 'merge request',
-        changeRequestTitle: 'Merge Request',
-        changeRequestPlural: 'merge requests',
-        changeRequestPluralTitle: 'Merge Requests',
+        changeRequest: i18nT('apps.issueRadar.lib.links.merge_request'),
+        changeRequestTitle: i18nT('apps.issueRadar.lib.links.merge_request_title'),
+        changeRequestPlural: i18nT('apps.issueRadar.lib.links.merge_requests'),
+        changeRequestPluralTitle: i18nT('apps.issueRadar.lib.links.merge_requests_title'),
         changeRequestShort: 'MR',
         sigil: '!',
         emptyDetailKey: 'apps.issueRadar.workspace.select_an_issue_to_see_its_details',
@@ -440,10 +405,10 @@ export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
         loginCommand: 'glab auth login',
       }
     : {
-        changeRequest: 'pull request',
-        changeRequestTitle: 'Pull Request',
-        changeRequestPlural: 'pull requests',
-        changeRequestPluralTitle: 'Pull Requests',
+        changeRequest: i18nT('apps.issueRadar.lib.links.pull_request'),
+        changeRequestTitle: i18nT('apps.issueRadar.lib.links.pull_request_title'),
+        changeRequestPlural: i18nT('apps.issueRadar.lib.links.pull_requests'),
+        changeRequestPluralTitle: i18nT('apps.issueRadar.lib.links.pull_requests_title'),
         changeRequestShort: 'PR',
         sigil: '#',
         emptyDetailKey: 'apps.issueRadar.workspace.select_an_issue_to_see_its_details',

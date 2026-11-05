@@ -49,7 +49,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         False,
         "(self, session_key: 'str', approval_id: 'str', approved: "
-        "'bool', decision: 'str' = '') -> 'None'",
+        "'bool', decision: 'str' = '', *, instance: 'str' = '') -> 'None'",
     ),
     "_audit_approval": (
         "function",
@@ -101,6 +101,13 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "_fan_out_web_push": ("function", False, False, "(self, note: 'dict[str, Any]') -> 'None'"),
     "_flush_dirty_slots": ("function", False, False, "(self) -> 'None'"),
     "_flush_loop": ("function", True, False, "(self) -> 'None'"),
+    "_has_generic_slots_audience": ("function", False, False, "(self) -> 'bool'"),
+    "answer_slots_resync": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse') -> 'None'",
+    ),
     "_has_legacy_slots_audience": ("function", False, False, "(self) -> 'bool'"),
     "_has_slot_patch_clients": ("function", False, False, "(self) -> 'bool'"),
     "_lineage_rows": ("function", False, False, "(self) -> 'list[dict[str, Any]]'"),
@@ -186,11 +193,20 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, msg_type: 'str', data: 'object', msg: 'str') -> 'None'",
     ),
+    "_broadcast_slots_note": (
+        "function",
+        False,
+        False,
+        "(self, slots_data: 'list[dict]', slots_data_ws: 'list[dict]', slots_json: 'str', "
+        "legacy_only: 'bool', envelope_args: 'dict[str, Any]', envelope: 'dict[str, Any]', "
+        "user_frame: 'str | None' = None) -> 'None'",
+    ),
     "_send_ws_owners": (
         "function",
         False,
         False,
-        "(self, msg: 'str', *, skip_slot_patch_clients: 'bool' = False) -> " "'None'",
+        "(self, msg: 'str', *, skip_slot_patch_clients: 'bool' = False, "
+        "skip_slot_diff_clients: 'bool' = False) -> 'None'",
     ),
     "_serialize_for_client": (
         "function",
@@ -242,6 +258,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "_yolo": ("property", False, False, "(self) -> 'bool'"),
     "ack_notification": ("function", True, False, "(self, ts: 'str') -> 'bool'"),
+    "add_fold_watch_listener": (
+        "function",
+        False,
+        False,
+        "(self, listener: 'Callable[[], None]') -> 'Callable[[], None]'",
+    ),
     "adopt_pinned_session_order": (
         "function",
         False,
@@ -259,17 +281,17 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, loop: 'asyncio.AbstractEventLoop') -> 'None'",
     ),
-    "broadcast_browser_event": (
-        "function",
-        False,
-        False,
-        "(self, event_type: 'str', data: 'dict') -> 'None'",
-    ),
     "broadcast_context_usage": (
         "function",
         False,
         False,
         "(self, slot_key: 'str', payload: 'dict') -> 'None'",
+    ),
+    "broadcast_slot_fold": (
+        "function",
+        False,
+        False,
+        "(self, slot: 'str', legacy: 'WsPayload', delta: 'WsPayload | None') -> 'None'",
     ),
     "broadcast_ws": (
         "function",
@@ -321,6 +343,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, msg_type: 'str', data: 'WsPayload') -> 'int'",
     ),
+    "deliver_ws_owners_bytes": (
+        "function",
+        True,
+        False,
+        "(self, payload: 'bytes') -> 'int'",
+    ),
     "disable_yolo": ("function", False, False, "(self) -> 'None'"),
     "effective_max_background_turns": ("function", False, False, "(self) -> 'int'"),
     "enable_yolo": ("function", False, False, "(self, *, from_config: 'bool' = False) -> 'None'"),
@@ -328,7 +356,19 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "ensure_context_snapshots_loaded": ("function", False, False, "(self) -> 'bool'"),
     "ensure_dynamic_card_store": ("function", False, False, "(self) -> 'Any'"),
     "finish_slot_list_rebuild": ("function", False, False, "(self) -> 'None'"),
-    "flush_slot_now": ("function", False, False, "(self, slot: '_ChatSlot') -> 'None'"),
+    "flush_slot_now": (
+        "function",
+        False,
+        False,
+        "(self, slot: '_ChatSlot', takeover_basis: 'TakeoverBasis | None' = None) -> 'None'",
+    ),
+    "fold_apply_watch": ("function", False, False, "(self) -> 'frozenset[str]'"),
+    "fold_watch_routing": (
+        "function",
+        False,
+        False,
+        "(self) -> 'tuple[bool, bool, frozenset[str]]'",
+    ),
     "folder_breadcrumb": (
         "function",
         False,
@@ -361,6 +401,12 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     ),
     "get_slot": ("function", False, False, "(self, name: 'str') -> '_ChatSlot | None'"),
     "has_slot": ("function", False, False, "(self, name: 'str') -> 'bool'"),
+    "hold_turn_heartbeat": (
+        "function",
+        False,
+        False,
+        "(self, holder: 'object', slot_key: 'str') -> 'None'",
+    ),
     "hold_folders": (
         "function",
         True,
@@ -456,6 +502,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "(self, slug: 'str', version: 'int', *, deleted: 'bool' = False) -> " "'None'",
     ),
     "push_lineage_patch": ("function", False, False, "(self) -> 'None'"),
+    "push_listing_refresh": ("function", False, False, "(self) -> 'None'"),
     "push_refresh": ("function", False, False, "(self, *kinds: 'str') -> 'None'"),
     "push_session_summary": ("function", False, False, "(self, key: 'str') -> 'None'"),
     "push_slot_patch": (
@@ -518,6 +565,7 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         False,
         "(self, ws: 'web.WebSocketResponse', *, owner: 'bool' = False) -> 'None'",
     ),
+    "release_turn_heartbeat": ("function", False, False, "(self, holder: 'object') -> 'None'"),
     "release_deleted_slot_keys": (
         "function",
         False,
@@ -630,7 +678,8 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         False,
         False,
-        "(self, *, owner: 'bool') -> 'tuple[list[dict], list[dict], " "list[dict] | None]'",
+        "(self, *, owner: 'bool', user: 'bool' = True) -> 'tuple[list[dict], list[dict], "
+        "list[dict] | None]'",
     ),
     "serialize_slots": (
         "function",
@@ -642,6 +691,24 @@ _BASE_STATE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
     "served_bundle_id": ("staticmethod", False, False, "(index: 'Path | None' = None) -> 'str'"),
     "serving_loop": ("property", False, False, "(self) -> \"'asyncio.AbstractEventLoop | None'\""),
     "set_dynamic_cards_enabled": ("function", False, False, "(self, enabled: 'bool') -> 'None'"),
+    "set_fold_apply_capable": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', capable: 'bool') -> 'bool'",
+    ),
+    "set_fold_delta_capable": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', capable: 'bool') -> 'bool'",
+    ),
+    "set_fold_watch": (
+        "function",
+        False,
+        False,
+        "(self, ws: 'web.WebSocketResponse', slots: 'object') -> 'frozenset[str]'",
+    ),
     "slot_exists": ("function", False, False, "(self, name: 'str') -> 'bool'"),
     "slot_list_held_keys": ("function", False, False, "(self) -> 'list[str]'"),
     "slot_list_hold_channels": ("function", False, False, "(self) -> 'bool'"),

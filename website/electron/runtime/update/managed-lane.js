@@ -29,6 +29,15 @@ function createManagedLane({
   managedPath,
   launchCheckDelayMs,
   checkIntervalMs,
+  // When a security policy provider governs this install's updates, the managed
+  // lane must also stand down: the policy provider and the EXTERNALLY-MANAGED
+  // command would otherwise both try to apply updates on the same install.
+  isPolicyGoverned = () => false,
+  // On Windows, BaseWindow emits 'session-end' but App does not, so the
+  // session-end notice listens on the main window this provider returns.
+  getMainWindow = () => null,
+  Notification,
+  osPlatform = process.platform,
   log,
 }) {
   // MANAGED AUTO-UPDATE (marker-driven): the marker carries the very
@@ -84,6 +93,7 @@ function createManagedLane({
   let stagedVersion = null; // version the user took Download for (the ready dialog's version)
   let managedQuitArmed = false; // is a before-quit auto-apply handler installed?
   let managedInstalling = false; // an apply is in progress — pause the poll
+  let sessionEndWindow = null; // window holding the session-end notice listener
 
   // Mirror the feed lane's emitError renderer contract: a failure WITH ITS
   // PHASE so the card can distinguish check from install failures.
@@ -301,6 +311,12 @@ function createManagedLane({
       log.info("[update] managed quit handler fired with no pending update — not applying");
       return;
     }
+    // If policy governance became active since the check found a pending update,
+    // the policy provider owns the install. Do not apply the managed command.
+    if (isPolicyGoverned()) {
+      log.info("[update] policy governed: skipping managed deferred install on quit");
+      return;
+    }
     let stillOn = false;
     try { stillOn = !!getAutoDownloadPreference(); } catch (err) {
       log.error("[update] getAutoDownloadPreference threw on quit — not installing", err);
@@ -327,6 +343,13 @@ function createManagedLane({
         log.error("[update] managed stop on quit errored", err);
       }
       log.info("[update] managed deferred install on quit — running update command");
+      // Re-check governance after the gateway stopped: policy may have arrived
+      // during the shutdown await (same race as the feed-lane manual path).
+      if (isPolicyGoverned()) {
+        log.info("[update] policy governed (post-gateway-stop managed): quitting without applying");
+        app.exit(0);
+        return;
+      }
       const { code } = await runUpdateCommand();
       if (code === 0 && await applyChangedNothing(appliedVersion)) {
         // The user asked to quit, so honor that, WITHOUT relaunching into the
@@ -357,7 +380,55 @@ function createManagedLane({
       app.removeListener("before-quit", managedInstallOnQuit);
       managedQuitArmed = false;
     }
+    disarmSessionEndNotice();
   };
+
+  // Windows session-end notice. Windows shutdown, restart and sign-out never
+  // emit before-quit, so managedInstallOnQuit is unreachable on those paths.
+  // The notice tells the user the found update is waiting and never runs
+  // updateCommand: Windows gives a process a few seconds at session end, an
+  // apply may run up to MANAGED_APPLY_TIMEOUT_MS, and an external command
+  // killed partway can leave a half-applied install. The toast persists in
+  // Action Center across the session boundary.
+  function armSessionEndNotice() {
+    if (osPlatform !== "win32") return;
+    disarmSessionEndNotice();
+    let win = null;
+    try { win = getMainWindow(); } catch { win = null; }
+    if (!win || (typeof win.isDestroyed === "function" && win.isDestroyed())) return;
+    win.once("session-end", sessionEndPendingNotice);
+    sessionEndWindow = win;
+  }
+
+  function disarmSessionEndNotice() {
+    const win = sessionEndWindow;
+    sessionEndWindow = null;
+    if (!win) return;
+    try {
+      if (!(typeof win.isDestroyed === "function" && win.isDestroyed())) {
+        win.removeListener("session-end", sessionEndPendingNotice);
+      }
+    } catch { /* a torn-down window holds no listener */ }
+  }
+
+  function sessionEndPendingNotice() {
+    // Registered with once(): the window has already dropped it.
+    sessionEndWindow = null;
+    if (!foundVersion || managedInstalling || isPolicyGoverned()) return;
+    // Same opt-out check as managedInstallOnQuit: a quit from the tray applies
+    // the update only while auto-download is on, so the notice says so only
+    // then.
+    let stillOn = false;
+    try { stillOn = !!getAutoDownloadPreference(); } catch { return; }
+    if (!stillOn) return;
+    try {
+      new Notification({
+        title: "Kiro Crew update ready",
+        body: `An update (version ${foundVersion}) was found but not installed, because Windows was closing. Quit Kiro Crew from the tray to install it.`,
+      }).show();
+    } catch { /* notifications optional */ }
+    log.info("[update] managed session-end — notified user of pending update (install on next quit)");
+  }
 
   // ONE check at a time. The launch timer, the poll and the renderer's Check
   // button all land here, and the commands are slow (up to
@@ -369,6 +440,15 @@ function createManagedLane({
   // still resolving only when that run has finished.
   let checkInFlight = null;
   function managedCheck() {
+    // Policy stand-down: if a security policy provider governs this install,
+    // the managed lane's own check/apply must not run — both would otherwise
+    // try to apply updates on the same install.
+    if (isPolicyGoverned()) {
+      log.info("[update] policy governed: managed check suppressed");
+      disarmManagedQuit();
+      emit("not-available");
+      return Promise.resolve();
+    }
     // An install owns the state until it relaunches or fails, as in the feed
     // lane: a check requested now is skipped, re-surfacing "installing" for a
     // caller (the Check button) that cleared the card first.
@@ -451,6 +531,16 @@ function createManagedLane({
       return;
     }
     foundVersion = version;
+    // Re-check governance: if the policy provider became active while the
+    // check command was running, discard the result so two update paths do
+    // not compete on the same install.
+    if (isPolicyGoverned()) {
+      log.info("[update] policy governed (post-command): discarding managed check result");
+      foundVersion = null;
+      disarmManagedQuit();
+      emit("not-available");
+      return;
+    }
     if (stagedVersion === version) {
       // The user already took Download for this version and the ready dialog
       // is (or was) up. Re-surface it rather than demoting the card back to
@@ -464,10 +554,15 @@ function createManagedLane({
       emit("found", { version });
     }
     // Auto-on-restart: if the user allows auto-download, arm a one-shot
-    // before-quit handler that applies on the natural quit.
-    if (autoDownloadOn() && !managedQuitArmed) {
-      managedQuitArmed = true;
-      app.once("before-quit", managedInstallOnQuit);
+    // before-quit handler that applies on the natural quit, and on Windows the
+    // session-end notice for the shutdown, restart and sign-out paths that
+    // skip before-quit.
+    if (autoDownloadOn()) {
+      if (!managedQuitArmed) {
+        managedQuitArmed = true;
+        app.once("before-quit", managedInstallOnQuit);
+      }
+      if (!sessionEndWindow) armSessionEndNotice();
     }
   }
 
@@ -487,6 +582,9 @@ function createManagedLane({
   async function managedInstall() {
     const appliedVersion = foundVersion;
     managedInstalling = true;
+    // The install owns the update now; a session end mid-install must not
+    // advertise "quit to install".
+    disarmSessionEndNotice();
     emit("installing", { version: foundVersion });
     try { if (onInstallDispatched) onInstallDispatched(); } catch { /* advisory */ }
     try { if (stopGateway) await stopGateway(); } catch (err) {
@@ -498,6 +596,15 @@ function createManagedLane({
         return;
       }
       log.error("[update] managed stop before install errored", err);
+    }
+    // Re-check governance after the gateway stopped: policy may have arrived
+    // during the shutdown await (same race as managed deferred install on quit).
+    if (isPolicyGoverned()) {
+      log.info("[update] policy governed (post-gateway-stop managed install): canceling");
+      managedInstalling = false;
+      try { if (onInstallFailed) onInstallFailed(); } catch { /* advisory */ }
+      emit("not-available");
+      return;
     }
     const { code } = await runUpdateCommand();
     if (code === 0 && await applyChangedNothing(appliedVersion)) {

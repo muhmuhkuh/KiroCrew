@@ -270,6 +270,16 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "and a redaction that fails writes the empty string instead of the input.",
     ),
     (
+        "Live browser metadata broadcasts",
+        "browser_harness/live_hub.py",
+        "Every textual value of the browser_live websocket event, including page "
+        "URLs, titles, step labels and nested quick-ask text, passes the platform-aware "
+        "credential and exfiltration-URL redactor at publish time. A scanner failure "
+        "drops the event. The replay routes (handlers/browser_recordings.py) pass "
+        "their turn list and turn detail JSON through the same function. Browser "
+        "state and binary pixel frames are unchanged.",
+    ),
+    (
         "Subagent wait broadcasts",
         "subagent_manager/admission/waits.py",
         "The wait REASON on the `subagent_waiting` frame, which reaches every dashboard "
@@ -308,6 +318,16 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "Selected facts, experiences, corrections, and owner-selected copy results "
         "returned to the dashboard or the memory_recall tool. Nested fields pass "
         "through the shared credential + exfiltration-URL chain before serialization.",
+    ),
+    (
+        "Bedrock Knowledge Base retrieval queries",
+        "knowledge/connectors/bedrock_kb.py",
+        "The user's knowledge-search query text as sent to the AWS Bedrock "
+        "Retrieve API -- an off-host egress boundary. A query pasted with a "
+        "credential-shaped token or an exfiltration-shaped URL would land in "
+        "a third-party service's request log, so the query runs the shared "
+        "credential + exfiltration-URL chain immediately before the client "
+        "call, once per remote search.",
     ),
     (
         "Managed-venv update failures",
@@ -382,42 +402,6 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "role ARN, and an endpoint override can carry an inline-credential URL -- "
         "so the first stderr line goes through the shared credential + "
         "exfiltration-URL chain at the source, before it is put on an `Identity`.",
-    ),
-    (
-        "Browser CLI install failures",
-        "browser_cli/install.py",
-        "The stderr of a failed `npm install -g @playwright/cli` / browser download, "
-        "which reaches TWO surfaces: a `logger.warning` line (durable, and pasted "
-        "into bug reports via `kirocrew logs`) and the Settings > Browser error card. "
-        "npm quotes the command's own environment back on failure, so the text can "
-        "carry a registry `_authToken`, an inline-credential proxy URL, or a "
-        "`*_TOKEN=` echo -- shapes the shared credential family does NOT match, so "
-        "this sink adds its own npm patterns on top of the shared two-pass and "
-        "redacts at the source rather than at either boundary.",
-    ),
-    (
-        "Browser install job failure detail",
-        "browser_cli/install_job.py",
-        "The `error_detail` of the gateway's browser install job, returned by "
-        "`GET /api/browser/install` and in every 409 `install_already_running` "
-        "body. Failed-step output is redacted by `install._step` at the source; "
-        "exception and error fallbacks are not. `bounded_detail` re-redacts every "
-        "carrier on the FULL text before the 2000-character cut, using only "
-        "`redact_install_output` (the shared two-pass plus npm patterns), so a "
-        "pre-redaction cut cannot split a credential past its matching anchor.",
-    ),
-    (
-        "Browser panel launch failures",
-        "browser_cli/launcher.py",
-        "The CLI's own words when the Browser panel's address bar could not open a "
-        "page (`playwright-cli -s=panel-… open|goto` failing), shown VERBATIM in the "
-        "panel's failure card; the gateway log gets only the session name and the "
-        "exit code, never the text. The daemon's stack quotes its "
-        "environment and the URL the human typed, so the text can carry a "
-        "query-string credential or a `*_TOKEN=` echo; `_error_text` distills the "
-        "message and runs the shared credential + exfiltration-URL chain on the "
-        "kept lines BEFORE the cap, so a truncated head cannot leak what the tail "
-        "would have matched.",
     ),
     (
         "Azure DevOps comment bodies",
@@ -871,5 +855,19 @@ _GATEWAY_SINKS: tuple[tuple[str, str, str], ...] = (
         "label, which are slices of transcript rows: each passes exfiltration-URL "
         "and credential redaction (the display battery for timeline labels) "
         "before it reaches the browser.",
+    ),
+    (
+        "One crew member's in-place recap",
+        "dashboard/handlers/crew_worker_recap.py",
+        "The crewmate Sessions tab's recap: the work item's title, report summary, "
+        "decision, artifacts, PR link and pending approval tool names, each passed "
+        "through the work-ledger board's deep redactor before it reaches the browser.",
+    ),
+    (
+        "Remote session Git views",
+        "coder/session_browse.py",
+        "Git status, log and diff output and error text pass the shared "
+        "exfiltration-URL and credential redactor at the gateway before reaching "
+        "the dashboard, preserving record separators and patch framing.",
     ),
 )

@@ -12,7 +12,6 @@ import json
 import os
 import shutil
 import threading
-import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -30,6 +29,7 @@ from native_skill_projection_helpers import (
 from conftest import requires_symlinks
 from kiro_crew.acp import skill_projection as projection
 from kiro_crew.hooks import FileTooLargeError
+from kiro_crew.testing.wait import wait_until
 
 # The shared fixtures, bound here by name so pytest registers them for this module.
 _no_eager_prune = native_skill_projection_helpers._no_eager_prune
@@ -209,6 +209,11 @@ def test_every_reclaim_stage_admits_an_ordinary_local_alias(native_tree):
     # what makes the alias unused. Nothing about the authored source changes.
     del prepared
     gc.collect()
+    # The drop's end (lease release + reclaim) runs on the reaper thread, not
+    # inline on the dropping thread (see ``_end_projection``). Wait for it.
+    _reached = threading.Event()
+    projection._COLLECTED_ENDS.put(_reached.set)
+    assert _reached.wait(10), "the reaper never reached the dropped projection's end"
 
     assert projection._active_aliases() == set(), "a dropped projection still claims its aliases"
     assert not _alias_is_live(
@@ -827,38 +832,42 @@ def test_projection_lock_covers_alias_publication_and_pruning(native_tree, monke
 def test_concurrent_threads_of_one_process_queue_instead_of_timing_out(tmp_path, monkeypatch):
     """N starts in ONE gateway must not each race the file lock on its own clock.
 
-    The first holder releases only after all eight threads have reached the
-    in-process queue, so contention is established without a wall-clock delay.
+    The first holder keeps the lock until the other seven are queued behind it
+    in-process (or one of them is refused), so every thread contends while the
+    lock is held. A thread that raced the file lock instead would wait out its
+    0.3 s ceiling against that holder and be refused; queued in-process, each
+    thread reaches the file lock only after the holder released it.
     """
     monkeypatch.setattr(projection, "_PROJECTION_LOCK_TIMEOUT_SECS", 0.3)
     directory = tmp_path / "agents"
     failures: list[BaseException] = []
+    queued: list[str] = []
     start = threading.Barrier(8)
-    local = projection._in_process_projection_lock(directory)
-    attempted = 0
-    count_lock = threading.Lock()
-    all_attempted = threading.Event()
+    real_lock_for = projection._in_process_projection_lock
 
-    class ObservedLock:
-        def acquire(self, *, timeout):
-            nonlocal attempted
-            with count_lock:
-                attempted += 1
-                if attempted == 8:
-                    all_attempted.set()
-            return local.acquire(timeout=timeout)
+    def lock_noting_waiters(path):
+        inner = real_lock_for(path)
 
-        def release(self):
-            local.release()
+        def acquire(timeout):
+            if inner.acquire(blocking=False):
+                return True
+            queued.append(threading.current_thread().name)  # found busy, so it queues now
+            return inner.acquire(timeout=timeout)
 
-    monkeypatch.setattr(projection, "_in_process_projection_lock", lambda _dir: ObservedLock())
+        return SimpleNamespace(acquire=acquire, release=inner.release)
+
+    monkeypatch.setattr(projection, "_in_process_projection_lock", lock_noting_waiters)
 
     def hold() -> None:
+        # flake-ok: the eight holders meet at the barrier so they contend at once; each join below is bounded at 30 s
+        start.wait()
         try:
-            start.wait(timeout=30)
             with projection._projection_alias_lock(directory):
-                assert all_attempted.wait(timeout=30), "threads never reached the local queue"
-        except BaseException as exc:
+                wait_until(
+                    lambda: failures or len(queued) == start.parties - 1,
+                    describe=lambda: f"{len(queued)} queued, {len(failures)} refused",
+                )
+        except OSError as exc:
             failures.append(exc)
 
     threads = [threading.Thread(target=hold) for _ in range(8)]
@@ -1354,5 +1363,10 @@ def test_projection_finalizer_removes_its_lease_sidecar(native_tree):
 
     del prepared
     gc.collect()
+    # The drop's end (lease release + sidecar removal) runs on the reaper thread,
+    # not inline on the dropping thread (see ``_end_projection``). Wait for it.
+    _reached = threading.Event()
+    projection._COLLECTED_ENDS.put(_reached.set)
+    assert _reached.wait(10), "the reaper never reached the dropped projection's end"
 
     assert list(lease_dir.glob("*.json")) == []

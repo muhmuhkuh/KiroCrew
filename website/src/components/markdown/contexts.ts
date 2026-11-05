@@ -7,7 +7,8 @@ import { createContext } from 'react'
  * The six exported through `MarkdownRenderer.tsx` are public API: callers wrap
  * the renderer in their providers and the element overrides consume them. Each
  * is created exactly once, here, so a provider and the component reading it can
- * never hold two different objects. The other four carry the renderer root's
+ * never hold two different objects. `ChatProjectDirCtx` is provided by the chat
+ * transcript hosts, which import it from here. The other four carry the renderer root's
  * (and `MdAnchor`'s) state down to overrides that react-markdown instantiates
  * deep inside its own tree, where no prop can reach. The one context kept out of
  * this module, `MediaApprovedCtx`, is private to `remoteMedia.tsx`: its provider

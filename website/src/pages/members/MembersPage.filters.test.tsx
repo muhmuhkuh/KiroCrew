@@ -167,19 +167,19 @@ describe('MembersPage filters', () => {
     // The menu trigger is the sidebar's 24px filter button, docked in the field.
     const trigger = screen.getByTestId('member-filter-menu')
     expect(trigger.className).toMatch(/\bw-6\b/)
-    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter mates')
+    expect(trigger.getAttribute('aria-label')).toBe('Sort and filter Bots')
   })
 
   it('header reads "N of M" while a filter narrows the list, plain count otherwise', async () => {
     await renderPage()
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 Bots')
     await openFilters()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 5 Bots')
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     // The search box is not a "filter" for this purpose: it is transient.
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
-    expect(screen.getByTestId('member-count')).toHaveTextContent('5 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('5 Bots')
   })
 
   it('starred-only keeps just the starred rows and persists the toggle', async () => {
@@ -250,7 +250,7 @@ describe('MembersPage filters', () => {
     fireEvent.click(screen.getByTestId('member-filter-source-package'))
     expect(names()).toEqual([])
     expect(screen.getByTestId('member-filtered-out')).toBeInTheDocument()
-    expect(screen.queryByText(/No mates yet/i)).toBeNull()
+    expect(screen.queryByText(/No Bots yet/i)).toBeNull()
     fireEvent.click(screen.getByTestId('member-filters-clear'))
     expect(names()).toHaveLength(5)
     expect(localStorage.getItem('mc-members-starred-only')).toBe('0')
@@ -279,7 +279,7 @@ describe('MembersPage filters', () => {
     // A second status widens the set (OR), so a member in either state shows.
     fireEvent.click(screen.getByTestId('member-filter-status-unread'))
     expect(names()).toEqual(['conductor', 'pkg-a'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('2 of 4 Bots')
     fireEvent.click(screen.getByTestId('member-filter-status-working'))
     // Only "unread" left and nothing is unread: the filters, not the roster, emptied the list.
     expect(names()).toEqual([])
@@ -381,7 +381,7 @@ describe('MembersPage star', () => {
     const notice = await screen.findByTestId('member-star-error')
     expect(screen.getByTestId('member-star-pkg-a')).toHaveAttribute('aria-pressed', 'false')
     // Localized copy, not the raw server text.
-    expect(notice).toHaveTextContent("Could not update this mate's star.")
+    expect(notice).toHaveTextContent("Could not update this Bot's star.")
     expect(notice).not.toHaveTextContent('Forbidden')
     // The journaled report is recovered from the THROWN message (not the
     // localized one) and handed to ErrorNotice explicitly, so the agent
@@ -392,18 +392,20 @@ describe('MembersPage star', () => {
       .filter((props) => props.testId === 'member-star-error' && props.report)
       .at(-1)
     expect(noticeProps?.report).toEqual(FAKE_REPORT)
-    expect(noticeProps?.message).toBe("Could not update this mate's star.")
+    expect(noticeProps?.message).toBe("Could not update this Bot's star.")
     // A later successful toggle clears the stale notice.
     fireEvent.click(screen.getByTestId('member-star-pkg-b'))
     await waitFor(() => expect(screen.queryByTestId('member-star-error')).toBeNull())
   })
 })
 
-/* The default roster lists a row when its DM thread holds a message, whoever
- * sent it, or when it is starred -- like a messages app, which lists no empty
- * thread. Everything else is hidden until the search reaches it; the built-in
- * default crewmate follows the same rule. Every fixture above omits the field,
- * as an older gateway does, and those rows stay listed. */
+/* The default roster lists a mate the person created (on the page, or by
+ * approving Mate's card) even with an empty chat, and any other row once its DM
+ * thread holds a message, whoever sent it, or when it is starred -- like a
+ * messages app, which lists no empty thread it did not start. Everything else
+ * is hidden until the search reaches it; the reserved default member is listed
+ * only once the person sent it a message. Every fixture above omits the
+ * fields, as an older gateway does, and those rows stay listed. */
 describe('MembersPage hides unlisted mates', () => {
   const NO = { dashboard_created: false, has_dm_message: false }
   const MIXED = [
@@ -417,10 +419,29 @@ describe('MembersPage hides unlisted mates', () => {
   it('lists rows whose thread holds a message and starred rows; the count says how many are listed', async () => {
     await renderPage(MIXED)
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('3 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 Bots')
     // Not "filtered out": hidden rows are unlisted, so no chip and no notice.
     expect(screen.queryByTestId('member-filter-chips')).toBeNull()
     expect(screen.queryByTestId('member-filtered-out')).toBeNull()
+  })
+
+  it('lists a mate the person created with an empty, never-opened chat, and still hides an auto-made one', async () => {
+    await renderPage([
+      ...MIXED,
+      row('nova-sky', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Nova Sky' }),
+    ])
+    await waitFor(() => expect(names()).toContain('nova-sky'))
+    expect(names()).not.toContain('pkg-tool')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('4 Bots')
+    expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent('legacy-aim and pkg-tool')
+  })
+
+  it('hides the reserved default member until the person sent it a message', async () => {
+    await renderPage([
+      ...MIXED,
+      row('default', { source: 'builtin', ...NO, has_dm_message: true, has_user_dm_message: false }),
+    ])
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
   })
 
   it('the search reaches a hidden row, and the count grows to include it', async () => {
@@ -428,7 +449,7 @@ describe('MembersPage hides unlisted mates', () => {
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     fireEvent.change(screen.getByTestId('member-search'), { target: { value: 'pkg' } })
     expect(names()).toEqual(['pkg-tool'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('4 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('4 Bots')
     fireEvent.click(screen.getByTestId('member-search-clear'))
     expect(names()).toEqual(['radar', 'kirocrew', 'oncall'])
   })
@@ -440,7 +461,7 @@ describe('MembersPage hides unlisted mates', () => {
   it('ends the list by naming the mates the rule hides and saying the search finds them', async () => {
     await renderPage(MIXED)
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('3 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('3 Bots')
     expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent(
       "legacy-aim and pkg-tool are hidden because you haven't used them yet, and aren't counted above. Search to find them.",
     )
@@ -459,7 +480,7 @@ describe('MembersPage hides unlisted mates', () => {
   it('names a single hidden mate by the label its row shows, in the singular', async () => {
     await renderPage([
       ...MIXED.filter((m) => m.name !== 'pkg-tool' && m.name !== 'legacy-aim'),
-      row('nova-sky', { ...NO, display_name: 'Nova Sky' }),
+      row('nova-sky', { source: 'radar-app', ...NO, display_name: 'Nova Sky' }),
     ])
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     expect(screen.getByTestId('member-hidden-hint')).toHaveTextContent(
@@ -476,23 +497,23 @@ describe('MembersPage hides unlisted mates', () => {
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     // The whole line: the counted form names no action.
     expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
-      "legacy-aim, pkg-three, pkg-tool and 1 more mate you haven't used yet are hidden and aren't counted above.",
+      "legacy-aim, pkg-three, pkg-tool and 1 more Bot you haven't used yet are hidden and aren't counted above.",
     )
   })
 
-  it('lists a dashboard-created mate instead of naming it as hidden', async () => {
-    // Explicitly created mates are listed even with no message; only the
-    // untouched package/app rows belong in the hidden hint.
+  it('names the mates the user made ahead of package and app rows', async () => {
+    // A legacy crewmate the user made (source kirocrew, no member id yet)
+    // sorts last by name here, behind four package rows; it is still one of
+    // the three named, and named first.
     await renderPage([
       ...MIXED,
       row('pkg-two', { ...NO }),
       row('pkg-three', { ...NO }),
-      row('zebra-notes', { source: 'kirocrew', ...NO, dashboard_created: true, display_name: 'Zebra Notes' }),
+      row('zebra-notes', { source: 'kirocrew', ...NO, display_name: 'Zebra Notes' }),
     ])
-    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall', 'zebra-notes']))
-    expect(screen.getByTestId('member-count')).toHaveTextContent('4 mates')
+    await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
-      "legacy-aim, pkg-three, pkg-tool and 1 more mate you haven't used yet are hidden and aren't counted above.",
+      "Zebra Notes, legacy-aim, pkg-three and 2 more Bots you haven't used yet are hidden and aren't counted above.",
     )
   })
 
@@ -505,7 +526,7 @@ describe('MembersPage hides unlisted mates', () => {
     ])
     await waitFor(() => expect(names()).toEqual(['radar', 'kirocrew', 'oncall']))
     expect(screen.getByTestId('member-hidden-hint').textContent).toBe(
-      "legacy-aim, pkg-four, pkg-three and 2 more mates you haven't used yet are hidden and aren't counted above.",
+      "legacy-aim, pkg-four, pkg-three and 2 more Bots you haven't used yet are hidden and aren't counted above.",
     )
   })
 
@@ -534,7 +555,7 @@ describe('MembersPage hides unlisted mates', () => {
     expect(within(screen.getByTestId('member-filter-source-builtin')).getByText('1')).toBeInTheDocument()
     fireEvent.click(screen.getByTestId('member-filter-starred'))
     expect(names()).toEqual(['oncall'])
-    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 3 mates')
+    expect(screen.getByTestId('member-count')).toHaveTextContent('1 of 3 Bots')
   })
 
   it('a team whose every mate is hidden keeps its header, so the team stays reachable', async () => {

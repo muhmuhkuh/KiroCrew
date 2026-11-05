@@ -1064,3 +1064,60 @@ describe('assemblePromptContent — the frontmatter block is the author\'s text'
       .toBe('---\ndescription: now described\n---\n\nJust body.\n')
   })
 })
+
+describe('PromptsTab filter selection (#20262)', () => {
+  // A prompt listed first whose description mentions the query, then the
+  // prompt the user actually typed.
+  const MENTIONS = [
+    { ...USER_PROMPT, name: 'alpha', fullName: 'alpha', description: 'calls review', path: '~/.kiro/prompts/alpha.md' },
+    { ...USER_PROMPT, name: 'review', fullName: 'review', description: 'code review', path: '~/.kiro/prompts/review.md' },
+  ]
+  const lastOpened = () => mockApi.promptDetail.mock.calls.at(-1)?.[0]
+
+  it('opens the prompt whose name matches the filter, not the first row', async () => {
+    mockApi.prompts.mockResolvedValue(MENTIONS)
+    renderTab()
+    await waitFor(() => expect(lastOpened()).toBe('alpha'))
+
+    fireEvent.change(screen.getByPlaceholderText(/filter prompts/i), { target: { value: 'review' } })
+    await waitFor(() => expect(lastOpened()).toBe('review'))
+    expect(screen.getByRole('option', { name: /alpha/ })).toBeInTheDocument()
+  })
+
+  it('keeps a prompt the user clicked while the filter still shows it', async () => {
+    mockApi.prompts.mockResolvedValue(MENTIONS)
+    renderTab()
+    await waitFor(() => expect(lastOpened()).toBe('alpha'))
+    fireEvent.click(screen.getByRole('option', { name: /alpha/ }))
+
+    fireEvent.change(screen.getByPlaceholderText(/filter prompts/i), { target: { value: 'review' } })
+    await waitFor(() => expect(screen.getAllByRole('option')).toHaveLength(2))
+    expect(lastOpened()).toBe('alpha')
+  })
+})
+
+
+describe('PromptsTab list-load failure', () => {
+  it('shows the error through a role=alert and a retry button that refetches', async () => {
+    // First load fails; the retry's load succeeds.
+    mockApi.prompts
+      .mockRejectedValueOnce(new StubApiError(503, 'gateway is unreachable'))
+      .mockResolvedValueOnce([USER_PROMPT])
+
+    renderTab()
+
+    // The failure renders through ErrorNotice (role="alert"), not a bare
+    // text-danger paragraph, so assistive tech announces it.
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/gateway is unreachable|failed to load/i)
+
+    // A Retry control exists and refetches the same query.
+    expect(mockApi.prompts).toHaveBeenCalledTimes(1)
+    fireEvent.click(screen.getByRole('button', { name: /retry/i }))
+    await waitFor(() => expect(mockApi.prompts).toHaveBeenCalledTimes(2))
+
+    // After the successful refetch the list renders and the error clears.
+    await screen.findByRole('option', { name: /my-prompt/ })
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})

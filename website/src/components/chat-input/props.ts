@@ -4,6 +4,7 @@ import type { ResizeInfo } from '../../utils/resizeImage'
 import type { SendMode } from '../../pages/chat/ChatSettings'
 import type { AutomationRecord } from '../../monitoring/automation'
 import type { PasteBlock } from '../../utils/pasteTokens'
+import type { ComposerActionItem } from '../../composerActions/composerActionRegistry'
 import type { FileKind } from '../FilePickerMenu'
 import type { PromptHistoryItem } from '../composerPromptHistory'
 import type { ApprovalModeRemote } from '../ApprovalModePicker'
@@ -250,6 +251,13 @@ export interface ChatInputProps {
    *  user who was not typing does not get the composer focused under them. */
   onModelClick?: (rect: DOMRect, trigger?: HTMLElement, composerHadFocus?: boolean) => void
   onProjectClick?: (rect: DOMRect, trigger?: HTMLElement) => void
+  /** Session Environment chip for this slot (`SessionEnvironmentChip`). It owns
+   *  its own separated shelf group and renders nothing until profiles exist. */
+  environmentSlot?: string | null
+  /** App-contributed composer actions (contributes.composerActions in app.json):
+   *  rows in the "+" menu whose app offers text the composer inserts as visible
+   *  text, refused when it holds anything the composer would resolve. */
+  composerActions?: readonly ComposerActionItem[]
   /** App-contributed session controls (contributes.sessionControls in app.json). */
   sessionControls?: {
     key: string
@@ -284,6 +292,9 @@ export interface ChatInputProps {
    *  attached. A pick there cannot land at the next turn, because the deferred
    *  session reset stays armed while children share the runtime. */
   projectLocked?: boolean
+  /** A project pick is still waiting on its route (it holds the turn-
+   *  preparation lock): the chip shows a spinner and announces it (#20351). */
+  projectSwitching?: boolean
   onStop?: () => void
   /**
    * True when an EMPTY composer can hand the thread back to the agent, so the
@@ -319,6 +330,8 @@ export interface ChatInputProps {
   approvalMode?: string
   /** The approval-mode picker drives another machine's session (crew window). */
   approvalModeRemote?: ApprovalModeRemote
+  /** Drawn directly right of the approval-mode picker (the mid-chat Ultra Mode chip). */
+  afterApprovalMode?: React.ReactNode
   reasoningEffort?: string
   /** True when `reasoningEffort` is the configured default rather than a
    *  per-slot pick. Only the chip's hover / accessible name says so: outside
@@ -558,7 +571,4 @@ export interface ChatInputProps {
    *  otherwise carry the pre-optimize text and send the rewrite to the
    *  session it then deletes. */
   onOptimizingChange?: (optimizing: boolean) => void
-  /** When set, shows a SessionEnvironmentChip for the given slot key so the user
-   *  can see / change the environment the session runs in. Fork-only. */
-  environmentSlot?: string | null
 }

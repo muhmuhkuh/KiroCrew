@@ -81,9 +81,13 @@ def _load_steering_resources() -> str:
     kiro-cli injects these automatically for its sessions; the dashboard
     must do it explicitly so that dashboard chat sessions also benefit
     from project-specific steering conventions.
-    Only loads ``file://`` resources matching ``*.md``.
+    Only loads ``file://`` resources matching ``*.md``, and of those only the
+    documents :func:`kiro_crew.folder_steering.every_session_body` keeps: one
+    declaring ``inclusion`` ``manual``, ``auto`` or ``fileMatch`` is withheld,
+    and the front matter is stripped from the rest.
     """
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
+    from kiro_crew.folder_steering import every_session_body
 
     try:
         cfg_path = ctx.kiro_agents_dir() / "kirocrew.json"
@@ -117,9 +121,11 @@ def _load_steering_resources() -> str:
             for p in sorted(base.glob(raw_pattern)):
                 if p.suffix == ".md" and steering_target_admissible(p.resolve()):
                     try:
-                        parts.append(ctx.safe_read_file(str(p)))
+                        body = every_session_body(ctx.safe_read_file(str(p)))
                     except PermissionError:
-                        pass
+                        continue
+                    if body is not None:
+                        parts.append(body)
         if parts:
             logger.debug(
                 "loaded %d steering bytes from %d files", sum(len(p) for p in parts), len(parts)
@@ -397,18 +403,19 @@ def _session_computer_use_gate(self, session_key: str, *, refresh: bool) -> bool
 def _live_browser_gate() -> bool:
     """Whether browsing is set up on this host now, as the ``browser`` tool reads it.
 
-    ``browser_cli.install.available`` is the predicate the tool's own call-time
-    check wraps: while it is False the tool refuses every op. Unlike that check
-    this fails OPEN. An unreadable state keeps the whole section, because a
-    section kept by mistake costs tokens while one dropped by mistake leaves a
-    working browser without its approval and loopback rules.
+    ``browser_harness.ops.browsing_available`` is the predicate the gateway's op
+    route answers ``not_installed`` by: while it is False the tool refuses every
+    op. Unlike that check this fails OPEN. An unreadable state keeps the whole
+    section, because a section kept by mistake costs tokens while one dropped by
+    mistake leaves a working browser without its loopback and takeover rules.
     """
     try:
         # Function-local: an owner takes no Kiro Crew import at module scope, so
-        # loading the context does not load the browser install plane.
-        from kiro_crew.browser_cli import install
+        # loading the context does not load the browser plane.
+        from kiro_crew.browser_harness import ops as browser_ops
+        from kiro_crew.config.paths import config_dir
 
-        return bool(install.available())
+        return bool(browser_ops.browsing_available(config_dir()))
     except Exception:
         logger.debug("browse gate unreadable; prompt keeps the Browser section", exc_info=True)
         return True
@@ -456,6 +463,11 @@ def _resolve_prompt_templates(
         available = _live_browser_gate() if browser is None else browser
         prompt = _sections.browser_section(prompt, available)
 
+    # The per-agent choice is made in ``_resolve_agent_prompt``, which knows the
+    # agent. A caller that reaches here without it keeps the section.
+    if _sections.SUBAGENTS_BEGIN in prompt or _sections.SUBAGENTS_END in prompt:
+        prompt = _sections.subagent_section(prompt, conductor=False)
+
     cfg = ctx.KiroCrewConfig.load()
 
     # A copied agent spec may still carry the retired
@@ -490,15 +502,23 @@ def _load_agent_prompt(
     from kiro_crew import context as ctx  # circular import: the facade imports this owner
     from kiro_crew.agent_discovery import _read_agent_spec
     from kiro_crew.member_essential_context import (
+        read_template_spec,
         resolve_relative_prompt_path,
-        resolve_template_path,
     )
 
     try:
-        path = spec_path or resolve_template_path(agent, project)
-        if path is None:
+        if spec_path is not None:
+            resolved: tuple[Path, dict | None] | None = (
+                spec_path,
+                _read_agent_spec(spec_path, operation="agent_prompt", source="context"),
+            )
+        else:
+            resolved = read_template_spec(
+                agent, project, operation="agent_prompt", source="context"
+            )
+        if resolved is None:
             return ""
-        data = _read_agent_spec(path, operation="agent_prompt", source="context")
+        path, data = resolved
         if data is None:
             return ""
         prompt = data.get("prompt") or ""
@@ -546,7 +566,7 @@ def _crewmate_worker_prompt(agent: str, base_prompt: str, session_key: str) -> s
     out against the on-disk worker base, the literal base KAS hands the seam, so a
     crewmate file whose prompt repeats that base adds nothing here either. Only a worker whose
     backend gets its prompt from this block alone
-    (``ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT``: claude)
+    (``ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT``: claude, codex)
     carries both here; KAS's wire spec already does, so its block keeps the base.
     Any other agent, or no session, keeps the base too.
     """
@@ -573,7 +593,7 @@ def _crewmate_worker_prompt(agent: str, base_prompt: str, session_key: str) -> s
     except (WorkerKitUnreadable, AgentSpecUnreadable):
         # The session itself is refused where its spec is projected; the
         # contract keeps the worker's base rather than failing the turn's assembly.
-        logger.warning("worker session %s: crewmate prompt unreadable", session_key)
+        logger.warning("worker session %s: Bot prompt unreadable", session_key)
         return worker_base
     merged = merged if isinstance(merged, str) else ""
     addition = merged[len(disk_prompt) :].strip() if merged.startswith(disk_prompt) else ""
@@ -632,6 +652,15 @@ def _resolve_agent_prompt(
     # After every branch: the worker is a default-named agent, so it takes the
     # default contract above, and its crewmate's prompt follows that base.
     agent_prompt = _crewmate_worker_prompt(agent or "", agent_prompt, session_key or "")
+    # A crewmate's conductor dispatches to worker sessions and mounts no spawn
+    # tools, so it gets its own delegation rule where the sub-agent span was.
+    # Resolved before the capacity token below, which sits inside that span.
+    if _sections.SUBAGENTS_BEGIN in agent_prompt or _sections.SUBAGENTS_END in agent_prompt:
+        from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT
+
+        agent_prompt = _sections.subagent_section(
+            agent_prompt, conductor=agent == MATE_CONDUCTOR_AGENT
+        )
     # A built-in spec whose own prompt asks for widgets gets the widget pointer
     # here rather than as a token in its spec: kiro-cli loads that spec prompt
     # natively and a crewmate's essentials deliver it verbatim, and neither path

@@ -307,10 +307,25 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
     { type: 'slot_projection', data: { slot: `dashboard:${BACKGROUND}` } },
     { type: 'slot_projection', data: {} },
   ]],
+  // A non-work slot fold frame as the gateway sends it now (no value) and as it
+  // sent it before (with one): the router must take the same effects for both.
+  ['slot_projection workstreams with a value', [{ type: 'slots', data: [
+    { key: ACTIVE, title: 'Active', last_ts: TS },
+    { key: BACKGROUND, title: 'Background', last_ts: TS, created_by: ACTIVE },
+  ] }], [
+    { type: 'slot_projection', data: { slot: `dashboard:${BACKGROUND}`, fold: 'workstreams', revision: 4, value: { streams: [] } } },
+  ]],
+  ['slot_projection workstreams without a value', [{ type: 'slots', data: [
+    { key: ACTIVE, title: 'Active', last_ts: TS },
+    { key: BACKGROUND, title: 'Background', last_ts: TS, created_by: ACTIVE },
+  ] }], [
+    { type: 'slot_projection', data: { slot: `dashboard:${BACKGROUND}`, fold: 'workstreams', revision: 4 } },
+  ]],
   ['session_summary', [], [{ type: 'session_summary', data: { key: ACTIVE } }, { type: 'session_summary', data: {} }]],
   ['pins_changed', [], [{ type: 'pins_changed', data: { slot_key: ACTIVE } }, { type: 'pins_changed', data: {} }]],
   ['artifact_update', [], [{ type: 'artifact_update', data: { slug: 'doc' } }]],
   ['artifact_update deleted', [], [{ type: 'artifact_update', data: { slug: 'doc', deleted: true } }, { type: 'artifact_update', data: {} }]],
+  ['resume_all_done', [], [{ type: 'resume_all_done', data: { run_id: 'run-1', total: 1, resumed: [ACTIVE], skipped: [], failed: [] } }]],
   ['notification', [], [{ type: 'notification', data: { kind: 'info', title: 'Hello', ts: '1790000001' } }]],
   ['notification silenced and passive', [], [
     { type: 'notification', data: { kind: 'info', title: 'Muted', ts: '1790000002', silenced: true } },
@@ -374,6 +389,9 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
   ['steer_push', [{ type: 'chat_chunk', data: { slot: ACTIVE, seq: 1, content: 'pre' } }], [{
     type: 'steer_push', data: { slot: ACTIVE, content: 'steer', ts: TS, sendId: 's-1', steerState: 'written', mid: 'm-9', meta: { files: ['f'], dirs: ['d'] } },
   }]],
+  ['steer_push that can be taken back', [], [{
+    type: 'steer_push', data: { slot: ACTIVE, content: 'steer', ts: TS, steerState: 'written', mid: 'm-10', steerRetract: true },
+  }]],
   ['steer_push without a slot', [], [{ type: 'steer_push', data: { content: 'steer' } }]],
   ['chat_chunk', [], [
     { type: 'chat_chunk', data: { slot: ACTIVE, seq: 1, content: 'Hello', gen: 'g-1' } },
@@ -436,7 +454,7 @@ const FRAME_CASES: Array<[string, Frame[], Frame[]]> = [
       { type: 'other', data: {} },
     ] } },
   ]],
-  ['subagent status and text', [], [
+  ['subagent status and text dispatch nothing', [], [
     { type: 'subagent_status', data: { slot: ACTIVE, running: 1 } },
     { type: 'subagent_status', data: { running: 1 } },
     { type: 'subagent_text', data: { slot: ACTIVE, id: 'sa-1', text: 't' } },
@@ -700,7 +718,7 @@ describe('useWebSocket lifecycle trace', () => {
   it('uses a secure socket on https and keeps the socket across a re-render', async () => {
     const original = window.location
     const { ws, view } = await mountOpen()
-    expect(ws.url).toMatch(/^ws:\/\/[^/]+\/api\/ws\?caps=slot_patch$/)
+    expect(ws.url).toMatch(/^ws:\/\/[^/]+\/api\/ws\?caps=slot_patch,slot_diff\.1,fold_delta\.1,fold_delta\.2$/)
     // A re-render keeps the socket: no owner identity changes, so neither
     // the mount effect nor the connect it runs fires again.
     act(() => { view.rerender() })
@@ -713,7 +731,7 @@ describe('useWebSocket lifecycle trace', () => {
       wrapper: ({ children }) => createElement(Provider, { store: testStore },
         createElement(QueryClientProvider, { client: qc }, children)),
     })
-    expect(WS_INSTANCES[0].url).toBe('wss://crew.test/api/ws?caps=slot_patch')
+    expect(WS_INSTANCES[0].url).toBe('wss://crew.test/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2')
   })
 
   it('unmount', async () => {
@@ -1051,6 +1069,14 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["command-center","slot-b","work"] {"exact":true} {"cancelRefetch":false}',
     'query invalidateQueries ["command-center","slot-a","work"] {"exact":true} {"cancelRefetch":false}',
   ],
+  "slot_projection workstreams with a value": [
+    'query invalidateQueries ["command-center","slot-b","work"] {"exact":true} {"cancelRefetch":false}',
+    'query invalidateQueries ["command-center","slot-a","work"] {"exact":true} {"cancelRefetch":false}',
+  ],
+  "slot_projection workstreams without a value": [
+    'query invalidateQueries ["command-center","slot-b","work"] {"exact":true} {"cancelRefetch":false}',
+    'query invalidateQueries ["command-center","slot-a","work"] {"exact":true} {"cancelRefetch":false}',
+  ],
   "session_summary": [
     'query invalidateQueries ["session-summary","slot-a"]',
   ],
@@ -1069,6 +1095,9 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'event kirocrew:artifact-deleted {"slug":"doc"}',
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["command-center","artifacts"]',
+  ],
+  "resume_all_done": [
+    'event kirocrew:resume-all-done {"run_id":"run-1","total":1,"resumed":["slot-a"],"skipped":[],"failed":[]}',
   ],
   "notification": [
     'action notifications/addNotification {"kind":"info","title":"Hello","ts":"1790000001"}',
@@ -1092,56 +1121,56 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   "approval in the owning slot": [
     'query invalidateQueries ["global-approvals"]',
     'event mc-notification {"kind":"approval"}',
-    "action notifications/addNotification {\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\\n\\nList files\",\"ts\":\"1790000000\",\"approval_id\":\"ap-1\",\"slot\":\"slot-a\"}",
-    "event mc-live-notification {\"note\":{\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\\n\\nList files\",\"ts\":\"1790000000\",\"approval_id\":\"ap-1\",\"slot\":\"slot-a\"}}",
+    "action notifications/addNotification {\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\\n\\nList files\",\"ts\":\"1790000000\",\"approval_id\":\"ap-1\",\"_local\":true,\"slot\":\"slot-a\"}",
+    "event mc-live-notification {\"note\":{\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\\n\\nList files\",\"ts\":\"1790000000\",\"approval_id\":\"ap-1\",\"_local\":true,\"slot\":\"slot-a\"}}",
     'action chat/sseChatMessage {"slot":"slot-a","role":"permission","content":"[agent] shell","ts":"1790000000","meta":{"tool_input":"ls","approval_id":"ap-1","source":"agent","registry":"coordinator","tool_call_id":"tc-1"}}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval","text":"shell","approval_id":"ap-1","approval_type":"chat"}',
   ],
   "approval for a spawn": [
     'query invalidateQueries ["global-approvals"]',
     'event mc-notification {"kind":"approval"}',
-    'action notifications/addNotification {"kind":"approval","title":"Tool approval: spawn_run(write docs)","body":"**Source:** agent","ts":"1790000004","approval_id":"spawn:agent-1","slot":"slot-a"}',
-    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: spawn_run(write docs)","body":"**Source:** agent","ts":"1790000004","approval_id":"spawn:agent-1","slot":"slot-a"}}',
+    'action notifications/addNotification {"kind":"approval","title":"Tool approval: spawn_run(write docs)","body":"**Source:** agent","ts":"1790000004","approval_id":"spawn:agent-1","_local":true,"slot":"slot-a"}',
+    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: spawn_run(write docs)","body":"**Source:** agent","ts":"1790000004","approval_id":"spawn:agent-1","_local":true,"slot":"slot-a"}}',
     'action chat/sseChatMessage {"slot":"slot-a","role":"permission","content":"[agent] spawn_run(write docs)","ts":"1790000004","meta":{"tool_input":"","approval_id":"spawn:agent-1","source":"agent","registry":"coordinator"}}',
     'action chat/sseSubagentPending {"slot":"slot-a","id":"agent-1","task":"write docs","approval_id":"spawn:agent-1"}',
   ],
   "approval from a subagent": [
     'query invalidateQueries ["global-approvals"]',
     'event mc-notification {"kind":"approval"}',
-    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** subagent","ts":"1790000005","approval_id":"ap-sub","slot":"slot-a"}',
-    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** subagent","ts":"1790000005","approval_id":"ap-sub","slot":"slot-a"}}',
+    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** subagent","ts":"1790000005","approval_id":"ap-sub","_local":true,"slot":"slot-a"}',
+    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** subagent","ts":"1790000005","approval_id":"ap-sub","_local":true,"slot":"slot-a"}}',
     'action chat/sseChatMessage {"slot":"slot-a","role":"permission","content":"[subagent] shell","ts":"1790000005","meta":{"tool_input":"","approval_id":"ap-sub","source":"subagent","registry":"coordinator"}}',
   ],
   "approval with no slot": [
     'query invalidateQueries ["global-approvals"]',
     'event mc-notification {"kind":"approval"}',
-    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** cron","ts":"1790000006","approval_id":"ap-free"}',
-    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** cron","ts":"1790000006","approval_id":"ap-free"}}',
+    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** cron","ts":"1790000006","approval_id":"ap-free","_local":true}',
+    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** cron","ts":"1790000006","approval_id":"ap-free","_local":true}}',
   ],
   "approval_resolved for a coordinator approval": [
     'query invalidateQueries ["global-approvals"]',
-    'action notifications/removeNotificationByTs "1790000000"',
+    'action notifications/endApprovalRow "1790000000"',
     'action chat/resolveByApprovalId {"id":"ap-1","slot":"slot-a","decision":"approved","registry":"coordinator"}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval_resolved","text":"","approval_id":"ap-1","approval_type":"chat"}',
   ],
   "approval_resolved expired spawn": [
     'query invalidateQueries ["global-approvals"]',
-    'action notifications/removeNotificationByTs "1790000007"',
+    'action notifications/endApprovalRow "1790000007"',
     'action chat/resolveByApprovalId {"id":"spawn:agent-2","slot":"slot-a","decision":"stale","registry":"coordinator"}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval_resolved","text":"","approval_id":"spawn:agent-2","approval_type":"spawn"}',
     'action chat/sseSubagentDone {"slot":"slot-a","id":"agent-2","elapsed":0,"error":"The approval wait expired, so the request was denied."}',
   ],
   "approval_resolved without a slot": [
     'query invalidateQueries ["global-approvals"]',
-    'action notifications/removeNotificationByTs "1790000000"',
+    'action notifications/endApprovalRow "1790000000"',
     'action chat/resolveByApprovalId {"id":"ap-1","slot":"slot-a","decision":"rejected","registry":"coordinator"}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval_resolved","text":"","approval_id":"ap-1","approval_type":"chat"}',
   ],
   "refresh with history": [
     'action dashboard/triggerRefresh undefined',
-    'query invalidateQueries ["cron-jobs"]',
-    'query invalidateQueries ["crons"]',
-    'query invalidateQueries ["cron-history-all"]',
+    'query invalidateQueries ["cron-jobs"] <predicate>',
+    'query invalidateQueries ["crons"] <predicate>',
+    'query invalidateQueries ["cron-history-all"] <predicate>',
     'query invalidateQueries ["agents-installed"]',
     'query invalidateQueries ["kirocrew-agents"]',
     'query invalidateQueries ["default-agent"]',
@@ -1248,6 +1277,12 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'cancel-frame 2',
     'action stream/flush {"slots":[],"subagents":[],"recency":[{"key":"slot-a","ts":"2026-09-01T00:00:00.000Z","settled":true}]}',
   ],
+  "steer_push that can be taken back": [
+    'action chat/appendSlotMessage {"slot":"slot-a","message":{"role":"user","content":"steer","cls":"msg msg-u","meta":{"steer":true,"steerState":"written","mid":"m-10","steerRetract":true},"ts":"2026-09-01T00:00:00.000Z"}}',
+    'frame',
+    'cancel-frame 1',
+    'action stream/flush {"slots":[],"subagents":[],"recency":[{"key":"slot-a","ts":"2026-09-01T00:00:00.000Z","settled":true}]}',
+  ],
   "steer_push without a slot": [
     'action chat/appendSlotMessage {"slot":"slot-a","message":{"role":"user","content":"steer","cls":"msg msg-u","meta":{"steer":true}}}',
   ],
@@ -1329,10 +1364,8 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'frame',
     'cancel-frame 3',
   ],
-  "subagent status and text": [
-    'action dashboard/sseSubagentStatus {"slot":"slot-a","running":1}',
-    'action dashboard/sseSubagentText {"slot":"slot-a","id":"sa-1","text":"t"}',
-  ],
+  // Every sub-agent surface reads the chat slice's per-agent frames instead.
+  "subagent status and text dispatch nothing": [],
   "app_reload": [
     'event mc:app-reload {"app":"notes"}',
   ],
@@ -1436,6 +1469,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["agent-resolved-model"]',
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
+    'action dashboard/triggerCronRefresh undefined',
     'action dashboard/triggerRefresh undefined',
     'query invalidateQueries ["cron-jobs"]',
     'query invalidateQueries ["crons"]',
@@ -1450,6 +1484,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
     'query invalidateQueries ["agent-resolved-model"]',
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
+    'action dashboard/triggerCronRefresh undefined',
   ],
   "update_progress": [
     'action dashboard/setUpdateProgress {"step":"downloading","detail":"1/2"}',
@@ -1486,8 +1521,8 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
   "approval without an id": [
     'query invalidateQueries ["global-approvals"]',
     'event mc-notification {"kind":"approval"}',
-    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** agent","ts":"1790000008","slot":"slot-a"}',
-    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** agent","ts":"1790000008","slot":"slot-a"}}',
+    'action notifications/addNotification {"kind":"approval","title":"Tool approval: shell","body":"**Source:** agent","ts":"1790000008","_local":true,"slot":"slot-a"}',
+    'event mc-live-notification {"note":{"kind":"approval","title":"Tool approval: shell","body":"**Source:** agent","ts":"1790000008","_local":true,"slot":"slot-a"}}',
     'action chat/sseChatMessage {"slot":"slot-a","role":"permission","content":"[agent] shell","ts":"1790000008","meta":{"tool_input":"","source":"agent","registry":"coordinator"}}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval","text":"shell","approval_type":"chat"}',
   ],
@@ -1496,7 +1531,7 @@ const EXPECTED_FRAMES: Record<string, string[]> = {
 
 const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   "first connect": [
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'query invalidateQueries ["shared-crew"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
@@ -1506,7 +1541,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query fetchQuery ["workflow-runs-reconcile"] {"staleTime":0,"gcTime":30000,"retry":false}',
     'action chat/resyncWaitingSideConversations/pending',
     'action chat/clearSubagentsForSnapshot undefined',
-    'send {"type":"subscribe_subagents"}',
+    'send {"type":"subscribe_subagents","slots":["slot-a"]}',
     'send {"type":"subscribe_logs"}',
     'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action chat/reconcileWorkflowRuns []',
@@ -1517,7 +1552,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   ],
   "reconnect catch-up": [
     'action dashboard/sseDisconnected undefined',
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'query invalidateQueries ["shared-crew"] {"cancelRefetch":false}',
     'action stream/flush {"slots":[{"slot":"slot-a","thinking":"kept","status":{"content":true,"thinking":true}}],"subagents":[],"recency":[]}',
@@ -1531,6 +1566,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
     'query invalidateQueries ["kirocrewConfig"]',
+    'query invalidateQueries ["monitor-contract"]',
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
@@ -1546,7 +1582,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/resyncWaitingSideConversations/pending',
     'action chat/refreshSlot/pending',
     'action chat/clearSubagentsForSnapshot undefined',
-    'send {"type":"subscribe_subagents"}',
+    'send {"type":"subscribe_subagents","slots":["slot-a"]}',
     'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action dashboard/fetchSlots/fulfilled',
     'action chat/reconcileWorkflowRuns []',
@@ -1558,7 +1594,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   ],
   "reconnect after an update restart reloads": [
     'action dashboard/sseDisconnected undefined',
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'query invalidateQueries ["shared-crew"] {"cancelRefetch":false}',
     'reload',
@@ -1571,7 +1607,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
   ],
   "forceReconnect": [
     'close',
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'query invalidateQueries ["shared-crew"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
@@ -1583,6 +1619,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query invalidateQueries ["artifacts"]',
     'query invalidateQueries ["artifact-folders"]',
     'query invalidateQueries ["kirocrewConfig"]',
+    'query invalidateQueries ["monitor-contract"]',
     'query fetchQuery ["credential-redaction"] {"staleTime":0}',
     'query invalidateQueries ["chat-thread"]',
     'query invalidateQueries ["chat-threads"]',
@@ -1598,7 +1635,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/resyncWaitingSideConversations/pending',
     'action chat/refreshSlot/pending',
     'action chat/clearSubagentsForSnapshot undefined',
-    'send {"type":"subscribe_subagents"}',
+    'send {"type":"subscribe_subagents","slots":["slot-a"]}',
     'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action dashboard/fetchSlots/fulfilled',
     'action chat/reconcileWorkflowRuns []',
@@ -1609,10 +1646,10 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action chat/refreshSlot/fulfilled',
   ],
   "StrictMode mounts twice and connects once": [
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'close',
     'action chat/setVoicePlaying false',
-    'connect ws:/api/ws?caps=slot_patch',
+    'connect ws:/api/ws?caps=slot_patch,slot_diff.1,fold_delta.1,fold_delta.2',
     'query invalidateQueries ["crew-log-projections"] {"cancelRefetch":false}',
     'query invalidateQueries ["shared-crew"] {"cancelRefetch":false}',
     'action dashboard/sseConnected undefined',
@@ -1622,7 +1659,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'query fetchQuery ["workflow-runs-reconcile"] {"staleTime":0,"gcTime":30000,"retry":false}',
     'action chat/resyncWaitingSideConversations/pending',
     'action chat/clearSubagentsForSnapshot undefined',
-    'send {"type":"subscribe_subagents"}',
+    'send {"type":"subscribe_subagents","slots":["slot-a"]}',
     'send {"type":"slot_focused","slot":"slot-a","announce":true}',
     'action chat/reconcileWorkflowRuns []',
     'query setQueryData ["command-center","workflows"]',
@@ -1666,7 +1703,7 @@ const EXPECTED_LIFECYCLE: Record<string, string[]> = {
     'action notifications/addNotification {"kind":"info","title":"Replayed","ts":"1790000009"}',
     'event mc-notification {"kind":"info"}',
     'query invalidateQueries ["global-approvals"]',
-    "action notifications/addNotification {\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\",\"ts\":\"1790000000\",\"approval_id\":\"ap-replay\",\"slot\":\"slot-a\"}",
+    "action notifications/addNotification {\"kind\":\"approval\",\"title\":\"Tool approval: shell\",\"body\":\"**Source:** agent\\n\\n```approval-command\\nls\\n```\",\"ts\":\"1790000000\",\"approval_id\":\"ap-replay\",\"_local\":true,\"slot\":\"slot-a\"}",
     'action chat/sseChatMessage {"slot":"slot-a","role":"permission","content":"[agent] shell","ts":"1790000000","meta":{"tool_input":"ls","approval_id":"ap-replay","source":"agent","registry":"coordinator"}}',
     'action chat/sseActivityEvent {"slot":"slot-a","kind":"approval","text":"shell","approval_id":"ap-replay","approval_type":"chat"}',
     'action chat/sseChatMessage {"slot":"slot-b","role":"assistant","content":"old","ts":"2026-09-01T00:00:00.000Z"}',

@@ -136,6 +136,15 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "redacted in its display form before any escape goes in.",
     ),
     (
+        "Discord [OPTIONS] press echo",
+        "discord/transport_dispatch_interactions.py",
+        "The quoted line posted when a user presses an `[OPTIONS:]` button. It "
+        "carries the full choice, which can be longer than the label that was "
+        "shown. This module calls only `_redact_transformed`, the renderer's "
+        "display-form pass for the answer body, which itself runs both the "
+        "credential and the exfiltration-URL scan.",
+    ),
+    (
         "Teams rendered message text",
         "teams/renderer.py",
         "Every LLM-authored string this channel sends, re-scanned in the form Teams "
@@ -541,6 +550,17 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "by segment through redact_path_segments.",
     ),
     (
+        "Files tab edited-file list",
+        "dashboard/session_files.py",
+        "The absolute paths the Files tab's Edited view (api_project_session_files) "
+        "returns are checked through _redact_project_path: a path the redactor would "
+        "change is withheld from the list rather than sent masked, and the response "
+        "says the list is incomplete. One edit's texts (api_project_session_file_diff) "
+        "are served only for a path the list would name: the snapshot texts the turn "
+        "runner redacted before they were stored, run through _redact_for_display "
+        "again as they are served, since a transcript line stays writable after it.",
+    ),
+    (
         "Slide-deck render screen and conversion diagnostic",
         "dashboard/handlers/office_slides.py",
         "The .pptx/.ppt slide renderer screens the deck's rendered text through "
@@ -884,4 +904,6 @@ _DELIVERY_SINKS: tuple[tuple[str, str, str], ...] = (
         "redactor is handed in by the route rather than chosen here, so the module "
         "applies the gateway's own redactor and cannot substitute a weaker one.",
     ),
+    ("Slack code-channel classifier", "slack/code_channels/classifier.py", "Its model prompt."),
+    ("Slack code-channel diagnostics", "slack/code_channels/client.py", "Logs; credentials only."),
 )

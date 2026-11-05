@@ -109,7 +109,11 @@ When the recorded directory resolves to the current pool default, continuation
 omits the redundant override. Disabled overrides therefore do not reject a turn
 that stays in the default directory. A different recorded directory remains an
 explicit override and must pass current directory policy, including after the
-pool default changes.
+pool default changes. A recorded directory that no longer exists is forwarded
+anyway, so `spawn` refuses it, with one exception: the run's own per-run scratch
+directory (`workspace_root()/<its session key>`, recorded only by a run spawned
+without a cwd and reclaimed when that run ends) is omitted, so the follow-up
+goes where a spawn without a cwd goes (`recorded_cwd_impl`).
 
 A run whose parent session is bound to a remote session environment inherits it
 before its session starts (`coder.session_launch.inherit_environment_for_subagent`):
@@ -410,7 +414,57 @@ same step (`_refuse_row` -> `taskq_fail`): a drained row, and a row `spawn_async
 committed before the read (`_store_accepted`, the default persistent path). A
 committed row is failed the same way when gateway admission closes during the
 read, so a row the caller was told was refused never runs once admission
-reopens. `spawn_async` hands the re-entry the parent's declaration and the
+reopens. That `failed` write is a SETTLE, not a posted write nothing waits for:
+`taskq_fail` runs ONE tracked store task (`_settle_refused_row`) covering the
+write and its verification, recorded under the row's id in the slot the accept
+path already awaits (`_pending_defers`), and every refusal path that returns a
+row the store holds -- `spawn_async`'s accept `finally`, the dispatcher's
+claimed re-entry on its not-registered branch (`claim_and_start`), and its
+drained non-claim branch beside `finish_parked_defer` -- awaits it
+(`await_pending_defer`) before the refusal is handed back, and a drained or
+memory-expired refusal's terminal record -- the `done` entry `GET
+/api/spawn/{id}` reads -- is registered by the settle's completion
+(`register_refused`), not at the refusal. A refusal published over a row still
+ADMITTED is the one state `reconcile_on_boot` requeues without asking, so the
+refusal is HELD until the row reads terminal. Store contention is
+routine, so the retry has no count bound: it paces like a state re-read, backs
+off to a 2-second cap (`_SETTLE_RETRY_BACKOFF_CAP_SECS`), warns once that it is
+holding, and stops only on an answer a retry cannot change (the row reads
+terminal, or a healthy store refused the edge) or when the store is gone; only
+the store's typed failure (`TaskStoreUnavailable`) is retried, and any other
+exception from the write is the row's, not the store's, and ends the settle
+with a warning rather than holding the dispatcher on a write no retry can
+land. Every awaiter joins the task SHIELDED and the entry outlives a cancelled awaiter, so a
+later awaiter of the same id joins the same task and `cancel_all` drains it at
+shutdown. For a `persistent` run the settle writes the refused run's tombstone
+(`write_refusal_tombstone`, `cause="refused"` -- `REFUSAL_TOMBSTONE_CAUSE`, a
+cause no run that started can leave behind) FIRST, where the store cannot
+reach: the boot reconcile asks the artifact probe before it requeues an ADMITTED
+row AND reads it for every row left QUEUED ([taskq](taskq.md) § Reconcile-first
+boot), and that tombstone is the probe's `REFUSED` -- a `failed` for the row,
+and the ONE ending the queued pass acts on -- so a store wedged for the whole
+shutdown drain still ends with the row settled on the next boot -- whether the
+refusal found the row claimed or, as the memory-pressure expiry does, still
+queued, and never started under an id whose tombstone already records an
+ending. The join has one bound, for a `persistent` run only: once that
+tombstone is confirmed on disk (written and read back) and the store has
+refused the `failed` write `_STATE_READ_ATTEMPTS` times, the awaiters are
+released on it, the verdict the next boot settles the row on either way, while
+the settle keeps retrying the store write behind them. With no tombstone (a
+memory-only run, a write the disk refused) the `failed` write is the only
+durable verdict and the CALLER's hold (`spawn_async`) has no bound: a refusal
+published over a row nothing durable records is one a restart reverses. The
+DISPATCHER's wait on the same settle (`_dispatch_async_impl`, `claim_and_start`,
+`await_pending_defer(dispatch=True)`) ends at the read bound tombstone or not:
+the pump runs its picked rows one at a time, and the store converts every
+`sqlite3.Error` into `TaskStoreUnavailable`, so a write that fails for one row
+alone (a damaged page) while every other row's claim succeeds would otherwise
+hold every row behind it. Past the bound the row stays in `_pending_defers` and
+so out of the refill, its terminal record stays unregistered
+(`register_refused` is attached to the settle), and the settle keeps retrying:
+nothing is published early, the pump just stops waiting. A defer write (`taskq_defer_posted`) is awaited the same way: its
+awaiter publishes `queued` on return, and a row whose `next_run_at` is still in
+flight at that point is one a restart dispatches at once. `spawn_async` hands the re-entry the parent's declaration and the
 agent check it read off the loop (`_parent_spawn_policy`, `_agent_check`), so
 neither the allowlist vet nor agent validation scans the agents directory on the
 loop. A spawn with no row to write (non-persistent, or the task queue off) runs
@@ -1518,7 +1572,8 @@ declaration itself (`subagent._vet_parent_available_agents`, called from
   memoized per directory in an `AgentsDirMemo` pinned to
   `agents_dir_revision` (names, mtime AND ctime, size, inode, mode, link
   count, the in-process spec generation, and a SHA-256 of the bytes of any
-  entry younger than the racy window) — a
+  entry younger than the racy window, or of every entry on Windows, where
+  `st_ctime_ns` is creation time) — a
   blocking read, so it never runs on the gateway loop: the
   event-loop entry points resolve `subagent.parent_spawn_policy` (parent
   template + declaration) through `asyncio.to_thread` and hand it to
@@ -1539,8 +1594,9 @@ declaration itself (`subagent._vet_parent_available_agents`, called from
   spec (`cp -p`, `rsync -t`, a restore) would serve its previous, permissive
   allowlist for ever; the non-blocking `cached_agent_specs` serves empty rows
   on a cold cache, and an empty read would admit a spawn the declaration
-  forbids. When the revision cannot prove freshness (Windows, a symlinked
-  spec, an entry younger than two seconds) the walk simply runs uncached.
+  forbids. When the revision cannot prove freshness (a symlinked spec, a
+  young entry it cannot hash, more bytes than its digest budget) the walk
+  simply runs uncached.
 - **Target** = the EFFECTIVE child template (`execution.template_id`: explicit
   `agent`, the inherited parent template, or a `crew=`/`target_member` member's
   `kiro_agent`), matched with `fnmatch.fnmatchcase` against each glob. Only
@@ -2439,6 +2495,8 @@ A record's terminal outcome is three-way, with a **single canonical source**: th
 | `failed` | `error` set | failure (tombstoned, counted in Stats) |
 | `completed` | neither | success |
 
+`outcome` is the coarse fold of `SubagentInfo.ending`, a `SubagentEnding` (`subagent_ending.py`) decided by `classify_ending` in one fixed order: `user_stopped` gives `interrupted_by_parent` (`stopped`); an `error` gives `reaped` when a deadline or the reaper wrote it (`_deadline_ending`, set by the run's own `wait_for` timeout, `_force_reap`'s synthesis and `_record_reap_ending`) and `failed` otherwise, including a run that recorded its own error before a reap tore it down (both `failed`); `partial` without an error gives `partial` (`completed`); anything else is `completed`. The parent's completion announce (`_compose_subagent_completion`) takes its status from the ending, so a reaped run reads `reaped` rather than `failed`, with the error text naming the deadline or limit, and the wave digest marks a completed member partial from it. Nothing else carries the ending: the `subagent_done` frame, tombstones and replays carry `outcome`. The terminal report makes the ending final through `TerminalCoordinator._finish` in one order, settle then record then flip: pending credits are settled, the crew log closer and the terminal metric are written, `done` is set and the report hold armed, and only then is `subagent_done` broadcast.
+
 - A user stop is neutral **in the record itself**: `cancel()` sets `user_stopped=True` and neither it nor `_force_reap` ever synthesizes an `error` for it.
 - **A completed ending is a claim, taken first or not at all.** A run whose stream delivered a whole answer takes `SubagentInfo._ending_claimed` synchronously, before any await, unless a stop already did (`done`, `_reap_started`, `user_stopped`, or an `error` a failed child under `on_child_failure=fail_parent` or an expired wait stamped while its cancel is still scheduled); every stop path then treats the claim as `done` — a Stop returns False (with no stagger-queue lookup, since a registered run is never queued), a parent end and a reap stamp nothing, and neither a failed child under `on_child_failure=fail_parent` nor an expired wait stamps an `error` on it — so a stop landing while the claimed run writes its result can no longer leave the run returning with no ending recorded (see the ending claim under Unexpected-Cancel Recovery).
 - **A reap's echo is recorded as the reap, never as a runtime death.** `_force_reap` tears a dedicated run's session down (`sessions.reset` → `provider.shutdown()` → `runtime.kill(reason="provider shutdown")`) BEFORE it cancels the run task, so the in-flight `client.stream` observes the kill first and raises `AcpProcessDied` — `Runtime process died during prompt — killed (provider shutdown) [returncode=<not reaped>]` — inside `_run`'s `except Exception` arm, ahead of the reaper's own record. That arm reads `_reap_started` together with `agent_sdk.drivers.acp_vocab.is_runtime_death(exc)` (the `AcpProcessDied` test, offered from the driver vocabulary so application code never names the ACP class): both true, the exception is the ECHO of our own teardown; any other exception under a reap is the run's own fault and keeps the existing failure path and traceback and the record names the stop — `_stop_origin` ("stopped by user", "parent conversation ended (<verb>)", "reaped after Ns (<reason>)", written by `cancel()` / `cancel_for_teardown` / `_force_reap` next to the `_reap_started` marker) and the reap's own tombstone cause `_reap_reason` (`user_stop` / `parent_end` / `reaped` / `startup_timeout`; the parent-end teardown writes it before calling `cancel`, a bare `cancel` is the user's Stop, and `_force_reap` fills in its own reason only when none is set — nothing is inferred from the origin text, and every writer assigns only when the field is still empty, so the FIRST stopper keeps the attribution when a user Stop and a parent end race). `tombstone_terminal_state` maps `parent_end` to the task queue's CANCELLED like `user_stop`, so boot reconciliation settles such a row instead of recovering a deliberately ended run. Nothing writes `stage_cancel` any more; tombstones older versions wrote with it still map to CANCELLED (`subagent_manager/admission/types.py`). Neutrality is decided by the FIRST stopper, `SubagentInfo.stop_is_neutral` (`_reap_reason in _NEUTRAL_REAP_REASONS` = `user_stop` / `parent_end`), never by `user_stopped` alone: a Stop that lands while a deadline reap is already tearing the run down sets `user_stopped` too, and both the echo arm and `_force_reap`'s own record put the flag back so the late Stop cannot convert a claimed deadline failure into a neutral stop. A user stop and a parent end stay neutral (`error` unset, `outcome == "stopped"`, partial output preserved); a deadline reap is a failure whose `error` names the deadline. The gateway log gets ONE line — INFO for a user's own stop, WARNING for a parent end or a deadline reap — never `Subagent X failed` at ERROR with a traceback. Recording the death text as the run's error, tombstoned `cause="error"`, sends every reader of a run "dying at random" (a user Stop-all, an identity-sweep parent end) to the provider, the OOM killer and the leak reaper in turn. `_reap_started` (not `reaped`) is the gate because the reaper sets `reaped` late, after the awaits; the record is still first-arrival (`if not info.done`) so the reaper's own synthesis is never duplicated. Pinned by `test_subagent_reap_attribution.py`.
@@ -2575,7 +2633,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 
 - **Side-effect gate**: recovery fires ONLY when `tool_count == 0`. The respawn runs on a fresh session with no ledger of prior tool calls, so once any tool has executed the model cannot verify which side effects already happened — the run is finalized instead (error `"cancelled (auto-continue suppressed: tools already executed …)"`, partial output preserved and delivered). Text-only activity is safe to resume.
 - One-shot: gated by `info._cancel_retry_used`; the recovered run's own cancel is terminal.
-- **Ending claim**: a whole answer — a successful complete event, post-processed into `result` with no await since — takes `info._ending_claimed` synchronously unless a stop got there first (`done`, `_reap_started`, `user_stopped`, a stamped `error`), and records the success stats there. From the claim on, the run ends completed whatever lands: `cancel()`, `cancel_for_teardown` and `_force_reap` (the reaper's too) treat the claim as `done` and stamp nothing, and a cancel, the shutdown or the deadline only cut the tail short — the result write is drained, `done` is set in its `finally`, and every arm of `_run_impl` treats an already-set `done` as first-arrival-wins, its log line saying the run completed. A respawn would re-run finished work, and a failure would discard a whole answer. Because nothing else can end it, the claimed result write is bounded by `_STATE_DRAIN_TIMEOUT` even uncancelled: past it the worker finishes detached under the `_abandoned_state_writers` hold, `done` is set and the flag lands late or not at all, so a wedged filesystem holds the run, its lane slot and its parent for seconds, not until the run deadline. While a claimed run is not yet `done`, `settle_before_delete` answers `pending` (the DELETE route's 409 `completion_delivery_pending`), since its report does not exist yet. A whole answer a stop got to first claims nothing and counts no success, so the stop owns its ending: under a reap in flight the tail records nothing and `_run` writes the reap's ending with the reap-echo arm's own record (`_record_reap_ending`: neutral for a user Stop, a parent end or a stage cancel, a failure naming the deadline otherwise) and leaves the report to the reap, its record naming how far the answer got (`SubagentInfo._answer_finished`, set by the tail: "the run was stopped as it finished its answer" after a complete event, "the runtime was torn down before the run finished" for a stream that just stopped, which also classifies as a normal end of turn; `test_a_reap_in_flight_names_whether_the_answer_had_finished`); a user stop no reap has reached yet records the neutral stop, since `cancel()` stamps `user_stopped` synchronously before it awaits its reap (`test_a_user_stop_no_reap_has_reached_yet_records_the_neutral_stop`); a run another path already ended keeps that record and counts no success (`test_a_run_another_path_already_ended_counts_no_success`). None records `result_complete` (see Gateway Restart Reconciliation). Recording a bare `done` there let the reap's record guard skip, so a deadline-stopped run was reported completed and cleared its session's failure count (`test_a_deadline_reap_that_got_there_first_owns_the_ending`). The per-turn usage row is read synchronously and appended on a task held in `_report_tasks`, so no ending waits for it and `cancel_all()` drains it within its report bound.
+- **Ending claim**: a whole answer — a successful complete event, post-processed into `result` with no await since — takes `info._ending_claimed` synchronously unless a stop got there first (`done`, `_reap_started`, `user_stopped`, a stamped `error`), and records the success stats there. From the claim on, the run ends completed whatever lands: `cancel()`, `cancel_for_teardown` and `_force_reap` (the reaper's too) treat the claim as `done` and stamp nothing, and a cancel, the shutdown or the deadline only cut the tail short — the result write is drained, `done` is set in its `finally`, and every arm of `_run_impl` treats an already-set `done` as first-arrival-wins, its log line saying the run completed. A respawn would re-run finished work, and a failure would discard a whole answer. Because nothing else can end it, the claimed result write is bounded by `_STATE_DRAIN_TIMEOUT` even uncancelled: past it the worker finishes detached under the `_abandoned_state_writers` hold, `done` is set and the flag lands late or not at all, so a wedged filesystem holds the run, its lane slot and its parent for seconds, not until the run deadline. While a claimed run is not yet `done`, `settle_before_delete` answers `pending` (the DELETE route's 409 `completion_delivery_pending`), since its report does not exist yet. A whole answer a stop got to first claims nothing and counts no success, so the stop owns its ending: under a reap in flight the tail records nothing and `_run` writes the reap's ending with the reap-echo arm's own record (`_record_reap_ending`: neutral for a user Stop, a parent end or a stage cancel, a failure naming the deadline otherwise) and leaves the report to the reap, its record naming how far the answer got (`SubagentInfo._answer_finished`, set by the tail: "the run was stopped as it finished its answer" after a complete event, "the runtime was torn down before the run finished" for a stream that just stopped, which also classifies as a normal end of turn; `test_a_reap_in_flight_names_whether_the_answer_had_finished`). The reap-owned report still hands the parent a finished answer: when `_answer_finished` is set the completion (`_compose_subagent_completion`) keeps the stop's outcome and error but carries the answer, named as finished rather than as a partial, so a run that completed under its reap never reaches the parent as only a stop (`test_a_finished_answer_a_reap_got_to_first_reaches_the_parent`); a user stop no reap has reached yet records the neutral stop, since `cancel()` stamps `user_stopped` synchronously before it awaits its reap (`test_a_user_stop_no_reap_has_reached_yet_records_the_neutral_stop`); a run another path already ended keeps that record and counts no success (`test_a_run_another_path_already_ended_counts_no_success`). None records `result_complete` (see Gateway Restart Reconciliation). Recording a bare `done` there let the reap's record guard skip, so a deadline-stopped run was reported completed and cleared its session's failure count (`test_a_deadline_reap_that_got_there_first_owns_the_ending`). The per-turn usage row is read synchronously and appended on a task held in `_report_tasks`, so no ending waits for it and `cancel_all()` drains it within its report bound.
 - Explicit handshake: `_resume` awaits the ORIGINAL task's full teardown (session release/reset, slot decrement, registry pop) before respawning — never a timed sleep.
 - The original task ends CANCELLED: after scheduling the recovery, `_run`'s CancelledError arm re-raises (its finally still runs and reports nothing while `_recovering`). A waiter holding the original task handle therefore sees the cancel (`await task` raises `CancelledError`, a `wait_for`/`timeout` that fired raises `TimeoutError`) instead of a clean completion while the run has moved to `"{id}:recovery"` and has not yet acquired its session (#12607). `_resume` waits with `asyncio.wait`, which is indifferent to how the task ended. The terminal arms (user stop, shutdown, spent one-shot, tool-activity suppression) still return normally.
 - Slot re-acquisition: waits (bounded, `_RECOVERY_SLOT_WAIT_SECS`) for free capacity; the slot claim and `create_task` are ATOMIC (no await between) so a concurrent `_drain_queue` cannot overshoot `max_concurrent`. The dispatcher honours the same invariant from its side with reserve-then-commit: when `spawn_impl` stops at the store claim (`ClaimPoint`) it has ALREADY taken the slot (`_running_count += 1`, stagger token) synchronously, the claim is awaited on the writer thread, and the re-entry (`_claimed=`) consumes that reservation instead of counting again; a claim the store refused or could not take, or a refusal at re-entry, releases it (`release_reservation`). So nothing admitted during the await -- a `spawn`, a `resume_grant`, a recovery re-acquisition -- can take a slot the dispatcher is about to use.
@@ -2753,6 +2811,19 @@ display context before it enters the broadcast digest text.
 Subagent results are routed back to the **originating session** via
 `_subagent_done` in `slack/gateway_runtime/subagent_wiring.py`. The `parent_session_key` on `SubagentInfo`
 tracks which session spawned the subagent.
+
+The parent's tab is looked up first (`_parent_tab`); a tab restored as a
+sidebar row loads its window off the loop before the completion lands. When
+that lookup or load raises (an unreadable stored window), `_subagent_done`
+logs it and treats the tab as closed: the completion takes the parent's own
+route now, as a parked completion does, instead of escaping before any route
+and waiting for the next start's re-announce.
+
+The failure card (`_subagent_event` on `subagent_injection_failed`) and the
+orphan notice (`_orphan_notify`) load a restored tab the same way and treat an
+unreadable window as no tab too. The failure card then goes out as its
+`subagent_injection_failed` frame only, and `_orphan_notify` returns `False`,
+so the manager sends the notice to the owner instead.
 
 ### Two-Level Timeout
 
@@ -3604,6 +3675,10 @@ Where `PreToolUse` runs depends on the backend (`agent_sdk/spec_hooks.py:turn_sp
   (`hook_runtime/hook_dispatch.py:permission_pre_tool_block`, the ladder's
   spec-hooks floor), and can refuse it. The informational `EVENT_TOOL_CALL` fire
   is skipped on such a turn, so each hook runs once.
+- On claude (`ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS` alone) the turn is not
+  gated: it gets the spec's hooks on every event but `PreToolUse`
+  (`spec_hooks.OBSERVER_HOOK_EVENTS`) and keeps the informational fire, and a
+  spec that cannot be read leaves it with none.
 
 The tool name is cached on `EVENT_TOOL_CALL` by `tool_call_id` and looked up
 when the result arrives. The `Running: ` prefix is stripped so both hooks
@@ -3817,6 +3892,19 @@ when the parent's own call already returned every member it carries:
   members whose whole block the reply carries (`_carried_in_reply`; a member
   whose block ends past the `MAX_RESPONSE_LEN` cut is left out). A cancelled,
   refused, abandoned, crashed, torn or brokered answer marks nothing.
+  `spawn_status` sends the same mark for its one run when the read is a full
+  read of a finished run (`done: true`, `outcome: "completed"`, no
+  `offset`/`limit`/`grep`, no `result_meta`) and the whole reply after
+  `sanitize_string` fits within `MAX_RESPONSE_LEN`, because that reply holds
+  the result the completion event carries: it answers through
+  `subagent_read_collected.StatusReadAnswer`, whose `on_answered(True)` POSTs
+  it. A running, paged, grepped, over-cap or failed read, a stopped or failed
+  run, a missing or unknown outcome, and a caller with no resolvable session
+  answer plain text and mark nothing. The live done response includes
+  `outcome` and `stopped`, matching the disk fallback. The
+  gateway applies every rule below to that mark too, so for a parent that
+  settles at release a read in a later turn than the one that spawned the run
+  flags nothing and its completion is still delivered.
 - **Only the caller's own children are marked.** `mark-collected` sets
   `SubagentInfo._collected_inline` on each named record whose
   `parent_session_key` is the authorised claim; an unknown id, another parent's
@@ -3910,8 +3998,10 @@ when the parent's own call already returned every member it carries:
   `_delivered_inline`, asked at the same two points.
 - **The cron route's cleanup never resets under a live turn.** The route's "last
   subagent done" cleanup (`_reset_cron_parent_when_idle`) runs
-  `reset(parent_key, skip_if_busy=True)`, which declines while a turn holds the
-  session. Who holds it decides the rest. Every branch that retires a key goes
+  `reset(parent_key, skip_if_busy=True, skip_if_injecting=True)`, which declines
+  while a turn holds the session or while `_cron_injecting` counts the key.
+  Both are read under the reset's own lock, atomically with the pop. Who holds
+  it decides the rest. Every branch that retires a key goes
   through `CronService.retire_finished_session_key`, which leaves a key the job's
   live run registered (a newer run, waiting for the permit or holding it) to that
   run's own finalizer, unless that run is done with it. Each cron engine marks
@@ -3922,6 +4012,10 @@ when the parent's own call already returned every member it carries:
   again, by any run, takes the mark off:
   - the reset happened, or no session was left: the job's active-session key is
     retired;
+  - the reset declined while `_cron_injecting` still counts the key (another
+    delivery began after this cleanup's own read): the session and the key are
+    left to that delivery, whose own cleanup runs this reset again after it
+    delivers;
   - a cron run's own task holds the permit (`SessionManager.turn_holder` is in
     `_cron_runs_holding`, which `_cron_callback` fills from before the run's
     first acquire to its end): the session and the key are left to that run's

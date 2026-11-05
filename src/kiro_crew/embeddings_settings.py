@@ -18,7 +18,8 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from kiro_crew.config.loader import config_path, read_config_text
+from kiro_crew.config.loader import config_local_path, config_path, read_config_text
+from kiro_crew.config.resolution import _deep_merge
 from kiro_crew.cpu_affinity import affinity_cpu_count
 
 logger = logging.getLogger("kiro_crew.embeddings")
@@ -125,10 +126,11 @@ _N_CTX = 2048
 # compute scratch arena and llama.cpp's per-token output buffer (one row per
 # micro-batch token, 610,772 bytes each for the shipped model) without reducing
 # the accepted context. On the shipped Qwen3 file and the vendored Linux CPU
-# runtime, 256, 512 and 2048 produce byte-identical vectors under last-token
-# pooling; 256 holds 317 MiB less anonymous memory than 512 once a long input
-# has run, at the same embed latency.
-_N_UBATCH = 256
+# runtime, 128, 256, 512 and 2048 produce byte-identical vectors under
+# last-token pooling. 256 holds 317 MiB less anonymous memory than 512 once a
+# long input has run, at the same embed latency, and 128 halves the compute
+# arena and the output buffer again: 83 MiB less than 256, at no more CPU time.
+_N_UBATCH = 128
 # Safety truncation (chars) before inference, sized under _N_CTX at a
 # conservative ~4 chars/token so a clipped input always fits the context
 # window. Only pathological un-chunked blobs exceed this; mirrors the
@@ -280,21 +282,33 @@ _PROGRESS_EVERY_BYTES = 16 << 20
 
 
 def _read_memory_config() -> dict:
-    """Read the raw ``memory`` section of ``config.json``. Never raises.
+    """Read the raw ``memory`` section, ``config.local.json`` over ``config.json``. Never raises.
 
     Read raw rather than through the config loader so the download thread and
     the backend factory never depend on the config dataclass import graph
-    (which imports large parts of the package).
+    (which imports large parts of the package). The overlay's keys win, as they
+    do for the loader: a knob set only in ``config.local.json`` is the one the
+    loader and Settings report, so it must be the one the embedder runs with.
+    A file that is absent or unreadable contributes nothing.
     """
+    # Whole documents are merged before ``memory`` is read, as the loader does: an
+    # overlay ``"memory": null`` replaces the base section rather than vanishing.
+    merged: dict = {}
+    for path in (config_path(), config_local_path()):
+        merged = _deep_merge(merged, _config_document(path))
+    section = merged.get("memory", {})
+    return section if isinstance(section, dict) else {}
+
+
+def _config_document(path) -> dict:
+    """One config file as an object, or ``{}`` when absent or unreadable. Never raises."""
     try:
-        path = config_path()
         if path.exists():
             data = json.loads(read_config_text(path))
-            section = data.get("memory", {})
-            if isinstance(section, dict):
-                return section
+            if isinstance(data, dict):
+                return data
     except Exception:
-        logger.debug("Could not read the memory config section", exc_info=True)
+        logger.debug("Could not read %s for the memory config section", path, exc_info=True)
     return {}
 
 
@@ -437,3 +451,40 @@ def bulk_pace_delay(elapsed: float) -> float:
     if duty >= 1.0:
         return 0.0
     return min(elapsed * (1.0 - duty) / duty, _MAX_BULK_PACE_SLEEP)
+
+
+# ── Child-process inference ──
+
+# Niceness the inference child runs at. The child serves interactive and bulk
+# work alike, so it is lowered once for the whole process: on a busy host the
+# gateway's event loop wins the CPU, and a query that loses too much time to it
+# reaches its own deadline and degrades to keyword search as it does today.
+_CHILD_NICE = 10
+# A request the child is working on that stays unanswered past this budget
+# (base plus a share per text, so a full 8-text bulk batch on one niced thread
+# fits) means a wedged runtime: the child is killed and respawned. It is checked
+# for every outstanding request, including ones whose caller already gave up at
+# its own deadline (30 s for interactive work), so interactive-only traffic still
+# recovers a wedged child.
+_CHILD_CALL_BASE_SECS = 60.0
+_CHILD_CALL_SECS_PER_TEXT = 30.0
+# How long the loader waits for a fresh child to load the model and say ready.
+_CHILD_LOAD_TIMEOUT_SECS = 300.0
+# Respawn backoff after the child dies: 1, 2, 4, ... seconds, capped.
+_CHILD_RESPAWN_BASE_SECS = 1.0
+_CHILD_RESPAWN_CAP_SECS = 300.0
+# A child must stay up this long before an answered embed resets the backoff, so
+# text that crashes the runtime cannot hold the respawn delay at its minimum.
+_CHILD_STABLE_SECS = 60.0
+
+
+def embedding_child_process_enabled() -> bool:
+    """Whether model load and inference run in a child process (``memory``).
+
+    ``memory.embedding_child_process``, default off: the model runs in-process on
+    the inference thread exactly as before. ``true`` moves it to a child. Read
+    raw like the other knobs here; anything but a literal ``true`` keeps the
+    default. Read at each model load, so the switch takes effect at the next
+    load (gateway restart, or the next load after an idle unload).
+    """
+    return _read_memory_config().get("embedding_child_process") is True

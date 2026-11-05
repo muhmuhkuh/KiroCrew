@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 #: the blocking issue, so these sections say "not checked" and move on instead
 #: of aborting the report -- or double-counting the same issue.
 _MEMBER_NAMES_NOT_CHECKED = (
-    "  ⚠️  not checked: the platform did not compose, so stored Crew Member names "
+    "  ⚠️  not checked: the platform did not compose, so stored Bot names "
     "cannot be vetted (see the Platform section above)"
 )
 
@@ -62,12 +62,12 @@ def _doctor_member_dispatchability(cfg: KiroCrewConfig, issues: list[str]) -> No
         return
     noun = "name" if count == 1 else "names"
     print("\nCrew Member Names")
-    print(f"  count:       {count} stored Crew Member {noun} cannot reach a model")
+    print(f"  count:       {count} stored Bot {noun} cannot reach a model")
     print("               Open Crew Manager and create a replacement with a safe name.")
     print("               If needed, make the replacement the default. Then delete the old member.")
     print("               The replacement gets a new member identity. The old member's DM")
     print("               history stays under its old key and is not transferred automatically.")
-    issues.append("stored Crew Member names are not dispatchable")
+    issues.append("stored Bot names are not dispatchable")
 
 
 def _missing_v1_store_remedy(cfg: KiroCrewConfig, member: str, store: object) -> str:
@@ -151,7 +151,7 @@ def _doctor_member_memory_bindings(cfg: KiroCrewConfig, issues: list[str]) -> No
                 # default crewmate onto its own memory knows where it applies.
                 print(
                     "               plain sessions use the default template on Global "
-                    "memory; this store is used only in this crewmate's DM and in "
+                    "memory; this store is used only in this Bot's DM and in "
                     "chats where you pick it"
                 )
     for store, reason in legacy.items():
@@ -527,6 +527,21 @@ def _doctor_agent_auth() -> None:
         if not host_probed:
             host_signed_in = cli_doctor._kiro_cli_signed_in()
             host_probed = True
+        if backend == kas_backend:
+            # KAS on the relay with an empty vault: kiro-cli's store answers this
+            # spawn. The row names that route, and its remedy is the Kiro sign-in,
+            # which the next spawn uses (through kiro-cli, or on Kiro Crew's own
+            # engine when kiro-cli cannot run).
+            if host_signed_in is True:
+                print(f"  {label.ljust(13)}✅ {source} (KAS through kiro-cli's relay)")
+            else:
+                state = "could not check" if host_signed_in is None else "not signed in"
+                glyph = "⚠  " if host_signed_in is None else "⏹ "
+                print(f"  {label.ljust(13)}{glyph}{source}; {state} (KAS through kiro-cli's relay)")
+                render._print_wrapped(remedy)
+            if vault_detail:
+                render._print_wrapped(f"crew vault: {vault_detail}")
+            continue
         if host_signed_in is True:
             print(f"  {label.ljust(13)}✅ {source}")
         elif host_signed_in is None:

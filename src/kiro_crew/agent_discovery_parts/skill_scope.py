@@ -25,6 +25,7 @@ from kiro_crew.agent_discovery_parts.spec_fields import (
 )
 from kiro_crew.agent_discovery_parts.spec_reads import _kiro_agents_dir, _read_agent_spec
 from kiro_crew.agent_discovery_parts.spec_snapshot import parsed_agent_specs
+from kiro_crew.agent_files import KIROCREW_DEFAULT_AGENT_NAMES, WORKER_AGENT_FILENAME
 from kiro_crew.config.paths import project_agents_dir
 
 # Logs under the facade's name, which operators and tests filter on.
@@ -39,10 +40,14 @@ class SkillScopeResolutionError(ValueError):
 # raised class as ``module.qualname``, so the owner module must not leak into it.
 SkillScopeResolutionError.__module__ = "kiro_crew.agent_discovery"
 
-#: The templates that see the whole catalog while they map no skill. The worker
-#: maps exactly the default's ``skill://`` entries (``_mirror_worker_skill_resources``),
-#: so an unmapped worker has an unmapped dispatcher and sees what it sees.
-WHOLE_CATALOG_TEMPLATES = frozenset({"kirocrew", "kirocrew-worker"})
+#: The templates that see the whole catalog while they map no skill: every default
+#: agent (:data:`~kiro_crew.agent_files.KIROCREW_DEFAULT_AGENT_NAMES`, which holds the
+#: crewmate's conductor and worker beside ``kirocrew``) and the dispatch worker. The
+#: worker maps exactly the default's ``skill://`` entries
+#: (``_mirror_worker_skill_resources``), so an unmapped worker has an unmapped
+#: dispatcher and sees what it sees. Built from the default-agent set so a name added
+#: there gets the catalog in ``skill_search`` as it does in the startup directory.
+WHOLE_CATALOG_TEMPLATES = KIROCREW_DEFAULT_AGENT_NAMES | {Path(WORKER_AGENT_FILENAME).stem}
 
 
 def skill_search_refusal(spec: dict[str, Any]) -> str | None:
@@ -99,6 +104,61 @@ def can_inherit_skills(spec: dict[str, Any]) -> bool:
     # tool list keeps that to skill_search: a missing list or a "*" would hand
     # the agent every kirocrew-core tool its author never asked for.
     return isinstance(tools, list) and "*" not in tools
+
+
+#: Whether a mapped crewmate conductor's skills ADD the user's ``~/.kiro/skills`` and
+#: workspace ``.kiro/skills``. A one-release deprecation: the intended scope is the
+#: mapping alone (``docs/decisions/``, "conductors stay simple"), and the next
+#: release sets this to ``False`` and removes it. While it is on, a new crewmate
+#: chat that inherits a skill shows one notice naming the change
+#: (``mate_conductor_inherited_skills``).
+MATE_CONDUCTOR_INHERITS_USER_SKILLS = True
+
+
+def mate_conductor_scope(
+    agent: str, spec: dict[str, Any], globs: list[str], project_dir: str | Path | None
+) -> list[str]:
+    """*globs* for *agent*, with the inherited trees added for the crewmate conductor.
+
+    THE one place the rule lives, so no caller can skip it: ``agent_skill_globs``
+    returns through it on every path (whatever ``inherit_defaults`` a caller
+    passes), and KAS's ``kas_skill_scope._spec_globs`` calls it too. The
+    crewmate's conductor maps only the skills its own prompt names
+    (``service_agents._install_mate_conductor_agent``); that mapping ADDS to the
+    user's ``~/.kiro/skills`` and workspace ``.kiro/skills``, never replaces them.
+    Any other agent, an unmapped conductor (which inherits on its own rule) and a
+    spec that may not inherit get *globs* unchanged. The crewmate worker's mapping
+    is the crewmate's own Abilities choice, so it keeps the rule every mapped
+    agent follows.
+    """
+    from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT
+
+    if (
+        not MATE_CONDUCTOR_INHERITS_USER_SKILLS
+        or agent != MATE_CONDUCTOR_AGENT
+        or not globs
+        or not can_inherit_skills(spec)
+    ):
+        return globs
+    return list(dict.fromkeys([*globs, *inherited_skill_globs(project_dir)]))
+
+
+def mate_conductor_inherited_skills(project_dir: str | Path | None) -> list[str]:
+    """The skill names the crewmate conductor takes from the user's trees, or ``[]``.
+
+    Read through :func:`agent_skill_globs`, so it is empty whenever the conductor
+    inherits nothing: the flag above is off, its spec maps no skill, or it may not
+    inherit. A name is the folder that holds a ``SKILL.md`` in an inherited tree.
+    """
+    import glob
+
+    from kiro_crew.mate_worker import MATE_CONDUCTOR_AGENT
+
+    if not MATE_CONDUCTOR_INHERITS_USER_SKILLS:
+        return []
+    scope = agent_skill_globs(MATE_CONDUCTOR_AGENT, project_dir=project_dir)
+    inherited = [g for g in inherited_skill_globs(project_dir) if g in scope]
+    return sorted({Path(m).parent.name for g in inherited for m in glob.glob(g)})
 
 
 def inherited_skill_globs(
@@ -177,7 +237,10 @@ def agent_skill_globs(
         ]
         if not globs and inherit_defaults and can_inherit_skills(data):
             return inherited_skill_globs(project_dir)
-        return globs
+        # Whatever *inherit_defaults* says: every caller (the session scope, the
+        # injection plan, the triggered-skill filter, KAS's deny rule) reads the
+        # crewmate conductor's mapping through this one rule.
+        return mate_conductor_scope(agent, data, globs, project_dir)
     if project_dir:
         rows = list_agents(agents_dir=agents_dir, project_dir=str(project_dir))
         winner = next((row for row in rows if row.name == agent), None)
@@ -208,7 +271,7 @@ def agent_skill_globs(
             and can_inherit_skills(data)
         ):
             return inherited_skill_globs(project_dir)
-        return globs
+        return mate_conductor_scope(agent, data or {}, globs, project_dir)
     # ``f`` is the ORIGINAL path: ``f.stem`` and ``expand_skill_uri`` below
     # must see it so a symlinked spec's relative globs stay anchored where
     # the symlink lives.
@@ -223,7 +286,7 @@ def agent_skill_globs(
             and can_inherit_skills(data)
         ):
             return inherited_skill_globs(project_dir)
-        return globs
+        return mate_conductor_scope(agent, data, globs, project_dir)
     if strict and agent not in WHOLE_CATALOG_TEMPLATES:
         raise SkillScopeResolutionError(f"Cannot resolve skill scope for agent {agent!r}")
     return []

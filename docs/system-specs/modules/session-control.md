@@ -18,7 +18,7 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 
 | Tool | Route | What it does |
 |------|-------|--------------|
-| `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace, optionally filed into a sidebar folder at creation and pinned to a `model` / `reasoning_effort`; either omitted is filled from the dispatching mate's worker pair, else its own pair (a copy made at creation), else the default. Before any gate, a title is refused with `invalid_title` (400) under `session_rename`'s character rules (control, text-direction and non-allowed format characters, U+2800 anywhere, no visible character), then scrubbed with `_scrub_text` and cut to 200 characters; a cut result that shows nothing is refused the same way, and a blank title is no title |
+| `session_create` | `POST /api/session-control/create` | Open a new session in the caller's workspace, empty unless `message` seeds its first turn through `send_to_target` (the `session_send` path), optionally filed into a sidebar folder at creation and pinned to a `model` / `reasoning_effort`; either omitted is filled from the dispatching mate's worker pair, else its own pair (a copy made at creation), else the default. Before any gate, a title is refused with `invalid_title` (400) under `session_rename`'s character rules (control, text-direction and non-allowed format characters, U+2800 anywhere, no visible character), then scrubbed with `_scrub_text` and cut to 200 characters; a cut result that shows nothing is refused the same way, and a blank title is no title |
 | `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point. The title meets `session_create`'s title rules before any gate (`invalid_title`, 400; scrubbed, cut to 200 characters, a cut result that shows nothing refused, a blank title is no title) |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_end_wait` | `POST /api/session-control/end-wait` | Wake a session the caller CREATED from the `wait` tool early, keeping its turn; any other target is refused `not_creator`, for every caller class |
@@ -502,17 +502,31 @@ design: an agent that has just worked out that a job needs its own session can
 open it pre-named and bound to the right agent, in the caller's workspace, and
 hand the person a key they can read and stop. Without it the person does that by
 hand -- new tab, retype the title, pick the agent -- and the two observation verbs
-have nothing to point at that the agent itself put there. It deliberately does
-NOT seed a first message: that would be delivery.
+have nothing to point at that the agent itself put there. An optional `message`
+seeds the first turn in the same call, through `send_to_target` -- the same
+target gate, size limit, provenance and audit as `session_send` -- so a caller
+never sends to a key it has not read back. A message `session_send` would refuse
+is refused before anything is created; a delivery failure after the create is
+returned next to the key, and the session is kept. A message never skips the
+prompt `session_send` would get: when the user-level spec of the caller's runtime
+template (never a project checkout's copy, which a cloned repository could plant)
+auto-approves
+`session_create` but not `session_send` (the conductors), through `allowedTools`
+or `autoApprove`, or the spec cannot be read, it is refused with `message_needs_send_approval` (403) before any create.
+A project-only template has no user-level spec, so it is refused the same way and
+creates, then calls `session_send`. `session_create` is read with the
+over-matching `mcp_refs.entry_reaches` (reading more refuses more), and
+`session_send` with the strict `mcp_refs.entry_grants`: only the exact ref, `*`,
+a bare `@kirocrew-dashboard`, or `@kirocrew-dashboard/<glob>` (case-sensitive,
+`*` and `?` only) count as granting send. A bare `session_send`, `*_send` or `@*`
+does not, since kiro-cli still prompts for them.
 
 `session_create` also takes an optional `folder` — a folder id or `/`-separated
 human path, resolved with `chat_folder_create`'s `parent` semantics (missing
 segments created, behind the same tree-shaping gate) — and files the slot as
-part of creation (#6118). The caller's OWN slot is filed the same way with
-`chat_folder_file_self` (folder tools, same server): it takes no `session`
-argument, resolves the target from the verified caller key, and so can be
-granted where `chat_folder_move_session` is withheld — a conductor files itself
-in the goal's folder and then creates its workers under `<goal>/<agent>`. Filing is
+part of creation (#6118). No dispatcher spec grants a folder verb or passes
+`folder`: conductor and crewmate guidance creates workers without it
+(rfc-crewmate-workers-under-the-crewmate.md, Design 6). Filing is
 part of creation rather than a second call (`chat_folder_move_session`), because a
 folder deleted between two calls would leave the session unfiled with the create
 already done. The handler assigns `folder_id` inside the same synchronous window
@@ -529,7 +543,10 @@ mutation behind.
 
 Filing into a folder also gives the child that folder's nearest inherited project
 directory as its project, as dashboard-native creation does; the workspace and
-memory boundary stay the caller's. An invalid folder project refuses the create
+memory boundary stay the caller's. Without a folder project the child takes the
+caller's own project, re-validated (absolute, existing, not a sensitive path),
+and the workspace default when the caller has none
+(`_inherited_project_dir` in `session_create.py`). An invalid folder project refuses the create
 with 400 `folder_project_invalid`, and a folder whose project changes while the
 creation is in flight refuses with 409 `folder_target_changed`.
 
@@ -543,8 +560,7 @@ leaves the child unfiled; the reply carries `folder_ignored: "crew_mode"` when
 a folder was named and `crew_mode: true` whenever the caller is in such a tree.
 `session_fork` from such a caller clears even the folder the source transcript
 carried before the child's first save and answers the same two fields.
-`chat_folder_file_self` from such a caller is a no-op that says where the
-session stays. The MCP tools' replies say "unfiled (this chat is in Crew Mode)"
+The MCP tools' replies say "unfiled (this chat is in Crew Mode)"
 so the agent does not report a filing that did not happen.
 
 `session_create` also takes an optional `agent_kind`, with one value: `template`.
@@ -1282,9 +1298,17 @@ A private member store is reachable on two authorities and no others:
   caller's own claim. The vouched identity is written only by
   `bind_session_execution`, which no session can reach, and only when the store it
   publishes was established independently of that record — a publication that
-  carries the owner over FROM the record, as a provider template switch or a
-  dashboard fork does, does not vouch for it, because vouching a value the session
-  chose would make the two sources one. Claiming it is OPT-IN: the default is not to
+  carries the owner over FROM the record, as a provider template switch does, does
+  not vouch for it, because vouching a value the session chose would make the two
+  sources one. A dashboard fork also copies its child's identity from the source's
+  record, so it vouches only on this gateway's own word about the source:
+  `source_vouch_agrees` answers yes when the source's in-memory vouch, or after a
+  restart its durable vouch copy while config still gives that member that store,
+  names the same member, store and memory mode the child copied. A source record
+  rewritten to a peer's store disagrees with that word, so its fork publishes
+  unvouched. The same rule covers an agent's `session_fork`, which reaches the same
+  binder through `fork_slot` after its caller passes `authorize_target` on the
+  source. Claiming it is OPT-IN: the default is not to
   vouch, so a binder that says nothing about provenance publishes the record and
   claims no authority, and a caller that should have claimed it fails loudly at a
   refused dispatch rather than quietly widening access. An owner's pick of a member
@@ -1321,11 +1345,15 @@ automatic: own-store dispatch self-heals at the next gate-verified admission, wh
 member DM key agrees with its record and the config, or the durable
 `vouched-executions/` copy agrees (`revouch_at_verified_admission`). Only when neither
 source agrees does a member session's worker dispatch keep answering
-`memory_delegation_denied`; the fallback is the owner re-selecting that member's agent
-on the slot, which binds afresh through the durable path and vouches again.
-Re-selecting the agent the slot already names is enough: the owner-facing switch
-records the selection with `replace`, so it re-binds rather than short-circuiting on an
-unchanged choice. Closing a tab is NOT such a trigger — a non-destructive close and an
+`memory_delegation_denied`; the fallback is the owner running the dispatch from their
+own chat tab, or starting a new chat with that member's agent and dispatching from
+there. A new member chat is vouched when it is created, because the vouching binder
+(`_pin_private_agent_assignment`) runs while a chat has no messages. Picking an agent
+again on the refused chat does not recover it: a different member is refused
+`member_session_pinned`, and the same agent is recorded through
+`record_agent_selection(replace=True)`, which re-publishes the record without vouching.
+The `session_create` tool reply names only the remedies that work
+(`_create_refusal_remedy`). Closing a tab is NOT such a trigger — a non-destructive close and an
 idle archive both retain a persistent session's vouch, because the conversation is
 recreated from the warm pool on resume and the turn-start rebind publishes nothing when
 the selection has not changed, so withdrawing there would charge a restart's refusal to
@@ -1520,9 +1548,8 @@ injection would strip a member thread of its tools mid-conversation. On the
 KAS backend the wire agent projection additionally grants the server in
 `tools` plus the member's approval-free dashboard verbs in `allowedTools`
 (ceiling-filtered like every other grant): `_MEMBER_DASHBOARD_GRANTS`, the
-conductor's set (`_CONDUCTOR_DASHBOARD_GRANTS`: `chat_folder_tree`,
-`chat_folder_create`, `chat_folder_file_self`, `session_create`,
-`session_read_message`, `session_status`) plus `session_send`,
+conductor's set (`_CONDUCTOR_DASHBOARD_GRANTS`: `session_create`,
+`session_read_message`, `session_status`; no folder verb) plus `session_send`,
 `session_broadcast`, `session_stop`, `session_retry` and `session_close` — the write verbs are safe to auto-approve for a member *specifically* because the
 `created_by` ownership fence above bounds them to worker sessions the member
 itself opened. Member sessions also bypass the provider warm pool
@@ -2462,6 +2489,8 @@ With the switch on, a peer's `crew_busy` refusal of the create keeps its code (`
 
 With the switch on, `work_ledger_read` first pulls each open remote item (at most 32 per read, 4 s each and 6 s per read, tried longest-ago first), reading the roster under the board lock: the crew's slot list (`running`, `pending_approval`, and `closed` when a complete list lacks the slot) and `GET api/chat/slots/{s}/work-item`. Under the board lock, and only while the item still names the same crew and slot, the peer worker's LATEST fields (`status`, `summary`, `artifacts`, `pr`, `reason`, stamped with the peer's `last_report_at`) are filed as an ordinary recorded `report` (actor `worker`, `by` the peer slot, `board_copy`), unless the hub item already holds exactly those values or the snapshot is older than the item's `last_report_at`. Worker fields are latest-value, so the item is the dedupe and nothing else is remembered between reads; a status the worker passed through between two reads is not kept. The report passes the peer's own report schema, redaction and one-line fit; one that fails is not filed and the row says why. What the pull learnt is kept in `work-ledger/remote/<board>/<item>.json`, outside the board directory, so a rebuild never prunes it. A crew that is down, skewed or unreadable keeps the last answers and sets `crew_state`, `crew_down_since` and `remote_error`; nothing is ever invented as a status.
 
+With the switch on, the hub also runs that pull with no model turn (`dashboard/handlers/remote_puller.py`): every 30 s (`work_ledger.REMOTE_PULL_INTERVAL_SECS`) it pulls each ledger here holding an open crew-bound item (`work_ledger.boards_with_open_remote`), at most 8 boards at once and 64 per run, each board cut off at 10 s, so one unreachable crew never stalls another. Runs never overlap, and a board a read is already pulling is skipped, as is a board whose cache is flagged dirty (it waits for a rebuild). A filing the crew log refuses is retried for the same peer snapshot (stamp and worker fields) only after 10 minutes (`remote_ingest.UNRECORDED_RETRY_SECS`), on a read too; a changed snapshot is filed at once. A pulled report is filed exactly as on a read, so `conductor_wake` and the work-ledger probe wake the conductor for a remote `done`, `question`, `blocked` or `reply` within one interval. The task starts at boot when the switch is on, and again on a crew bind or a ledger read; it ends at its next run once the switch is off, and the dashboard's cleanup stops it. The person-wait hold (`probes/work_ledger.py` `person_wait_fingerprint`) applies to a board with a remote item only while every remote item's last pull is fresh (`work_ledger.remote_pull_fresh`: connected, slot list read, no error, under 90 s old); a stale or failed pull, or the switch off, lets the patrol run.
+
 A remote row adds `worker_instance_id`, `crew_state`, `crew_down_since`, `pending_approval` and `remote_error` (compact rows too). Its `stale`, the Crew board's and the work-ledger probe's stall wake all answer liveness from that stored record through `work_ledger.item_liveness`, never from this gateway's slot table; with no pull yet it reads neither running nor closed. A recorded `decide` on a remote item then PATCHes `api/chat/slots/{s}/work-item {decision}` (scrubbed); the reply carries `remote_decide` `{ok}` or `{ok: false, code}`, and the local decision stands either way. The whole forward (its per-item lock, the settled read and the PATCH) is bounded at 10 s (`DECIDE_DEADLINE_SECS`), under the record tool's 30 s wait, and past it answers `crew_decide_timeout`. The pull and the forward run on a patrol wake too; see the patrol-wake exception under the owner-only caller rule. With the switch off none of this runs and a board with no remote item reads and records exactly as before.
 
 ### Wave 5: the hub picks the crew
@@ -2493,6 +2522,14 @@ An idle session with few MCP servers is 0.6 GB; one with the usual MCP servers i
 Disk: a fresh `git clone --filter=blob:none` of the repository is 983 MB (356 MB of it `.git`), `website/node_modules` after `npm ci` is 869 MB, and an existing worktree's backend virtualenv is 430 MB (sizes from `du`): 2.3 GB for one self-contained worker. The default doubles that for build output, test temp files and repository growth.
 
 Why fixed defaults and not a peer-reported per-worker figure: a fixed default changes two numbers and no wire format, older peers and hubs agree on it, and the peer gate already reads live free memory and disk on every create, so a worker that outgrows the estimate shrinks the headroom the next create on that crew is checked against. A peer-reported average would add a reply field, sampling state on the peer and a trust question about a number the hub cannot check, for a ranking the peer gate overrides anyway.
+
+### Wave 8: retire and redispatch
+
+With the switch on, the conductor's `work_ledger_read` retires a remote binding whose crew this hub process has seen unreachable, on each read's own tunnel state and in the stored record, for longer than `work_ledger.remote_dispatch_retire_minutes` (default 30). `ingest_board` also runs from the hub's background puller (`dashboard/handlers/remote_puller.py`) with no conductor turn, so `_retire_overdue` can retire a binding, leave it `redispatch_due`, and close its old slot on reconnect, with nobody watching; the redispatch itself still waits for a turn the owner sends. With the switch off the puller never starts. The clock is monotonic and in memory: it starts at the first read after process start that sees the crew down, so a stored `crew_down_since` from before a restart, and time the host spent asleep, never count; a read that sees the crew `connected` or `connecting` stops it (`connecting` also clears `crew_down_since`). The retire is a recorded conductor write (action and event kind `retire`, `dashboard/handlers/remote_ingest.py` `_retire_overdue`, store `work_ledger.apply_remote_retire`): the pair moves into the item's `retired_bindings` (oldest first, at most 8: a `destroyed` entry is dropped first, a `retired` one never, so a ninth retire while all eight are `retired` is refused `retired_history_full` and the binding stays) with the worker's last `artifacts.branch`, the reason `crew_unreachable` and a stamp, and the item stays open and unbound. The item's remote record names the binding it describes (`RemoteState.binding`) and starts fresh after a retire, so a later binding is timed from its own crew and its reports are not held against the retired worker's last stamp: the report floor belongs to the binding (`RemoteState.report_floor`), never the item. A retired item with no readable record has no floor; only an item never retired falls back to its `last_report_at`. If that fresh record fails to store, the old one still names the retired pair and the item is fenced: nothing is ingested on it, a bind is refused `crew_retire_pending`, and each later read retries the store. A rebuild from the crew log keeps the history and the unbound pair.
+
+Only the current binding is read. Ingest pulls only the pair the item holds, so a report a retired worker files later, `done` included, is never applied. The retire drops the slot from the in-memory dispatch record (no peer call), so `send`, `read` and `stop` reach only the current binding and refuse a retired slot without reading the history (`crew_target_retired` when the history names it, else `crew_target_not_dispatched`), and the slot stops counting against its caller's crew-session cap. A retire that does not land puts the slot back for every caller that held it. Evict, write and restore run under the cap lock (`remote_dispatch_routes.cap_lock`), which a `session_create(crew=)` also takes for its cap check and for its record, so the cap never reads a record a retire is still settling. A `session_close(crew=)` of a retired slot is admitted only when the history can be read and holds it. When a retired binding's crew reads `connected` again, the read starts one close of the old slot (`DELETE api/chat/slots/{slot}`, its own task, so it never delays the read); a 2xx, or a 404 `slot_not_found`, records `destroy` and the entry reads `destroyed`. Each slot is tried once per hub process, never in a retry loop: a failed close leaves the entry `retired`, still close-only, and the owner's `session_close(crew=)` closes it and records `destroy` too.
+
+The read row of an item with retired bindings adds `redispatch_due` (open and unbound) and `retired_crews`, compact rows included. The redispatch is the conductor's own `session_create(work_item=)`, so it needs a turn the owner sent, as every crew create does: a patrol wake shows `redispatch_due` and cannot place. Placement skips every crew in `retired_crews`, and its reply carries `previous_branch`, the retired worker's last pushed branch, for the seed; the conductor names a new branch, so two workers never push to one. The peer half (replacing a closed worker on the same crew, removing an empty `hub:` mailbox list) is wave 8b.
 
 ## Configuration
 

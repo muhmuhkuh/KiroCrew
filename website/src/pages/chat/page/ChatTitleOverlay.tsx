@@ -2,6 +2,7 @@ import { forwardRef, type ComponentPropsWithoutRef, type MutableRefObject, type 
 import { CrewWorkerBreadcrumb } from '../../../components/crew/CrewWorkerBreadcrumb'
 import { Undo2, ExternalLink, Columns2 } from 'lucide-react'
 import type { SidePanelDock } from '../../../hooks/useSidePanelDock'
+import type { SplitDir } from '../../../hooks/useSessionGrid'
 import type { AppDispatch } from '../../../store'
 import type { ChatSlot } from '../../../types'
 import type { ErrorReport } from '../../../utils/errorReport'
@@ -53,7 +54,7 @@ interface ChatTitleOverlayProps {
   title: string
   activeIsSplitAnchor: boolean
   editingTitle: boolean
-  enterSplit: (anchor: string | null) => void
+  enterSplit: (anchor: string | null, dir?: SplitDir) => void
   setEditingTitleSlot: Dispatch<SetStateAction<string | null>>
   setSidebarPinned: Dispatch<SetStateAction<boolean>>
   sidebarAutoHidden: MutableRefObject<boolean | null>
@@ -115,7 +116,9 @@ export default function ChatTitleOverlay({
           what a phone keyboard does — where they painted over the caret.
           Scoping the lift to the edit is safe because opening the drawer
           blurs the input, which commits and closes the editor. */}
-      <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties} {...{ [SELECTION_INERT_ATTR]: '' }}>
+      {/* `data-transcript-top-overlay`: what the transcript scrolls under; a card
+          that must keep its header visible measures it (browserLiveClearance). */}
+      <div className={`absolute top-0 left-0 right-1.5 ${editingTitle ? 'z-[47]' : 'z-[45]'} pointer-events-none`} style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties} {...{ [SELECTION_INERT_ATTR]: '' }} data-transcript-top-overlay="">
         {/* The row's left padding GLIDES between its open (20px) and
             collapsed (60px, clearing the stationary toggle + divider)
             values on the same 320ms curve as the panel — an instant
@@ -130,7 +133,8 @@ export default function ChatTitleOverlay({
             worker this is and the way back are always on screen. */}
         {currentCrewRoot && currentSlot && (
           <div className={`relative pr-4 ${!isMobile && embedMode !== 'chat' && filteredSlots.length > 0 && !sidebarOpen ? 'pl-[60px]' : 'pl-4'} pt-[9px] pb-2 flex items-center bg-bg border-b border-border`} data-testid="crew-worker-header">
-            <CrewWorkerBreadcrumb root={currentCrewRoot} worker={currentSlot} />
+            {/* Keyed by member: a reopen-failed notice belongs to the member it was about. */}
+            <CrewWorkerBreadcrumb key={currentSlot.key} root={currentCrewRoot} worker={currentSlot} />
             {/* The panel's open control, which the title row carries and the
                 breadcrumb replaces: with the panel closed, one click brings the
                 Workers list back beside the worker. */}
@@ -182,6 +186,7 @@ export default function ChatTitleOverlay({
             mode={effectiveMode}
             sidebarOnScreen={sidebarOnScreen}
             newSessionHere={embedMode !== 'chat' && isMobile ? mobileNewSessionItem : undefined}
+            onSplitDown={!embedMode && splitFeatureEnabled && activeSlot && !(splitAnchorForActive && !activeIsSplitAnchor) ? () => enterSplit(activeSlot, 'down') : undefined}
           />
           </div>
           {/* Shared with every split-view pane header (#9727). The editor

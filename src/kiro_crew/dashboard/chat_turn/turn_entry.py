@@ -12,17 +12,17 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.agent_sdk.drivers.acp_vocab import EngineFallbackWalk
 from kiro_crew.dashboard.poisoned_escalation import PoisonedConversationEscalation
 from kiro_crew.dashboard.state import SUBAGENT_SYNTHESIS_PROMPT, row_mid
 from kiro_crew.llm_helpers import _NO_PRIOR_STATS
 from kiro_crew.metrics.usage_attrs import set_current_trigger, trigger_for_dashboard_turn
 from kiro_crew.security import StreamRedactor
-from kiro_crew.start_priority import person_priority
+from kiro_crew.start_priority import StartPriority, person_priority
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.chat_runner import (
         ReplayFamily,
-        StartPriority,
         effective_session_key,
         logger,
     )
@@ -314,6 +314,7 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
         user_origin=_directive_user_origin,
         crew_log_actor=_crew_log_actor,
         provenance_restored=_turn_provenance_restored,
+        start_background=turn._turn_start_background,
     )
     turn._turn_priority = _turn_priority
     # Append-only the session's log identity, declared HERE rather than only where
@@ -368,6 +369,14 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     #: message, which can carry a path or a credential.
     _crew_log_error = ""
     turn._crew_log_error = _crew_log_error
+
+    #: The body of the dead-turn bell entry, set by a terminal
+    #: non-retry error arm (stop-reason or exception) to the one-line text for
+    #: the operator; None when the turn did not end in a death that needs them.
+    #: The finally closer reads it and fires the note ONCE, so the bell is wired
+    #: at a single choke point and a future terminal arm is covered by setting
+    #: this flag rather than by remembering a scattered call.
+    turn.died_notice = None
 
     # Time-to-first-token clock: starts when the user's message reaches the
     # runner, stops at the first visible model output (text OR thinking chunk).
@@ -439,8 +448,6 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # object must hold it before the cut is published on the slot. Nothing touches it
     # between here and the flag block.
     turn._produced_visible_output = False
-    last_heartbeat = time.time()
-    turn.last_heartbeat = last_heartbeat
     # Continues the slot's counter rather than starting at 0: seqs are ordered
     # across turns so a client floor from an earlier turn sits below every
     # chunk of this one (see _ChatSlot._chunk_seq).
@@ -682,6 +689,10 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # call time.
     _seen_tool_identity: dict[str, tuple[str, str]] = {}
     turn._seen_tool_identity = _seen_tool_identity
+    # tool_call_id -> the receipt selector of a ``session_send`` call
+    # (``session_send_receipts.call_selector`` over its raw arguments), so its
+    # completed result can pick up what the gateway delivered.
+    turn._send_receipt_selectors = {}
     # A worker-tool call the harness never delivered (undelivered_call_watch):
     # built lazily on the first tool call, once the turn's provider is known.
     turn._undelivered_watch = None
@@ -919,6 +930,10 @@ async def _turn_open(turn: _ChatTurn) -> _Flow | None:
     # teardown before that, so it must be bound up front.
     _stop_reason = ""
     turn._stop_reason = _stop_reason
+    # The engine's own fallback hops this turn (acp/engine_fallback.py). Bound up
+    # front for the same reason: _run_chat's finally ends the walk with a notice.
+    _engine_fallback_walk = EngineFallbackWalk()
+    turn._engine_fallback_walk = _engine_fallback_walk
     # Replay settlement also lives in _turn_settle_debts. Bind at turn scope because
     # config, binding and session-start failures can reach teardown before the
     # acquisition block in _turn_admit determines whether replay is pending.
@@ -1037,7 +1052,11 @@ async def _turn_release_handles(turn: _ChatTurn) -> None:
 
 
 def _turn_start_priority(
-    *, user_origin: bool, crew_log_actor: str, provenance_restored: bool
+    *,
+    user_origin: bool,
+    crew_log_actor: str,
+    provenance_restored: bool,
+    start_background: bool = False,
 ) -> StartPriority:
     """The start priority of a turn's cold start (rule: ``kiro_crew.start_priority``).
 
@@ -1047,5 +1066,12 @@ def _turn_start_priority(
     covers a typed turn, a person's Resume/Continue press and the runner's requeue
     of a person's failed turn; a self-wake, a dispatch-named actor (cron, sub-agent,
     gateway, app, crew) or a restored queue entry starts BACKGROUND.
+
+    *start_background* drops a person's turn to BACKGROUND when its queue entries
+    asked for it: the bulk Resume answers its request at once, so nobody waits on
+    any one of the starts it leads to, and FOREGROUND would put each of them in
+    the person-only reserve ahead of the owner's next typed message.
     """
+    if start_background:
+        return StartPriority.BACKGROUND
     return person_priority(user_origin and crew_log_actor == "user" and not provenance_restored)

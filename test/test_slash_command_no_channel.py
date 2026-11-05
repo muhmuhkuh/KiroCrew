@@ -17,7 +17,7 @@ to the model as text.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from chat_test_helpers import _make_state
@@ -106,7 +106,7 @@ class TestKasClear:
         dispatched.assert_not_called()
         state.sessions.get_or_create.assert_not_called()
         state.sessions.discard_conversation.assert_awaited_once_with(
-            effective_session_key(slot), replay=False, skip_if_busy=True
+            effective_session_key(slot), replay=False, skip_if_busy=True, refuse_if=ANY
         )
         assert any("Conversation cleared" in t for t in _texts(slot)), _texts(slot)
         # The plan goes with the conversation, or the fresh one rebuilds it.
@@ -150,7 +150,9 @@ class TestKasClear:
 
 class TestKasOtherCommands:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("command", ["/help", "/context add x", "/usage"])
+    @pytest.mark.parametrize(
+        "command", ["/hooks", "/context add x", "/agent create x", "/changelog"]
+    )
     async def test_unrunnable_command_is_refused_not_prompted(self, tmp_path, command) -> None:
         state, slot, dispatched = _live(tmp_path, ACP_BACKEND_KAS)
 
@@ -213,7 +215,7 @@ class TestOtherHarnessesClear:
         dispatched.assert_not_called()
         state.sessions.get_or_create.assert_not_called()
         state.sessions.discard_conversation.assert_awaited_once_with(
-            effective_session_key(slot), replay=False, skip_if_busy=True
+            effective_session_key(slot), replay=False, skip_if_busy=True, refuse_if=ANY
         )
         assert any("Conversation cleared" in t for t in _texts(slot)), _texts(slot)
         assert slot.todo_payload() is None
@@ -235,9 +237,13 @@ class TestOtherHarnessesClear:
     async def test_goose_runs_its_own_clear(self, tmp_path) -> None:
         """goose's prompt handler runs ``/clear`` itself, so it is sent on."""
         state, slot, dispatched = _live(tmp_path, ACP_BACKEND_GOOSE)
+        slot.set_todo({"description": "plan", "tasks": [{"id": "1", "task_description": "a"}]})
 
         await _run_chat(state, slot, "/clear")
 
+        # Nothing was cleared locally: the slot keeps its todo and shows no notice.
+        assert slot.todo_payload() is not None
+        assert not any("Conversation cleared" in t for t in _texts(slot)), _texts(slot)
         assert dispatched.called
         state.sessions.discard_conversation.assert_not_awaited()
 
@@ -246,9 +252,13 @@ class TestKiroUnchanged:
     @pytest.mark.asyncio
     async def test_kiro_clear_still_runs_natively(self, tmp_path) -> None:
         state, slot, dispatched = _live(tmp_path, ACP_BACKEND_KIRO)
+        slot.set_todo({"description": "plan", "tasks": [{"id": "1", "task_description": "a"}]})
 
         await _run_chat(state, slot, "/clear")
 
+        # Nothing was cleared locally: the slot keeps its todo and shows no notice.
+        assert slot.todo_payload() is not None
+        assert not any("Conversation cleared" in t for t in _texts(slot)), _texts(slot)
         dispatched.assert_called_once_with("/clear")
         state.sessions.discard_conversation.assert_not_awaited()
 
@@ -283,10 +293,10 @@ class TestKasMenuMatchesTheGate:
     async def test_every_command_left_out_of_the_menu_is_one_the_gate_refuses(
         self, tmp_path
     ) -> None:
-        """RED on main: the KAS menu listed /context, /help and the rest."""
+        """Every command the KAS menu leaves out (/hooks, /changelog, ...) gets the notice."""
         listed = await _menu_names(ACP_BACKEND_KAS)
         left_out = _SLASH_COMMANDS - _BLOCKED_SLASH_COMMANDS - listed
-        assert {"/context", "/help", "/usage"} <= left_out
+        assert {"/changelog", "/code", "/experiment", "/hooks", "/logdump"} <= left_out
 
         for command in sorted(left_out):
             state, slot, dispatched = _live(tmp_path, ACP_BACKEND_KAS)
@@ -303,12 +313,15 @@ class TestKasMenuMatchesTheGate:
             "/agent",
             "/clear",
             "/compact",
+            "/context",
             "/goal",
+            "/help",
             "/mcp",
             "/model",
             "/prompts",
             "/side",
             "/tools",
+            "/usage",
             "/workflow",
         }
 
@@ -324,10 +337,10 @@ class TestKasMenuMatchesTheGate:
         )
         state, slot, dispatched = _live(tmp_path, ACP_BACKEND_CODEX)
 
-        await _run_chat(state, slot, "/help")
+        await _run_chat(state, slot, "/hooks")
 
         dispatched.assert_not_called()
-        assert any("`/help`" in t for t in _texts(slot)), _texts(slot)
+        assert any("`/hooks`" in t for t in _texts(slot)), _texts(slot)
 
     @pytest.mark.asyncio
     async def test_kiro_menu_is_unchanged(self) -> None:
@@ -363,21 +376,25 @@ class TestStrandsCommandsAreServedHere:
 
     @pytest.mark.asyncio
     async def test_the_menu_lists_only_what_the_dashboard_serves(self) -> None:
-        """KAS's /model, /tools and /mcp read KAS's own registration, so they are
+        """KAS's local answers read state only a KAS session has, so they are
         left out of a Strands menu, which keeps every other dashboard command."""
         kas = await _menu_names(ACP_BACKEND_KAS)
-        assert await _menu_names(ACP_BACKEND_STRANDS) == kas - {"/model", "/tools", "/mcp"}
+        kas_only = {"/context", "/help", "/mcp", "/model", "/tools", "/usage"}
+        assert await _menu_names(ACP_BACKEND_STRANDS) == kas - kas_only
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("command", ["/model", "/tools", "/mcp"])
+    @pytest.mark.parametrize(
+        "command", ["/model", "/tools", "/mcp", "/context", "/usage", "/help", "/agent list"]
+    )
     async def test_a_kas_inspect_command_gets_the_strands_notice(self, tmp_path, command) -> None:
         state, slot, dispatched = _live(tmp_path, ACP_BACKEND_STRANDS)
 
         await _run_chat(state, slot, command)
 
         dispatched.assert_not_called()
+        first = command.split()[0]
         assert any(
-            f"`{command}`" in t and "doesn't work with Strands" in t for t in _texts(slot)
+            f"`{first}`" in t and "doesn't work with Strands" in t for t in _texts(slot)
         ), _texts(slot)
 
 
@@ -390,4 +407,7 @@ def test_only_kas_is_served_its_own_inspect_commands() -> None:
 
     served = _DASHBOARD_SERVED_SLASH_COMMANDS
     assert served_slash_commands(ACP_BACKEND_KAS, served) == served
-    assert served_slash_commands(ACP_BACKEND_STRANDS, served) == served - KAS_LOCAL_INSPECT_COMMANDS
+    # ``/agent <name>`` is Crew's own switch on every harness, so ``/agent`` stays.
+    assert served_slash_commands(ACP_BACKEND_STRANDS, served) == served - (
+        KAS_LOCAL_INSPECT_COMMANDS - {"/agent"}
+    )

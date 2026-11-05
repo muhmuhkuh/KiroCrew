@@ -63,7 +63,12 @@ from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.metrics import work as work_metrics
 from kiro_crew.validation import WORK_LEDGER_RECORD_SCHEMA, ValidationError, validate_tool_args
 from kiro_crew.work_ledger import WorkLedgerError
-from kiro_crew.work_vocab import WORK_CONDUCTOR_FIELDS
+from kiro_crew.work_vocab import (
+    WORK_CONDUCTOR_FIELDS,
+    WORK_MAX_ARTIFACT_VALUE_CHARS,
+    WORK_MAX_DEPTH_MAX,
+    WORK_MAX_RETIRE_REASON_CHARS,
+)
 
 logger = logging.getLogger("kiro_crew.dashboard.handlers.work_ledger")
 
@@ -176,12 +181,13 @@ async def _record_conductor_write(
         generation=_WIDEST_HEX_ID,
         goal=cleaned.get("goal"),
         round=_WIDEST_COUNTER,
-        depth=work_ledger.MAX_DEPTH,
+        depth=WORK_MAX_DEPTH_MAX,
         parent_item=_WIDEST_ITEM_ID,
         title=cleaned.get("title"),
         acceptance=cleaned.get("acceptance"),
         worker_session_key=cleaned.get("worker_session_key"),
         worker_instance_id=cleaned.get("worker_instance_id"),
+        retired_bindings=(_widest_retired_bindings() if action in ("retire", "destroy") else None),
         decision=probe_decision,
         verdict=cleaned.get("verdict"),
         state="abandoned",
@@ -210,7 +216,7 @@ async def _record_conductor_write(
             item_id=cleaned.get("item_id") or _WIDEST_ITEM_ID,
             generation=_WIDEST_HEX_ID,
             round=_WIDEST_COUNTER,
-            depth=work_ledger.MAX_DEPTH,
+            depth=WORK_MAX_DEPTH_MAX,
             parent_item=_WIDEST_ITEM_ID,
             fails=_WIDEST_COUNTER,
             event=_WIDEST_EVENT_TEXT,
@@ -323,14 +329,17 @@ async def _record_conductor_write(
                 title=getattr(item, "title", None) if "title" in sets else None,
                 acceptance=getattr(item, "acceptance", None) if "acceptance" in sets else None,
                 worker_session_key=(
-                    getattr(item, "worker_session_key", None)
+                    _set_pair_field(action, getattr(item, "worker_session_key", None))
                     if "worker_session_key" in sets
                     else None
                 ),
                 worker_instance_id=(
-                    getattr(item, "worker_instance_id", None)
+                    _set_pair_field(action, getattr(item, "worker_instance_id", None))
                     if "worker_instance_id" in sets
                     else None
+                ),
+                retired_bindings=(
+                    getattr(item, "retired_bindings", None) if "retired_bindings" in sets else None
                 ),
                 decision=getattr(item, "decision", None) if "decision" in sets else None,
                 verdict=getattr(item, "verdict", None) if "verdict" in sets else None,
@@ -806,11 +815,19 @@ async def _bootstrap(key: str) -> None | web.Response:
 
     A session that is ITSELF bound to an item is a second-level conductor, so its
     depth is one past its parent's and its ``parent_item`` is the item it was
-    dispatched for. :func:`work_ledger.child_depth` refuses past the cap, which
+    dispatched for. An existing ledger is returned untouched. For a new one,
+    :func:`work_ledger.child_depth` refuses past the cap, which
     is how a grandchild is stopped from conducting — the refusal surfaces as
     ``depth_exceeded`` (409) at the moment the child tries to open a ledger,
     rather than later when it tries to create an item.
     """
+    # A ledger that already exists keeps working whatever the cap has become since it
+    # opened: lowering ``work_ledger.max_depth`` refuses NEW ledgers and new items past
+    # the cap (``child_depth`` below, ``create`` in the store), never a ``goal`` update
+    # of a ledger that is already open. An unreadable header reads as absent here, so it
+    # falls through to the normal path and its strict re-read.
+    if await asyncio.to_thread(work_ledger.read_conductor, key) is not None:
+        return None
     depth = 0
     parent_item: str | None = None
     binding = await asyncio.to_thread(work_ledger.read_binding, key)
@@ -840,7 +857,8 @@ async def _bootstrap(key: str) -> None | web.Response:
                 "readable.",
             )
         try:
-            depth = work_ledger.child_depth(parent.depth)
+            # Off the loop: the cap comes from the config file.
+            depth = await asyncio.to_thread(work_ledger.child_depth, parent.depth)
         except WorkLedgerError as exc:
             _audit(key, "work_ledger_record", "denied", resources="bootstrap", error=exc.code)
             return _refuse_store_error(exc)
@@ -855,12 +873,52 @@ async def _bootstrap(key: str) -> None | web.Response:
     return None
 
 
+def _set_pair_field(action: str, value: Any) -> Any:
+    """A pair field as the entry logs it: a retire that unbound the item logs ``""``,
+    since an absent field reads as "unchanged" to the fold."""
+    if action == "retire":
+        return value or ""
+    return value
+
+
+def _widest_retired_bindings() -> list[dict[str, Any]]:
+    """A full history at every cap, so a retire's fit probe is its widest entry."""
+    entry = {
+        "worker_session_key": "w" * work_ledger.MAX_PEER_SLOT_CHARS,
+        "worker_instance_id": "c" * work_ledger.MAX_INSTANCE_ID_CHARS,
+        "branch": "b" * WORK_MAX_ARTIFACT_VALUE_CHARS,
+        "state": "destroyed",
+        "reason": "r" * WORK_MAX_RETIRE_REASON_CHARS,
+        "retired_at": _WIDEST_STAMP,
+        "destroyed_at": _WIDEST_STAMP,
+    }
+    return [dict(entry) for _ in range(work_ledger.MAX_RETIRED_BINDINGS)]
+
+
 def _ensure(key: str, depth: int, parent_item: str | None) -> work_ledger.ConductorRecord:
     return work_ledger.ensure_conductor(key, depth=depth, parent_item=parent_item)
 
 
 def _write(key: str, action: str, cleaned: dict[str, Any]) -> dict[str, Any]:
     """Route one validated action to the store call that owns it."""
+    if action == "destroy":
+        # Reached only from the hub's own close of a retired peer slot.
+        return work_ledger.apply_remote_destroy(
+            key,
+            str(cleaned.get("item_id") or ""),
+            worker_session_key=cleaned.get("worker_session_key"),
+            worker_instance_id=cleaned.get("worker_instance_id"),
+        )
+    if action == "retire":
+        # Reached only from the hub's own remote ingest (wave 8), never from the
+        # record route: its schema has no ``retire`` action.
+        return work_ledger.apply_remote_retire(
+            key,
+            str(cleaned.get("item_id") or ""),
+            worker_session_key=cleaned.get("worker_session_key"),
+            worker_instance_id=cleaned.get("worker_instance_id"),
+            reason=cleaned.get("reason"),
+        )
     if action == "bind" and cleaned.get("worker_instance_id"):
         # Reached only from the gateway's own remote create, never from the record
         # route: its schema has no ``worker_instance_id``. The peer's slot key is

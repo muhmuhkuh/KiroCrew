@@ -30,7 +30,6 @@ describe('meeting audio control', () => {
     expect(button).toBeDisabled()
   })
 
-<<<<<<< HEAD
   it('keeps stop available when an active share is paused by a status request', () => {
     const source = audio(true)
     render(<MeetingAudioControl audio={source} enabled={false} />)
@@ -41,8 +40,6 @@ describe('meeting audio control', () => {
     expect(source.start).not.toHaveBeenCalled()
   })
 
-=======
->>>>>>> 7d8677836b (feat: add Meetings Audio feature (MeetingAudioControl, useMeetingAudio, tests))
   it('reports a missing audio source with recovery guidance', () => {
     render(<MeetingAudioControl audio={{ ...audio(), error: true }} enabled />)
     expect(screen.getByText(i18nT('apps.meetings.audio.failed'))).toBeInTheDocument()

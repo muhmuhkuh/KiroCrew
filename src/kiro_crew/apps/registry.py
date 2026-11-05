@@ -618,7 +618,10 @@ if _typing.TYPE_CHECKING:
         time,
     )
     from kiro_crew.apps.registry_pipeline.catalog import (  # noqa: F401
+        _VERSION_RELEASE_RE,
+        _VERSION_STRING_RE,
         FIRST_PARTY_AUTHORS,
+        NATIVE_WINDOWS_SHELL_REFUSAL,
         SOURCE_REGISTRY_PREFIX,
         _append_external_registry_apps,
         _apply_trust_fields,
@@ -633,6 +636,9 @@ if _typing.TYPE_CHECKING:
         _identity,
         _is_catalog_row,
         _is_external_row,
+        _is_prerelease,
+        _manifest_shell_platform_refusal,
+        _parse_version,
         _pinned_registry_entry,
         _platform,
         _registry_app_candidates,
@@ -692,6 +698,8 @@ if _typing.TYPE_CHECKING:
         _GIT_NO_FSMONITOR_PAIR,
         _GIT_NO_HOOKS_PAIR,
         _PUBLIC_GIT_HOSTS,
+        _SSH_METHOD_CHARS,
+        _SSH_REFUSAL_PREFIX,
         IPv6Address,
         _clone_sandbox_mode,
         _entry_git_url,
@@ -703,6 +711,7 @@ if _typing.TYPE_CHECKING:
         _git_target_is_unsupported,
         _git_transport_env,
         _git_url_host,
+        _is_ssh_auth_refusal,
         _is_ssh_git_url,
         _loggable_git_transport_output,
         _looks_like_git_url,
@@ -712,6 +721,7 @@ if _typing.TYPE_CHECKING:
         _redact_url_userinfo,
         _redacted_git_failure_class,
         _same_git_target,
+        _ssh_method_list_closes,
         _strip_git_target_userinfo,
         _valid_git_port,
         re,
@@ -728,8 +738,11 @@ if _typing.TYPE_CHECKING:
     )
     from kiro_crew.apps.registry_pipeline.install import (  # noqa: F401
         _SCRIPT_TIMEOUT,
+        NATIVE_WINDOWS_HOOK_REFUSAL,
         RESERVED_APP_NAME_CODE,
         StreamingLogLines,
+        _adoption_pending,
+        _install_script_platform_refusal,
         _official_entry,
         _remote_controlled_url,
         _retained_startup_refusal,
@@ -787,6 +800,7 @@ if _typing.TYPE_CHECKING:
         _merge_manifest,
         _resolve_manifest,
         official_catalog,
+        sanitize_links,
     )
     from kiro_crew.apps.registry_pipeline.recovery import (  # noqa: F401
         _STALE_CHECKOUT_PATTERN,

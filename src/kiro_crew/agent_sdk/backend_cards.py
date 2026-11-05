@@ -378,6 +378,18 @@ OPERATOR_LINES: Tuple[_LineSpec, ...] = (
 #: DEFECT rather than an absent feature, and a card that listed defect classes in
 #: front of someone choosing a harness would be worse than one line shorter.
 OFF_CARD_SETS: Mapping[str, str] = {
+    "ACP_BACKENDS_DIRECT_CLIENT_CHILD_CALLS_MARKED": (
+        "whether a deny-rule refusal on the direct client may become an override "
+        "card. A non-member keeps today's refusal, which the person already meets "
+        "with its own reason, and the card appears where it applies, so a card "
+        "line would repeat what the refusal says"
+    ),
+    "ACP_BACKENDS_SHARED_RUNTIME_CHILD_CALLS_MARKED": (
+        "whether a deny-rule refusal on the shared runtime may become an override "
+        "card. A non-member keeps today's refusal, which the person already meets "
+        "with its own reason, and the card appears where it applies, so a card "
+        "line would repeat what the refusal says"
+    ),
     "ACP_BACKENDS_TEMPLATE_ADDITIONS_AT_SPAWN": (
         "whether a server the user approved for a template Crew does not own reaches "
         "that template's sessions here. The approval card asks the same question for "
@@ -385,14 +397,14 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "would repeat a refusal the user already meets where it applies"
     ),
     "ACP_BACKENDS_MATE_WORKER_KIT": (
-        "whether a crewmate's worker may run here with its kit. A worker always runs "
-        "on its crewmate's backend, so the choice it depends on is the member "
+        "whether a Bot's worker may run here with its kit. A worker always runs "
+        "on its Bot's backend, so the choice it depends on is the member "
         "backend, and a non-member refuses the hand-off with an error that names "
         "the backends that can carry it. Nothing runs without its kit, so a card "
         "line would describe a refusal the user meets with its own remedy"
     ),
     "ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT": (
-        "which channel carries a crewmate worker's prompt: the context block or the "
+        "which channel carries a Bot worker's prompt: the context block or the "
         "wire spec. The worker gets the same prompt either way, so there is nothing "
         "for a user choosing a harness to weigh"
     ),
@@ -453,6 +465,14 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "choosing a harness loses nothing; a wrong membership runs every hook twice "
         "or not at all, which is a defect"
     ),
+    "ACP_BACKENDS_CREW_FIRES_SPEC_OBSERVER_HOOKS": (
+        "who runs the agent spec's hooks that cannot refuse a tool call: the harness, "
+        "or Crew's turn loop. They run either way. What a reader loses on claude, the "
+        "spec's preToolUse hooks, is already on the card as the one setting there that "
+        "has no effect (backend_mcp_ability.HOOKS_PRE_TOOL_USE_CARD_ID), so a line here "
+        "would repeat it; a wrong membership runs a hook twice or not at all, which is "
+        "a defect"
+    ),
     "ACP_BACKENDS_HARNESS_OWNED_SESSIONS": (
         "whose disk the transcript sits on. Crew holds a non-member's transcript under "
         "its own sessions tree and a reopened chat restores from there, so the "
@@ -484,9 +504,9 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "says whether the spec loads at all"
     ),
     "ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS": (
-        "whether a crewmate worker's single-tool switch-offs are honoured. A worker "
+        "whether a Bot worker's single-tool switch-offs are honoured. A worker "
         "with such limits on a non-member is refused before spawn with an error naming "
-        "the fix, so it never runs wider than its crewmate saved; a worker without "
+        "the fix, so it never runs wider than its Bot saved; a worker without "
         "them runs, and the card's saved-agent line already says whether it loads"
     ),
     "ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE": (
@@ -632,6 +652,13 @@ OFF_CARD_SETS: Mapping[str, str] = {
         "caller asks the right path; a wrong membership is a spawn under the "
         "WRONG IDENTITY -- kas or codex under a bare kiro-cli spawn -- which is a "
         "defect, not an absent feature a reader choosing a harness acts on"
+    ),
+    "ACP_BACKENDS_REMOTE_MCP_OAUTH": (
+        "whether a remote MCP entry's oauth block (a pre-registered OAuth "
+        "client) reaches the engine. The Connections page already says it where "
+        "it matters, on each pre-registered provider's card, and the answer "
+        "covers only those providers: a server that registers its own client "
+        "signs in on every backend that serves remote MCP at all"
     ),
     "ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP": (
         "whether a session/new stdio element whose command cannot be found is left "

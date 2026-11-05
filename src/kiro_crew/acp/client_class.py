@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from kiro_crew import pinned_fs
+from kiro_crew.acp import batch_guard
 from kiro_crew.acp import client_claude_seed as _client_claude_seed
 from kiro_crew.acp import client_claude_session as _client_claude_session
 from kiro_crew.acp import client_copilot as _client_copilot
@@ -48,6 +49,7 @@ from kiro_crew.acp.client_start import CLIENT_NAME
 from kiro_crew.acp.client_timeouts import _CANCEL_GRACE_SECS
 from kiro_crew.acp.client_turn_control import _CLIENT_STEERING_REQUEST_METHODS, _ConcurrentSteerTurn
 from kiro_crew.acp.elicitation import ElicitationRequest
+from kiro_crew.acp.engine_fallback import EngineFallbackTracker
 from kiro_crew.acp.liveness import LivenessOracle
 from kiro_crew.acp.mcp_session_report import McpSessionReport
 from kiro_crew.acp.mcp_startable import PrunedServer
@@ -127,6 +129,9 @@ class AcpClient:
     # The frame the idle reader saw an agent-started turn begin with, which it
     # left in _buffer (see _agent_turn_pending).
     _agent_turn_start: JsonRpcMessage | None = None
+    # That turn's frames a claimed reader other than the turn has read, held for
+    # the turn until that reader returns (see _claiming_stdout).
+    _agent_turn_held: list[JsonRpcMessage] | None = None
     # _install_idle_reader has bound its steps on this client.
     _idle_reader_installed: bool = False
     # Held by stream_unsolicited while it reads; a prompt waits on it (see
@@ -520,6 +525,9 @@ class AcpClient:
         # from self._model when that's the "auto" sentinel). It keys the lookup of
         # the context window when usage_update isn't sent (see _track_metadata).
         self._resolved_model_id: str | None = None
+        # Keeps _model / _resolved_model_id in step with a fallback the ENGINE
+        # made mid-turn (acp/engine_fallback.py).
+        self._engine_fallback = EngineFallbackTracker()
         # The model a ``_kiro.dev/agent/switched`` frame says the session now
         # runs, waiting to be judged by ``_judge_activated_model`` before the next
         # prompt. ``""`` = nothing to judge. See ``_note_agent_switched``.
@@ -715,6 +723,9 @@ class AcpClient:
         # clock (``_TOOL_STALL_TIMEOUT``) stays armed and the stale clock
         # disarmed for a call whose row was dropped but may still be running.
         self._active_tool_calls = InFlightIdSet()
+        # The current parallel tool batch, for the opt-in batch write guard
+        # that ``approve_tool`` consults (``acp.batch_guard``).
+        self._batch_window = batch_guard.BatchWindow()
         # Armed by _handle_compaction_status on a `failed` status and cleared at
         # turn start: gates the _COMPACTION_FAILED_TURN_BUDGET check in
         # _prompt_loop. _compaction_failed_turn records that the check fired, so
@@ -1344,6 +1355,11 @@ class AcpClient:
     _verify_goose_routing = _client_permissions._verify_goose_routing
     _verify_vibe_routing = _client_permissions._verify_vibe_routing
     approve_tool = _client_permissions.approve_tool
+
+    def take_batch_refusal(self, request_id: str | int) -> str | None:
+        """The batch write guard's reason for refusing *request_id*, taken once."""
+        return batch_guard.take_refusal(self, request_id)
+
     _note_pi_gate_denied = _client_permissions._note_pi_gate_denied
     reject_tool = _client_permissions.reject_tool
     _handle_permission = _client_permissions._handle_permission

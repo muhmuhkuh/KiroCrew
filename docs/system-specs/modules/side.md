@@ -190,7 +190,7 @@ second time.
 | turn | POST | `/api/chat/slots/{slot}/side/turn` | Submit question; starts a turn, steers the running one, or queues. A dashboard-user caller must be the owner (`chat.side_turn`); app tokens keep slot scoping |
 | queue cancel | DELETE | `/api/chat/slots/{slot}/side/queue/{queue_id}` | Drop a queued entry; echoes its text back for the composer |
 | queue edit | PATCH | `/api/chat/slots/{slot}/side/queue/{queue_id}` | Rewrite a queued entry in place |
-| close | POST | `/api/chat/slots/{slot}/side/close` | Drop buffer + queue + destroy LLM session |
+| close | POST | `/api/chat/slots/{slot}/side/close` | Drop buffer + queue + destroy LLM session, then tell every tab (`chat.side_closed`, whose `dropped` names every queue entry the close dropped by queue id, plus the steer id for a requeued steer, when there are any); body `{client}` names the tab that asked |
 | stop | POST | `/api/chat/slots/{slot}/side/stop` | Cancel the in-flight side turn (hung-turn escape hatch); idempotent when none is running. Owner-gated like turn (`chat.side_stop`); 409 `side_not_open` when no sidecar is open |
 | tools | GET | `/api/chat/side/tools` | `{read_only_tools, claude_adapter_outdated, claude_adapter_min_version, claude_adapter_update_command, config_unavailable}`: whether a side turn runs read-only tools, from the same check the turn makes (`_side_read_only_tools`), whether an old claude adapter is the only reason it does not, that adapter's floor (`CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`) and `npm i -g` step (`claude_adapter_install_command`), and whether the config failed to load; the footer reads it |
 
@@ -344,6 +344,71 @@ The main chat assembler never sees these frames — isolation is structural
 (separate event type → separate reducer → separate `slotSide` state key), not
 filter-based.
 
+A run broadcasts its frames only while its sidecar is still the slot's
+(`_run_side_turn`'s `_broadcast`). A close drops the sidecar and every tab clears
+the conversation, and a reopen makes a new sidecar, so a later frame of the old
+run would land in a conversation it does not belong to.
+
+`chat.side_closed` (`{kind, slot, origin_client?, dropped?}`) says the slot's
+side conversation was closed. `dropped` is present only when the close dropped
+queue entries. It names each one by queue id, plus the steer id for a requeued
+steer. A tab immediately returns a named requeued steer when it holds that
+steer's submitted text. It notes each named entry it has not handed back as a
+card or from that text, outside the panel, so a delayed queued, pending,
+demoted, or `/side` receipt returns its question instead of creating a card in
+a replacement conversation. That dropped-entry
+record lives for the page, is bounded per slot, and is consumed when the delayed
+receipt returns its question. The submitted-text record lives for the page, is
+bounded per slot, and is dropped when its card goes back or is cancelled here,
+or when a close names its steer. Refresh context issues that close
+optimistically. The API client records every close request in flight, and a
+later send waits until each same-slot close is acknowledged, whether its request
+resolves or rejects, before `/side/open` and `/side/turn`. A close that does not
+settle keeps that fence; the later send reaches its own deadline and hands its
+text back without asking it. If the close settles after that, the send's
+`/side/open` still goes out and opens an empty conversation. Every tab but the
+one named by `origin_client`, which cleared its panel when it sent the close,
+applies `sideClose`. The named tab also applies `sideClose` when its slot holds
+rows, a run ID, or a queue card the gateway sent after that clear: those belong
+to a turn that reached the gateway before the close. Before that, a question the
+tab queued into the conversation (`raw`) goes back to its composer, since the
+gateway dropped the queue with it, behind any question already cancelled here
+whose text still waits for that slot's panel (`releasedText`). A plain-text
+requeued steer is marked `raw` and handed back too, even when its broadcast
+content is identical to the submitted text. The submitted text is kept by slot
+and steer ID outside the panel, so the card goes back when the panel showed
+another slot or was closed before it could mark the card as this tab's own. Once
+marked, the card is never rewritten from the submitted text, so a saved edit's
+wording is what goes back. When that card's queue editor is open, its current
+non-blank text goes back instead of the card's saved wording. The typed words
+are what is checked: when they are blank after trimming the editor reports no
+draft, matching its commit rule, so a card's quote or knowledge does not make a
+cleared editor count as an edit. When the close frame beats a question's own
+receipt, the tab holds only the scrubbed card the queue frame made, so it
+records that card's queue ID before clearing the conversation. A requeued steer
+records its steer ID too, because its demoted
+receipt carries no queue ID. The receipt consumes the matching record and hands
+the text back even if a new user frame has reopened the slot. A steer still
+pending in the running turn whose requeued card the close dropped goes back the
+same way, matched by its `steer_id`. A different queue ID from the replacement
+conversation still makes its card. While the slot stays closed, a queued receipt
+hands the text back even if its card never reached this tab, which happens when
+the queue frame was lost to a dropped socket. Follow-up chip questions use the
+same path, and so does a question asked with `/side` from the main composer: its
+queued receipt puts the raw text on the card the same way, or hands it to the
+slot's side draft when the close came first. A card whose edit is still in
+flight goes back with the edit's wording, and the edit's own result does not
+hand it back a second time.
+
+When another tab sent the close (`origin_client` names a tab other than this
+one), and this tab showed rows or queue cards or handed a question back to its
+composer, it then marks the slot (`sideClosedElsewhere`). Its panel says that
+refreshing the context in another tab cleared this side chat. That line replaces
+an error the panel showed for the closed conversation. It remains until a new
+conversation begins there (a user frame, this tab's send, or a send status for
+the slot) or this tab closes it. A close this tab sent, or one that names no
+tab, shows nothing new.
+
 ## Backend Modules
 
 ### `dashboard/ws.py` — `broadcast_side_queue`
@@ -375,7 +440,9 @@ return the id for the frame that announces the row.
 `settle_consumed_steers(pending, snapshot)` — pure, and shared with the main chat
 (`chat_runner._settle_consumed_steers` delegates to it). Matches by EQUALITY and
 is count-aware: containment would false-positive a short steer against a longer
-one, and a falsely-settled steer is never requeued, so the question is lost.
+one, and a falsely-settled steer is never requeued, so the question is lost. Each
+steer is wrapped by `wrap_user_message`, which escapes tags inside the text, so the
+echo splits one way and settling compares the escaped text.
 
 ### `dashboard/side_prompts.py`
 
@@ -392,7 +459,12 @@ Four prompt constants, two lifted from the upstream protocol:
 - `SIDE_BOUNDARY_PROMPT_NO_TOOLS` — the variant for a harness outside
   `ACP_BACKENDS_SIDE_READONLY`, saying tools are unavailable.
 - `SIDE_BOUNDARY_PROMPT_NO_SHELL` — the same read-only boundary for a session
-  with no shell tool (claude), naming no shell command.
+  with no shell tool (claude), naming no shell command. A shell-capable side
+  turn gets it too while `name_grant.environment_refusal()` refuses every
+  program name (a PowerShell profile, an inherited `BASH_ENV`, an ambiguous
+  `PATH`): each shell read is then declined and side chat has no card to fall
+  back to. The handler runs that check off the loop, and only for a turn that
+  sends the envelope.
 - `SIDE_BOUNDARY_PROMPT_LISTING` — the read-only boundary for a session that
   can list folders and view images but has no shell and no tool that reads a
   file's text (goose).
@@ -524,8 +596,10 @@ hardened reader refuses a hardlink); its declared `name` equals its stem and is
 the derived name of the base its owner-marked `description` names; no provider
 in the session registry was spawned under it; and the base does not resolve
 where publication looks. A user-scope base resolves while any
-`<agent>.json`/`.md` entry exists or `agent.agent_spec_path` finds a spec
-declaring it (two declaring it still resolves). A project variant is reaped
+`<agent>.json`/`.md` entry exists, `agent.agent_spec_path` finds a spec
+declaring it (two declaring it still resolves), or
+`member_essential_context.linked_global_template_spec` finds a linked entry
+declaring it, the same lookup publication reads the base through. A project variant is reaped
 only when its recorded checkout is gone, or that checkout's `.kiro/agents`
 holds no entry named or declaring the agent; an unreadable or protected
 checkout, a variant recording no checkout or a relative path, one whose
@@ -862,6 +936,12 @@ Module-level helper emitting `chat.side_result` frames to owner sockets only
 (`broadcast_ws_owners`), never to app sockets, matching `_check_slot_ownership`.
 Deliberately separate from `broadcast_ws` main-channel events.
 
+### `dashboard/ws.py` — `broadcast_side_closed`
+
+Emits `chat.side_closed` to owner sockets only, from `api_side_close`, whether or
+not a conversation was open: a tab can still show one the gateway lost in a
+restart.
+
 ## Frontend Modules
 
 ### `ActivityViewer.tsx`
@@ -973,15 +1053,19 @@ action types stay `chat/<name>` and every consumer keeps importing them from
   duplicate cannot overwrite the raw text), `edit` rewrites, `cancel`/`drain`
   remove. Never resurrects a closed side.
 - `sideClose` action drops per-slot side state.
+- `sideClosedElsewhere` action marks a slot another tab closed while this tab
+  showed it (`slotSideClosedElsewhere`); `sideClose` and a new conversation
+  clear it.
 - Cleaned up with the slot's other per-slot state (`evictSlotState` in
   `store/chat/slotResidue.ts`) on `deleteSlot.fulfilled` and when the slot
   leaves the authoritative slot list.
 
 ### `useWebSocket.ts`
 
-`case 'chat.side_result':` dispatches `sseSideResult` and
-`case 'chat.side_queue':` dispatches `sseSideQueue` — two lines alongside the
-existing subagent/tool dispatch cases.
+`case 'chat.side_result':` dispatches `sseSideResult`,
+`case 'chat.side_queue':` dispatches `sseSideQueue` and `case 'chat.side_closed':`
+dispatches `sideClose`, then `sideClosedElsewhere` for another tab's close (see
+Wire Protocol), alongside the existing subagent/tool dispatch cases.
 
 ## Security & Isolation
 

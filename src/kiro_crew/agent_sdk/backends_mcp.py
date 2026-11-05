@@ -85,7 +85,7 @@ from kiro_crew.agent_sdk.backends import (
 # entry with pi's built-in MCP support (``pi.registerMcpServer``; the release that
 # carries it is ``PI_MIN_VERSION``). The array still travels on the wire because
 # the session report reads its roster from it. Captured as a ROUND TRIP against
-# pi-acp 0.0.34 over pi 1.3.0: ``test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl``
+# pi-acp 0.0.34 over pi 1.4.0: ``test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl``
 # -- the server is asked ``initialize``, ``tools/list`` and ``tools/call``, the call
 # raises ``session/request_permission`` through the gate first, and the tool's own
 # result reaches the turn. A same-named server in pi's own ``mcp.json`` (user-level,
@@ -360,7 +360,7 @@ ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KA
 # spec's ``tools`` is read beside the member mounts and ``_deny_zero_tools`` answers
 # every request with the reject option. Measured end to end on a zero-tool spec:
 # ``test/fixtures/acp_frames/pi/zero-tools-refused-live.jsonl`` (pi-acp 0.0.34 over
-# pi 1.3.0, driven through ``AcpClient``) holds a ``write``, a ``bash``, an MCP call
+# pi 1.4.0, driven through ``AcpClient``) holds a ``write``, a ``bash``, an MCP call
 # and a tool pi does not have, each ended ``failed`` with nothing on disk, and a
 # session with no gate extension is refused before its first prompt by the routing.
 #
@@ -398,6 +398,17 @@ ACP_BACKENDS_HONOR_ZERO_TOOL_BAN = frozenset(
         ACP_BACKEND_STRANDS,
     }
 )
+
+# Backends that honour a remote MCP entry's ``oauth`` block (the pre-registered
+# client id, redirect URI and scopes a Connections provider writes). Only kiro-cli
+# reads it: it loads the entry from the agent file it was launched with. KAS takes
+# its agents over ``_meta.kiro.customAgents``, whose remote-server schema has no
+# ``oauth`` slot, so the block is dropped and the engine falls back to dynamic
+# client registration, which a pre-registered provider does not offer.
+# The kiro-cli relay route of KAS projects through the same schema, so it is not a
+# member either. A backend joins only once its own path carries the block to the
+# engine; until then the Connections page marks those providers kiro-cli only.
+ACP_BACKENDS_REMOTE_MCP_OAUTH = frozenset({ACP_BACKEND_KIRO})
 
 # Backends whose ``session/new`` array Crew prunes of stdio elements whose command
 # certainly cannot be found (``acp.mcp_startable``), recording each one as a failed
