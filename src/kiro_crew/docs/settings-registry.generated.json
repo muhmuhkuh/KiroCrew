@@ -1856,7 +1856,8 @@
       "id": "voice.aws-region-transcribe",
       "label": "AWS Region (Transcribe)",
       "tab": "voice",
-      "route": "/settings/voice?highlight=voice.aws-region-transcribe"
+      "route": "/settings/voice?highlight=voice.aws-region-transcribe",
+      "description": "AWS region for Transcribe"
     },
     {
       "id": "voice.custom-model-file",

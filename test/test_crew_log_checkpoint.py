@@ -186,7 +186,7 @@ def _state_digest(state: dict[str, Any]) -> str:
 #: and none exists yet; only an existing fold's digest moving obliges a bump.
 _FOLD_STATE_PINS: dict[str, tuple[str, int]] = {
     "status": ("929af8634f6d6a5f", 4),
-    "usage": ("44a2ec30deecc134", 16),
+    "usage": ("e3a396c492999e74", 22),
     "timeline": ("4f461179faff39a3", 5),
     "tools": ("008b36fed498d32b", 4),
     "approvals": ("c9db629215cc2620", 4),
@@ -260,6 +260,7 @@ _PAYLOAD_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "first_seq": (("identity", "first_seq"),),
     "prefix_sha": (("witness", "prefix_sha"),),
     "prefix_records": (("witness", "prefix_records"),),
+    "prefix_cuts": (("witness", "prefix_cuts"),),
 }
 
 
@@ -1041,21 +1042,8 @@ def test_a_savepoint_records_the_digest_it_was_handed_rather_than_re_reading():
     assert savepoints.load(handle, ("status",)) is None
 
 
-def test_a_read_that_reused_a_cached_bundle_writes_no_savepoint():
-    """A pass standing on an earlier call's state has no evidence about its prefix.
-
-    A savepoint may only be written from a digest of the bytes its state was folded
-    from. A pass that resumed from DISK has one -- the savepoint records the digest
-    its own writer read, and :func:`savepoints.resumed_prefix_still_verifies` checks
-    it again -- so the custody holds across the two calls. A cached bundle records no
-    digest at all, and the bytes below its seq were consumed by an earlier call, so
-    nothing this pass can read is evidence about them. It therefore takes no witness,
-    and :func:`savepoints.save` writes nothing without one.
-
-    What that costs is a savepoint that lags a hot cached reader until a read folds
-    the prefix itself, which the module already allows for: resuming from an older
-    savepoint replays the tail and reaches the same value.
-    """
+def test_a_cached_bundle_with_custody_advances_its_savepoint():
+    """A warm read can persist when its cut counter and file extent preserve custody."""
     handle = _long_log()
     first = crew_log.fold_session(SESSION, ("status",))
     on_disk = savepoints.load(handle, ("status",))
@@ -1068,9 +1056,9 @@ def test_a_read_that_reused_a_cached_bundle_writes_no_savepoint():
 
     assert warm.last_seq > first.last_seq, "the warm read consumed nothing to earn a write"
     assert savepoints.write_is_earned(warm.last_seq, first.saved_seq)
-    assert warm.saved_seq == first.saved_seq
+    assert warm.saved_seq == warm.last_seq
     after = savepoints.load(handle, ("status",))
-    assert after is not None and after.saved_seq == on_disk.saved_seq
+    assert after is not None and after.saved_seq == warm.saved_seq
 
 
 def test_damage_below_a_cached_bundle_is_not_written_into_a_savepoint():
@@ -1230,7 +1218,8 @@ def test_a_savepoint_without_a_prefix_digest_is_ignored():
     _long_log()
     crew_log.fold_session(SESSION)
     payload = _payload("status")
-    del payload["prefix_sha"]
+    payload.pop("prefix_sha", None)
+    payload.pop("prefix_cuts", None)
     payload["state"]["turns_completed"] = 99999
     _write_payload("status", payload)
 

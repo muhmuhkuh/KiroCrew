@@ -144,6 +144,7 @@ class SubagentManager:
         completion_keep_chars: int = COMPLETION_KEEP_DEFAULT_CHARS,
         memory_mode_for_session: Callable[[str], str] | None = None,
         defer_queue_dispatch: bool = False,
+        hold_orphan_notices: bool = False,
     ):
         self._sessions = sessions
         # Run ids a parent-end teardown stopped. Keyed by ID rather than carried
@@ -193,6 +194,9 @@ class SubagentManager:
         #: a hold that is never released leaves one debug line behind instead
         #: of the silent "accepted, never claimed" queue this fix diagnoses.
         self._queue_dispatch_hold_logged = False
+        self._orphan_notice_gate: asyncio.Event | None = (
+            asyncio.Event() if hold_orphan_notices else None
+        )
         # ``_max_concurrent`` is the EFFECTIVE cap every admission read site
         # consults: ``min(user cap, adaptive cap)``. The user's resolved cap
         # (``agent.max_subagents`` / the auto ceiling) is the ceiling in
@@ -878,6 +882,7 @@ class SubagentManager:
     reconfigure = _config_surface.reconfigure
     apply_limits = _config_surface.apply_limits
     release_queue_dispatch = _config_surface.release_queue_dispatch
+    release_orphan_notices = _config_surface.release_orphan_notices
     _clamp_effective_cap = _config_surface._clamp_effective_cap
     set_cap_raise_listener = _config_surface.set_cap_raise_listener
     _notify_cap_raised = _config_surface._notify_cap_raised

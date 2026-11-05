@@ -58,3 +58,26 @@ def count(value: Any) -> int | None:
     if value < 0:
         return None
     return min(int(value), MAX_COUNT)
+
+
+LIST_CATEGORIES: Final[tuple[str, ...]] = ("agentsIndex", "skillsIndex", "powersIndex")
+
+
+SUB_PARTS: Final[tuple[tuple[str, str, str], ...]] = (
+    ("toolIO", "inputChars", "input"),
+    ("toolIO", "outputChars", "output"),
+    ("workspace", "fileTreeChars", "file_tree"),
+    ("workspace", "openFilesChars", "open_files"),
+    ("workspace", "environmentChars", "environment"),
+    ("workspace", "repositoriesChars", "repositories"),
+    ("memory", "learningsChars", "learnings"),
+    ("memory", "knowledgeChars", "knowledge"),
+)
+
+
+MEDIA_PARTS: Final[tuple[tuple[str, str], ...]] = (
+    ("images", "images"),
+    ("imageBytes", "image_bytes"),
+    ("documents", "documents"),
+    ("documentBytes", "document_bytes"),
+)

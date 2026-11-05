@@ -17,6 +17,7 @@ describe('chat backend registry ids over the real API transport', () => {
     ['codex', 'Codex', 'codex'], ['pi', 'Pi', 'pi'],
     ['opencode', 'OpenCode', 'opencode'], ['goose', 'Goose', 'goose'],
     ['deepseek', 'DeepSeek', 'deepseek'],
+    ['vibe', 'Vibe', 'vibe'],
     ['__inherit__', 'Use global default', null],
   ])('selecting %s sends %s with the canonical runtime value', async (id, label, expected) => {
     const posts: { path: string; body: unknown }[] = []
@@ -27,7 +28,7 @@ describe('chat backend registry ids over the real API transport', () => {
       const path = String(input)
       if (path === '/api/acp-backends') return json({ backends: [
         { id, policy_id: label, selectable: true },
-        { id: 'vibe', policy_id: 'Vibe', selectable: false },
+        { id: 'blocked', policy_id: 'Blocked', selectable: false },
       ].filter((row) => row.id !== '__inherit__') })
       if (init?.method === 'POST') {
         const body = JSON.parse(String(init.body))
@@ -43,7 +44,7 @@ describe('chat backend registry ids over the real API transport', () => {
     </QueryClientProvider></Provider>)
     const picker = screen.getByRole('combobox', { name: 'Backend' })
     await waitFor(() => expect(picker).not.toBeDisabled())
-    expect(within(picker).queryByRole('option', { name: 'Vibe' })).toBeNull()
+    expect(within(picker).queryByRole('option', { name: 'Blocked' })).toBeNull()
     const option = within(picker).getByRole('option', { name: label }) as HTMLOptionElement
     fireEvent.change(picker, { target: { value: option.value } })
     await waitFor(() => expect(posts).toEqual([

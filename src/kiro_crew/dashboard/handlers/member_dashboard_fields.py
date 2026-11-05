@@ -309,28 +309,45 @@ class LivePage:
     def _resolve_trees(self, read: Any) -> None:
         """Fill the tree-bound fields from the cached read, in place.
 
-        The feed reported them missing, because it has no subscription for a fold with
-        no scope. Resolved here from the cache :meth:`_read_trees` filled, and taken OUT
-        of ``missing`` when they resolve -- a tree-bound page would otherwise fly the
-        stale band permanently, which teaches a reader to ignore it.
+        The feed reported them missing and unresolved, because it has no subscription
+        for a fold with no scope. Resolved here from the cache :meth:`_read_trees`
+        filled, and taken OUT of both when they resolve -- a tree-bound page would
+        otherwise dim its cells and tell the crewmate the tree is unseen on every turn.
+        A tree read that FAILED leaves the feed's ``fold_unseen`` standing; a tree that
+        has a value without the path reads ``path_missing``, or ``older_value`` when
+        the field resolved before.
         """
-        from kiro_crew.dashboard_feed import MISSING, resolve_path
+        from kiro_crew.dashboard_feed import (
+            FOLD_UNSEEN,
+            MISSING,
+            OLDER_VALUE,
+            PATH_MISSING,
+            remember_resolved,
+            resolve_path,
+            resolved_before,
+        )
 
         with self._lock:
             trees = dict(self._trees)
+        resolved_here: list[str] = []
         for name, spec in self._manifest.fields.items():
             fold = spec.fold or ""
             if fold not in self._tree_folds or fold not in trees:
                 continue
             resolved = resolve_path(trees[fold], spec.path or "")
             if resolved is MISSING:
+                # The tree HAS a value, so a miss is the path, not an unseen fold.
+                if read.unresolved.get(name) == FOLD_UNSEEN:
+                    read.unresolved[name] = (
+                        OLDER_VALUE if name in resolved_before(self._feed.slot) else PATH_MISSING
+                    )
                 continue
             read.fields[name] = resolved
+            resolved_here.append(name)
             if name in read.missing:
                 read.missing.remove(name)
-        read.stale = bool(read.missing) and any(
-            not self._manifest.fields[n].agentic for n in read.missing if n in self._manifest.fields
-        )
+            read.unresolved.pop(name, None)
+        remember_resolved(self._feed.slot, resolved_here)
 
     def _payload(self, fields: Mapping[str, Any], read: Any, version: int) -> dict[str, Any]:
         """One frame's ``read``, in the shape the frame's own builder produces."""
@@ -340,7 +357,6 @@ class LivePage:
             fields,
             agentic=sorted(self._agentic),
             seq=getattr(read, "seq", 0),
-            stale=bool(getattr(read, "stale", False)),
             missing=sorted(getattr(read, "missing", ()) or ()),
             written_at={
                 name: str(self._redact(at))

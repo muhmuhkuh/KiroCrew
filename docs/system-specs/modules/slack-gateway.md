@@ -2,6 +2,12 @@
 
 ## Overview
 
+`slack/channel_policy.py` supplies the channel-posture verdict shared by
+message intake, interactive actions and client writes. Review-modal submits
+check the channel after parsing their draft key; pure cancellation and
+explicit tool rejection remain available. `slack/team_ids.py` reads the real
+client's channel-to-home-workspace cache for child and control-plane identity.
+
 The Slack integration (`kiro_crew/slack/`) connects KiroCrew to Slack via Socket Mode. DMs are routed through ACP to kiro-cli with real-time streaming and interactive tool approval.
 
 Independently scheduled agent runs admit their exact execution key as durable

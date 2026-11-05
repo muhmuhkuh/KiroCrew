@@ -1220,3 +1220,19 @@ class DashboardConfig:
             "an inline code span whose whole text matches becomes a link chip.",
         ),
     )
+
+    translucent_panels: str = field(
+        default="",
+        metadata=_meta(
+            "Translucent Panels",
+            "Show the top bar, the tab bar, the message box, the suggestion chips and "
+            "the search fields as frosted glass over the content that scrolls under "
+            "them (the Liquid Glass primitive): 'on', or 'off' for solid cards. "
+            "Empty = never chosen on this workspace (the browser's own stored choice "
+            "holds, as before the setting was server-backed). Stored here like the "
+            "theme mode, not only in the browser, so the choice follows the user "
+            "across ports, browsers and the desktop app; the browser keeps a copy "
+            "only so the first paint already matches.",
+            enum=["", "on", "off"],
+        ),
+    )

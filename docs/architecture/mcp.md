@@ -1,5 +1,9 @@
 # MCP Server Architecture
 
+Dashboard session-run tools share their Crew Mode folder visibility check
+through `mcp_dashboard_caller_scope._caller_in_crew_tree` and
+`CREW_MODE_FOLDER_NOTE`, alongside the existing app and channel caller gates.
+
 How MCP (Model Context Protocol) servers are configured, merged, probed and
 loaded, plus the two invariants every new Kiro Crew MCP tool must satisfy: it
 ships as an MCP tool (not only a CLI command), and it holds no per-caller state.

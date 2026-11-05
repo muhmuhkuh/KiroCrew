@@ -1134,15 +1134,12 @@ jobs:
     # longer budget.
     timeout-minutes: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 60 || 70 }}
     strategy:
-<<<<<<< HEAD
-=======
       # 4 protects the shared hosted pool and the larger-runner group's own
       # `maximum_runners` cap; the CodeBuild label has its own account quota.
       # startsWith(..., 'codebuild-') is true only on CodeBuild-routed runs. Every
       # non-fleet value ('kirocrew-linux-4-core' or 'ubuntu-latest') fails that
       # test, so this still lifts only on CodeBuild.
       max-parallel: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 8 || 4 }}
->>>>>>> upstream/main
       # Don't cancel sibling shards when one fails -- we want the full failure
       # picture across the suite, not just the first shard to break.
       fail-fast: false
@@ -1161,6 +1158,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -1420,15 +1418,12 @@ jobs:
     # Retain the existing Windows budget and coverage-free run.
     timeout-minutes: 60
     strategy:
-<<<<<<< HEAD
-=======
       # 4 protects the pool this run is NOT on CodeBuild for; the CodeBuild label has
       # its own account quota. startsWith(..., 'codebuild-') is true only on
       # CodeBuild-routed runs, so this lifts only there: both non-fleet values,
       # `kirocrew-windows-4-core` and `windows-latest`, keep the cap at 4, and the
       # group's own `maximum_runners` is the ceiling the first of them shares.
       max-parallel: ${{ startsWith(needs.changes.outputs.windows_runner, 'codebuild-') && 8 || 4 }}
->>>>>>> upstream/main
       # Full failure picture across shards, same as backend-test.
       fail-fast: false
       matrix:
@@ -2079,8 +2074,6 @@ jobs:
   # lane list.
   # test_macos_platform_tests_gate.py pins all of it.
 
-<<<<<<< HEAD
-=======
   # ── New-test stability gate ──────────────────────────────────────────────
   # The leaf-test path (LEAF_REPEAT loop) already repeats changed test files
   # on leaf PRs (test-only, modify-only diffs).  This job closes the gap for
@@ -2198,7 +2191,6 @@ jobs:
             if [ "$rc" -ne 0 ]; then exit "$rc"; fi
           done
 
->>>>>>> upstream/main
   # The job where Linux mount-namespace tests EXECUTE rather than skip. They need
   # unprivileged user namespaces (unshare NEWNS), which the hosted Ubuntu image
   # restricts via AppArmor -- the same restriction codex-review.yml clears for its
@@ -3163,35 +3155,9 @@ jobs:
     runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
-<<<<<<< HEAD
       # persist-credentials retained: frontend-lint/Check for new hardcoded UI strings runs `git fetch origin`
       # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-=======
-      # Nothing in THIS job reads history or the remote: tsc and eslint judge
-      # the checked-out tree alone. Every gate that resolved a diff base here --
-      # the file line cap through scripts/ratchet_scope.py, and the i18n and
-      # phantom-classes gates through their own `git fetch origin` -- now runs
-      # in `frontend-ratchets`, whose checkout carries what they need. So the
-      # bounded deepening step this job used to run for the cap gate is gone
-      # with it.
-      #
-      # Because nothing here reads the remote, nothing here needs the token
-      # either. The retention rationale this checkout carried on `main` belonged
-      # to the hardcoded-UI-strings gate, which has moved to
-      # `frontend-ratchets`; the credential moved with it. Opting out rather
-      # than leaving it unexplained is what
-      # test_workflow_checkout_credentials.py requires, and `backend-lint`
-      # already runs this way.
-      #
-      # The depth is the bounded one #26131 set while the cap gate still lived
-      # here. Nothing in this job needs even that now; tightening it further is
-      # a separate change from the gate split.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: 2
->>>>>>> upstream/main
 
       # CodeBuild images have no tool cache, so setup-node would resolve the
       # major through a GitHub API manifest call on every run; seed the cache
@@ -3408,8 +3374,6 @@ jobs:
             pyproject.toml
             setup.cfg
 
-<<<<<<< HEAD
-=======
       # The same file line cap gate as `backend-ratchets`, which a frontend-only
       # diff skips. Stdlib only, so it needs no install; scoped to this change
       # through the full-history checkout above.
@@ -3418,7 +3382,6 @@ jobs:
           python3 scripts/check_file_line_cap.py --test
           python3 scripts/check_file_line_cap.py
 
->>>>>>> upstream/main
       - name: Check the find_ui location index is fresh
         # The packaged index the guide server's find_ui reads is generated from
         # the dashboard source (surfaces, Settings tabs, the settings extraction,

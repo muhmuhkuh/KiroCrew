@@ -98,6 +98,7 @@ from kiro_crew.session_pid import (
     kill_orphan_mcps,
 )
 from kiro_crew.session_scope_reap import reap_abandoned_agent_scopes
+from kiro_crew.session_staging_sweep import SESSIONS_DIR_NAME, sweep_session_staging_temps
 from kiro_crew.shell_audit_log import rotate_shell_audit_log
 from kiro_crew.stats import Stats
 from kiro_crew.watchdog import CleanupHook, SessionWatchdog
@@ -139,6 +140,9 @@ def _cleanup_deps(self: SessionManager) -> CleanupDeps:
         # ``${KIROCREW_HOME:-$HOME/.kiro/crew}`` is this path.
         rotate_shell_audit_log=lambda: rotate_shell_audit_log(data_home),
         prune_pycache=lambda: prune_pycache(),
+        sweep_session_staging_temps=lambda: sweep_session_staging_temps(
+            data_home / SESSIONS_DIR_NAME
+        ),
         collect_active_pids=lambda sessions: _collect_active_pids(cast(dict[Any, Any], sessions)),
         periodic_pid_sweep=lambda gateway_pid, active_pids: _periodic_pid_sweep(
             gateway_pid,

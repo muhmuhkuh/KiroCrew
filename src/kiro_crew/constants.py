@@ -1826,3 +1826,11 @@ WAIT_TOOL_MAX_SECS = 1800
 # takes at startup, so that graph lands once per session per server.
 # ``validation`` re-exports it, so every other reader is unaffected.
 MAX_SHORT_STRING = 500  # names, IDs, categories
+
+
+LEAKED_TOOL_CALL_NOTE = (
+    "ended with a tool call written as text instead of run, so that last call "
+    "did not execute and the output it was meant to produce may be missing. "
+    "Earlier calls in the run may have taken effect. Check the result before "
+    "treating this step as done."
+)

@@ -2,6 +2,13 @@
 
 ## Overview
 
+Consolidation reads its semantic snapshot through
+`history_consolidation_memory._semantic_snapshot_in_pages`: bounded keyset
+pages release the store lock between reads, and a page that does not advance
+the cursor ends the walk. The store's `get_all_semantic(after_key=...)`
+filters by key before ordering and applying its page limit. `transcript_person_rows.py` supplies the shared
+predicate for whether a transcript contains a person's own message.
+
 Persistent conversation history with provenance tracking and LLM-driven consolidation. Conversations survive session expiry and gateway restarts.
 
 Private essential-context receipts are not transcript metadata and are never

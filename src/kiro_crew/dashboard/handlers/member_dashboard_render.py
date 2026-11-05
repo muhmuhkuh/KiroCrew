@@ -96,7 +96,6 @@ def _render(
             {name: safe(value) for name, value in read.fields.items()},
             agentic=[name for name, spec in manifest.fields.items() if spec.agentic],
             seq=read.seq,
-            stale=read.stale,
             missing=read.missing,
             # Masked like the values beside them: a stamp is not a secret, but this is
             # the one chokepoint and a field added here later would otherwise skip it.

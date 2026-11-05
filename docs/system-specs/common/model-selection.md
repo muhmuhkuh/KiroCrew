@@ -11,6 +11,12 @@ was already chosen stops working mid-session is
 
 ## The default is `"auto"`
 
+Picker rows use `model_registry.live_advertised_model_rows` for a live catalog
+and `advertised_model_rows` for its persisted snapshot. Their advisory labels
+are bounded by the pure helpers in `model_registry_labels.py`; labels neither
+admit additional ids nor select a model. The KAS bundle catalog is read through
+`agent_sdk/kas_model_catalog.py` and served by `handlers/models_kas_bundle.py`.
+
 `agent.model` defaults to `"auto"` in `config/defaults.json`. Do not replace it with a
 concrete model. `"auto"` is validated like any other id and is not assumed usable: a
 partition that does not serve it makes it as unusable as any other unentitled id.

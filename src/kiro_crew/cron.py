@@ -608,6 +608,7 @@ class CronService:
         #: Where :meth:`create` moved an unparseable store, or None.
         self.quarantined_store: Path | None = None
         self._on_job = on_job
+        self.folder_creator: Callable[[str], Awaitable[tuple[str, str | None]]] | None = None
         self._jobs: list[CronJob] = []
         self._timer_task: asyncio.Task[None] | None = None
         # True only for the span of an in-flight _on_timer() dispatch pass

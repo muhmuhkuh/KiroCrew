@@ -246,3 +246,17 @@ def set_effective_cap(self: SubagentManager, cap: int | None) -> int:
     if self._max_concurrent > old_cap:
         self._notify_cap_raised()
     return self._max_concurrent
+
+
+def release_orphan_notices(self: SubagentManager) -> None:
+    """Let the boot orphan sweep send the notices held by ``hold_orphan_notices``.
+
+    Called by the gateway once the surface that receives them is up: the
+    dashboard has restored its tabs, or the API-only server is listening. It
+    is also called when that start fails, because the owner DM digest is then
+    the only delivery left. Idempotent, and a no-op for a manager built
+    without the hold.
+    """
+    gate = self._orphan_notice_gate
+    if gate is not None:
+        gate.set()

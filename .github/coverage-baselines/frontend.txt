@@ -25,11 +25,8 @@ src/components/Strands.tsx 52.2   # 71/136
 src/hooks/useCronActions.ts 31.0   # 9/29
 src/lib/embedded.ts 75.0   # 3/4
 src/main.tsx 0.0   # 0/26
-<<<<<<< HEAD
 src/pages/AppPage.tsx 0.0   # 0/21
 src/pages/chat/KnowledgePicker.tsx 0.0   # 0/23
 src/pages/overview/MemoryGraphTab.tsx 68.3   # 97/142
 src/pages/settings/InstancesPanel.tsx 63.3   # 88/139
-=======
->>>>>>> upstream/main
 src/pages/settings/OverviewPanel.tsx 0.0   # 0/2

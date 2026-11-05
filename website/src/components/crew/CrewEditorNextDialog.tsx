@@ -17,6 +17,7 @@ import {
 import { Btn, SendBtn } from '../ui'
 import { i18nT } from '../../i18n/t'
 import SimpleSelect from '../SimpleSelect'
+import { acpBackendName } from '../../api/acpBackend'
 import { toolMeta } from './toolMeta'
 import CrewAvatar from '../CrewAvatar'
 import CrewAvatarBuilder from '../CrewAvatarBuilder'
@@ -384,6 +385,7 @@ export default function CrewEditorNextDialog({
     workspace, setWorkspace, workspaceOptions,
     wsModalOpen, openWsModal, closeWsModal, onWorkspaceCreated, setWsDirty, onPaneSaveChain,
     editModel, setEditModel, editEffort, setEditEffort,
+    editBackend, setEditBackend, backendOptions, backendLoading,
     modelOptions, modelsDegraded, retryModels, retryingModels, pinHarness,
     resolvedError, effortCapable, effortLevels, effortModel,
     memberId, isDefaultCrew, guardedNavigate,
@@ -650,6 +652,16 @@ export default function CrewEditorNextDialog({
                       and workspace, not a behavior toggle. The underlying model
                       state and save path are unchanged. */}
                   <div className="flex flex-col gap-3" data-testid="next-general-model">
+                    <Field label={i18nT('pages.membersPage.profile_harness')} hint={i18nT('pages.membersPage.profile_harness_hint', { name: editing })}>
+                      <SimpleSelect
+                        aria-label={i18nT('pages.membersPage.profile_harness')}
+                        options={['__inherit__', ...Array.from(new Set([...backendOptions, ...(editBackend ? [editBackend] : [])]))]}
+                        optionLabels={[i18nT('pages.kiroCrewAgentsPage.inherited'), ...Array.from(new Set([...backendOptions, ...(editBackend ? [editBackend] : [])])).map(id => acpBackendName({ id }))]}
+                        value={editBackend || '__inherit__'}
+                        onChange={value => setEditBackend(value === '__inherit__' ? '' : value)}
+                        disabled={backendLoading || sheetBusy}
+                      />
+                    </Field>
                     <p className="text-[12px] text-muted">
                       {i18nT('components.crew.crewEditorNextDialog.model_frame')}
                     </p>

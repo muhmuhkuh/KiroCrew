@@ -163,6 +163,9 @@ class _ChatTurn:
     _mirror_chan: "str | None"
     _mirror_post_ts: "str | None"
     _mirror_stream_ts: "str"
+    _mirror_stream_tried: bool
+    _mirror_thinking_ts: str
+    _mirror_echo_posted: bool
     _mirror_task_counter: "int"
     _mirror_thread: "str | None"
     _msg: "str"

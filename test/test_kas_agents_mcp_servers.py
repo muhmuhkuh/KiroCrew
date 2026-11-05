@@ -20,7 +20,11 @@ import pytest
 from kas_agents_helpers import _spec
 
 from kiro_crew.acp import kas_agents
-from kiro_crew.acp.kas_agents import hoist_managed_servers, to_client_custom_agent
+from kiro_crew.acp.kas_agents import (
+    hoist_managed_servers,
+    hoist_servers_for_session,
+    to_client_custom_agent,
+)
 
 
 @pytest.fixture

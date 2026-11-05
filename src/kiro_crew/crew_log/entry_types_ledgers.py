@@ -60,6 +60,7 @@ RADAR_ENTRY_TYPE = "radar/recorded"
 #: set that is narrower than the truth drops a real change with nothing raised -- so
 #: the type the fold matches on and the type the registry declares are one value.
 WORK_ENTRY_TYPE = "work/recorded"
+WORK_CHARGE_ENTRY_TYPE = "work/charged"
 
 #: One worker charge relayed into the board's own log (see the type's note below).
 WORK_CHARGE_ENTRY_TYPE = "work/charged"

@@ -994,8 +994,6 @@ jobs:
             echo "::warning title=Unsubstantiated BLOCK::Opus 5.5 emitted [BLOCK-MERGE] for $HEAD without a Trigger: line and an Outcome: line, so the BLOCK is treated as PASS."
           fi
 
-<<<<<<< HEAD
-=======
       # Turn-budget exhaustion is its own outcome (#13296). A stage stopped at
       # --max-turns writes a `result` message with subtype `error_max_turns`
       # and no verdict stamp, so it used to land as the same `review
@@ -1023,7 +1021,6 @@ jobs:
             echo "::notice::turn budget spent (error_max_turns) in stage(s): $spent"
           fi
 
->>>>>>> upstream/main
       - name: Post/update summary comment
         id: post
         if: always() && steps.pr.outputs.obsolete != 'true'

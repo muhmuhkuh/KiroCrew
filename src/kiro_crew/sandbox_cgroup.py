@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 # module's public _CGROUP_AGENTS_SLICE name and every reader of it stay unchanged.
 from kiro_crew.sandbox_tiers import _CGROUP_AGENTS_SLICE  # noqa: F401
 
+if TYPE_CHECKING:
+    from kiro_crew.config.sections_limits import ResourceLimitsConfig
+
+_CGROUP_DEFAULT_SCOPE_MEMORY_HIGH_PCT = 90
+
 # Logged under the sandbox's name, which operator log filters, level settings
 # and the tests' caplog scopes key on.
 logger = logging.getLogger("kiro_crew.sandbox")

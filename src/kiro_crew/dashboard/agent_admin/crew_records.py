@@ -386,6 +386,17 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
         )
+    from kiro_crew.crewmate_harness import harness_pin_rejected
+
+    backend_value = body.get("acp_backend")
+    if backend_value is None:
+        backend_value = ""
+    backend_reason = harness_pin_rejected(backend_value)
+    if backend_reason:
+        return web.json_response(
+            {"error": backend_reason, "code": "invalid_acp_backend"}, status=400
+        )
+    backend_value = backend_value.strip()
     name = body.get("name", "")
     if not isinstance(name, str):
         return web.json_response(
@@ -632,7 +643,10 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
 
             avatar = default_icon_avatar(display_name or name)
         model_reason = _model_pin_rejected(
-            model, request, cfg.agent.provider, backend=_pin_entitlement_backend(cfg)
+            model,
+            request,
+            cfg.agent.provider,
+            backend=_pin_entitlement_backend(cfg, acp_backend=backend_value),
         )
         if model_reason:
             return web.json_response({"error": model_reason, "code": "invalid_model"}, status=400)
@@ -683,6 +697,7 @@ async def _api_kirocrew_agents_create(request: web.Request) -> web.Response:
         # create and team the same name between the purge and the registration.
         # A purge that cannot be made refuses the create (409 below).
         new_agent = KiroCrewAgentConfig(
+            acp_backend=backend_value,
             kiro_agent=kiro_agent,
             workspace=workspace,
             memory_store=memory_store,

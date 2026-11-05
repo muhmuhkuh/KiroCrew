@@ -71,6 +71,7 @@ class ConfigEntry:
     # re-exec jail). Declared per field with ``_meta(..., restart=True)``; every
     # other field is hot-applied by the config watcher (``config.live``).
     requires_restart: bool = False
+    other_types: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +118,8 @@ def _optional_inner(tp: type) -> tuple[type, bool]:
     origin = typing.get_origin(tp)
     if origin is typing.Union or (
         # ``X | None`` (PEP 604) has origin ``types.UnionType`` on 3.10+
-        origin is not None and getattr(origin, "__name__", "") == "UnionType"
+        origin is not None
+        and getattr(origin, "__name__", "") == "UnionType"
     ):
         args = [a for a in typing.get_args(tp) if a is not type(None)]  # noqa: E721
         if len(args) == 1 and len(typing.get_args(tp)) == 2:
@@ -354,10 +356,12 @@ def _flatten_recurse(
     # the field accepts null.  Normalize to a single base type string plus a
     # ``nullable`` flag so downstream consumers (baseline emitter, UI, etc.)
     # continue to see a scalar type.
+    other_types: tuple[str, ...] = ()
     if isinstance(raw_type, list):
         non_null = [t for t in raw_type if t != "null"]
         nullable = "null" in raw_type
         node_type = non_null[0] if non_null else "null"
+        other_types = tuple(non_null[1:])
     else:
         node_type = raw_type
         nullable = False
@@ -391,6 +395,7 @@ def _flatten_recurse(
             default_value=default_value,
             nullable=nullable,
             requires_restart=requires_restart,
+            other_types=other_types,
         )
         out.append(entries_entry)
 

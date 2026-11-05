@@ -54,6 +54,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_STRANDS,
     ACP_BACKENDS_KNOWN,
     ACP_BACKENDS_SELF_SERVED_ACP,
+    COPILOT_VERIFIED_VERSION,
     POLICY_ID_BY_BACKEND,
     STRANDS_VERIFIED_VERSION,
     host_unservable_reason,
@@ -175,6 +176,7 @@ class BackendInstallState:
     missing_components: Tuple[str, ...] = ()
     install_command: str = ""
     restart_required: bool = False
+    found_version: str = ""
 
 
 def _probe_kiro() -> BackendInstallState:
@@ -369,6 +371,16 @@ def _probe_self_served(backend: str) -> BackendInstallState:
     launch = launch_for(backend)
     policy_id = _policy_id(backend)
     if acp_driver.self_served_resolves(backend):
+        found = acp_driver.self_served_wrong_version(backend)
+        if found:
+            return BackendInstallState(
+                backend,
+                policy_id,
+                MISSING,
+                (f"{launch.binary} {COPILOT_VERIFIED_VERSION}",),
+                acp_driver.self_served_install_command(backend),
+                found_version=found,
+            )
         return BackendInstallState(
             backend,
             policy_id,

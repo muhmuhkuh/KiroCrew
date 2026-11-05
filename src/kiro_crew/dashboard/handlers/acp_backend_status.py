@@ -194,6 +194,7 @@ def _row(state: Any, selectable: set) -> Dict[str, Any]:
             list(state.missing_components) if state.installed == MISSING else []
         ),
         "install_command": state.install_command,
+        "found_version": state.found_version if state.installed == MISSING else "",
         # Clamped to a MISSING-free verdict for the same reason as
         # ``missing_components`` above: "installed but the running gateway
         # cannot use it yet" is only meaningful once the components are

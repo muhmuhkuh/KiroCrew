@@ -275,6 +275,14 @@ def test_vibe_spawn_seed_carries_the_clamp_variables() -> None:
     assert seed["VIBE_BYPASS_TOOL_PERMISSIONS"] == "false"
     assert "auto-approve" in seed["VIBE_DISABLED_AGENTS"]
     assert "accept-edits" in seed["VIBE_DISABLED_AGENTS"]
+    import json
+    import re
+
+    patterns = json.loads(seed["VIBE_DISABLED_AGENTS"])
+    wildcard = next(p.removeprefix("re:") for p in patterns if p.startswith("re:"))
+    assert re.fullmatch(wildcard, "dev")
+    assert re.fullmatch(wildcard, "custom-profile")
+    assert not re.fullmatch(wildcard, "ask")
     assert sorted(vibe_mod.VIBE_REQUIRED_MODE_IDS) == ["ask"]
 
 

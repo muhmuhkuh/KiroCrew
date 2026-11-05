@@ -171,10 +171,12 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
     # conductor tells the user once), both read off the same header.
     # Advisory: the compact read carries them so a patrol that reads only the
     # status columns still sees a goal spending past what the user expected.
+    depth_cap = await asyncio.to_thread(work_ledger.max_depth)
     conductor = dict(
         record.to_dict(),
         goal_items_used=record.goal_items_used,
         cap_exceeded=record.cap_exceeded,
+        max_depth=depth_cap,
     )
     payload: dict[str, Any] = {"conductor": conductor, "items": rows}
     if compact:

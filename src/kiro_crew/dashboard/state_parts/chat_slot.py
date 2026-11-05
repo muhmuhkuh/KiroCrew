@@ -68,6 +68,8 @@ class _ChatSlot:
         "crew_mode_agent",
         "app_agent_owner",
         "model",
+        "acp_backend",
+        "model_backend",
         "jev_route",
         "_model_withheld",
         "_model_withheld_for",
@@ -690,6 +692,8 @@ class _ChatSlot:
         self.agent = agent
         _slot_session.init_session_fields(self)
         self.model = model
+        self.acp_backend: str | None = None
+        self.model_backend: str | None = None
         # "" = default chat; app workers may carry their own mode (apps/seams.py)
         self.mode = mode
         self.workspace = workspace

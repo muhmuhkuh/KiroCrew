@@ -13,7 +13,6 @@ from kiro_crew.acp.steering_wire import (  # noqa: F401
     steering_advertised,
     steering_outcome,
 )
-
 # Backend identifiers, the capability sets and the selectable registry live in the
 # leaf module
 # ``kiro_crew.acp_backends`` (it imports nothing from this package, which is what
@@ -435,7 +434,7 @@ PROVIDER_LABEL_GOOSE = "goose"
 PROVIDER_LABEL_DEEPSEEK = "deepseek"
 PROVIDER_LABEL_COPILOT = "copilot"
 PROVIDER_LABEL_STRANDS = "strands"
-
+PROVIDER_LABEL_VIBE = "vibe"
 #: Backend id -> its label. The mapping is what ``provider_label`` resolves
 #: through, so a harness's label and the answer a session persists under are one
 #: fact rather than a constant here and a branch in ``providers.acp``. Closed on
@@ -456,6 +455,7 @@ PROVIDER_LABEL_BY_BACKEND: dict = {
     ACP_BACKEND_GOOSE: PROVIDER_LABEL_GOOSE,
     ACP_BACKEND_DEEPSEEK: PROVIDER_LABEL_DEEPSEEK,
     ACP_BACKEND_COPILOT: PROVIDER_LABEL_COPILOT,
+    ACP_BACKEND_VIBE: PROVIDER_LABEL_VIBE,
 }
 
 # KAS reads only fs.readTextFile / fs.writeTextFile / terminal from the top
@@ -827,25 +827,6 @@ class TurnUsage:
     num_turns: int = 0
     duration_ms: int = 0
     context_sum_tokens: int = 0
-
-
-def _normalize_to_kebab(name: str) -> str:
-    """Convert PascalCase/camelCase to kebab-case for consistent deny matching.
-
-    ``DeleteStack`` → ``delete-stack``, ``send-command`` → ``send-command``
-    (already kebab, unchanged). This ensures the security deny globs (which are
-    authored in kebab-case, e.g. ``*delete-stack*``) match regardless of whether
-    kiro-cli or the LLM sends the AWS API PascalCase name or the CLI kebab name.
-
-    The transform is injective within the space of valid AWS operation names
-    (single-word PascalCase identifiers), so it cannot wrongly DENY a benign op
-    by colliding with a destructive one: AWS operation names are globally unique
-    per service, and the kebab form of each is equally unique.
-    """
-    # Insert hyphen before uppercase runs: "DeleteStack" → "Delete-Stack" → "delete-stack"
-    s = _re.sub(r"([a-z0-9])([A-Z])", r"\1-\2", name)
-    s = _re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1-\2", s)
-    return s.lower()
 
 
 def _command_from_tool_params(params: dict) -> str | None:

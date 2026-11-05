@@ -50,6 +50,7 @@ import ProjectPicker from '../../../components/ProjectPicker'
 import { ProjectAwsProfileSection } from '../../../components/ProjectAwsProfile'
 import ModelEffortDropdown from '../../../components/ModelEffortDropdown'
 import ChatInput from '../../../components/ChatInput'
+import ChatBackendSelect from '../../../components/ChatBackendSelect'
 import { useStableCallbackProps } from '../useStableCallbackProps'
 import type { ComposerTypingLock } from '../shared-crew/useComposerTypingLock'
 import SessionControlHost from '../../../components/SessionControlHost'
@@ -587,6 +588,7 @@ export default function ComposerDockView({
                 voice={voiceOptions}
                 pastes={pasteSlice}
               >
+              <ChatBackendSelect slot={currentSlot} />
               <StableChatInput
               aboveComposer={composerAbove}
               // StableChatInput carries the root's draft snapshot to the memoized editor.

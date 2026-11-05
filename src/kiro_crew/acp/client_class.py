@@ -66,7 +66,6 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
     ACP_BACKEND_STRANDS,
-    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
@@ -80,6 +79,7 @@ from kiro_crew.acp.types import (
     model_registry_namespace,
 )
 from kiro_crew.agent import DerivedSpecSnapshot
+from kiro_crew.agent_sdk.backends import ACP_BACKEND_VIBE
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.config.paths import config_dir
 from kiro_crew.mcp_gateway.claim import mint_stub_session_token

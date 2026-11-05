@@ -24,6 +24,7 @@ from kiro_crew.messaging.identity import channel_inbound_permitted
 from kiro_crew.messaging.renderer import count_redaction_tags, redaction_notice
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+from kiro_crew.slack.channel_policy import channel_refusal
 from kiro_crew.slack.handler import (
     APPROVAL_INTERACTIVE,
     handle_interaction,
@@ -50,7 +51,10 @@ async def _handle_tool_approval(
     # Only approve/trust are blocked outright.
     _is_reject = action_id == "reject_tool"
     if not _is_reject:
-        if not await channel_inbound_permitted("slack"):
+        if not (
+            await channel_inbound_permitted("slack")
+            and not channel_refusal(channel, operation="slack.interactive", caller=user_id)
+        ):
             logger.info(
                 "slack tool-approval (native) dropped: denied by channels governance policy"
             )
@@ -154,6 +158,8 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
@@ -228,6 +234,8 @@ async def _handle_review_edit(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.blocks import review_edit_modal
     from kiro_crew.slack.handler import _review_drafts_get
@@ -274,6 +282,8 @@ async def _handle_review_cancel(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
@@ -327,6 +337,8 @@ async def _handle_review_edit_submit(payload: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
@@ -376,6 +388,8 @@ async def _handle_review_revise(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.blocks import review_revise_modal
     from kiro_crew.slack.handler import _review_drafts_get
@@ -428,6 +442,8 @@ async def _handle_review_revise_submit(payload: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
+    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 

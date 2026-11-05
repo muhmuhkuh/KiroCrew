@@ -283,3 +283,26 @@ def _is_messaging_caller(caller_key: str) -> bool:
         f"{ns}{sep}" for ns in CHANNEL_SESSION_NAMESPACES for sep in (":", "_")
     )
     return caller_key.startswith(prefixes) or bool(SLACK_THREAD_TS_RE.fullmatch(caller_key))
+
+
+CREW_MODE_FOLDER_NOTE = (
+    " (folder ignored: this session is part of a Crew Mode chat, which keeps its "
+    "sessions out of the person's folders)"
+)
+
+
+def _caller_in_crew_tree(caller_key: str, rows: list[dict]) -> bool:
+    """Whether the caller belongs to a chat that turned Crew Mode on.
+
+    Read off the caller's own row in the slot list, which the gateway stamps
+    (``crew_mode.stamp_rows``): a stamped root or a worker of one
+    (``crew_mode.row_in_turned_on_tree``). A caller with no ``dashboard:`` row is
+    not in one.
+    """
+    from kiro_crew import crew_mode
+
+    if not caller_key.startswith("dashboard:"):
+        return False
+    slot_key = caller_key.split(":", 1)[1]
+    by_key = {str(r.get("key") or ""): r for r in rows}
+    return crew_mode.row_in_turned_on_tree(by_key.get(slot_key), by_key)

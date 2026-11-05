@@ -384,6 +384,11 @@ def _read_agent(r: _Read) -> None:
         r.slot.agent = r.meta["agent"]
 
 
+def _read_backend(r: _Read, name: str) -> None:
+    value = r.meta.get(name)
+    setattr(r.slot, name, value if isinstance(value, str) else None)
+
+
 def _read_model(r: _Read) -> None:
     # `jev_route` is deliberately NEITHER written nor read by this table. It
     # records an OWNER's pick that spends money -- a routed turn can run on a
@@ -823,6 +828,22 @@ FIELDS: tuple[Field, ...] = (
             "RESUME restores no model: History resume restores it after the build "
             "(``_restore_model_fields``) and an import carries none"
         ),
+    ),
+    Field(
+        "acp_backend",
+        _ALL,
+        attr="acp_backend",
+        line=_always(lambda s: s.acp_backend),
+        merge=_always(lambda s: s.acp_backend),
+        read=lambda r: _read_backend(r, "acp_backend"),
+    ),
+    Field(
+        "model_backend",
+        _ALL,
+        attr="model_backend",
+        line=_always(lambda s: s.model_backend),
+        merge=_always(lambda s: s.model_backend),
+        read=lambda r: _read_backend(r, "model_backend"),
     ),
     Field(
         "reasoning_effort",
@@ -1310,6 +1331,8 @@ LINE_ORDER: tuple[str, ...] = (
     "title_low_signal",
     "agent",
     "model",
+    "acp_backend",
+    "model_backend",
     "reasoning_effort",
     "autocompact_pct",
     "turn_timeout_secs",
@@ -1368,6 +1391,8 @@ MERGE_ORDER: tuple[str, ...] = (
     "color_theme",
     "memory_mode",
     "model",
+    "acp_backend",
+    "model_backend",
     "queued_prompts",
     "autocompact_pct",
     "turn_timeout_secs",

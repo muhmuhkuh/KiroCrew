@@ -313,10 +313,9 @@ def release_channel() -> str:
     An enterprise build follows ``stable`` whatever the file says
     (:mod:`kiro_crew.edition_locks`, RFC D3).
     """
-    from kiro_crew.edition_locks import local_enable_locked
-
-    if local_enable_locked("updates.channel"):
-        return "stable"
+    required = policy_release_channel()
+    if required:
+        return required
     try:
         raw = (data_home() / "channel").read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -438,3 +437,19 @@ __all__ = [
     "RELEASE_CHANNELS",
     "EXTERNALLY_MANAGED",
 ]
+
+
+def policy_release_channel() -> str:
+    """The channel the policy requires, or ``""`` when the local file decides.
+
+    The policy's ``updates.channel`` pin; with none, ``stable`` in an enterprise
+    build. :func:`release_channel` and the channel-switch API both read this, so
+    the channel followed and the channel a switch may pick cannot disagree.
+    """
+    from kiro_crew.edition import is_enterprise
+    from kiro_crew.platform.governance import active_update_pins
+
+    pinned = active_update_pins().channel
+    if pinned in RELEASE_CHANNELS:
+        return pinned
+    return "stable" if is_enterprise() else ""

@@ -1364,3 +1364,37 @@ async def close_all_ws(self: DashboardState) -> None:
         if coalescer is not None:
             coalescer.shutdown()
     await _websocket_for(self).close_all_ws()
+
+
+def set_fold_delta_capable(self: DashboardState, ws: web.WebSocketResponse, capable: bool) -> bool:
+    return _websocket_for(self).set_fold_delta_capable(ws, capable)
+
+
+def set_fold_apply_capable(self: DashboardState, ws: web.WebSocketResponse, capable: bool) -> bool:
+    return _websocket_for(self).set_fold_apply_capable(ws, capable)
+
+
+def broadcast_slot_fold(
+    self: DashboardState, slot: str, legacy: WsPayload, delta: WsPayload | None
+) -> None:
+    _websocket_for(self).broadcast_slot_fold(slot, legacy, delta)
+
+
+def set_fold_watch(
+    self: DashboardState, ws: web.WebSocketResponse, slots: object
+) -> frozenset[str]:
+    return _websocket_for(self).set_fold_watch(ws, slots)
+
+
+def fold_watch_routing(self: DashboardState) -> tuple[bool, bool, frozenset[str]]:
+    return _websocket_for(self).fold_watch_routing()
+
+
+def fold_apply_watch(self: DashboardState) -> frozenset[str]:
+    return _websocket_for(self).fold_apply_watch()
+
+
+def add_fold_watch_listener(
+    self: DashboardState, listener: Callable[[], None]
+) -> Callable[[], None]:
+    return _websocket_for(self).add_fold_watch_listener(listener)

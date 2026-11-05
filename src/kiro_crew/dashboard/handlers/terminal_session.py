@@ -126,6 +126,8 @@ class _TerminalSession:
     # forwarded byte-for-byte.
     ready_marker: bytes | None = None
     ready_probe: bytearray = field(default_factory=bytearray)
+    remote: bool = False
+    chat_slot: str = ""
     # Serializes concurrent WS writes (reader loop + title poller + pong);
     # aiohttp's WebSocket writer is not safe for concurrent sends.
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)

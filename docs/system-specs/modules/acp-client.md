@@ -2,6 +2,14 @@
 
 ## Overview
 
+Copilot's process adapter lives in `acp/harness/copilot.py`; its session-specific
+permission helpers live in `client_copilot.py`. The client mirror includes that
+owner and `client_native_children.py`, preserving patches through `acp.client`.
+Its MCP-array accessors and permission-state tripwires are bound from their
+respective client owners before the client class is imported.
+Session handles feed and persist advertised models through their model-selection
+owner after create or load when the selected backend advertises its model list.
+
 The primary ACP session transport path spans **five** entry modules: the legacy per-session client (`acp/client.py`, one subprocess per session), the multiplexed runtime (`acp/runtime.py`, one subprocess fanned out to N sessions), the per-session handle (`acp/session_handle.py`, one `sessionId` + queue + prompt/approve/reject loop), a shared dispatch parser (`acp/_dispatch.py`, pure frame-shaping/redaction helpers all paths route through), and the session provider (`acp/session_provider.py`, `AcpSessionProvider` adapting an `AcpSessionHandle` to the `LLMProvider` ABC so runtime-backed sessions are interchangeable with `AcpClient`). All are JSON-RPC 2.0 over stdio for a registry-selected ACP harness, managing subprocess lifecycle, session initialization, prompt streaming, and tool permissions. Protocol constants live in `acp/types.py`; the complete backend and host-capability matrix is in [agent-host-contract.md](agent-host-contract.md#column-meaning).
 
 Module-level code moved out of the two transports lives in the owner modules

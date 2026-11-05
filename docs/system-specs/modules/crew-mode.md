@@ -22,6 +22,19 @@ store.
 
 ## Crew Mode
 
+CrewMate creation and updates validate an explicit `acp_backend` before
+writing the record; an empty value inherits the configured member backend.
+Model eligibility on creation is checked against the selected backend.
+The profile picker receives the selectable harness list from the gateway,
+including Vibe when it is permitted by the active policy.
+The CrewMate editor also exposes this choice alongside its model. Saving a
+different harness clears the worker model pin, and starts the model field at
+Inherited so a model from the old harness is not carried over accidentally.
+
+The ledger read response includes its current `max_depth` alongside the
+conductor's depth. A ledger already open remains available for goal updates
+after the cap is lowered; new ledgers and new items still obey the live cap.
+
 Crew Mode is a chat that runs a conductor and the sessions that conductor dispatches.
 The person sees the chat; the crew it dispatched is the chat's to show.
 

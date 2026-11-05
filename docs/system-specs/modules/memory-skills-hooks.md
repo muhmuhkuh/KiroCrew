@@ -2,6 +2,13 @@
 
 ## Overview
 
+`embeddings_child.py` supplies `ChildLlama` when
+`memory.embedding_child_process` is enabled. Its load deadline, per-call
+deadline, process priority and respawn backoff constants live in the
+import-light `embeddings_settings.py` module beside the enablement reader.
+`VectorMemoryStore` uses `vector_memory_lifecycle.StoreDbLock` to detect
+reentrant reads on the owning thread and preserve uncommitted transaction visibility.
+
 Memory V2 is a development-stage replacement with one stable `member_id` mapped
 to one stable `store_id` and one managed SQLite database. Facts, learned rules,
 episodes, learned history, source spans, revisions, full-text search, embeddings

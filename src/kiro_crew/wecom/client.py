@@ -196,7 +196,7 @@ class WeComClient:
         self._ws_url = ws_url
         self._on_message: Callable[[WeComInbound], Awaitable[None]] | None = on_message
         self._proxy = proxy or _resolve_proxy()
-        self._ws: aiohttp.ClientWebSocketResponse[Any] | None = None
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
         # Serializes all WS sends: aiohttp's WebSocketResponse is not safe for
         # concurrent send_json from multiple tasks (per-turn dispatch tasks + the
         # ping loop), which can interleave frames or raise on newer aiohttp.
@@ -355,7 +355,7 @@ class WeComClient:
         if handler_tasks:
             await asyncio.gather(*handler_tasks, return_exceptions=True)
 
-    async def _ws_send(self, ws: aiohttp.ClientWebSocketResponse[Any], frame: dict) -> None:
+    async def _ws_send(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
         """Serialize a single WS send under ``_send_lock`` (concurrent-safe)."""
         async with self._send_lock:
             await ws.send_json(frame)
@@ -906,7 +906,7 @@ class WeComClient:
                     pass
                 self._ws = None
 
-    async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse[Any]) -> None:
+    async def _ping_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         """Send ping every 30s, detect dead connection after 3 missed pongs."""
         while not ws.closed:
             await asyncio.sleep(30)

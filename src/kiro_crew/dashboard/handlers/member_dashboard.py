@@ -1000,7 +1000,14 @@ def _trusted_page(slug: str, record: Any) -> str | None:
     return entry.html
 
 
-def read_fields(slug: str, member: str, manifest: Any, *, slot: str | None = None) -> Any:
+def read_fields(
+    slug: str,
+    member: str,
+    manifest: Any,
+    *,
+    slot: str | None = None,
+    prime_wait: float | None = None,
+) -> Any:
     """One read of *manifest*'s field values for this crewmate, as the page gets them.
 
     The page's own read, shared with ``dashboard_fields`` so the values an agent is
@@ -1029,6 +1036,10 @@ def read_fields(slug: str, member: str, manifest: Any, *, slot: str | None = Non
     feed = DashboardFeed(slot, session, panel_record=record)
     try:
         feed.subscribe(manifest)
+        if prime_wait is None:
+            feed.wait_for_primes()
+        else:
+            feed.wait_for_primes(prime_wait)
         agentic: Any = {}
         if any(spec.agentic for spec in manifest.fields.values()):
             agentic = projection.read_slot_projection(slot, "agentic").value

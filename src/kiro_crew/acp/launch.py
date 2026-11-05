@@ -1167,6 +1167,12 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     env = {**os.environ}
     # Before any configured layer: only the INHERITED value can be foreign.
     drop_foreign_inherited_port(env)
+    dropped_scratch = tools.agent_scratch.drop_inherited_scratch_env(env)
+    if dropped_scratch:
+        tools.logger.debug(
+            "agent-scratch: dropped inherited %s naming another process's scratch",
+            ",".join(dropped_scratch),
+        )
     # ``agent.env``: the operator's variables for everything the agent runs, over
     # the inherited gateway environment and under everything below -- the
     # driver's ``extra_env``, its session identity and credential repair, and the

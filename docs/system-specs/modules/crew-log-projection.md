@@ -2,6 +2,16 @@
 
 ## 1. Purpose
 
+The projection facade and its owners share the session prefix-custody records,
+slot cold-fold readiness, newest-unit memo and context-rendering interface.
+`prefix_extent.py` validates a resumed prefix; `projection_usage_measured.py`
+owns the context state rendered by `projection_usage.py`. Worker charge relays
+use the `work/charged` entry type declared in `entry_types_ledgers.py`.
+Checkpoint witness records live in `checkpoint_records.py` and retain their
+public import path through `checkpoint.py`. `load_resumable` returns both the
+admitted bundle and its tail positions, so resumed folding and savepoint
+persistence share the same prefix evidence.
+
 A session's crew log is an append-only file (`crew-log-core.md`). Every view of it
 is a FOLD: `status`, `usage`, `timeline`, `tools`, `approvals`, `subagents` and
 `class` -- the session side panel of the RFC's section 5 table, plus the one fold a
