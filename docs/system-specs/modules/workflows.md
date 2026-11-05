@@ -1407,7 +1407,10 @@ never spawns `kiro-cli` in tests. Two production adapters:
   worker after `provider.new_conversation()` (a fresh `session/new` on the live
   process, skipping spawn and initialize), falling back to a hard
   `SessionManager.reset` if that is unavailable or fails, so a reused worker can
-  never carry prior-task context forward. Dead workers are retired and replaced.
+  never carry prior-task context forward. Only a backend on the shared runtime
+  (kiro, KAS, Codex) has the cheap reset; one on its own `AcpClient` (claude and
+  the other per-session adapters) raises `NotImplementedError` naming the backend,
+  and its reuse is the hard reset, logged at INFO as a cold start. Dead workers are retired and replaced.
   A `session=<key>` call bypasses the pool entirely, since it needs a stable named
   session rather than a reset-between-uses worker.
 
@@ -1586,7 +1589,7 @@ At the ceiling both delivery paths (`inject_workflow_result` and
 create nothing, log one warning naming the run id, and return `False`; the result
 stays on the run record (`workflow_status`, the Runs view). The test keeps a
 workflow whose origin is gone on every run from filling the slot table, which
-would answer the person's own new chat with 429 `slot_cap_reached`. A re-fire into an
+would answer the person's own new chat with 409 `slot_cap_reached`. A re-fire into an
 existing `workflow-<run_id>` slot and delivery into a live originating chat
 allocate nothing and are not tested.
 

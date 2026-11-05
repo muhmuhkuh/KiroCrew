@@ -48,7 +48,7 @@ begin on its own line; the assembly newline-terminates the caller's
 
 | # | Block | Fed by | Condition |
 |--:|---|---|---|
-| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md`; `_load_agent_prompt` for a custom agent | skipped on a slim resume |
+| 1 | `[AGENT SYSTEM PROMPT]` | `config/prompt.md` (on the Claude Code backend with `kiro-cli` respelled `claude code`, nothing else renamed); `_load_agent_prompt` for a custom agent | skipped on a slim resume |
 | 2 | `[CRITICAL RULES]` | `_critical_rules_for` (runtime-conditional) | unless the agent sets `includeCrewContext: false` |
 | 3 | `[CURRENT DATE]` | `get_local_tz` + `KiroCrewConfig.timezone` | always |
 | 4 | `[CURRENT AGENT]` / `[RUNTIME]` | `_runtime_display_name`, trusted `runtime_source` from the dispatcher | when a session key exists |
@@ -61,7 +61,7 @@ begin on its own line; the assembly newline-terminates the caller's
 | 9 | `[USER PROFILE]` | onboarding answers in config | non-empty, `lessons` group |
 | 10 | `[WORKSPACE IDENTITY]` | `workspace_dir_for` | `kirocrew` agent only |
 | 11 | `[DOCUMENTATION]` | `_build_docs_section`, the packaged docs dir | `kirocrew` agent, `project` group |
-| 12 | `[Steering resources]` | `_load_steering_resources` → `file://*.md` in `~/.kiro/agents/kirocrew.json`, front matter stripped; a `manual`/`auto`/`fileMatch` document withheld (`folder_steering.every_session_body`) | **Claude Code backend**, `kirocrew` agent, `project` group |
+| 12 | `[Steering resources]` | `_load_steering_resources` → `file://*.md` in `~/.kiro/agents/kirocrew.json`, front matter stripped; a `manual`/`auto`/`fileMatch` document withheld (`folder_steering.every_session_body`); gated by `context_assembly/inclusion.py` → `steering_resources_part` | **Claude Code backend**, `kirocrew` agent, `project` group, not a member chat; re-sent after a compaction (§2, item 8) |
 | 13 | `[THREAD CONVERSATION HISTORY]` | `build_session_replay` (lossless, newest first), else `_recall_rows` truncation | new, non-resumed session |
 | 14 | `[PREVIOUS TURN WAS CANCELLED …]` | `_build_stop_event_notes` | recent user stop |
 | 15 | `[Memory …]` + `[Memory activity index]` + `[Memory activity]` + `[Memory tools]` | `memory.py` → `get_context`, `activity_index`, `get_activity_context` | not temporary, `memory` group; the activity block also needs `memory.inject_activity` |
@@ -409,11 +409,17 @@ re-adds, once:
    the user's text for that turn. With per-message lessons on (the
    `[Learned corrections — relevant to this message …]` row above), the
    shown-lesson record restarts from this block, so that block does not repeat it.
+8. `[REINJECTED AFTER COMPACTION — steering resources]` — row 12's text, Claude
+   Code backend only, through the same `steering_resources_part` gate as session
+   start, payload scrubbed of structural markers. kiro-cli loads the agent's
+   `resources` natively and keeps them across its own compaction, so the kiro and
+   KAS paths get nothing here.
 
 If that turn does not land (cancelled, refused, errored), `rearm_reinjection` puts
 the flag back, so the context is never lost to a failed turn. A minimal-context turn
 gets back only the agent contract and the reply-style preferences; the memory index,
-skills index, lessons, folder steering, member section and work ledger stay withheld
+skills index, lessons, steering resources, folder steering, member section and work
+ledger stay withheld
 (`post_compaction_parts(minimal_context=True)`).
 
 ### The `[work ledger]` snapshot

@@ -399,8 +399,9 @@ X_FEATURE_SETS: dict[str, frozenset[str] | None] = {
     "ACP_BACKENDS_MARKDOWN_AGENT_SPECS": None,
     "ACP_BACKENDS_KIRO_SLASH_COMMANDS": None,
     "ACP_BACKENDS_MEMBER_DISPATCH": frozenset({"codex", "kas", "opencode"}),
-    # pi's membership rides its gate extension's confirm dialog, not a mirror.
-    "ACP_BACKENDS_HONOR_ZERO_TOOL_BAN": frozenset({"kas", "kiro", "opencode", "pi"}),
+    # pi's membership rides its gate extension's confirm dialog, not a mirror;
+    # claude's rides session options that mount no tool at all.
+    "ACP_BACKENDS_HONOR_ZERO_TOOL_BAN": frozenset({"claude", "kas", "kiro", "opencode", "pi"}),
     "ACP_BACKENDS_MATE_WORKER_KIT": None,
     "ACP_BACKENDS_PERMISSION_KIND_FROM_TOOL_CALL": None,
     # copilot's drop is off the wire (its log, no frame), so no capture can show it.
@@ -432,6 +433,9 @@ X_FEATURE_SETS: dict[str, frozenset[str] | None] = {
     # Strands CLI 0.2.3: a second process with a changed --mcp-config loads the
     # same session; the added server's tool is offered, a withdrawn one's is not.
     "ACP_BACKENDS_MCP_RELAUNCH_RELOAD": None,
+    # claude-agent-acp 0.94.0: a `/compact` prompt run as the SDK's own command
+    # inside session/prompt.
+    "ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS": None,
 }
 
 # Coverage is opt-out: every ``ACP_BACKENDS_*`` set is in X_FEATURE_SETS, here, or
@@ -470,6 +474,7 @@ HARNESS_EXEMPT_SETS: dict[str, str] = {
     "ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION": "standard ACP: session/set_config_option",
     "ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION": "standard ACP: advertised config options",
     "ACP_BACKENDS_ADVERTISED_MODEL_SELECTION": "standard ACP: advertised model list",
+    "ACP_BACKENDS_DEFAULT_PSEUDO_MODEL": "standard ACP: advertised model list and config options",
     "ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS": "standard ACP: advertised model id values",
     "ACP_BACKENDS_INLINE_COMPACTION": "standard ACP: session/prompt terminal frame",
     "ACP_BACKENDS_UNATTRIBUTED_TERMINAL_ERROR": "standard ACP: agent_message_chunk shape",

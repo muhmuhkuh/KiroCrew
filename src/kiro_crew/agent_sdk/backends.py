@@ -181,6 +181,9 @@ with no row here.
    * - ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``
      - driver-internal (whether the ADVERTISED option, rather than Crew's model
        registry, answers that this session takes an effort level and which ones)
+   * - ``ACP_BACKENDS_DEFAULT_PSEUDO_MODEL``
+     - driver-internal (whether an unpinned session serves a pseudo-model the
+       registry cannot name, so the advertised effort option answers there)
    * - ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``
      - semantic question (``SessionCapabilities.resolves_model_from_advertised_list``)
    * - ``ACP_BACKENDS_SEED_LOCAL_SETTINGS``
@@ -196,6 +199,8 @@ with no row here.
        the kiro-cli / KAS branch), and the card's kiro-family marker
    * - ``ACP_BACKENDS_NATIVE_TODOS``
      - semantic question (``SessionCapabilities.supports_native_todos``)
+   * - ``ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS``
+     - semantic question (``SessionCapabilities.runs_own_slash_commands``)
    * - ``ACP_BACKENDS_LOCAL_CLEAR``
      - pre-session registry query (whether the dashboard answers ``/clear``
        itself rather than handing it to the harness as prompt text)
@@ -1149,6 +1154,7 @@ from kiro_crew.agent_sdk.backends_models import (  # noqa: E402,F401 - re-export
     _MODEL_REFUSAL_PHRASE_BY_BACKEND,
     _MODEL_REGISTRY_NAMESPACE_BY_BACKEND,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_DEFAULT_PSEUDO_MODEL,
     ACP_BACKENDS_EFFORT_AT_LAUNCH,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
@@ -1220,6 +1226,7 @@ from kiro_crew.agent_sdk.backends_turns import (  # noqa: E402,F401 - re-exporte
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
+    ACP_BACKENDS_HARNESS_OWNED_SLASH_COMMANDS,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_KIRO_FAMILY,
     ACP_BACKENDS_KIRO_SLASH_COMMANDS,

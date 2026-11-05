@@ -57,7 +57,10 @@ guarantee; sandbox-off code, external host tools and pre-existing writable alias
 remain outside it. No per-member sandbox machinery is introduced.
 
 Manual member essentials resolve directly from canonical member identity without
-opening SQLite. The optional learned-rule block can report member-memory
+opening SQLite. Their template path follows `agent.spec_pins` through
+`agent.session_agent_spec_path`, with project scope ahead of user and mate scope;
+the prompt reader and read-only side-session base use the same selected template.
+The optional learned-rule block can report member-memory
 unavailable while manual essentials remain usable. Incognito allows reads and
 blocks all learned writes; Temporary neither reads nor writes memory, including
 lessons. Ordinary V2 recall has no persistent side effects: it does not touch
@@ -7163,10 +7166,12 @@ it is not the public turn's slim-resume path.
 | Cross-tab history | Not injected |
 
 Post-compaction reinjection separately refreshes bounded skill discovery,
-protected skill bodies, memory navigation, reply preferences and member identity.
+protected skill bodies, memory navigation, reply preferences and member identity,
+and on the Claude Code backend the steering resources, under the session-start gate
+(`context_assembly/inclusion.py` → `steering_resources_part`).
 A minimal-context turn refreshes only what its minimal session start carried, the
-agent contract and reply preferences; memory navigation, skills, folder steering
-and the member section stay withheld.
+agent contract and reply preferences; memory navigation, skills, steering
+resources, folder steering and the member section stay withheld.
 
 The owner copy dialog names its destination member. Recovery distinguishes
 **Restore experience** from whole-store **Restore backup**. A dirty store switch

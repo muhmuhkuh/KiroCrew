@@ -89,6 +89,7 @@ function CommentRow({ comment, onEdit, onRemove, onEditingChange }: {
         <div className="text-muted text-[11px] font-mono truncate" title={comment.anchor}>"{comment.anchor.slice(0, 60)}{comment.anchor.length > 60 ? '…' : ''}"</div>
         {editing ? (
           <input ref={inputRef} value={draft} onChange={e => setDraft(e.target.value)}
+            aria-label={i18nT('components.commentsSidebar.edit_comment_2')}
             {...ime.bindComposition<HTMLInputElement>({ onBlur: commitEdit })}
             onKeyDown={e => {
               if (e.key === 'Enter' && draft.trim()) { if (ime.claimEnter(e)) commitEdit() }

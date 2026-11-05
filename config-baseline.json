@@ -20,6 +20,7 @@
         "role_models": {},
         "role_efforts": {},
         "model_context_tokens": {},
+        "spec_pins": {},
         "fallback_model": "auto",
         "refusal_fallback_model": "",
         "reasoning_effort": "",
@@ -255,6 +256,34 @@
       "defaultValue": null
     },
     {
+      "path": "agent.spec_pins",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Agent spec pins",
+      "help": "Which file an agent name runs when two or more specs in the agents directory declare it, as {\"<agent name>\": \"<file name>\"}, for example {\"helper\": \"PkgA-helper.json\"}. A bare .json or .md file name, never a path, so a pin survives the package's updates. Set it with 'kirocrew agent pin <name> <file>' or the chat's chooser. With no pin, differing specs under one name are refused; a pin naming none of them is refused too and never falls back to another file. New sessions run the pinned file; a running session's later spec reads follow the current pin.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.spec_pins.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
       "path": "agent.fallback_model",
       "kind": "core",
       "type": "string",
@@ -470,8 +499,8 @@
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Crew Mode conductor",
-      "help": "The conductor template a chat runs when Crew Mode is turned on. Empty falls back to the default. Takes effect live for new chats; no gateway restart.",
+      "label": "Ultra Mode agent",
+      "help": "The agent template a chat runs when Ultra Mode is turned on. Empty falls back to the default. Takes effect live for new chats; no gateway restart.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "kirocrew-conductor"
@@ -916,7 +945,7 @@
       "sensitive": false,
       "tags": [],
       "label": "MCP Tool Search",
-      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli applies it through the agent overlay; KAS receives it in the ACP initialize request, enabled only when the spawn agent's spec grants the tool_search loader. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Crew's servers defer only when the spawn runs the pinned kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0; any other executable, an older or unknown version keeps them resident. To override the never-defer list, set ASBX_KIRO_MANDATORY_MCPS (comma-separated server names) in the gateway's environment. No effect on any other ACP backend.",
+      "help": "Load MCP tool specs on demand (search-and-call) instead of sending every tool definition each turn, keeping the context window clear when many MCP servers are configured. kiro-cli applies it through the agent overlay; KAS receives it in the ACP initialize request, enabled only when the spawn agent's spec grants the tool_search loader. Deferral only starts once the specs cross tool_search_min_pct or tool_search_min_tokens; disabling reverts to sending full tool specs. Crew's servers defer only when the spawn runs the pinned kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0; any other executable, an older or unknown version keeps them resident. On Kiro Crew's own KAS engine bundle they always defer: that engine keeps its tools array fixed when a tool loads. To override the never-defer list, set ASBX_KIRO_MANDATORY_MCPS (comma-separated server names) in the gateway's environment. No effect on any other ACP backend.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true

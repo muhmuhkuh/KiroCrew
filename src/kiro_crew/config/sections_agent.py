@@ -142,6 +142,20 @@ class AgentConfig:
             "1,000,000-token reference. Takes effect on the next config reload.",
         ),
     )
+    spec_pins: dict[str, str] = field(
+        default_factory=dict,
+        metadata=_meta(
+            "Agent spec pins",
+            "Which file an agent name runs when two or more specs in the agents "
+            'directory declare it, as {"<agent name>": "<file name>"}, for example '
+            '{"helper": "PkgA-helper.json"}. A bare .json or .md file name, never a '
+            "path, so a pin survives the package's updates. Set it with "
+            "'kirocrew agent pin <name> <file>' or the chat's chooser. With no pin, "
+            "differing specs under one name are refused; a pin naming none of them is "
+            "refused too and never falls back to another file. New sessions run the "
+            "pinned file; a running session's later spec reads follow the current pin.",
+        ),
+    )
     fallback_model: str = field(
         default="auto",
         metadata=_meta(
@@ -346,8 +360,8 @@ class AgentConfig:
     crew_mode_agent: str = field(
         default=_CREW_MODE_AGENT_DEFAULT,
         metadata=_meta(
-            "Crew Mode conductor",
-            "The conductor template a chat runs when Crew Mode is turned on. "
+            "Ultra Mode agent",
+            "The agent template a chat runs when Ultra Mode is turned on. "
             "Empty falls back to the default. Takes effect live for new chats; "
             "no gateway restart.",
         ),
@@ -678,7 +692,10 @@ class AgentConfig:
             "tool_search_min_tokens; disabling reverts to sending full tool "
             "specs. Crew's servers defer only when the spawn runs the pinned "
             "kiro-cli install or its kiro-cli-chat, and both are >= 2.27.0; any "
-            "other executable, an older or unknown version keeps them resident. To override the never-defer list, set "
+            "other executable, an older or unknown version keeps them resident. "
+            "On Kiro Crew's own KAS engine bundle they always defer: that engine "
+            "keeps its tools array fixed when a tool loads. To override the "
+            "never-defer list, set "
             "ASBX_KIRO_MANDATORY_MCPS (comma-separated server names) in the "
             "gateway's environment. No effect on any other ACP backend.",
         ),
@@ -1451,6 +1468,11 @@ class AgentConfig:
         self.role_models = coerce_role_models(self.role_models)
         self.role_efforts = coerce_role_efforts(self.role_efforts)
         self.model_context_tokens = coerce_model_context_tokens(self.model_context_tokens)
+        # Call-time: bound here, the coercer would be a name this section module
+        # serves, and the sections facade re-exports only names its owners define.
+        from kiro_crew.agent_spec_pins import coerce_spec_pins
+
+        self.spec_pins = coerce_spec_pins(self.spec_pins)
         # Same defensive TYPE coercion for the DeepSeek provider-key map. What its
         # names and values may BE is refused at spawn, by name -- see
         # coerce_deepseek_env.
