@@ -639,7 +639,15 @@
         "cycles_count_one": "{{count}} цикл",
         "cycles_count_few": "{{count}} цикла",
         "cycles_count_many": "{{count}} циклов",
-        "cycles_count_other": "{{count}} цикла"
+        "cycles_count_other": "{{count}} цикла",
+        "cycles": "циклов,",
+        "cycles_2": "циклов",
+        "findings": "выводов",
+        "min": "мин",
+        "s_idle": "с простоя. ~",
+        "sub_questions_2": "подвопросов",
+        "suggested_from": "предложено из",
+        "up_to": "До"
       }
     },
     "autoTriagePipeline": {
@@ -970,7 +978,8 @@
           "pending_count_one": "{{count}} в ожидании",
           "pending_count_few": "{{count}} в ожидании",
           "pending_count_many": "{{count}} в ожидании",
-          "pending_count_other": "{{count}} в ожидании"
+          "pending_count_other": "{{count}} в ожидании",
+          "pending": "в ожидании"
         },
         "leftRail": {
           "code_review_sage": "Code Review Sage",
@@ -1117,7 +1126,10 @@
           "failing_count_one": "{{count}} падает",
           "failing_count_few": "{{count}} падают",
           "failing_count_many": "{{count}} падают",
-          "failing_count_other": "{{count}} падают"
+          "failing_count_other": "{{count}} падают",
+          "failing": "падают",
+          "passed": "прошли",
+          "running": "выполняются"
         },
         "repoSwitcher": {
           "add_a_repo": "Добавить репозиторий",
@@ -1165,7 +1177,9 @@
           "should_fix_count_one": "стоит исправить: {{count}}",
           "should_fix_count_few": "стоит исправить: {{count}}",
           "should_fix_count_many": "стоит исправить: {{count}}",
-          "should_fix_count_other": "стоит исправить: {{count}}"
+          "should_fix_count_other": "стоит исправить: {{count}}",
+          "blocking": "блокирующих",
+          "should_fix": "стоит исправить"
         },
         "reviewChat": {
           "error_generic": "Не удалось открыть сеанс для уточнений. Попробуйте снова.",
@@ -1220,7 +1234,8 @@
           "more_count_one": "ещё +{{count}}",
           "more_count_few": "ещё +{{count}}",
           "more_count_many": "ещё +{{count}}",
-          "more_count_other": "ещё +{{count}}"
+          "more_count_other": "ещё +{{count}}",
+          "more": "ещё"
         },
         "runDetail": {
           "cancelled_before_any_finished": "Оно было отменено до того, как хоть один pull request успел закончиться.",
@@ -1242,7 +1257,8 @@
           "more_count_one": "ещё +{{count}}",
           "more_count_few": "ещё +{{count}}",
           "more_count_many": "ещё +{{count}}",
-          "more_count_other": "ещё +{{count}}"
+          "more_count_other": "ещё +{{count}}",
+          "more": "ещё"
         },
         "runList": {
           "new_review": "Новое ревью"
@@ -1269,7 +1285,10 @@
           "cancelled_count_one": "отменено: {{count}}",
           "cancelled_count_few": "отменено: {{count}}",
           "cancelled_count_many": "отменено: {{count}}",
-          "cancelled_count_other": "отменено: {{count}}"
+          "cancelled_count_other": "отменено: {{count}}",
+          "cancelled": "отменено",
+          "failed": "с ошибкой",
+          "reviewed": "отревьюено"
         },
         "runStatusPill": {
           "cancelled": "Отменено",
@@ -1791,7 +1810,8 @@
         "link_placeholder_staged": "Используются твои скриншоты — убери их, чтобы разобрать ссылку",
         "link_placeholder": "Ссылка Figma · git-репозиторий · папка на этом компьютере · запущенный URL (localhost или развёрнутый предпросмотр)",
         "link_label": "Ссылка для разбора",
-        "render_before_judging": "Я отрисовываю всё, прежде чем оценивать, — никогда не только по коду. Если твоё приложение уже запущено, вставь его URL, и я смогу измерить настоящие цвета и размеры, а не прикидывать их."
+        "render_before_judging": "Я отрисовываю всё, прежде чем оценивать, — никогда не только по коду. Если твоё приложение уже запущено, вставь его URL, и я смогу измерить настоящие цвета и размеры, а не прикидывать их.",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "constants": {
         "blocked_figma_app_missing_hint": "Открой файл в настольном приложении Figma и попробуй снова, или экспортируй фреймы в PNG и перетащи их сюда.",
@@ -1957,7 +1977,8 @@
         "screens": "Экраны",
         "start_over": "Начать заново",
         "suggested_flows": "Предлагаемые сценарии",
-        "what_should_i_audit": "Что мне проанализировать?"
+        "what_should_i_audit": "Что мне проанализировать?",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "utils": {
         "i_ll_capture_it_and_measure_real_contrast_and_si": "Я сниму его и измерю настоящий контраст и размеры.",
@@ -2325,7 +2346,8 @@
           "timeline": "Хронология",
           "unassign_me": "Снять с меня",
           "unassigned": "снял назначение",
-          "updated": "Обновлено"
+          "updated": "Обновлено",
+          "by": "· автор"
         },
         "issueList": {
           "clear_search": "Очистить поиск",
@@ -2367,7 +2389,9 @@
           "add_suggested_one": "Добавить предложенные: {{count}}",
           "add_suggested_few": "Добавить предложенные: {{count}}",
           "add_suggested_many": "Добавить предложенные: {{count}}",
-          "add_suggested_other": "Добавить предложенные: {{count}}"
+          "add_suggested_other": "Добавить предложенные: {{count}}",
+          "add": "Добавить",
+          "suggested": "предложено"
         },
         "leftRail": {
           "click_to_expand_the_sidebar": "{{name}} — нажми, чтобы развернуть боковую панель",
@@ -2580,7 +2604,10 @@
           "skipped_count_one": "{{count}} пропущено",
           "skipped_count_few": "{{count}} пропущено",
           "skipped_count_many": "{{count}} пропущено",
-          "skipped_count_other": "{{count}} пропущено"
+          "skipped_count_other": "{{count}} пропущено",
+          "failing": "с ошибками",
+          "passed": "успешно",
+          "running": "выполняется"
         },
         "prFiltersSection": {
           "assigned_to_me": "Назначено мне",
@@ -2658,7 +2685,8 @@
           "deep_count_few": "глубина {{count}}",
           "deep_count_many": "глубина {{count}}",
           "deep_count_other": "глубина {{count}}",
-          "dialog_label": "{{kind}} {{ref}} в {{repo}}"
+          "dialog_label": "{{kind}} {{ref}} в {{repo}}",
+          "deep": "в глубину"
         },
         "repoSwitcher": {
           "repositories": "Репозитории"
@@ -3233,7 +3261,8 @@
             "labels_defined_one": "определено: {{count}} · по числу открытых задач",
             "labels_defined_few": "определено: {{count}} · по числу открытых задач",
             "labels_defined_many": "определено: {{count}} · по числу открытых задач",
-            "labels_defined_other": "определено: {{count}} · по числу открытых задач"
+            "labels_defined_other": "определено: {{count}} · по числу открытых задач",
+            "defined_by_open_issue_count": "определено · по числу открытых задач"
           },
           "untaggedIssueCard": {
             "add": "Добавить",
@@ -3348,7 +3377,9 @@
           "live_edges_one": "{{n}} активное ребро",
           "live_edges_few": "{{n}} активных ребра",
           "live_edges_many": "{{n}} активных рёбер",
-          "live_edges_other": "{{n}} активного ребра"
+          "live_edges_other": "{{n}} активного ребра",
+          "tree_stat": "дерево {{kind}}-{{number}}: {{nodes}} узлов · {{edges}} активных рёбер",
+          "aria_tree": "Дерево зависимостей {{kind}}-{{number}}: {{nodes}} узлов, {{edges}} активных рёбер"
         },
         "groupReviewsView": {
           "title": "Запросы на ревью",
@@ -4407,7 +4438,13 @@
         "busiest_day_one": "Самый болтливый день: {{date}} ({{n}} сообщ.)",
         "busiest_day_few": "Самый болтливый день: {{date}} ({{n}} сообщ.)",
         "busiest_day_many": "Самый болтливый день: {{date}} ({{n}} сообщ.)",
-        "busiest_day_other": "Самый болтливый день: {{date}} ({{n}} сообщ.)"
+        "busiest_day_other": "Самый болтливый день: {{date}} ({{n}} сообщ.)",
+        "busiest_day": "Самый болтливый день: {{date}} ({{count}} сообщ.)",
+        "drags": "Перетащен {{count}} раз",
+        "longest_chat": "Самый долгий чат: {{count}} сообщений",
+        "peeks": "Выглянул {{count}} раз",
+        "screenshots": "Смотрел на ваш экран {{count}} раз",
+        "walks": "{{count}} шагов"
       },
       "tip": {
         "bedtime": "Попробуйте: \"скажи мне сбавить темп в 23:00\"",
@@ -4926,7 +4963,11 @@
         "unclaimed_count_one": "ещё не взято: {{count}}",
         "unclaimed_count_few": "ещё не взято: {{count}}",
         "unclaimed_count_many": "ещё не взято: {{count}}",
-        "unclaimed_count_other": "ещё не взято: {{count}}"
+        "unclaimed_count_other": "ещё не взято: {{count}}",
+        "cleared": "снят ·",
+        "firing_2": "срабатывает ·",
+        "not_yet_claimed": "ещё не взято",
+        "parked_at_provider": "отложено у провайдера ·"
       }
     },
     "papyrus": {
@@ -5521,7 +5562,8 @@
           "done_of_total_one": "Готово {{done}} из {{total}} задачи",
           "done_of_total_few": "Готово {{done}} из {{total}} задач",
           "done_of_total_many": "Готово {{done}} из {{total}} задач",
-          "done_of_total_other": "Готово {{done}} из {{total}} задачи"
+          "done_of_total_other": "Готово {{done}} из {{total}} задачи",
+          "done_of_total": "Готово {{done}} из {{total}} задач"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "Опишите, что вы хотите создать, ответьте на несколько вопросов и получите проверенный план — требования, дизайн и задачи — который сможет выполнить агент.",
@@ -6065,7 +6107,8 @@
         "keys_healthy_one": "Исправных ключей: {{healthy}} из {{n}}",
         "keys_healthy_few": "Исправных ключей: {{healthy}} из {{n}}",
         "keys_healthy_many": "Исправных ключей: {{healthy}} из {{n}}",
-        "keys_healthy_other": "Исправных ключей: {{healthy}} из {{n}}"
+        "keys_healthy_other": "Исправных ключей: {{healthy}} из {{n}}",
+        "totals_summary": "Аккаунтов: {{accounts}} · Исправных ключей: {{healthy}} из {{keys}}"
       },
       "rail": {
         "accounts": "Аккаунты и учётные данные",
@@ -6249,7 +6292,9 @@
       "value_question": "есть вопрос",
       "value_rejected": "отклонена",
       "value_review_required": "нужен ревью",
-      "why": "Почему"
+      "why": "Почему",
+      "progress": "Прогресс",
+      "progress_count": "Готово {{accepted}} из {{total}}"
     },
     "voicePlaybackNotice": {
       "failed": "Не удалось выполнить «{{speak}}». Проверь настройки преобразования текста в речь и попробуй снова.",
@@ -6560,7 +6605,9 @@
       "found_count_one": "найдено: {{count}}",
       "found_count_few": "найдено: {{count}}",
       "found_count_many": "найдено: {{count}}",
-      "found_count_other": "найдено: {{count}}"
+      "found_count_other": "найдено: {{count}}",
+      "found": "найдено",
+      "items_selected": "элементов выбрано"
     },
     "agentSpecNotRewrittenNotice": {
       "saved_but_not_applied": "Сохранено, но эта копия {{productName}} не смогла обновить конфигурацию агента, поэтому новые чаты используют прежние настройки. Причину смотри на странице «Логи»."
@@ -6634,7 +6681,8 @@
       "trusted_channel_all": "Доверенный — все инструменты в этом канале разрешаются автоматически, сохраняется после перезапуска",
       "trusted_channel_base": "Доверенный — команды {{base}} разрешаются автоматически для @{{role}} до перезапуска {{productName}}",
       "trusted_channel_command": "Доверенный — «{{cmd}}» разрешается автоматически для @{{role}} до перезапуска {{productName}}",
-      "title_wants_to_run": "<title/> запрашивает запуск"
+      "title_wants_to_run": "<title/> запрашивает запуск",
+      "running": "Выполняется:"
     },
     "approvalModePicker": {
       "nudge_body": "Здесь можно настроить, как {{productName}} запрашивает одобрение. Если выбрать здесь «Доверие», он сможет работать в этом чате без предварительных вопросов — вернуть можно в любой момент.",
@@ -6728,7 +6776,8 @@
         "run_this_on_your_local_machine": "Выполните это на своей локальной машине:",
         "uninstall": "Удалить",
         "update": "Обновить",
-        "update_to": "Обновить до v{{version}}"
+        "update_to": "Обновить до v{{version}}",
+        "open": "Открыть"
       },
       "sourcesPopover": {
         "developer_install_equivalent_to_command": "Установка локального каталога приложения для разработчика (эквивалент <command/>).",
@@ -6738,7 +6787,8 @@
         "installing": "Установка…",
         "kirocrew_app_install_path": "kirocrew app install <path>",
         "manage_app_sources": "Управление источниками приложений",
-        "path_to_app_directory": "/path/to/app-directory"
+        "path_to_app_directory": "/path/to/app-directory",
+        "developer_install_of_a_local_app_directory_equiv": "Установка локального каталога приложения для разработчика (эквивалент"
       },
       "types": {
         "built_in": "Встроенное",
@@ -7379,7 +7429,9 @@
       "messages_count_one": "{{count}} сообщение",
       "messages_count_few": "{{count}} сообщения",
       "messages_count_many": "{{count}} сообщений",
-      "messages_count_other": "{{count}} сообщения"
+      "messages_count_other": "{{count}} сообщения",
+      "messages": "сообщений",
+      "open": "открытых ·"
     },
     "commentsSidebar": {
       "add_a_comment_on_the_whole_artifact": "Добавить комментарий ко всему артефакту…",
@@ -7425,7 +7477,10 @@
       "hide_resolved_count_one": "Скрыть решённые ({{count}})",
       "hide_resolved_count_few": "Скрыть решённые ({{count}})",
       "hide_resolved_count_many": "Скрыть решённые ({{count}})",
-      "hide_resolved_count_other": "Скрыть решённые ({{count}})"
+      "hide_resolved_count_other": "Скрыть решённые ({{count}})",
+      "hide": "Скрыть",
+      "resolved": "разрешён",
+      "show": "Показать"
     },
     "computerUseLiveView": {
       "close": "Закрыть",
@@ -7630,7 +7685,9 @@
       "show_more_count_one": "Показать ещё {{count}}",
       "show_more_count_few": "Показать ещё {{count}}",
       "show_more_count_many": "Показать ещё {{count}}",
-      "show_more_count_other": "Показать ещё {{count}}"
+      "show_more_count_other": "Показать ещё {{count}}",
+      "more": "ещё",
+      "show": "Показать"
     },
     "openFileChips": {
       "open_file": "Открыть файл"
@@ -7656,7 +7713,8 @@
       "search_denied_path": "Нет доступа к этому пути",
       "check_path_inside_project": "Выбери другой путь",
       "enter_sends": "Enter отправит сообщение",
-      "ctrl_enter_sends": "Ctrl+Enter отправит сообщение"
+      "ctrl_enter_sends": "Ctrl+Enter отправит сообщение",
+      "search_failed": "Не удалось выполнить поиск файлов. Попробуйте ещё раз."
     },
     "fileRenderers": {
       "binary_file_download_hint": "Это не текст, поэтому здесь нечего показать. Скачайте копию, чтобы открыть его в другом приложении.",
@@ -7728,7 +7786,12 @@
       "more_count_one": "ещё {{count}}",
       "more_count_few": "ещё {{count}}",
       "more_count_many": "ещё {{count}}",
-      "more_count_other": "ещё {{count}}"
+      "more_count_other": "ещё {{count}}",
+      "items": "элементов",
+      "lines": "строк",
+      "more": "ещё",
+      "rows": "строк",
+      "showing_500_of": "Показано 500 из"
     },
     "folderColorNames": {
       "amber": "Янтарный",
@@ -8136,7 +8199,8 @@
       "cancel_unsettled": "Не удалось отменить вход. Он всё ещё активен — нажмите тот же вариант ещё раз, чтобы повторить.",
       "card_intro": "Используется только бэкендом Kiro Agent: его агенты работают от имени этого аккаунта Kiro. Kiro CLI сохраняет собственный вход kiro-cli, поэтому вход здесь на него не влияет.",
       "previous_sign_in_not_removed": "Вход выполнен, но предыдущий вход не удалось удалить",
-      "previous_sign_in_not_removed_body": "Новый аккаунт сохранён, но тот, с которого вы переключались, всё ещё хранится и имеет приоритет. Выйдите из него, затем проверьте вход, показанный здесь."
+      "previous_sign_in_not_removed_body": "Новый аккаунт сохранён, но тот, с которого вы переключались, всё ещё хранится и имеет приоритет. Выйдите из него, затем проверьте вход, показанный здесь.",
+      "click_to_copy": "Нажми, чтобы скопировать"
     },
     "kiroPrerequisiteGate": {
       "setup_completion_not_recorded": "Завершение настройки не сохранено",
@@ -9346,7 +9410,8 @@
       "sent_transcript_only": "Отправлено (только расшифровка)",
       "transcript_only_hint": "Эта команда не смогла восстановить полный контекст беседы, поэтому эта копия продолжается только по расшифровке.",
       "unknown_error": "Неизвестная ошибка",
-      "default_badge": "по умолчанию"
+      "default_badge": "по умолчанию",
+      "failed": "Ошибка"
     },
     "sessionActionsMenu": {
       "bring_back_to_main": "Вернуть в главное окно",
@@ -9517,7 +9582,8 @@
       "installed_files_one": "Установлен {{count}} файл",
       "installed_files_few": "Установлено {{count}} файла",
       "installed_files_many": "Установлено {{count}} файлов",
-      "installed_files_other": "Установлено {{count}} файла"
+      "installed_files_other": "Установлено {{count}} файла",
+      "by": "от"
     },
     "skillDirectoryBrowser": {
       "description": "Описание",
@@ -9816,7 +9882,8 @@
       "dismiss_tip": "Скрыть подсказку",
       "feature_tip": "Подсказка о функции",
       "learn_more": "Подробнее",
-      "turn_off_tips": "Отключить подсказки"
+      "turn_off_tips": "Отключить подсказки",
+      "tip_settings": "Настройки подсказок"
     },
     "toolInputPreview": {
       "collapse": "Свернуть",
@@ -10067,7 +10134,33 @@
       "annotate_click_to_edit": "Нажмите, чтобы изменить эту заметку",
       "annotate_note_for_n": "Заметка к метке {{n}}",
       "annotate_added_ack": "Добавлено в поле сообщения — ничего не отправляется, пока вы не отправите сообщение",
-      "try_again": "Повторить"
+      "try_again": "Повторить",
+      "browser_view": "Представление браузера",
+      "browser_view_can_t_be_reached_from_this_browser": "Представление браузера недоступно из этого браузера",
+      "browser_view_is_not_running": "Представление браузера не запущено",
+      "browser_view_unavailable": "Представление браузера недоступно",
+      "can_t_embed_an_http_page_here": "Здесь нельзя встроить http:// страницу",
+      "couldn_t_open_this_page_in_the_browser": "Не удалось открыть эту страницу в браузере",
+      "couldn_t_start_the_browser_view": "Не удалось запустить представление браузера.",
+      "dashboard_policy_blocks_embedding_http_page": "Браузер разрешил бы эту страницу, но эта панель встраивает страницы http:// только с 127.0.0.1 или localhost. Это политика шлюза, а не блокировка браузера.",
+      "http": "http://",
+      "live_browser_session": "Активный сеанс браузера",
+      "loading_the_browser_view": "Загрузка представления браузера…",
+      "more_actions": "Другие действия",
+      "opening_in_the_browser": "Открывается в браузере…",
+      "page_mixed_content": "страницы (смешанное содержимое).",
+      "start_browser_view": "Запустить представление браузера",
+      "start_it_to_watch_and_drive_the_agent_s_browser": "Запустите его, чтобы наблюдать за сеансом браузера агента и управлять им в этой панели.",
+      "the_browser_view_isn_t_available_on_this_gateway": "Представление браузера недоступно на этом шлюзе.",
+      "the_gateway_could_not_open_a_browser_for_this_page": "Шлюз не смог открыть браузер для этой страницы.",
+      "the_view_runs_on_the_gateway_host_pin_and_forward": "Представление обслуживается на loopback-адресе хоста шлюза, и этот браузер не смог к нему подключиться. Если ты открываешь панель через SSH-туннель, закрепи порт представления в настройке ниже и пробрось этот порт тоже.",
+      "browser_view_can_t_load_its_files_here": "Представление браузера, вероятно, не может загрузить здесь свои файлы",
+      "a_sign_in_proxy_refuses_the_view_s_files": "Файлы представления отклонены без cookie, но ответили с ним. Вероятная причина — что-то перед панелью, например прокси входа или туннель, проверяющее cookie в каждом запросе. Представление работает в изолированной рамке, которая не может отправить этот cookie. Если это так, открой панель через прямой проброс порта по SSH.",
+      "opened_from_this_chat": "Открыто из этого чата",
+      "this_dashboard_is_served_over_https_so_the_brows": "Эта панель работает по HTTPS, поэтому браузер блокирует встраивание",
+      "to_open_another_site_unlock_the_view_s_address_bar": "Нажми на замок над страницей, чтобы ввести там другой адрес; кнопка с монитором (вверху справа) возвращает строку предпросмотра.",
+      "your_page_is_in_pick_it_in_the_sidebar": "Твоя страница в {{session}} — выбери её в боковой панели фрейма.",
+      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "Ссылки с частью ? или # не проходят через эту адресную строку — сначала открой простой адрес сайта, затем нажми на замок над страницей и введи полную ссылку в адресную строку самого фрейма."
     },
     "welcomeView": {
       "incognito": "Инкогнито",
@@ -10893,7 +10986,13 @@
       "ultra_done_line_files_other": "Готово, когда пройдут все {{count}} проверки файлов.",
       "ultra_done_line_files_rest_other": "Готово, когда пройдут все {{count}} проверки файлов и ты одобришь остальное.",
       "breadcrumb_nav_label": "Навигационная цепочка",
-      "breadcrumb_back_to": "Назад к {{t}}"
+      "breadcrumb_back_to": "Назад к {{t}}",
+      "breadcrumb_label": "Участник команды",
+      "ultra_needs_you_none_blocked": "Ничего не ждёт твоего одобрения. Заблокированные задачи — в разделе «Этапы».",
+      "ultra_stalled": "застряло",
+      "ultra_ms_blocked": "Заблокировано",
+      "ultra_recap_blocked_one": "{{names}} — заблокировано",
+      "ultra_recap_blocked_many": "{{names}} — заблокированы"
     },
     "guideLayer": {
       "region_label": "Руководство",
@@ -11381,8 +11480,26 @@
       "copy_failed": "Не удалось скопировать. Выдели текст в приложении и скопируй его вручную.",
       "more_actions": "Другие действия"
     },
-    "meetYourMatesIntro": {},
-    "startupVideoModal": {},
+    "meetYourMatesIntro": {
+      "sample_line_1": "Ночью я нашёл нестабильный тест и исправил его.",
+      "sample_line_2": "PR готов. Выполнить слияние?",
+      "sample_merge": "Слить",
+      "sample_show_first": "Сначала покажи"
+    },
+    "startupVideoModal": {
+      "close": "Закрыть",
+      "crewmates_description": "Они сами находят работу, выполняют её и спрашивают тебя только тогда, когда ты им нужен.",
+      "crewmates_title": "Знакомься: твои напарники.",
+      "got_it": "Понятно",
+      "media_failed": "Не удалось загрузить видео о функции",
+      "new_tag": "Новое",
+      "not_now": "Не сейчас",
+      "share": "Поделиться",
+      "share_description": "Превратите это видео о функции в карточку, которую можно опубликовать где угодно.",
+      "share_include_title": "Добавить название видео",
+      "streaming": "Играет из сети",
+      "try_now": "Попробовать"
+    },
     "selectionActions": {
       "apps": "Приложения",
       "apps_hint": "Отправить выделенный текст в приложение",
@@ -11878,7 +11995,14 @@
         "installed_needs_newer_host": "Установленной версии {{name}} нужен более новый {{productName}}. Обнови {{productName}}; твои данные не изменились."
       },
       "grants_reconsent_composer_actions": "Кнопки поля ввода: приложение может добавить эти кнопки в меню + поля ввода. По нажатию его текст вставляется в черновик; приложение не видит черновик и не может его отправить.",
-      "grants_reconsent_selection_actions": "Действия с выделенным текстом: элементы приложения получают текст, который ты выделяешь в ответах чата, и могут предложить результат для копирования или открытия."
+      "grants_reconsent_selection_actions": "Действия с выделенным текстом: элементы приложения получают текст, который ты выделяешь в ответах чата, и могут предложить результат для копирования или открытия.",
+      "installed": "Установлено:",
+      "lifecycle": "| Жизненный цикл:",
+      "memory": "Память:",
+      "min_kirocrew_v": "Мин. {{productName}}: v",
+      "origin": "Источник:",
+      "platform": "Платформа:",
+      "resources_2": "| Ресурсы:"
     },
     "appPage": {
       "loading_app": "Загрузка приложения…",
@@ -11982,7 +12106,14 @@
       "updated_from_the_registry": "{{name}} обновлено из реестра.",
       "updated_needs_session_approval_consent": "{{name}} отключено, потому что теперь запрашивает управление твоими чатами. Проверь разрешение в сведениях о приложении и включи его.",
       "refresh_store": "Обновить магазин",
-      "refreshing_store": "Обновление магазина…"
+      "refreshing_store": "Обновление магазина…",
+      "action_failed": "Не удалось {{action}} {{name}}",
+      "kept": "Сохранено —",
+      "show_disabled_one": "Показать {{count}} отключённое приложение",
+      "show_disabled_few": "Показать {{count}} отключённых приложения",
+      "show_disabled_many": "Показать {{count}} отключённых приложений",
+      "show_disabled_other": "Показать {{count}} отключённого приложения",
+      "show_enabled_only": "Показать только включённые"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/мес",
@@ -12165,7 +12296,9 @@
       "more_count_one": "ещё {{n}}",
       "more_count_few": "ещё {{n}}",
       "more_count_many": "ещё {{n}}",
-      "more_count_other": "ещё {{n}}"
+      "more_count_other": "ещё {{n}}",
+      "access_reachable": ": доступ подтверждён",
+      "more": "ещё"
     },
     "artifactDetailPage": {
       "published_to_provider": "Опубликовано в {{provider}}",
@@ -12304,7 +12437,12 @@
       "content_copied_from_version": "содержимое скопировано из v{{version}}",
       "version_label": "v{{version}}",
       "to_version": "→ v{{version}}",
-      "version_change": "v{{from}} → v{{to}}"
+      "version_change": "v{{from}} → v{{to}}",
+      "by": "автор",
+      "content_copied_from_v": "содержимое скопировано из v",
+      "updated": "· Обновлено",
+      "v": "v",
+      "v_2": "→ v"
     },
     "artifactPopoutFrame": {
       "artifact": "Артефакт",
@@ -12439,7 +12577,9 @@
       "saved_to_library_notice": "«{{name}}» сохранён в ваших артефактах.",
       "open_doc_in_editor": "Открыть {{path}} в редакторе",
       "open_doc_in_editor_failed": "Не удалось открыть этот файл в редакторе: {{reason}}. Нажми на его имя, чтобы открыть предпросмотр.",
-      "folder_renamed_to": "Папка переименована в {{name}}"
+      "folder_renamed_to": "Папка переименована в {{name}}",
+      "by": "автор:",
+      "on": "В"
     },
     "capabilitiesPage": {
       "agent_capabilities": "Кастомизация",
@@ -12788,7 +12928,8 @@
         "approvals_pending_count_one": "{{count}} подтверждение ожидает",
         "approvals_pending_count_few": "{{count}} подтверждения ожидают",
         "approvals_pending_count_many": "{{count}} подтверждений ожидают",
-        "approvals_pending_count_other": "{{count}} подтверждения ожидают"
+        "approvals_pending_count_other": "{{count}} подтверждения ожидают",
+        "approvals_pending": "ожидают подтверждения"
       },
       "cronAckBar": {
         "acknowledge": "Подтвердить",
@@ -12898,7 +13039,9 @@
         "tokens_count_one": "{{count}} токен",
         "tokens_count_few": "{{count}} токена",
         "tokens_count_many": "{{count}} токенов",
-        "tokens_count_other": "{{count}} токена"
+        "tokens_count_other": "{{count}} токена",
+        "selected": "выбрано ·",
+        "tokens": "токенов"
       },
       "mcpInfoButton": {
         "agent_loads_only_its_own_mcp_servers": "Агент «{{name}}» загружает только свои серверы MCP.",
@@ -13208,7 +13351,8 @@
         "more_running_normally_count_one": "ещё {{count}} выполняется нормально…",
         "more_running_normally_count_few": "ещё {{count}} выполняются нормально…",
         "more_running_normally_count_many": "ещё {{count}} выполняются нормально…",
-        "more_running_normally_count_other": "ещё {{count}} выполняются нормально…"
+        "more_running_normally_count_other": "ещё {{count}} выполняются нормально…",
+        "more_running_normally": "ещё выполняются нормально…"
       },
       "subagentQueued": {
         "low_memory": "ожидание запуска — требуется {{required}} свободной памяти, сейчас свободно {{available}}; освободи память, чтобы продолжить",
@@ -13310,7 +13454,8 @@
         "more_count_one": "ещё {{n}}…",
         "more_count_few": "ещё {{n}}…",
         "more_count_many": "ещё {{n}}…",
-        "more_count_other": "ещё {{n}}…"
+        "more_count_other": "ещё {{n}}…",
+        "more": "ещё…"
       },
       "thinkingBlock": {
         "collapse_model_reasoning": "Свернуть рассуждения модели",
@@ -13542,7 +13687,8 @@
         "events_count_one": "{{n}} событие",
         "events_count_few": "{{n}} события",
         "events_count_many": "{{n}} событий",
-        "events_count_other": "{{n}} события"
+        "events_count_other": "{{n}} события",
+        "events": "событий"
       },
       "pins": {
         "pinned_messages": "Закреплённые сообщения",
@@ -14963,7 +15109,10 @@
       "hide_sessions_count_few": "Скрыть {{n}} сессии",
       "hide_sessions_count_many": "Скрыть {{n}} сессий",
       "hide_sessions_count_other": "Скрыть {{n}} сессии",
-      "broadcast_crewmates_hint": "Чаты, которые ведут участники команды — ИИ-агенты твоей crew"
+      "broadcast_crewmates_hint": "Чаты, которые ведут участники команды — ИИ-агенты твоей crew",
+      "hide": "Скрыть",
+      "skip": "Пропустить",
+      "will_be_moved_to_older_sessions": "будут перемещены в старые сессии."
     },
     "connectionsPage": {
       "action_failed": "Не удалось выполнить действие: {{error}}",
@@ -15508,7 +15657,8 @@
       "orphan_pods_label": "Осиротевшие домашние каталоги подов: {{value}}",
       "total_disk_used_by_running_pod_homes": "Всего диска, занятого домашними каталогами работающих подов",
       "pod_homes_left_on_disk_with_no_live_pod": "Домашние каталоги подов на диске без активного пода",
-      "disk_usage_unavailable": "Данные об использовании диска недоступны"
+      "disk_usage_unavailable": "Данные об использовании диска недоступны",
+      "just_now": "только что"
     },
     "developer": {
       "agentBackendTab": {
@@ -15850,6 +16000,9 @@
         },
         "telemetry": {
           "label": "Телеметрия"
+        },
+        "mcpPool": {
+          "label": "Управление MCP"
         }
       }
     },
@@ -16067,7 +16220,10 @@
       "open_crew_manager": "Открыть менеджер команд",
       "built_from": "Основа",
       "change_default_crewmate": "Сменить Bot по умолчанию",
-      "change_default_hint": "Открывает настройку «Bot по умолчанию» в разделе Разработчик → Конфигурация."
+      "change_default_hint": "Открывает настройку «Bot по умолчанию» в разделе Разработчик → Конфигурация.",
+      "inherited_from_the_agent_template": "взята из пользовательского агента, на котором он основан.",
+      "no_pin_anywhere_the_backend_chooses": "ни здесь, ни в пользовательском агенте ничего не выбрано, поэтому {{productName}} выбирает сам.",
+      "resolves_to": "Используется {{model}}"
     },
     "knowledge": {
       "detailView": {
@@ -16103,7 +16259,8 @@
         "shared_count_many": "общих: {{n}}",
         "shared_count_other": "общих: {{n}}",
         "status_active": "Активно",
-        "status_archived": "В архиве"
+        "status_archived": "В архиве",
+        "shared": "общий"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} векторизовано ({{pct}}%)",
@@ -16215,7 +16372,8 @@
         "type_policy": "политика",
         "type_personal_notes": "личные заметки",
         "type_external_reference": "внешняя ссылка",
-        "type_document": "документ"
+        "type_document": "документ",
+        "selected": "выбрано"
       },
       "itemCard": {
         "copied": "Скопировано!",
@@ -16245,7 +16403,9 @@
         "edges_count_few": "{{count}} ребра",
         "edges_count_many": "{{count}} рёбер",
         "edges_count_other": "{{count}} ребра",
-        "graph_counts": "{{nodes}}, {{edges}}"
+        "graph_counts": "{{nodes}}, {{edges}}",
+        "edges": "рёбер",
+        "nodes": "узлов,"
       },
       "sourceGroup": {
         "items_added_directly": "Добавлено напрямую",
@@ -16393,7 +16553,8 @@
         "items_count_one": "{{n}} элемент",
         "items_count_few": "{{n}} элемента",
         "items_count_many": "{{n}} элементов",
-        "items_count_other": "{{n}} элемента"
+        "items_count_other": "{{n}} элемента",
+        "items": "элементов"
       },
       "settings": {
         "title": "Ingestion Settings",
@@ -16457,7 +16618,8 @@
       "section_disabled": "Отключённые",
       "unpin": "Открепить",
       "unpin_from_sidebar": "Открепить {{name}} от боковой панели",
-      "installed_apps": "Установленные приложения"
+      "installed_apps": "Установленные приложения",
+      "tile_disabled": "Отключено"
     },
     "logsPage": {
       "filter_logs": "Фильтр журналов",
@@ -16476,7 +16638,8 @@
       "matches_count_one": "{{count}} совпадение",
       "matches_count_few": "{{count}} совпадения",
       "matches_count_many": "{{count}} совпадений",
-      "matches_count_other": "{{count}} совпадения"
+      "matches_count_other": "{{count}} совпадения",
+      "matches": "совпадений"
     },
     "mcpGatewayCard": {
       "backends": "Бэкенды",
@@ -16493,7 +16656,8 @@
       "status_stopped": "остановлен",
       "status_unhealthy": "неисправен",
       "with_shared_gateway_pooled": "С общим шлюзом (пул)",
-      "without_gateway_per_session_copies": "Без шлюза (копия на каждую сессию)"
+      "without_gateway_per_session_copies": "Без шлюза (копия на каждую сессию)",
+      "s": "s"
     },
     "mcpManagement": {
       "assessment": {
@@ -17005,7 +17169,8 @@
         "tools_count_one": "{{n}} инструмент",
         "tools_count_few": "{{n}} инструмента",
         "tools_count_many": "{{n}} инструментов",
-        "tools_count_other": "{{n}} инструмента"
+        "tools_count_other": "{{n}} инструмента",
+        "tools_2": "инструментов"
       },
       "memoryGraphTab": {
         "all_count": "Все ({{count}})",
@@ -17213,7 +17378,8 @@
         "agent_template_skip_unwritable": "не удалось записать",
         "agent_template_skip_over_limit": "сверх лимита архива",
         "archive_agent_templates_more": "Шаблоны сверх лимита архива, не предложены: {{templates}}",
-        "include_agent_templates_memory_hint": "Экспорт памяти никогда не включает шаблоны агентов."
+        "include_agent_templates_memory_hint": "Экспорт памяти никогда не включает шаблоны агентов.",
+        "kb": "KB"
       },
       "promptsTab": {
         "agent_sop_name": "@agent-sop:name",
@@ -17917,7 +18083,11 @@
       "today_tokens_one": "{{amount}} токен",
       "today_tokens_few": "{{amount}} токена",
       "today_tokens_many": "{{amount}} токенов",
-      "today_tokens_other": "{{amount}} токена"
+      "today_tokens_other": "{{amount}} токена",
+      "messages": "сообщений",
+      "sessions": "сессий ·",
+      "today": "Сегодня:",
+      "tokens": "токенов"
     },
     "performanceTab": {
       "builder_mcp_procs": "Builder MCP",
@@ -17959,7 +18129,8 @@
       "session_storage_detail_one": "{{sessions}} сессия · {{reclaimable}} можно освободить",
       "session_storage_detail_few": "{{sessions}} сессии · {{reclaimable}} можно освободить",
       "session_storage_detail_many": "{{sessions}} сессий · {{reclaimable}} можно освободить",
-      "session_storage_detail_other": "{{sessions}} сессии · {{reclaimable}} можно освободить"
+      "session_storage_detail_other": "{{sessions}} сессии · {{reclaimable}} можно освободить",
+      "session_storage_detail": "{{sessions}} сессий · {{reclaimable}} можно освободить"
     },
     "popoutFrame": {
       "session": "Сессия",
@@ -18385,7 +18556,8 @@
       "tool_count_many": "{{n}} инструментов",
       "tool_count_other": "{{n}} инструмента",
       "unknown_agent": "субагент",
-      "unknown_model": "неизвестно"
+      "unknown_model": "неизвестно",
+      "tool_count": "{{count}} инструментов"
     },
     "sessionStorage": {
       "age_option_few": "Старше {{days}} дней — {{count}} сессии · {{size}}",
@@ -18461,7 +18633,8 @@
       "unknown_session": "сессия вне списка",
       "busy_emptying": "Корзина очищается. Некоторые действия приостановлены до завершения.",
       "empty_failed_next_step": "Повторите «Удалить навсегда». Подробности в журнале шлюза.",
-      "kept_identity_changed": "Одна партия изменилась на диске после выбора, поэтому она сохранена."
+      "kept_identity_changed": "Одна партия изменилась на диске после выбора, поэтому она сохранена.",
+      "refused_heading": "Не удалось переместить {{count}} сессий"
     },
     "sessionsPage": {
       "page_title": "Все сессии",
@@ -18789,7 +18962,12 @@
         "backfill_folder_gone_nothing_filed": "Папка {{folder}} была удалена во время выполнения, поэтому ничего не размещено. Сначала сохраните эти настройки, чтобы создать её заново.",
         "loading_channel_config": "Загрузка конфигурации {{channel}}…",
         "cannot_load_channel_config": "Не удалось загрузить конфигурацию {{channel}}. Шлюз запущен?",
-        "channel_settings_read_only": "Настройки {{channel}} управляются на машине, где запущен {{productName}}, и доступны только для чтения из удалённых сессий."
+        "channel_settings_read_only": "Настройки {{channel}} управляются на машине, где запущен {{productName}}, и доступны только для чтения из удалённых сессий.",
+        "cannot_load": "Не удалось загрузить",
+        "config": "конфигурацию…",
+        "config_is_the_gateway_running": "конфигурацию. Шлюз запущен?",
+        "loading": "Загрузка",
+        "settings_are_managed_on_the_machine_running_kiro": "настройки управляются на машине, где запущен {{productName}}, и доступны только для чтения из удалённых сессий."
       },
       "browserPanel": {
         "cannot_load": "Не удалось загрузить состояние браузера. Шлюз запущен?",
@@ -18881,14 +19059,101 @@
         "credentials_applied_one": "{{count}} cookie применён",
         "credentials_applied_few": "{{count}} cookie применены",
         "credentials_applied_many": "{{count}} cookie применено",
-        "credentials_applied_other": "{{count}} cookie применено"
+        "credentials_applied_other": "{{count}} cookie применено",
+        "use_builtin_label": "Использовать встроенный браузер",
+        "use_builtin_desc": "Открывает страницы во встроенной панели {{productName}}. Отключите, чтобы просматривать через playwright-cli.",
+        "browsing": "Просмотр веб-страниц",
+        "presence_is_consent": "Просмотр доступен, потому что установлен Playwright CLI. Его удаление отзывает эту возможность.",
+        "not_installed": "Агент пока не может просматривать страницы.",
+        "install_explains": "Установка Playwright CLI позволяет агенту открывать страницы, читать их и заполнять формы. Вы можете наблюдать и взять управление на себя в панели Browser.",
+        "install": "Установить Playwright CLI",
+        "install_takes_a_while": "Загружается браузер, это может занять несколько минут. Можно уйти с этой страницы.",
+        "needs_node": "Для установки нужен Node.js 20 или новее (найдено {{version}}).",
+        "get_the_extension": "Установить расширение",
+        "token_label": "Токен расширения (необязательно)",
+        "token_placeholder": "Вставьте из расширения",
+        "token_set": "Сохранён",
+        "token_save": "Сохранить",
+        "token_clear": "Очистить",
+        "token_explains": "Без токена браузер запрашивает подтверждение при каждом подключении. С токеном подключение происходит без запроса. Скопируйте его из расширения Playwright в браузере.",
+        "attach_title": "Использовать свой браузер с активным входом",
+        "token_stored": "сохранён",
+        "install_steps_intro": "Установка выполняет три шага.",
+        "step_npm": "Установить @playwright/cli глобально через npm.",
+        "step_browser": "Загрузить браузер, которым он управляет.",
+        "step_skills": "Зарегистрировать его навыки, чтобы агент знал команды.",
+        "engine_chromium": "Chromium",
+        "engine_firefox": "Firefox",
+        "engine_webkit": "WebKit",
+        "engine_downloaded": "Загружен",
+        "engine_download": "Загрузить",
+        "node_missing": "Нужен Node.js 20 или новее, а на этой машине Node не найден.",
+        "node_how": "Установите его и снова откройте эту страницу. <dl>Скачать Node.js</dl>",
+        "node_no_admin": "На машине, где вы не можете установить Node — нет прав администратора или реестр требует входа в систему — выполните команду ниже на той машине, где работает {{productName}}. Скрипт установит Node и CLI в ваш домашний каталог и подскажет, как это исправить, если сеть блокирует загрузку.",
+        "copy_command": "Копировать команду",
+        "copied": "Скопировано",
+        "builtin_save_failed": "Не удалось сохранить настройку встроенного браузера.",
+        "builtin_status_unavailable": "Не удалось загрузить настройку встроенного браузера.",
+        "host_unavailable": "Не удалось загрузить имя хоста.",
+        "copy_failed": "Не удалось скопировать. Выдели команду и скопируй её вручную.",
+        "engine_download_failed": "Не удалось начать загрузку браузера.",
+        "token_save_failed": "Не удалось сохранить токен расширения.",
+        "managed_title": "Управляемые браузеры на хосте {{productName}}",
+        "host_label": "Хост: {{host}}",
+        "managed_explains": "Playwright загружает отдельные сборки браузеров на машину, где работает {{productName}}. У них свой профиль, и они не используют входы из твоего личного браузера.",
+        "managed_host_note": "Эти загрузки попадают на хост {{productName}}, а не на устройство, где открыта эта страница. Mac, открывший Linux-хост, получает сборки для Linux на этом хосте, а расширение в Chrome на Mac само по себе не даёт CLI хоста подключиться к этому браузеру.",
+        "cli_installed": "Playwright CLI установлен",
+        "engines_heading": "Движки браузера",
+        "engines_help": "Chromium используется для автоматизации по умолчанию. Google Chrome — отдельный браузер, который здесь не устанавливается, а WebKit — сборка движка Safari от Playwright, а не твоё приложение Safari. Управляемые браузеры — полноценные браузеры и могут открывать видимые окна. «Загружен» значит, что файлы есть на диске; запуск при этом не проверяется.",
+        "engine_default_badge": "По умолчанию для автоматизации",
+        "engine_downloading": "Загрузка...",
+        "engine_retry": "Повторить",
+        "engine_unknown": "Неизвестно",
+        "engine_unknown_reason": "{{productName}} не удалось подтвердить эту сборку в кэше браузера. Повторная загрузка безопасна.",
+        "status_region_label": "Ход настройки браузера",
+        "status_unavailable": "Не удаётся прочитать состояние настройки браузера, поэтому показанное может быть устаревшим.",
+        "op_cli_setup": "Настройка Playwright CLI",
+        "op_engine_download": "Загрузка {{engine}}",
+        "stage_line": "Шаг: {{stage}}",
+        "stage_preparing": "Подготовка",
+        "stage_installing_cli": "Установка Playwright CLI",
+        "stage_downloading_browser": "Загрузка браузера",
+        "stage_installing_skills": "Регистрация браузерных навыков агента",
+        "stage_finishing": "Завершение",
+        "elapsed_running": "Идёт уже {{duration}}",
+        "elapsed_done": "Заняло {{duration}}",
+        "done_cli": "Настройка Playwright CLI завершена",
+        "failed_cli": "Не удалось настроить Playwright CLI",
+        "interrupted_cli": "Настройка Playwright CLI прервана",
+        "done_engine": "Загрузка {{engine}} завершена",
+        "failed_engine": "Не удалось загрузить {{engine}}",
+        "interrupted_engine": "Загрузка {{engine}} прервана",
+        "outcome_succeeded": "Настройка браузера завершена",
+        "outcome_failed": "Не удалось настроить браузер",
+        "outcome_interrupted": "Настройка браузера прервана",
+        "failure_no_detail": "Хост не сообщил подробностей.",
+        "reason_status_unavailable": "Загрузки приостановлены, пока снова не загрузится состояние настройки.",
+        "reason_checking": "Проверяем, запустил ли последний запрос загрузку. Загрузки станут доступны, как только хост ответит.",
+        "reason_engine_busy": "{{engine}} загружается. Другие загрузки станут доступны, когда она закончится.",
+        "reason_cli_busy": "Идёт настройка Playwright CLI. Загрузки станут доступны, когда она закончится.",
+        "reason_busy_generic": "Выполняется другая операция настройки браузера.",
+        "op_busy_generic": "На хосте {{productName}} выполняется настройка браузера.",
+        "reason_cli_first": "Сначала установи Playwright CLI.",
+        "connect_title": "Подключи свой браузер",
+        "connect_explains": "Используй вкладки и входы браузера, которым ты уже пользуешься. Нужен браузер на основе Chromium, например Chrome, с установленным расширением Playwright.",
+        "connect_host_note": "Браузер и его расширение должны работать на хосте {{productName}}, где их видит CLI. Расширение в браузере на другом устройстве само к этому хосту не подключится.",
+        "connect_consent": "Установленное расширение или сохранённый токен не значат, что браузер подключён.",
+        "desktop_title": "Встроенный браузер в настольном приложении",
+        "desktop_web_explains": "Доступно в настольном приложении {{productName}}. В веб-панели агенты используют Playwright."
       },
       "channelDisabledPanel": {
         "checking_your_organization_s_channel_policy": "Проверка политики каналов вашей организации…",
         "channel_policy_status_unavailable": "Статус политики {{channel}} недоступен",
         "channel_turned_off": "{{channel}} отключён твоим администратором",
         "kirocrew_couldn_t_confirm_whether_your_organizat": "{{productName}} не удалось подтвердить, разрешает ли политика безопасности\n          вашей организации этот канал. Его настройки скрыты до определения статуса —\n          на применение политики это не влияет. Попробуйте перезагрузить.",
-        "your_organization_s_security_policy_disables_thi": "Политика безопасности вашей организации отключает этот канал. Его настройки\n        недоступны, и любая конфигурация здесь не будет применена."
+        "your_organization_s_security_policy_disables_thi": "Политика безопасности вашей организации отключает этот канал. Его настройки\n        недоступны, и любая конфигурация здесь не будет применена.",
+        "is_turned_off_by_your_administrator": "отключён вашим администратором",
+        "policy_status_unavailable": "статус политики недоступен"
       },
       "channels": {
         "get_your_bot_credentials": "Получи учётные данные бота",
@@ -19244,7 +19509,13 @@
         "default_session_folder_deleted": "Удалённая папка",
         "default_session_folder_save_failed": "Не удалось сохранить папку по умолчанию. Попробуй ещё раз.",
         "default_session_folder_load_failed": "Не удалось загрузить твои папки боковой панели, поэтому их здесь нет.",
-        "model_for_spawned_sub_agents": "Модель для запускаемых субагентов."
+        "model_for_spawned_sub_agents": "Модель для запускаемых субагентов.",
+        "default_defers_to_your_agent_config_and_then_to": "Агенты с собственной настроенной моделью игнорируют эту настройку. «По умолчанию» использует модель из конфигурации агента или системную модель по умолчанию, если ничего не настроено. Изменение не влияет на уже открытые сеансы.",
+        "which_model_new_sessions_start_with_pick_a_model": "С какой моделью начинаются новые сессии, если их агент не закрепил свою. Задай модель для каждого агента в «Кастомизация → Товарищи по команде» или выбери модель внутри сессии, чтобы переопределить её там.",
+        "follow_default_description": "Старые чаты могут сохранять модель, с которой начали, и не переходить на новую модель по умолчанию. Чаты, которые начали участники команды, приложения, расписания или каналы, сохраняют свою модель. Прежде чем что-то изменится, ты увидишь, сколько чатов изменится, и подтвердишь.",
+        "follow_default_hint": "Считаются только чаты, начатые тобой.",
+        "default_session_folder_desc": "Папка боковой панели, в которую попадают новые чаты, начатые без выбора папки. Она группирует чаты в боковой панели; это не папка на диске.",
+        "default_session_folder_hint": "Чат использует проект и агента, привязанные к папке, как и «Новый чат в папке»."
       },
       "computerUsePanel": {
         "accessibility": "Универсальный доступ",
@@ -19611,7 +19882,11 @@
         "warm_cap_count_few": "Одновременно «тёплыми» (живой туннель) остаются не более {{count}} удалённых команд; остальные подключаются по требованию. Настрой через",
         "warm_cap_count_many": "Одновременно «тёплыми» (живой туннель) остаются не более {{count}} удалённых команд; остальные подключаются по требованию. Настрой через",
         "warm_cap_count_other": "Одновременно «тёплыми» (живой туннель) остаются не более {{count}} удалённой команды; остальные подключаются по требованию. Настрой через",
-        "remote_port_value": "· удалённый порт {{port}}"
+        "remote_port_value": "· удалённый порт {{port}}",
+        "instances_stay_warm_live_tunnel_at_once_the_rest": "удалённых команд остаются «тёплыми» (живой туннель) одновременно; остальные подключаются по\n                требованию. Настройте через",
+        "port_2": "· удалённый порт",
+        "ttl": "· ttl",
+        "up_to": "Не более"
       },
       "notificationsPanel": {
         "desktop_alerts": "Уведомления на рабочем столе",
@@ -19817,7 +20092,9 @@
         "label_credential_families": "Шаблоны учётных данных",
         "label_exfil_heuristics": "Обнаружение утечки через URL",
         "label_audit_surfaces": "Журнал аудита SEL",
-        "label_token_auth": "Аутентификация панели по токену"
+        "label_token_auth": "Аутентификация панели по токену",
+        "more": "ещё",
+        "show": "Показать"
       },
       "releases": {
         "badge_unreleased": "Не выпущено",
@@ -20159,7 +20436,9 @@
         "file_delivery_title": "Куда можно доставлять помеченные файлы",
         "file_delivery_waiting": "Ожидание на этом устройстве",
         "file_delivery_withdraw": "Отозвать",
-        "file_delivery_section": "Доставка помеченных файлов"
+        "file_delivery_section": "Доставка помеченных файлов",
+        "categories": "категорий ·",
+        "rules": "правил"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Назначить переключение вкладок чата на Ctrl+цифра вместо Option+цифра. Option+цифра не переключает чат, пока фокус находится в текстовом поле.",
@@ -21251,7 +21530,11 @@
       "daily_trend_point_few": "{{date}} · холодный {{cold}} · тёплый {{warm}} · запусков: {{n}}",
       "daily_trend_point_many": "{{date}} · холодный {{cold}} · тёплый {{warm}} · запусков: {{n}}",
       "daily_trend_point_other": "{{date}} · холодный {{cold}} · тёплый {{warm}} · запусков: {{n}}",
-      "top_spenders_link_to_chat": "Сессии панели с названием — ссылки на чат"
+      "top_spenders_link_to_chat": "Сессии панели с названием — ссылки на чат",
+      "daily_trend_point": "{{date}} · холодный {{cold}} · тёплый {{warm}} · запусков: {{count}}",
+      "local_only_no_egress": "· только локально, без передачи наружу",
+      "shard_s_source": "шард(ов) · источник",
+      "window_footer": "Разделы OTEL · период: {{period}} ·"
     },
     "terminalPopoutFrame": {
       "return": "Вернуть в док",
@@ -21435,7 +21718,18 @@
       "slots_open_other": "{{n}} свободного слота",
       "summary": "{{present}} · {{active}} · {{open}}",
       "scene_label": "Сцена",
-      "scene_button": "Сцена {{label}}: {{desc}}"
+      "scene_button": "Сцена {{label}}: {{desc}}",
+      "active": "активно,",
+      "agent_few": "{{count}} агента",
+      "agent_many": "{{count}} агентов",
+      "agent_one": "{{count}} агент",
+      "agent_other": "{{count}} агента",
+      "open": "открыто",
+      "present": "присутствует,",
+      "slot_few": "{{count}} слота",
+      "slot_many": "{{count}} слотов",
+      "slot_one": "{{count}} слот",
+      "slot_other": "{{count}} слота"
     },
     "worldsPopout": {
       "hide_controls": "Скрыть управление",
@@ -22020,7 +22314,9 @@
       "profile_monitor_type": "Тип",
       "profile_monitor_type_bounded": "Монитор",
       "profile_monitor_unavailable": "Статус монитора недоступен",
-      "profile_monitor_unknown": "Неизвестно"
+      "profile_monitor_unknown": "Неизвестно",
+      "driving_idle": "Простой",
+      "member_count_filtered": "{{shown}} из {{count}} товарищей по команде"
     },
     "tasksCapacityCard": {
       "title": "Задачи и ёмкость",
@@ -23305,7 +23601,29 @@
     "preview_save_failed": "Не удалось сохранить настройку общего Crew.",
     "preview_restart_failed": "Не удалось перезапустить шлюз.",
     "raised_by": "Инициатор: {{name}}",
-    "take_over_keeps_draft": "Перехвати, чтобы печатать. Черновик {{name}} сохранится."
+    "take_over_keeps_draft": "Перехвати, чтобы печатать. Черновик {{name}} сохранится.",
+    "several_typing": "Несколько человек печатают",
+    "person_viewing": "{{name}} здесь",
+    "composer_locked_hint": "Ты снова сможешь писать, когда этот человек отправит сообщение или сделает паузу.",
+    "sent_by": "Отправил(а) {{name}}",
+    "approval_waiting": "Действие {{name}} ожидает одобрения",
+    "invite_status_pending": "Ожидает",
+    "invite_single_use": "Одноразовая ссылка",
+    "question_waiting": "Kiro ждёт ответа от {{name}}",
+    "invite_title": "Пригласить через Tailscale",
+    "person_typing": "{{name}} печатает",
+    "collab_region": "Активность сеанса",
+    "decisions_list": "Одобрения и вопросы",
+    "invite_empty": "Приглашений пока нет.",
+    "invite_list_title": "Приглашения",
+    "people_tip": "Чтобы убрать человека, убери его в Tailscale.",
+    "composer_taken_over_hint": "Твой черновик сохранён. Ты снова сможешь писать, когда этот человек отправит сообщение или сделает паузу.",
+    "take_over_typing_label": "Перехватить ввод у {{name}}. Черновик этого человека останется у него.",
+    "step_share": "Открой доступ к этому компьютеру в Tailscale",
+    "step_send": "Отправь им ссылку на Crew",
+    "not_joined": "Не присоединился",
+    "approval_waiting_you": "Твоё действие ждёт одобрения",
+    "question_waiting_you": "Kiro ждёт твоего ответа"
   },
   "milestone": {
     "streak_best": {
@@ -23411,7 +23729,8 @@
     "notice_count_few": "{{count}} новости в обзоре",
     "streak_days_many": "{{count}} дней · рекорд {{best}}",
     "notice_count_many": "{{count}} новостей в обзоре",
-    "video_failed": "Не удалось загрузить видео о функции"
+    "video_failed": "Не удалось загрузить видео о функции",
+    "intro_video_title": "{{productName}} за 15 секунд"
   },
   "chatBackend": {
     "label": "Бэкенд",

@@ -576,7 +576,15 @@
         "suggested_from_sub_questions_other": "根据 {{count}} 个子问题建议",
         "estimate_other": "最多 {{count}} 个周期，每次空闲 {{idle}} 秒。约 {{minutes}} 分钟",
         "findings_tally_other": "{{count}} 项发现",
-        "cycles_count_other": "{{count}} 个周期"
+        "cycles_count_other": "{{count}} 个周期",
+        "cycles": "轮，",
+        "cycles_2": "轮",
+        "findings": "条结论",
+        "min": "分钟",
+        "s_idle": "秒空闲。~",
+        "sub_questions_2": "个子问题",
+        "suggested_from": "建议来自",
+        "up_to": "最多"
       }
     },
     "autoTriagePipeline": {
@@ -880,7 +888,8 @@
           "invalid_namespace_name": "namespace 名称会用作文件夹名称，因此只能包含小写拉丁字母（a–z）、数字（0–9）、点、短横线或下划线，必须以字母或数字开头和结尾，长度为 2 到 64 个字符。",
           "invalid_namespace_name_char": "namespace 名称中不能使用“{{char}}”。只能使用小写 a–z、0–9、. -⁠ _。",
           "invalid_namespace_name_letter": "namespace 名称中不能使用“{{char}}”（{{script}}，{{code}}）。只能使用小写 a–z、0–9、. -⁠ _。",
-          "pending_count_other": "{{count}} 个待处理"
+          "pending_count_other": "{{count}} 个待处理",
+          "pending": "待处理"
         },
         "leftRail": {
           "code_review_sage": "Code Review Sage",
@@ -994,7 +1003,10 @@
           "open": "开着",
           "running_count_other": "{{count}} 个进行中",
           "passed_count_other": "{{count}} 个通过",
-          "failing_count_other": "{{count}} 个失败"
+          "failing_count_other": "{{count}} 个失败",
+          "failing": "失败",
+          "passed": "通过",
+          "running": "进行中"
         },
         "repoSwitcher": {
           "add_a_repo": "添加仓库",
@@ -1030,7 +1042,9 @@
           "step_solution_fit": "方案契合度",
           "step_why_it_matters": "为什么重要",
           "blocking_count_other": "{{count}} 个阻塞项",
-          "should_fix_count_other": "{{count}} 个建议修复"
+          "should_fix_count_other": "{{count}} 个建议修复",
+          "blocking": "阻塞项",
+          "should_fix": "建议修复"
         },
         "reviewChat": {
           "error_generic": "无法打开追问会话。请重试。",
@@ -1073,7 +1087,8 @@
           "review_of": "{{label}} 的评审",
           "review_of_with_more_other": "{{label}} 及另外 {{count}} 个的评审",
           "worth_a_glance_count_other": "{{count}} 项值得一看",
-          "more_count_other": "另外 +{{count}} 个"
+          "more_count_other": "另外 +{{count}} 个",
+          "more": "个"
         },
         "runDetail": {
           "cancelled_before_any_finished": "它在任何 pull request 完成之前就被取消了。",
@@ -1086,7 +1101,8 @@
           "started": "开始于",
           "this_review_produced_no_report": "这次评审没有生成报告。",
           "you_can_leave_this_page_a_notification_will_tell": "你可以离开这个页面——完成时会有通知告诉你。",
-          "more_count_other": "另外 +{{count}} 个"
+          "more_count_other": "另外 +{{count}} 个",
+          "more": "个"
         },
         "runList": {
           "new_review": "新建评审"
@@ -1104,7 +1120,10 @@
           "working": "工作中",
           "reviewed_of_other": "已评审 {{done}} / {{count}}",
           "failed_count_other": "{{count}} 个失败",
-          "cancelled_count_other": "{{count}} 个已取消"
+          "cancelled_count_other": "{{count}} 个已取消",
+          "cancelled": "已取消",
+          "failed": "失败",
+          "reviewed": "已评审"
         },
         "runStatusPill": {
           "cancelled": "已取消",
@@ -1590,7 +1609,8 @@
         "link_placeholder_staged": "正在使用你的截图——清除截图即可改为评审链接",
         "link_placeholder": "Figma 链接 · git 仓库 · 本机文件夹 · 运行中的 URL（localhost 或已部署预览）",
         "link_label": "要评审的链接",
-        "render_before_judging": "我会先渲染再评判，绝不只看代码。如果应用已在运行，粘贴它的 URL，我就能测量真实颜色和尺寸，而不是估算。"
+        "render_before_judging": "我会先渲染再评判，绝不只看代码。如果应用已在运行，粘贴它的 URL，我就能测量真实颜色和尺寸，而不是估算。",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "constants": {
         "blocked_figma_app_missing_hint": "在 Figma 桌面版中打开该文件后重试，或把画板导出为 PNG 拖到这里。",
@@ -1741,7 +1761,8 @@
         "screens": "界面",
         "start_over": "重新开始",
         "suggested_flows": "推荐流程",
-        "what_should_i_audit": "我该评审什么？"
+        "what_should_i_audit": "我该评审什么？",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "utils": {
         "i_ll_capture_it_and_measure_real_contrast_and_si": "我会截取它，并测量真实对比度和尺寸。",
@@ -2109,7 +2130,8 @@
           "timeline": "时间线",
           "unassign_me": "取消指派给我",
           "unassigned": "取消分配",
-          "updated": "更新时间"
+          "updated": "更新时间",
+          "by": "· 由"
         },
         "issueList": {
           "clear_search": "清除搜索",
@@ -2142,7 +2164,9 @@
           "remove_this_label_no_longer_exists_on_the_repo": "移除 — 此标签在仓库中已不存在",
           "saved_but_no_longer_on_this_repo": "已保存但仓库中已不存在：",
           "this_repo_has_no_labels": "此仓库没有标签。",
-          "add_suggested_other": "添加 {{count}} 个建议"
+          "add_suggested_other": "添加 {{count}} 个建议",
+          "add": "添加",
+          "suggested": "建议"
         },
         "leftRail": {
           "click_to_expand_the_sidebar": "{{name}} — 点击展开侧边栏",
@@ -2316,7 +2340,10 @@
           "failing_count_other": "{{count}} 个失败",
           "running_count_other": "{{count}} 个运行中",
           "passed_count_other": "{{count}} 个通过",
-          "skipped_count_other": "{{count}} 个跳过"
+          "skipped_count_other": "{{count}} 个跳过",
+          "failing": "失败中",
+          "passed": "通过",
+          "running": "运行中"
         },
         "prFiltersSection": {
           "assigned_to_me": "分配给我",
@@ -2385,7 +2412,8 @@
           "open_in_the_list_detail_column": "在列表 + 详情栏中打开",
           "open_this_item_in_the_workspace": "在工作区中打开此项",
           "deep_count_other": "{{count}} 层",
-          "dialog_label": "{{repo}} 中的 {{kind}} {{ref}}"
+          "dialog_label": "{{repo}} 中的 {{kind}} {{ref}}",
+          "deep": "层"
         },
         "repoSwitcher": {
           "repositories": "仓库"
@@ -2930,7 +2958,8 @@
             "suggested_new_labels_not_created_until_you_say_s": "建议的新标签 — 未经你确认不会创建",
             "re_fetch_this_repo_s_labels_from": "从 {{provider}} 重新获取此仓库的标签",
             "create_this_label_on": "在 {{provider}} 上创建此标签",
-            "labels_defined_other": "已定义 {{count}} 个 · 按待处理 issue 数量"
+            "labels_defined_other": "已定义 {{count}} 个 · 按待处理 issue 数量",
+            "defined_by_open_issue_count": "已定义 · 按待处理 issue 数量"
           },
           "untaggedIssueCard": {
             "add": "添加",
@@ -3021,7 +3050,9 @@
           "retry": "重试",
           "tree_stat_other": "{{kind}}-{{number}} 的树：{{nodes}} 个节点 · {{edges}}",
           "aria_tree_other": "{{kind}}-{{number}} 的依赖树：{{nodes}} 个节点，{{edges}}",
-          "live_edges_other": "{{n}} 条活跃边"
+          "live_edges_other": "{{n}} 条活跃边",
+          "tree_stat": "{{kind}}-{{number}} 的树：{{nodes}} 个节点 · {{edges}} 条活跃边",
+          "aria_tree": "{{kind}}-{{number}} 的依赖树：{{nodes}} 个节点，{{edges}} 条活跃边"
         },
         "groupReviewsView": {
           "title": "审查请求",
@@ -4044,7 +4075,13 @@
         "thinking_time": "想了 {{time}}",
         "title": "回忆",
         "walks_other": "走了 {{n}} 步",
-        "busiest_day_other": "最话多的一天：{{date}}（{{n}} 句）"
+        "busiest_day_other": "最话多的一天：{{date}}（{{n}} 句）",
+        "busiest_day": "最话多的一天：{{date}}（{{count}} 句）",
+        "drags": "被拽了 {{count}} 次",
+        "longest_chat": "最长一次聊了 {{count}} 句",
+        "peeks": "偷瞄了 {{count}} 次",
+        "screenshots": "帮你看了 {{count}} 次屏幕",
+        "walks": "走了 {{count}} 步"
       },
       "tip": {
         "bedtime": "试试：“11点提醒我该睡了”",
@@ -4521,7 +4558,11 @@
         "firing_count_other": "{{count}} 个报警中 ·",
         "parked_count_other": "{{count}} 个在提供方处挂起 ·",
         "cleared_count_other": "{{count}} 个已恢复 ·",
-        "unclaimed_count_other": "{{count}} 个尚未接手"
+        "unclaimed_count_other": "{{count}} 个尚未接手",
+        "cleared": "已恢复 ·",
+        "firing_2": "报警中 ·",
+        "not_yet_claimed": "尚未接手",
+        "parked_at_provider": "在提供方处挂起 ·"
       }
     },
     "papyrus": {
@@ -5092,7 +5133,8 @@
           "run_task": "运行任务：{{task}}",
           "starting": "正在启动…",
           "task_progress": "任务进度",
-          "done_of_total_other": "已完成 {{done}} / {{total}} 个任务"
+          "done_of_total_other": "已完成 {{done}} / {{total}} 个任务",
+          "done_of_total": "已完成 {{done}} / {{total}} 个任务"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "描述你想构建的内容，回答几个问题，然后获得一份经过审阅的方案——需求、设计和任务——供代理执行。",
@@ -5591,7 +5633,8 @@
         "forget_key_confirm": "忘记这一行的密钥“{{name}}”？AWS 和你的 AWS CLI 配置不会有任何改动。",
         "forget_key_action": "忘记密钥",
         "totals_summary_other": "{{accounts}} 个账户 · {{keys}}",
-        "keys_healthy_other": "{{n}} 个密钥中 {{healthy}} 个正常"
+        "keys_healthy_other": "{{n}} 个密钥中 {{healthy}} 个正常",
+        "totals_summary": "{{accounts}} 个账户 · {{keys}} 个密钥中 {{healthy}} 个正常"
       },
       "rail": {
         "accounts": "账户与凭证",
@@ -5766,7 +5809,9 @@
       "value_question": "有问题待答",
       "value_rejected": "已拒绝",
       "value_review_required": "待审查",
-      "why": "原因"
+      "why": "原因",
+      "progress": "进度",
+      "progress_count": "{{total}} 项中已完成 {{accepted}} 项"
     },
     "voicePlaybackNotice": {
       "failed": "{{speak}}失败。请检查文字转语音设置后重试。",
@@ -6065,7 +6110,9 @@
       "category_count_other": "{{count}} 个类别",
       "source_categories": "{{name}} 的类别",
       "items_selected_count_other": "已选择 {{count}} 项",
-      "found_count_other": "已找到 {{count}} 项"
+      "found_count_other": "已找到 {{count}} 项",
+      "found": "已找到",
+      "items_selected": "已选项目"
     },
     "agentSpecNotRewrittenNotice": {
       "saved_but_not_applied": "已保存，但此 {{productName}} 无法更新智能体配置，新聊天会继续使用之前的设置。请打开“日志”页面查看原因。"
@@ -6136,7 +6183,8 @@
       "trusted_channel_all": "已信任 — 此频道中的所有工具将自动批准，重启后仍然有效",
       "trusted_channel_base": "已信任 — {{base}} 命令将对 @{{role}} 自动批准，{{productName}} 重启前有效",
       "trusted_channel_command": "已信任 — “{{cmd}}”将对 @{{role}} 自动批准，{{productName}} 重启前有效",
-      "title_wants_to_run": "<title/> 请求运行"
+      "title_wants_to_run": "<title/> 请求运行",
+      "running": "正在运行："
     },
     "approvalModePicker": {
       "nudge_body": "在这里可以调整 {{productName}} 的审批模式——选择这里的“信任”后，它在此对话中无需先询问即可工作，随时可以改回。",
@@ -6227,7 +6275,8 @@
         "run_this_on_your_local_machine": "在本地机器上运行：",
         "uninstall": "卸载",
         "update": "更新",
-        "update_to": "更新到 v{{version}}"
+        "update_to": "更新到 v{{version}}",
+        "open": "打开"
       },
       "sourcesPopover": {
         "developer_install_equivalent_to_command": "以开发者方式安装本地应用目录（等同于 <command/>）。",
@@ -6237,7 +6286,8 @@
         "installing": "正在安装…",
         "kirocrew_app_install_path": "kirocrew app install <path>",
         "manage_app_sources": "管理应用来源",
-        "path_to_app_directory": "/path/to/app-directory"
+        "path_to_app_directory": "/path/to/app-directory",
+        "developer_install_of_a_local_app_directory_equiv": "以开发者方式安装本地应用目录（等同于"
       },
       "types": {
         "built_in": "内置",
@@ -6836,7 +6886,9 @@
       "write_a_comment_to_send": "写一条评论……{{keys}} 发送",
       "open_count_other": "{{count}} 个未解决",
       "resolved_count_other": "{{count}} 个已解决",
-      "messages_count_other": "{{count}} 条消息"
+      "messages_count_other": "{{count}} 条消息",
+      "messages": "条消息",
+      "open": "未解决 ·"
     },
     "commentsSidebar": {
       "add_a_comment_on_the_whole_artifact": "对整个产物添加评论…",
@@ -6876,7 +6928,10 @@
       "draft_a_prompt_in_chat": "在聊天中起草提示",
       "draft_a_prompt_in_chat_hint": "打开聊天，并在输入框中放入一条关于这些评论的提示。你自己发送之前，不会发送任何内容。",
       "show_resolved_count_other": "展开 {{count}} 条已解决",
-      "hide_resolved_count_other": "隐藏 {{count}} 条已解决"
+      "hide_resolved_count_other": "隐藏 {{count}} 条已解决",
+      "hide": "隐藏",
+      "resolved": "已解决",
+      "show": "展开"
     },
     "computerUseLiveView": {
       "close": "关闭",
@@ -7060,7 +7115,9 @@
       "switch_to_unified_view": "切换到统一视图",
       "this_document_is_tracked_as_a_session_artifact_n": "此文档被记录为会话产物，而非源文件更改",
       "toggle_diff": "显示或隐藏 {{path}} 的差异",
-      "show_more_count_other": "展开另外 {{count}} 项"
+      "show_more_count_other": "展开另外 {{count}} 项",
+      "more": "更多",
+      "show": "展开"
     },
     "openFileChips": {
       "open_file": "打开文件"
@@ -7086,7 +7143,8 @@
       "search_denied_path": "无权访问此路径",
       "check_path_inside_project": "请选择其他路径",
       "enter_sends": "按 Enter 直接发送消息",
-      "ctrl_enter_sends": "按 Ctrl+Enter 直接发送消息"
+      "ctrl_enter_sends": "按 Ctrl+Enter 直接发送消息",
+      "search_failed": "无法搜索文件。请重试。"
     },
     "fileRenderers": {
       "binary_file_download_hint": "它不是文本，因此这里没有可显示的内容。请下载一份副本，用其他应用打开。",
@@ -7143,7 +7201,12 @@
       "showing_first_rows_other": "显示 {{shown}} 行，共 {{count}} 行",
       "items_count_other": "{{count}} 项",
       "lines_count_other": "{{count}} 行",
-      "more_count_other": "还有 {{count}} 项"
+      "more_count_other": "还有 {{count}} 项",
+      "items": "项",
+      "lines": "行",
+      "more": "更多",
+      "rows": "行",
+      "showing_500_of": "显示 500 项，共"
     },
     "folderColorNames": {
       "amber": "琥珀色",
@@ -7542,7 +7605,8 @@
       "cancel_unsettled": "无法取消登录。登录仍在进行中，请再次点击同一选项重试。",
       "card_intro": "仅供 Kiro Agent 后端使用：其 Agent 将以这个 Kiro 账号运行。Kiro CLI 仍沿用自己的 kiro-cli 登录，在此登录不会改变它。",
       "previous_sign_in_not_removed": "已登录，但无法移除之前的登录",
-      "previous_sign_in_not_removed_body": "新账号已保存，但你切换前的那个账号仍然存在且优先生效。请先将其登出，再确认此处显示的登录。"
+      "previous_sign_in_not_removed_body": "新账号已保存，但你切换前的那个账号仍然存在且优先生效。请先将其登出，再确认此处显示的登录。",
+      "click_to_copy": "点击复制"
     },
     "kiroPrerequisiteGate": {
       "setup_completion_not_recorded": "未记录设置完成",
@@ -8704,7 +8768,8 @@
       "sent_transcript_only": "已发送（仅对话记录）",
       "transcript_only_hint": "该 Crew 无法恢复完整的对话上下文，因此此副本仅从对话记录继续。",
       "unknown_error": "未知错误",
-      "default_badge": "默认"
+      "default_badge": "默认",
+      "failed": "失败"
     },
     "sessionActionsMenu": {
       "bring_back_to_main": "移回主窗口",
@@ -8869,7 +8934,8 @@
       "select_a_skill_to_preview": "选择技能以预览",
       "skill_search_results": "技能搜索结果",
       "source": "来源",
-      "installed_files_other": "已安装 {{count}} 个文件"
+      "installed_files_other": "已安装 {{count}} 个文件",
+      "by": "作者"
     },
     "skillDirectoryBrowser": {
       "description": "描述",
@@ -9168,7 +9234,8 @@
       "dismiss_tip": "忽略提示",
       "feature_tip": "功能提示",
       "learn_more": "了解更多",
-      "turn_off_tips": "关闭提示"
+      "turn_off_tips": "关闭提示",
+      "tip_settings": "提示设置"
     },
     "toolInputPreview": {
       "collapse": "折叠",
@@ -9413,7 +9480,33 @@
       "annotate_click_to_edit": "点击编辑这条批注",
       "annotate_note_for_n": "标记 {{n}} 的批注",
       "annotate_added_ack": "已加入消息输入框 — 在你发送消息之前不会发出",
-      "try_again": "重试"
+      "try_again": "重试",
+      "browser_view": "浏览器视图",
+      "browser_view_can_t_be_reached_from_this_browser": "无法从此浏览器访问浏览器视图",
+      "browser_view_is_not_running": "浏览器视图未运行",
+      "browser_view_unavailable": "浏览器视图不可用",
+      "can_t_embed_an_http_page_here": "无法在此嵌入 http:// 页面",
+      "couldn_t_open_this_page_in_the_browser": "无法在浏览器中打开此页面",
+      "couldn_t_start_the_browser_view": "无法启动浏览器视图。",
+      "dashboard_policy_blocks_embedding_http_page": "浏览器本可以允许此页面，但此仪表板只嵌入来自 127.0.0.1 或 localhost 的 http:// 页面。这是网关策略，而不是浏览器的拦截。",
+      "http": "http://",
+      "live_browser_session": "实时浏览器会话",
+      "loading_the_browser_view": "正在加载浏览器视图…",
+      "more_actions": "更多操作",
+      "opening_in_the_browser": "正在浏览器中打开…",
+      "page_mixed_content": "页面（混合内容）。",
+      "start_browser_view": "启动浏览器视图",
+      "start_it_to_watch_and_drive_the_agent_s_browser": "启动后即可在此面板中查看并操作代理的浏览器会话。",
+      "the_browser_view_isn_t_available_on_this_gateway": "此网关上没有可用的浏览器视图。",
+      "the_gateway_could_not_open_a_browser_for_this_page": "网关无法为此页面打开浏览器。",
+      "the_view_runs_on_the_gateway_host_pin_and_forward": "浏览器视图由网关主机的回环地址提供，此浏览器无法连接到它。如果你通过 SSH 隧道访问仪表板，请用下方设置固定视图端口，并同时转发该端口。",
+      "browser_view_can_t_load_its_files_here": "浏览器视图可能无法在此加载其文件",
+      "a_sign_in_proxy_refuses_the_view_s_files": "视图的文件在不带 Cookie 时被拒绝，带 Cookie 时则有响应。可能的原因是仪表板前面的某个组件（例如登录代理或隧道）会在每个请求上检查 Cookie。视图运行在一个隔离的框架中，无法发送该 Cookie。如果是这种情况，请改为通过直接的 SSH 端口转发访问仪表板。",
+      "opened_from_this_chat": "从本聊天打开",
+      "this_dashboard_is_served_over_https_so_the_brows": "此仪表板通过 HTTPS 提供服务，因此浏览器会阻止嵌入",
+      "to_open_another_site_unlock_the_view_s_address_bar": "点击页面上方的锁图标即可在那里输入其他地址；右上角的显示器按钮可切回预览地址栏。",
+      "your_page_is_in_pick_it_in_the_sidebar": "你的页面在 {{session}} 中，请在框架的侧边栏中选择它。",
+      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "带 ? 或 # 部分的链接无法通过此地址栏打开——请先打开网站普通地址，再点击页面上方的锁图标，在框架自带地址栏中输入完整链接。"
     },
     "welcomeView": {
       "incognito": "隐身",
@@ -10188,7 +10281,13 @@
       "ultra_done_line_files_other": "当全部 {{count}} 项文件检查通过后完成。",
       "ultra_done_line_files_rest_other": "当全部 {{count}} 项文件检查通过且你批准其余部分后完成。",
       "breadcrumb_nav_label": "面包屑导航",
-      "breadcrumb_back_to": "返回 {{t}}"
+      "breadcrumb_back_to": "返回 {{t}}",
+      "breadcrumb_label": "团队成员",
+      "ultra_needs_you_none_blocked": "没有等你批准的事项。受阻的工作在“里程碑”下。",
+      "ultra_stalled": "停滞",
+      "ultra_ms_blocked": "受阻",
+      "ultra_recap_blocked_one": "{{names}}受阻",
+      "ultra_recap_blocked_many": "{{names}}受阻"
     },
     "guideLayer": {
       "region_label": "引导",
@@ -10673,8 +10772,26 @@
       "copy_failed": "无法复制。请在应用中选中文字后自行复制。",
       "more_actions": "更多操作"
     },
-    "meetYourMatesIntro": {},
-    "startupVideoModal": {},
+    "meetYourMatesIntro": {
+      "sample_line_1": "我昨晚发现了一个不稳定的测试，并修好了。",
+      "sample_line_2": "PR 已经准备好了。要我合并吗？",
+      "sample_merge": "合并",
+      "sample_show_first": "先给我看看"
+    },
+    "startupVideoModal": {
+      "close": "关闭",
+      "crewmates_description": "它们会自己找到要做的事、动手完成，只在需要你时才来问你。",
+      "crewmates_title": "认识你的队友。",
+      "got_it": "知道了",
+      "media_failed": "无法加载功能视频",
+      "new_tag": "新",
+      "not_now": "暂不",
+      "share": "共享",
+      "share_description": "把这个功能视频变成可以发布到任何地方的分享卡片。",
+      "share_include_title": "包含视频标题",
+      "streaming": "在线播放",
+      "try_now": "立即试试"
+    },
     "selectionActions": {
       "apps": "应用",
       "apps_hint": "把选中的文字发给一个应用",
@@ -11164,7 +11281,14 @@
         "installed_needs_newer_host": "已安装的 {{name}} 需要更新的 {{productName}}。请更新 {{productName}}；你的数据不受影响。"
       },
       "grants_reconsent_composer_actions": "输入框按钮：允许应用在输入框的 + 菜单中添加这些按钮。点击后会把应用的文字插入你的草稿；应用看不到草稿，也不能发送。",
-      "grants_reconsent_selection_actions": "选中文字操作：允许应用的条目拿到你在聊天回复中选中的文字，并提供结果供复制或打开。"
+      "grants_reconsent_selection_actions": "选中文字操作：允许应用的条目拿到你在聊天回复中选中的文字，并提供结果供复制或打开。",
+      "installed": "已安装：",
+      "lifecycle": "| 生命周期：",
+      "memory": "内存：",
+      "min_kirocrew_v": "最低 {{productName}}：v",
+      "origin": "安装来源：",
+      "platform": "平台：",
+      "resources_2": "| 资源："
     },
     "appPage": {
       "loading_app": "加载应用…",
@@ -11247,7 +11371,11 @@
       "updated_from_the_registry": "已从注册表更新 {{name}}。",
       "updated_needs_session_approval_consent": "{{name}} 已被禁用，因为它新增了控制你对话的请求。请在应用详情中查看该权限，然后启用它。",
       "refresh_store": "刷新商店",
-      "refreshing_store": "正在刷新商店…"
+      "refreshing_store": "正在刷新商店…",
+      "action_failed": "{{action}} {{name}} 失败",
+      "kept": "已保留 —",
+      "show_disabled_other": "显示 {{count}} 个已禁用应用",
+      "show_enabled_only": "仅显示已启用"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",
@@ -11421,7 +11549,9 @@
       "col_type": "类型",
       "col_url": "链接",
       "col_cost": "费用",
-      "more_count_other": "另外 {{n}} 个"
+      "more_count_other": "另外 {{n}} 个",
+      "access_reachable": "：访问可达",
+      "more": "更多"
     },
     "artifactDetailPage": {
       "published_to_provider": "已发布到 {{provider}}",
@@ -11560,7 +11690,12 @@
       "content_copied_from_version": "内容复制自 v{{version}}",
       "version_label": "v{{version}}",
       "to_version": "→ v{{version}}",
-      "version_change": "v{{from}} → v{{to}}"
+      "version_change": "v{{from}} → v{{to}}",
+      "by": "由",
+      "content_copied_from_v": "内容复制自 v",
+      "updated": "· 更新于",
+      "v": "v",
+      "v_2": "→ v"
     },
     "artifactPopoutFrame": {
       "artifact": "产物",
@@ -11689,7 +11824,9 @@
       "saved_to_library_notice": "已将“{{name}}”保存到你的产物中。",
       "open_doc_in_editor": "在编辑器中打开 {{path}}",
       "open_doc_in_editor_failed": "无法在编辑器中打开此文件：{{reason}}。点击文件名即可预览。",
-      "folder_renamed_to": "文件夹已重命名为 {{name}}"
+      "folder_renamed_to": "文件夹已重命名为 {{name}}",
+      "by": "由",
+      "on": "开"
     },
     "capabilitiesPage": {
       "agent_capabilities": "自定义",
@@ -12011,7 +12148,8 @@
         "trust": "信任",
         "trusted": "已信任",
         "view_full_activity": "查看完整动态 →",
-        "approvals_pending_count_other": "{{count}} 项待审批"
+        "approvals_pending_count_other": "{{count}} 项待审批",
+        "approvals_pending": "项待审批"
       },
       "cronAckBar": {
         "acknowledge": "确认",
@@ -12115,7 +12253,9 @@
         "search_failed_for_query": "知识搜索失败：“{{query}}”",
         "searching_knowledge_for_query": "正在搜索知识：“{{query}}”…",
         "selected_count_other": "已选 {{count}} 项",
-        "tokens_count_other": "{{count}} 个令牌"
+        "tokens_count_other": "{{count}} 个令牌",
+        "selected": "已选 ·",
+        "tokens": "个令牌"
       },
       "mcpInfoButton": {
         "agent_loads_only_its_own_mcp_servers": "代理“{{name}}”仅加载自己的 MCP 服务器。",
@@ -12377,7 +12517,8 @@
         "chip_failed_other": "{{count}} 个代理失败",
         "chip_stopped_other": "{{count}} 个代理已停止",
         "chip_stalled_other": "{{count}} 个代理可能已停滞",
-        "more_running_normally_count_other": "另有 {{count}} 个正常运行中…"
+        "more_running_normally_count_other": "另有 {{count}} 个正常运行中…",
+        "more_running_normally": "个仍在正常运行…"
       },
       "subagentQueued": {
         "low_memory": "等待开始 — 需要 {{required}} 可用内存，当前可用 {{available}}；请释放内存以继续",
@@ -12437,7 +12578,8 @@
         "set_by_you_open": "你标成了未完成，agent 还没确认。",
         "sending": "发送中",
         "done_of_total": "{{done}} / {{total}}",
-        "more_count_other": "另外 {{n}} 个…"
+        "more_count_other": "另外 {{n}} 个…",
+        "more": "更多…"
       },
       "thinkingBlock": {
         "collapse_model_reasoning": "收起模型推理",
@@ -12651,7 +12793,8 @@
       },
       "workflowSidebarRow": {
         "could_not_load_snapshot": "无法加载快照：",
-        "events_count_other": "{{n}} 个事件"
+        "events_count_other": "{{n}} 个事件",
+        "events": "个事件"
       },
       "pins": {
         "pinned_messages": "已置顶消息",
@@ -13913,7 +14056,10 @@
       "cleanup_move_count_other": "{{n}} 个会话将被移至较早的会话。",
       "show_sessions_count_other": "显示 {{n}} 个会话",
       "hide_sessions_count_other": "隐藏 {{n}} 个会话",
-      "broadcast_crewmates_hint": "由 AI 队友（crew 里的 agent）运行的会话"
+      "broadcast_crewmates_hint": "由 AI 队友（crew 里的 agent）运行的会话",
+      "hide": "隐藏",
+      "skip": "跳过",
+      "will_be_moved_to_older_sessions": "将被移至较早的会话。"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",
@@ -14422,7 +14568,8 @@
       "orphan_pods_label": "孤立 Pod 主目录：{{value}}",
       "total_disk_used_by_running_pod_homes": "运行中 Pod 主目录占用的磁盘总量",
       "pod_homes_left_on_disk_with_no_live_pod": "磁盘上没有对应运行 Pod 的遗留主目录",
-      "disk_usage_unavailable": "磁盘用量不可用"
+      "disk_usage_unavailable": "磁盘用量不可用",
+      "just_now": "刚刚"
     },
     "developer": {
       "agentBackendTab": {
@@ -14764,6 +14911,9 @@
         },
         "telemetry": {
           "label": "遥测"
+        },
+        "mcpPool": {
+          "label": "MCP 管理"
         }
       }
     },
@@ -14978,7 +15128,10 @@
       "open_crew_manager": "打开团队管理页",
       "built_from": "基于",
       "change_default_crewmate": "更换默认 Bot",
-      "change_default_hint": "打开“开发者 → 配置”里的“默认 Bot”设置。"
+      "change_default_hint": "打开“开发者 → 配置”里的“默认 Bot”设置。",
+      "inherited_from_the_agent_template": "来自它所基于的自定义代理。",
+      "no_pin_anywhere_the_backend_chooses": "这里和自定义代理里都没有选定，所以由 {{productName}} 替你挑一个。",
+      "resolves_to": "使用 {{model}}"
     },
     "knowledge": {
       "detailView": {
@@ -15011,7 +15164,8 @@
         "unarchive": "取消归档",
         "shared_count_other": "{{n}} 个共有",
         "status_active": "使用中",
-        "status_archived": "已归档"
+        "status_archived": "已归档",
+        "shared": "共享"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} 已嵌入 ({{pct}}%)",
@@ -15105,7 +15259,8 @@
         "type_policy": "策略",
         "type_personal_notes": "个人笔记",
         "type_external_reference": "外部参考",
-        "type_document": "文档"
+        "type_document": "文档",
+        "selected": "已选择"
       },
       "itemCard": {
         "copied": "已复制！",
@@ -15129,7 +15284,9 @@
         "retry": "重试",
         "nodes_count_other": "{{count}} 个节点",
         "edges_count_other": "{{count}} 条边",
-        "graph_counts": "{{nodes}}，{{edges}}"
+        "graph_counts": "{{nodes}}，{{edges}}",
+        "edges": "条边",
+        "nodes": "个节点，"
       },
       "sourceGroup": {
         "items_added_directly": "直接添加的条目",
@@ -15262,7 +15419,8 @@
         "region_example_placeholder": "例如 us-east-1",
         "word_count_other": "{{n}} 个词",
         "word_count_approx_other": "约 {{n}} 个词",
-        "items_count_other": "{{n}} 个条目"
+        "items_count_other": "{{n}} 个条目",
+        "items": "个条目"
       },
       "settings": {
         "title": "Ingestion Settings",
@@ -15323,7 +15481,8 @@
       "section_disabled": "已禁用",
       "unpin": "取消置顶",
       "unpin_from_sidebar": "取消 {{name}} 在侧边栏的置顶",
-      "installed_apps": "已安装的应用"
+      "installed_apps": "已安装的应用",
+      "tile_disabled": "已禁用"
     },
     "logsPage": {
       "filter_logs": "筛选日志",
@@ -15339,7 +15498,8 @@
       "wrap_off": "换行：关",
       "wrap_on": "换行：开",
       "level_change_failed": "更改日志级别失败",
-      "matches_count_other": "{{count}} 条匹配"
+      "matches_count_other": "{{count}} 条匹配",
+      "matches": "条匹配"
     },
     "mcpGatewayCard": {
       "backends": "后端",
@@ -15356,7 +15516,8 @@
       "status_stopped": "已停止",
       "status_unhealthy": "异常",
       "with_shared_gateway_pooled": "使用共享网关（池化）",
-      "without_gateway_per_session_copies": "不使用网关（每会话独立副本）"
+      "without_gateway_per_session_copies": "不使用网关（每会话独立副本）",
+      "s": "s"
     },
     "mcpManagement": {
       "assessment": {
@@ -15826,7 +15987,8 @@
         "temp_refusal_unclassifiable": "已忽略声明的 {{key}}={{path}}，原因：无法确认它的实际位置。探测改用了托管的临时文件夹。",
         "temp_refusal_check_failed": "已忽略声明的 {{key}}={{path}}，原因：位置检查失败。探测改用了托管的临时文件夹。",
         "mcp_deny_spared": "这是 {{productName}} 自己的服务器，因此在 {{name}} 上关闭这里的一个工具只会停止该工具。",
-        "tools_count_other": "{{n}} 个工具"
+        "tools_count_other": "{{n}} 个工具",
+        "tools_2": "个工具"
       },
       "memoryGraphTab": {
         "all_count": "全部（{{count}}）",
@@ -16007,7 +16169,8 @@
         "agent_template_skip_unwritable": "无法写入",
         "agent_template_skip_over_limit": "超出归档上限",
         "archive_agent_templates_more": "超出归档上限、未提供的模板：{{templates}}",
-        "include_agent_templates_memory_hint": "记忆导出从不包含智能体模板。"
+        "include_agent_templates_memory_hint": "记忆导出从不包含智能体模板。",
+        "kb": "KB"
       },
       "promptsTab": {
         "agent_sop_name": "@agent-sop:name",
@@ -16651,7 +16814,11 @@
       "today_line": "今天：{{summary}}",
       "today_sessions_other": "{{amount}} 个会话",
       "today_messages_other": "{{amount}} 条消息",
-      "today_tokens_other": "{{amount}} 个令牌"
+      "today_tokens_other": "{{amount}} 个令牌",
+      "messages": "条消息",
+      "sessions": "个会话 ·",
+      "today": "今天：",
+      "tokens": "令牌"
     },
     "performanceTab": {
       "builder_mcp_procs": "Builder MCP",
@@ -16690,7 +16857,8 @@
       "working_directory": "工作目录",
       "graph_scale_network": "满量程 {{max}} · 最近 {{seconds}}",
       "graph_scale_percent": "满量程 100% · 最近 {{seconds}}",
-      "session_storage_detail_other": "{{sessions}} 个会话 · 可回收 {{reclaimable}}"
+      "session_storage_detail_other": "{{sessions}} 个会话 · 可回收 {{reclaimable}}",
+      "session_storage_detail": "{{sessions}} 个会话 · 可回收 {{reclaimable}}"
     },
     "popoutFrame": {
       "session": "会话",
@@ -17083,7 +17251,8 @@
       "title": "会话拆解",
       "tool_count_other": "{{n}} 个工具",
       "unknown_agent": "子代理",
-      "unknown_model": "未知"
+      "unknown_model": "未知",
+      "tool_count": "{{count}} 个工具"
     },
     "sessionStorage": {
       "age_option_other": "超过 {{days}} 天 — {{count}} 个会话 · {{size}}",
@@ -17150,7 +17319,8 @@
       "unknown_session": "未列出的会话",
       "busy_emptying": "正在清空回收站，部分操作会暂停到完成为止。",
       "empty_failed_next_step": "请再次尝试“永久删除”。详细信息见网关日志。",
-      "kept_identity_changed": "有一批在你选择之后于磁盘上发生了变化，因此被保留。"
+      "kept_identity_changed": "有一批在你选择之后于磁盘上发生了变化，因此被保留。",
+      "refused_heading": "{{count}} 个会话无法移动"
     },
     "sessionsPage": {
       "page_title": "全部会话",
@@ -17457,7 +17627,12 @@
         "backfill_folder_gone_nothing_filed": "{{folder}} 文件夹在运行期间被删除，因此没有放入任何内容。请先保存此设置以重新创建。",
         "loading_channel_config": "正在加载 {{channel}} 配置…",
         "cannot_load_channel_config": "无法加载 {{channel}} 配置。网关是否正在运行？",
-        "channel_settings_read_only": "{{channel}} 设置在运行 {{productName}} 的机器上管理，远程会话中为只读。"
+        "channel_settings_read_only": "{{channel}} 设置在运行 {{productName}} 的机器上管理，远程会话中为只读。",
+        "cannot_load": "无法加载",
+        "config": "配置…",
+        "config_is_the_gateway_running": "配置。网关是否正在运行？",
+        "loading": "正在加载",
+        "settings_are_managed_on_the_machine_running_kiro": "设置在运行 {{productName}} 的机器上管理，远程会话中为只读。"
       },
       "browserPanel": {
         "add_origin": "添加地址",
@@ -17546,14 +17721,101 @@
         "cred_domains_full": "最多 {{count}} 个网站。删掉一个才能再添加。",
         "add_cred_domain": "添加网站",
         "remove_cred_domain": "删除 {{domain}}",
-        "credentials_applied_other": "已应用 {{count}} 个 Cookie"
+        "credentials_applied_other": "已应用 {{count}} 个 Cookie",
+        "use_builtin_label": "使用内置浏览器",
+        "use_builtin_desc": "在 {{productName}} 的内置面板中打开页面。关闭后改用 playwright-cli 浏览。",
+        "browsing": "网页浏览",
+        "presence_is_consent": "因为已安装 Playwright CLI，所以可以浏览网页。卸载它就会收回这项能力。",
+        "not_installed": "助手还不能浏览网页。",
+        "install_explains": "安装 Playwright CLI 后，助手可以打开页面、读取内容并填写表单。你可以在 Browser 面板里查看，也可以随时接手操作。",
+        "install": "安装 Playwright CLI",
+        "install_takes_a_while": "这会下载一个浏览器，可能需要几分钟。你可以离开此页面。",
+        "needs_node": "安装需要 Node.js 20 或更高版本（检测到 {{version}}）。",
+        "get_the_extension": "获取扩展",
+        "token_label": "扩展令牌（可选）",
+        "token_placeholder": "从扩展里粘贴",
+        "token_set": "已保存",
+        "token_save": "保存",
+        "token_clear": "清除",
+        "token_explains": "没有令牌时，浏览器每次连接都会请你批准；有令牌则静默连接。从浏览器里的 Playwright 扩展复制它。",
+        "attach_title": "使用你自己已登录的浏览器",
+        "token_stored": "已保存",
+        "install_steps_intro": "安装会执行三步。",
+        "step_npm": "用 npm 全局安装 @playwright/cli。",
+        "step_browser": "下载它驱动的浏览器。",
+        "step_skills": "注册它的技能，让智能体知道有哪些命令。",
+        "engine_chromium": "Chromium",
+        "engine_firefox": "Firefox",
+        "engine_webkit": "WebKit",
+        "engine_downloaded": "已下载",
+        "engine_download": "下载",
+        "node_missing": "需要 Node.js 20 或更新版本，而本机没有找到 Node。",
+        "node_how": "安装后重新打开本页面。<dl>下载 Node.js</dl>",
+        "node_no_admin": "在无法安装 Node 的机器上（没有管理员权限，或者注册表需要登录），请在运行 {{productName}} 的那台机器上执行以下命令。脚本会把 Node 和 CLI 安装到你的主目录，并在网络阻止下载时告诉你如何解决。",
+        "copy_command": "复制命令",
+        "copied": "已复制",
+        "builtin_save_failed": "无法保存内置浏览器设置。",
+        "builtin_status_unavailable": "无法加载内置浏览器设置。",
+        "host_unavailable": "无法加载主机名。",
+        "copy_failed": "复制失败。请选中命令并手动复制。",
+        "engine_download_failed": "无法开始下载浏览器。",
+        "token_save_failed": "无法保存扩展令牌。",
+        "managed_title": "{{productName}} 主机上的托管浏览器",
+        "host_label": "主机：{{host}}",
+        "managed_explains": "Playwright 会把独立的浏览器版本下载到运行 {{productName}} 的机器上。它们使用自己的浏览配置文件，不共享你个人浏览器的登录状态。",
+        "managed_host_note": "这些下载位于 {{productName}} 主机上，而不是显示此页面的设备上。用 Mac 访问 Linux 主机时，会在该主机上得到 Linux 版本；在 Mac 的 Chrome 里安装扩展，本身并不能让主机上的 CLI 连接到那个浏览器。",
+        "cli_installed": "已安装 Playwright CLI",
+        "engines_heading": "浏览器引擎",
+        "engines_help": "Chromium 是自动化的默认引擎。Google Chrome 是另一个浏览器，这里不会安装；WebKit 是 Playwright 构建的 Safari 引擎，不是你的 Safari 应用。托管浏览器是完整的浏览器，可以打开可见窗口。已下载表示文件已在磁盘上，并不代表测试过启动。",
+        "engine_default_badge": "自动化默认引擎",
+        "engine_downloading": "正在下载…",
+        "engine_retry": "重试",
+        "engine_unknown": "未知",
+        "engine_unknown_reason": "{{productName}} 无法从浏览器缓存中确认此版本。重新下载是安全的。",
+        "status_region_label": "浏览器设置进度",
+        "status_unavailable": "无法读取浏览器设置状态，显示的内容可能已过时。",
+        "op_cli_setup": "正在设置 Playwright CLI",
+        "op_engine_download": "正在下载 {{engine}}",
+        "stage_line": "步骤：{{stage}}",
+        "stage_preparing": "准备中",
+        "stage_installing_cli": "正在安装 Playwright CLI",
+        "stage_downloading_browser": "正在下载浏览器",
+        "stage_installing_skills": "正在注册助手的浏览器技能",
+        "stage_finishing": "正在收尾",
+        "elapsed_running": "已运行 {{duration}}",
+        "elapsed_done": "用时 {{duration}}",
+        "done_cli": "Playwright CLI 设置完成",
+        "failed_cli": "Playwright CLI 设置失败",
+        "interrupted_cli": "Playwright CLI 设置被中断",
+        "done_engine": "{{engine}} 下载完成",
+        "failed_engine": "{{engine}} 下载失败",
+        "interrupted_engine": "{{engine}} 下载被中断",
+        "outcome_succeeded": "浏览器设置完成",
+        "outcome_failed": "浏览器设置失败",
+        "outcome_interrupted": "浏览器设置被中断",
+        "failure_no_detail": "主机没有报告更多详情。",
+        "reason_status_unavailable": "在设置状态重新加载之前，下载已暂停。",
+        "reason_checking": "正在确认上一个请求是否启动了下载。主机回应后即可下载。",
+        "reason_engine_busy": "正在下载 {{engine}}。完成后才能进行其他下载。",
+        "reason_cli_busy": "正在设置 Playwright CLI。完成后才能下载。",
+        "reason_busy_generic": "另一个浏览器设置操作正在进行。",
+        "op_busy_generic": "{{productName}} 主机上正在进行浏览器设置。",
+        "reason_cli_first": "请先安装 Playwright CLI。",
+        "connect_title": "连接你现有的浏览器",
+        "connect_explains": "使用你正在运行的浏览器里的标签页和登录状态。这需要一个基于 Chromium 的浏览器（例如 Chrome），并安装 Playwright 扩展。",
+        "connect_host_note": "浏览器及其扩展必须运行在 {{productName}} 主机上，CLI 才能访问到它们。其他设备上浏览器里的扩展不会自行连接到这台主机。",
+        "connect_consent": "已安装扩展或已保存令牌并不表示浏览器已连接。",
+        "desktop_title": "桌面应用中的内置浏览器",
+        "desktop_web_explains": "可在 {{productName}} 桌面应用中使用。在网页控制台中，助手改用 Playwright。"
       },
       "channelDisabledPanel": {
         "checking_your_organization_s_channel_policy": "正在检查你所在组织的渠道策略…",
         "channel_policy_status_unavailable": "{{channel}} 策略状态不可用",
         "channel_turned_off": "{{channel}} 已被管理员关闭",
         "kirocrew_couldn_t_confirm_whether_your_organizat": "{{productName}} 无法确认你所在组织的安全策略\n          是否允许此渠道。在状态解析完成前，其设置处于隐藏状态 —\n          强制执行不受影响。请尝试重新加载。",
-        "your_organization_s_security_policy_disables_thi": "你所在组织的安全策略已禁用此渠道。其设置\n        不可用，此处的任何配置都不会生效。"
+        "your_organization_s_security_policy_disables_thi": "你所在组织的安全策略已禁用此渠道。其设置\n        不可用，此处的任何配置都不会生效。",
+        "is_turned_off_by_your_administrator": "已被管理员关闭",
+        "policy_status_unavailable": "策略状态不可用"
       },
       "channels": {
         "get_your_bot_credentials": "获取你的机器人凭证",
@@ -17897,7 +18159,13 @@
         "default_session_folder_deleted": "已删除的文件夹",
         "default_session_folder_save_failed": "无法保存默认文件夹。请重试。",
         "default_session_folder_load_failed": "无法加载侧边栏文件夹，因此这里没有列出它们。",
-        "model_for_spawned_sub_agents": "用于派生子代理的模型。"
+        "model_for_spawned_sub_agents": "用于派生子代理的模型。",
+        "default_defers_to_your_agent_config_and_then_to": "配置了自己模型的代理会忽略此设置。“默认”使用代理配置中的模型；若未配置，则使用系统默认模型。更改此设置不会影响已打开的会话。",
+        "which_model_new_sessions_start_with_pick_a_model": "代理未指定模型时，新会话默认使用的模型。可在“自定义 → 队友”中为每个代理单独设置模型，或在会话内选择模型以就地覆盖。",
+        "follow_default_description": "旧聊天可能保留最初使用的模型，不随新默认模型变化。由队友、应用、计划或频道发起的聊天会保留各自模型。在任何更改之前，你会看到将更改的聊天数量并进行确认。",
+        "follow_default_hint": "只统计你自己发起的聊天。",
+        "default_session_folder_desc": "未选择文件夹就开始的新聊天会归入这个侧边栏文件夹。它只用于在侧边栏中分组聊天，不是磁盘上的文件夹。",
+        "default_session_folder_hint": "聊天会使用该文件夹关联的项目和代理，与“在文件夹中新建聊天”相同。"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",
@@ -18261,7 +18529,11 @@
         "not_active_until_restart": "— 重启后才会生效",
         "remote_port_ttl": "· 远程端口 {{port}} · ttl {{ttl}}",
         "warm_cap_count_other": "最多 {{count}} 个远程 Crew 可同时保持预热（活动隧道）；其余按需重连。可通过以下命令调整",
-        "remote_port_value": "· 远程端口 {{port}}"
+        "remote_port_value": "· 远程端口 {{port}}",
+        "instances_stay_warm_live_tunnel_at_once_the_rest": "个远程 Crew 可同时保持预热（活动隧道）；其余按需重连。可通过\n                以下命令调整",
+        "port_2": "· 远程端口",
+        "ttl": "· ttl",
+        "up_to": "最多"
       },
       "notificationsPanel": {
         "desktop_alerts": "桌面通知",
@@ -18434,7 +18706,9 @@
         "label_credential_families": "凭据模式",
         "label_exfil_heuristics": "URL 数据外泄检测",
         "label_audit_surfaces": "SEL 审计日志",
-        "label_token_auth": "仪表板令牌认证"
+        "label_token_auth": "仪表板令牌认证",
+        "more": "更多",
+        "show": "展开"
       },
       "releases": {
         "badge_unreleased": "未发布",
@@ -18767,7 +19041,9 @@
         "file_delivery_title": "被标记文件可以投递到哪里",
         "file_delivery_waiting": "正在此设备上等待",
         "file_delivery_withdraw": "撤回",
-        "file_delivery_section": "被标记文件的投递"
+        "file_delivery_section": "被标记文件的投递",
+        "categories": "个类别 ·",
+        "rules": "条规则"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "将聊天标签切换绑定到 Ctrl+数字，而不是 Option+数字。文本框获得焦点时，Option+数字不会切换聊天。",
@@ -19838,7 +20114,11 @@
       "otel_retention_cap": "轮次、延迟和启动数据仅涵盖最近 {{days}} 天；更早的指标会被删除（<settingRef/>）。",
       "window_footer_shards_other": "OTEL 部分 · 时间范围：{{period}} · {{n}} 个分片 · 来源：<dir/> · 仅本地，无外发",
       "daily_trend_point_other": "{{date}} · 冷启动 {{cold}} · 热启动 {{warm}} · {{n}} 次启动",
-      "top_spenders_link_to_chat": "有标题的仪表板会话可点击跳转"
+      "top_spenders_link_to_chat": "有标题的仪表板会话可点击跳转",
+      "daily_trend_point": "{{date}} · 冷启动 {{cold}} · 热启动 {{warm}} · {{count}} 次启动",
+      "local_only_no_egress": "· 仅本地，无外发",
+      "shard_s_source": "个分片 · 来源",
+      "window_footer": "OTEL 部分 · 时间范围：{{period}} ·"
     },
     "terminalPopoutFrame": {
       "return": "返回停靠面板",
@@ -20007,7 +20287,12 @@
       "slots_open_other": "{{n}} 个空闲槽位",
       "summary": "{{present}}，{{active}}，{{open}}",
       "scene_label": "场景",
-      "scene_button": "{{label}} 场景：{{desc}}"
+      "scene_button": "{{label}} 场景：{{desc}}",
+      "active": "个活动，",
+      "agent_other": "{{count}} 个代理",
+      "open": "打开",
+      "present": "个在场，",
+      "slot_other": "{{count}} 个槽位"
     },
     "worldsPopout": {
       "hide_controls": "隐藏控制项",
@@ -20547,7 +20832,9 @@
       "profile_monitor_type": "类型",
       "profile_monitor_type_bounded": "监视器",
       "profile_monitor_unavailable": "无法获取监视器状态",
-      "profile_monitor_unknown": "未知"
+      "profile_monitor_unknown": "未知",
+      "driving_idle": "空闲",
+      "member_count_filtered": "显示 {{shown}} / {{count}} 位队友"
     },
     "tasksCapacityCard": {
       "title": "任务与容量",
@@ -21823,7 +22110,29 @@
     "preview_save_failed": "无法保存共享 Crew 设置。",
     "preview_restart_failed": "无法重启网关。",
     "raised_by": "由 {{name}} 发起",
-    "take_over_keeps_draft": "接手后即可输入。{{name}} 的草稿会保留。"
+    "take_over_keeps_draft": "接手后即可输入。{{name}} 的草稿会保留。",
+    "several_typing": "有几个人正在输入",
+    "person_viewing": "{{name}} 在这里",
+    "composer_locked_hint": "对方发送或停下后，你就可以再次输入了。",
+    "sent_by": "由 {{name}} 发送",
+    "approval_waiting": "{{name}} 的操作待批准",
+    "invite_status_pending": "等待中",
+    "invite_single_use": "一次性链接",
+    "question_waiting": "Kiro 在等 {{name}} 回答",
+    "invite_title": "通过 Tailscale 邀请",
+    "person_typing": "{{name}} 正在输入",
+    "collab_region": "会话动态",
+    "decisions_list": "审批与问题",
+    "invite_empty": "还没有邀请。",
+    "invite_list_title": "邀请",
+    "people_tip": "要移除某人，请在 Tailscale 中移除。",
+    "composer_taken_over_hint": "你的草稿已保留。对方发送或停下后，你就可以再次输入了。",
+    "take_over_typing_label": "从 {{name}} 那里接手输入。对方的草稿会保留在对方那里。",
+    "step_share": "在 Tailscale 共享这台机器",
+    "step_send": "把 Crew 链接发给对方",
+    "not_joined": "未加入",
+    "approval_waiting_you": "你的操作待批准",
+    "question_waiting_you": "Kiro 在等你回答"
   },
   "milestones": {
     "getting_started_result": "第一个完成的成果",
@@ -21856,7 +22165,8 @@
     "try_today_hint": "点“试试”到达那里就算完成，今天也会计入连续天数。",
     "arrival_failed": "无法保存你已到达那里。",
     "retry": "重试",
-    "video_failed": "无法加载功能视频"
+    "video_failed": "无法加载功能视频",
+    "intro_video_title": "15 秒了解 {{productName}}"
   },
   "milestone": {
     "streak_best": {
