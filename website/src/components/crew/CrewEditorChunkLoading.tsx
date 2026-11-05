@@ -12,7 +12,7 @@ import { i18nT } from '../../i18n/t'
 export default function CrewEditorChunkLoading() {
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-bg/60"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-bg/60 p-safe"
       role="dialog"
       aria-busy="true"
       aria-label={i18nT('pages.chatPage.loading')}

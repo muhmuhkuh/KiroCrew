@@ -278,7 +278,7 @@ class TestSwitchingOff(_Isolated):
 
 
 class TestAPersonsPickWins(_Isolated):
-    """The crew changes only a model it chose itself (the Design and review finding).
+    """The crew changes only a model it chose itself.
 
     A pick in the crew's session -- the model picker, or ``session_set_model`` --
     holds the slot until the crew's ``model`` or ``triage_model`` setting changes.
@@ -506,9 +506,8 @@ PICK_GEN_WRITERS: dict[tuple[str, str], tuple[str, int]] = {
     ("dashboard/agent_admin/crew_update.py", "_reload"): ("pick", 1),
     ("dashboard/session_control_parts/model_switch.py", "apply_pending_model_pick"): ("pick", 1),
     ("dashboard/server_runtime/config_watch.py", "_switch_provider"): ("runtime", 1),
-    # Namespace writes outside app-owned crews are ordinary backend resets, not picks.
-    ("dashboard/chat_backend.py", "chat_session_selection"): ("backend_reset", 1),
-    ("dashboard/chat_handlers.py", "api_chat_slot_backend"): ("backend_reset", 1),
+    # A code channel's session starts on the Slack Code default model a person set.
+    ("slack/code_channels/binding.py", "create_bound_session"): ("pick", 1),
     ("apps/builtins/issue_radar/backend/crew_model.py", "apply_turn_model"): ("crew", 1),
 }
 

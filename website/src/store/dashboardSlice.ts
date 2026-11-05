@@ -1,21 +1,20 @@
 import { safeSetItem } from '../utils/safeStorage'
 import { newerTs } from '../lib/slotReadRelay'
 import { jsonEqual } from '../utils/structuralEqual'
-import { createSlice, createAsyncThunk, type PayloadAction } from '@reduxjs/toolkit'
+import { slotSurfaceKey } from './slotIdentity'
+import { createSlice, createAsyncThunk, createSelector, type PayloadAction } from '@reduxjs/toolkit'
 import { api } from '../api/client'
 import { streamFlush } from './streamFlush'
 import { ApiError } from '../api/apiError'
-import { sanitizeLlmOutput, isUnsafeKey } from '../utils/sanitize'
+import { isUnsafeKey } from '../utils/sanitize'
 import type { StatusData, ChatSlot, TodoList, McpSessionReport } from '../types'
 import { bumpLastTsOverlay, dropCaughtUpLastTs, pruneLastTsOverlay, slotLastTsOf } from './slotLastTs'
 import type { SessionColorMode, PaletteName, DefaultColorSetting, IntensityName } from '../utils/sessionColors'
+import { isChatPageSurface } from '../utils/channelOrigin'
 import { slotListHoldTest } from '../utils/slotListHold'
-import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince } from './dashboard/unread'
+import { crewModeEnabled } from '../lib/crewMode'
+import { MANUAL_UNREAD, _relayUnreadToParent, clearSharedUnreadIfCovered, crewMemberKeys, drainUnreadKeys, dropQueuedSharedUnreadCoveredBy, hasUnreadRelayHold, heldOrphanTest, persistManualSentinels, persistSharedUnread, queueSharedUnread, readCovers, relayUnreadCount, relayUnreadIfHolding, relayedUnreadKeys, restoreUnreadBadges, restoreUnreadSince, retireSharedUnreadIfUnchanged, sharedUnreadWatermark } from './dashboard/unread'
 export { selectPersonSlots } from './personSlots'
-
-export interface SubagentDetail {
-  id: string; task: string; agent: string; turns: number; last_tool: string; startedAt: number
-}
 
 /** A close tombstone entry (see `applySlots`). */
 interface CloseHold {
@@ -170,6 +169,8 @@ export interface DashboardState {
   approvalMode: string
   channelTrusted: boolean
   refreshTrigger: number
+  /** Bumped when the cron caches are re-read (see `invalidateRefreshQueries`):
+   *  what the Schedule page reloads its job list on. */
   cronRefreshTrigger: number
   unreadSlots: string[]
   /** Watermarks for relayed clears: slot -> newest message ts that marked it
@@ -212,9 +213,6 @@ export interface DashboardState {
   // downloaded). Drives the Settings nav dot + the About tab dot. Mirrored
   // from the Electron update-state events by useUpdateSubscription.
   desktopUpdateAvailable: boolean
-  subagentRunning: Record<string, number>
-  subagentDetails: Record<string, SubagentDetail[]>
-  subagentText: Record<string, Record<string, string>>
   sessionDefaultColor: DefaultColorSetting
   sessionColorsMode: SessionColorMode
   sessionColorsPalette: PaletteName
@@ -265,9 +263,6 @@ const initialState: DashboardState = {
   slotsFetchFailed: false,
   updateProgress: null,
   desktopUpdateAvailable: false,
-  subagentRunning: {},
-  subagentDetails: {},
-  subagentText: {},
   sessionDefaultColor: (() => { try { return (JSON.parse(localStorage.getItem('mc-session-default-color') ?? 'null') as DefaultColorSetting) ?? null } catch { return null } })(),
   sessionColorsMode: safeGet('mc-session-colors-mode', 'tint') as SessionColorMode,
   sessionColorsPalette: safeGet('mc-session-colors-palette', 'horizon') as PaletteName,
@@ -276,6 +271,34 @@ const initialState: DashboardState = {
 }
 
 export const fetchSlots = createAsyncThunk('dashboard/fetchSlots', () => api.chatSlots())
+
+/** After a local read, check whether the shared watermark that read could
+ *  not cover is an ORPHAN: newer than every saved row the gateway has for an
+ *  idle session. Builds before #15014 left such records (the watermark was a
+ *  turn's unsaved `done` row, which a gateway restart drops). No read can
+ *  ever cover one, so without this check the dot comes back on every relayed
+ *  read and every reload.
+ *
+ *  This window's own slot row cannot decide it: it may lag a sibling that
+ *  just watermarked a real reply. So the gateway is asked, AFTER the
+ *  watermark is read: a real reply is a saved row the gateway already holds,
+ *  so its fresh `last_ts` covers it. The fulfilled reducer then removes the
+ *  record only if it still holds that same watermark. Does nothing (and
+ *  sends nothing) when the read already cleared the record. */
+export const confirmOrphanUnread = createAsyncThunk(
+  'dashboard/confirmOrphanUnread',
+  async (slot: string): Promise<{ slot: string; watermark: string } | null> => {
+    const watermark = sharedUnreadWatermark(slot)
+    if (watermark === undefined) return null
+    let rows: ChatSlot[]
+    try { rows = await api.chatSlots() } catch { return null }
+    const row = Array.isArray(rows) ? rows.find(r => r.key === slot) : undefined
+    // Unknown or mid-turn: rows still being written may cover it soon.
+    if (!row || row.running) return null
+    if (readCovers(row.last_ts, watermark)) return null // last-ts: the gateway's fresh reply, not this window's row
+    return { slot, watermark }
+  },
+)
 
 /** Switch the approval mode, carrying a policy refusal back to the caller.
  *
@@ -317,17 +340,6 @@ export const changeApprovalMode = createAsyncThunk<
   },
 )
 
-/** Drop one slot's live sub-agent state.
- *
- *  These three maps are keyed by the bare slot key and are otherwise cleared
- *  only wholesale on reconnect, so a departed slot's counters and rows would
- *  otherwise survive for the tab's lifetime.
- *
- *  Driven by the AUTHORITATIVE slot-list writers — `sseSlots` and
- *  `fetchSlots.fulfilled` — and deliberately NOT by `removeSlotOptimistic`: that
- *  reducer runs before the delete is confirmed, and `sseSubagentText` drops every
- *  frame for a slot with no `subagentRunning` entry, so evicting optimistically
- *  would leave a slot whose delete failed alive but permanently mute. */
 /** Reconcile per-slot dashboard state against an authoritative slot list. Both
  *  authoritative writers (`sseSlots`, `fetchSlots.fulfilled`) drive teardown
  *  through here, so the two cannot drift apart the way the eviction lists this
@@ -359,10 +371,7 @@ const reconcileSlots = (
   // frames that arrived while it travelled, and would then delete a slot the
   // stream has since created.
   if (!evictStale) return
-  for (const key of Object.keys(state.subagentRunning ?? {})) {
-    if (!liveKeys.has(key)) evictSlotSubagents(state, key)
-  }
-  // Same guard, same reason: a write stamp for a key the authoritative list has
+  // A write stamp for a key the authoritative list has
   // dropped protects nothing, and keeping it would let the record grow for the
   // tab's lifetime. Pruned only when the caller vouches for the list, so an HTTP
   // reply that merely predates a newly created slot cannot strip its protection.
@@ -373,12 +382,6 @@ const reconcileSlots = (
     if (!liveKeys.has(slotKeyOfStamp(stamped))) delete state.slotMemberAt[stamped]
   }
   pruneLastTsOverlay(state, liveKeys)
-}
-
-const evictSlotSubagents = (state: DashboardState, slotKey: string): void => {
-  delete state.subagentRunning[slotKey]
-  delete state.subagentDetails[slotKey]
-  delete state.subagentText[slotKey]
 }
 
 /** Apply an authoritative slot list, reusing the object identity of every row
@@ -1064,9 +1067,6 @@ const dashboardSlice = createSlice({
       state.slotsListPartial = false
       state.slotsHeldKeys = []
       state.slotsHoldChannels = false
-      state.subagentRunning = {}
-      state.subagentDetails = {}
-      state.subagentText = {}
       relayUnreadIfHolding(state, hadUnreadRelayHold)
     },
     sseDisconnected(state) { state.connected = false; state.unreadDrainHeld = true },
@@ -1615,36 +1615,6 @@ const dashboardSlice = createSlice({
     setDesktopUpdateAvailable(state, action: PayloadAction<boolean>) {
       state.desktopUpdateAvailable = action.payload
     },
-    sseSubagentStatus(state, action: PayloadAction<{ running: number; slot: string; agents?: SubagentDetail[] }>) {
-      const { slot, running, agents } = action.payload
-      // `slot` is an untrusted key from the SSE payload; __proto__/constructor/
-      // prototype would write through Object.prototype in the else-branch below.
-      if (!slot || isUnsafeKey(slot)) return
-      if (running <= 0) {
-        evictSlotSubagents(state, slot)
-      } else {
-        state.subagentRunning[slot] = running
-        if (agents) state.subagentDetails[slot] = agents.map(a => ({
-          ...a,
-          agent: sanitizeLlmOutput(a.agent || ''),
-          last_tool: sanitizeLlmOutput(a.last_tool || ''),
-          task: sanitizeLlmOutput(a.task || ''),
-        }))
-      }
-    },
-    sseSubagentText(state, action: PayloadAction<{ slot: string; id: string; text: string }>) {
-      const { slot, id, text } = action.payload
-      // Both `slot` and `id` are untrusted keys from the SSE payload. A value of
-      // __proto__/constructor/prototype would pollute Object.prototype via the
-      // `state.subagentText[slot][id] = ...` assignment below — and the
-      // `subagentRunning[slot]` check does NOT stop `slot="__proto__"` because
-      // it resolves truthily through the prototype chain. Guard both keys.
-      if (isUnsafeKey(slot) || isUnsafeKey(id)) return
-      if (!slot || !state.subagentRunning[slot]) return
-      if (!state.subagentText[slot]) state.subagentText[slot] = {}
-      const cur = (state.subagentText[slot][id] || '') + sanitizeLlmOutput(text)
-      state.subagentText[slot][id] = cur.length > 4096 ? cur.slice(-4096) : cur
-    },
     sseSlotColor(state, action: PayloadAction<{ key: string; color_index?: number | null; color_hex?: string | null }>) {
       patchSlotRow(state, action.payload.key, slot => {
         // Mirror the backend's mutual exclusion: a non-null value for either
@@ -1827,6 +1797,19 @@ const dashboardSlice = createSlice({
         settleSlotFetch(state, action.meta?.requestId)
         if (!(state.slotFetchesInFlight ?? []).length) state.slotsFetchFailed = true
       })
+      .addCase(confirmOrphanUnread.fulfilled, (state, action) => {
+        if (!action.payload) return
+        const { slot, watermark } = action.payload
+        if (!retireSharedUnreadIfUnchanged(slot, watermark)) return
+        // The relayed read's echo may already have re-lit this window's badge
+        // from the orphan. Clear only that badge: one guarded by any other
+        // watermark (a newer arrival, a manual reminder) stays.
+        if (state.unreadSince?.[slot] !== watermark) return
+        delete state.unreadSince[slot]
+        if (!state.unreadSlots.includes(slot)) return
+        state.unreadSlots = state.unreadSlots.filter(k => k !== slot)
+        _relayUnreadToParent(JSON.stringify(relayedUnreadKeys(state)))
+      })
       .addCase(changeApprovalMode.fulfilled, (state, action) => { state.approvalMode = action.payload })
       // The created slot joins the list on the SAME action that activates it
       // (chatSlice's createSlot.fulfilled), so the sidebar row and the empty
@@ -1909,11 +1892,85 @@ const dashboardSlice = createSlice({
 })
 
 export const { sseStatus, sseYolo, setYoloDuration, sseConnected, sseDisconnected, sseSlots, sseSlotsPartial, sseSlotListHolds, setSidebarOrder, sseTodoUpdate, sseMcpReportUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, sseSlotPatch, addSlotOptimistic, removeSlotOptimistic, releaseCloseHold, awaitCloseOutcome, expireCloseHold, confirmCloseHold, armConfirmedCloseHold, updateSlot, updateSlotFolder, updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, triggerRefresh, triggerCronRefresh, markSlotUnread, markSlotRead, remoteSlotRead, setUpdateProgress,
-  setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError, setManualRanks, setPendingManualOrder, setManualOrderError } = dashboardSlice.actions
+  setDesktopUpdateAvailable, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink, dropSlotLinks, setPinRanks, setPendingPinOrder, setPinOrderError, setManualRanks, setPendingManualOrder, setManualOrderError } = dashboardSlice.actions
 
 export { slotSurfaceKey, slotIsRemoteBound } from './slotIdentity'
 
-export { selectUnreadByMode } from './dashboard/unreadSelectors'
+/**
+ * Count unread slots whose surface matches `mode`. Slots present in
+ * `unreadSlots` but missing from `slots` (e.g. deleted but not yet drained)
+ * are treated as the default chat surface (`""`) so they keep contributing
+ * to the Chat badge rather than vanishing silently.
+ *
+ * Note — intentional asymmetry with `filterUnreadKeysBySurface` in
+ * `surfaces/registry.ts`: that helper drops orphan keys (the sidebar can't
+ * display them regardless), whereas this one keeps them so the badge stays
+ * stable across the brief race between `removeSlotOptimistic` and
+ * `fetchSlots.fulfilled`.
+ *
+ * The exception is an orphan no reconcile will drain: any orphan while the
+ * gateway labels its lists partial, or one the gateway holds (`slotsHeldKeys`, or a
+ * channel key under `slotsHoldChannels`). The premise above does not hold for it. Its unread entry is kept so the dot returns with the tab, but
+ * it is left out of the badge, which would otherwise count a session the
+ * sidebar cannot show.
+ */
+function countUnreadByMode(
+  slots: ChatSlot[],
+  unread: string[],
+  mode: string,
+  heldKeys: readonly string[] = [],
+  holdChannels = false,
+  listPartial = false,
+): number {
+  if (unread.length === 0) return 0
+  const surfaceByKey = new Map(slots.map(s => [s.key, slotSurfaceKey(s)]))
+  const isHeldOrphan = heldOrphanTest(new Set(surfaceByKey.keys()), heldKeys, holdChannels, listPartial)
+  // A Crew Mode crew member is no row of the person's lists (its root's Crew
+  // panel lists it), so its unread entry is kept for that panel but not counted.
+  const crewMembers = crewMemberKeys(slots)
+  // The chat surface ('') counts every slot the chat page renders, legacy
+  // Autopilot slots included (see `isChatPageSurface`).
+  const isChatSurface = mode === ''
+  let count = 0
+  for (const k of unread) {
+    if (isHeldOrphan(k) || crewMembers.has(k)) continue
+    const sk = surfaceByKey.get(k) ?? ''
+    if (isChatSurface ? isChatPageSurface(sk) : sk === mode) count++
+  }
+  return count
+}
+
+/**
+ * Memoized factory for "unread count for slots whose surface === mode".
+ * One memo cache per `mode` argument so registry surfaces don't trash each
+ * other's memoization. Built-in nav badges should not call this directly —
+ * they go through `selectSurfaceBadgeCount(navId)` from `surfaces/registry`,
+ * which routes to this factory only when a surface declares `slotMode`.
+ */
+type UnreadByModeSelector = (state: { dashboard: DashboardState }) => number
+const _unreadByModeCache = new Map<string, UnreadByModeSelector>()
+export function selectUnreadByMode(mode: string): UnreadByModeSelector {
+  let sel = _unreadByModeCache.get(mode)
+  if (!sel) {
+    // The Crew Mode preview decides whether crew members count (`crewMemberKeys`).
+    // It is passed as an argument, not read inside an input selector: the
+    // selector memoizes on its arguments, so a flip with the same state would
+    // otherwise answer from the cache.
+    const count = createSelector(
+      (state: { dashboard: DashboardState }) => state.dashboard.slots,
+      (state: { dashboard: DashboardState }) => state.dashboard.unreadSlots,
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsHeldKeys,
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsHoldChannels,
+      (state: { dashboard: DashboardState }) => state.dashboard.slotsListPartial,
+      (_state: { dashboard: DashboardState }, crewMode: boolean) => crewMode,
+      (slots, unread, heldKeys, holdChannels, listPartial) =>
+        countUnreadByMode(slots, unread, mode, heldKeys ?? [], holdChannels === true, listPartial === true),
+    )
+    sel = state => count(state, crewModeEnabled())
+    _unreadByModeCache.set(mode, sel)
+  }
+  return sel
+}
 
 /**
  * True while the page has never seen a slot list and one may still arrive, so a

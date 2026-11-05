@@ -652,7 +652,7 @@ describe('change card', () => {
   it('continues an apply a reload interrupted, from the step the gateway expects', async () => {
     pending = [card({
       kind: 'crewmate.create',
-      title: 'Create mate Scout',
+      title: 'Create Bot Scout',
       status: 'applying',
       params: { name: 'Scout', goal: 'g', schedule: { cron_expr: '0 9 * * *' } },
       plan: {
@@ -702,7 +702,7 @@ describe('change card', () => {
     server.use(http.delete('/api/agents/:name', () => HttpResponse.json({ ok: true })))
     pending = [card({
       kind: 'crewmate.create',
-      title: 'Create mate Scout',
+      title: 'Create Bot Scout',
       status: 'applied',
       params: { name: 'Scout', goal: 'g', schedule: { cron_expr: '0 9 * * *' } },
       plan: {

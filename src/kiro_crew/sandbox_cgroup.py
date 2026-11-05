@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING
 from kiro_crew import platform_compat
 from kiro_crew.config.paths import config_dir
 
+if TYPE_CHECKING:
+    from kiro_crew.config.sections_limits import ResourceLimitsConfig
+
 # The single source of the agents-slice name is sandbox_tiers (beside
 # _IN_SANDBOX_MARKER, in the lowest sandbox layer); re-exported below so this
 # module's public _CGROUP_AGENTS_SLICE name and every reader of it stay unchanged.
@@ -61,6 +64,15 @@ _CGROUP_DEFAULT_MAX_PROCESSES = 8192  # pids.max counts TASKS (threads), not pro
 # Both grok-build and OpenClaw ship no default CPU quota; fair-share weight is
 # the correct default for agent workloads that include legitimate builds.
 _CGROUP_DEFAULT_CPU_WEIGHT = 50
+
+# MemoryHigh for each agent scope, as a percent of that scope's own MemoryMax.
+# A scope at memory.high=max is never reclaimed on its own: page cache it fills
+# grows until the SHARED slice MemoryHigh, where the kernel throttles every
+# runtime together. 90 lets an anon-heavy single tree (a JVM build) on a small
+# host reach its hard MemoryMax at nearly the same point as with no soft
+# ceiling, while every scope reclaims its own cache first. Override
+# via resource_limits.scope_memory_high_pct; 0 emits no MemoryHigh at all.
+_CGROUP_DEFAULT_SCOPE_MEMORY_HIGH_PCT = 90
 
 # The memory.max default is HOST-PROPORTIONAL, not a flat cap: the agent
 # subprocess tree may occupy up to this fraction of physical RAM before the

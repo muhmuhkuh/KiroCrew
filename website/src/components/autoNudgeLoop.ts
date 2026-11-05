@@ -8,6 +8,7 @@
  */
 import { i18nT } from '../i18n/t'
 import { fmtDuration, fmtTimeNumeric } from '../i18n/format'
+import { activeMonitorKinds } from '../monitoring/automation'
 import monitorContract from '../monitoring/contract.json'
 
 export interface AutoNudgeLoop {
@@ -108,6 +109,20 @@ export const FINISHED_STOP_REASONS = new Set(['stop_sentinel', 'monitor_terminal
  *  loop is never finished, whatever its reason field still says. */
 export function loopFinished(loop: Pick<AutoNudgeLoop, 'active' | 'stopped_reason'> | null | undefined): boolean {
   return !!loop && !loop.active && FINISHED_STOP_REASONS.has(loop.stopped_reason ?? '')
+}
+
+/** Whether a watch's kind is a pull or merge request: the gated prompt loop's
+ *  own `gh-pr`, plus the structured provider kinds. A finished watch of any
+ *  other kind (a conductor's work ledger) is worded as a subject, not a pull
+ *  request, because its finish is neither a merge nor a close.
+ *
+ *  Consults the runtime
+ *  monitor contract (`activeMonitorKinds`), so a kind an edition contributed at
+ *  boot is recognized once the gateway's runtime list is installed,
+ *  and falls back to the bundled vocabulary otherwise. */
+export function isPullRequestWatchKind(kind: string | null | undefined): boolean {
+  if (!kind) return false
+  return kind === 'gh-pr' || activeMonitorKinds().has(kind)
 }
 
 /** The watch kinds whose subject is a pull or merge request: the gated prompt

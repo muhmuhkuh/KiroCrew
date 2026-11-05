@@ -98,8 +98,11 @@ def _rules(policy) -> list[tuple[str, str]]:
         (("WEB_FETCH",), {"web_fetch"}),
         (("execute_bash",), set()),
         (("fs_write", "grep"), set()),
+        # With no tool list to resolve against, an MCP-form matcher covers all of MCP.
         (("mcp__github__create_issue",), {"mcp"}),
         (("@github/create_issue",), {"mcp"}),
+        (("mcp__srv___x",), {"mcp"}),
+        (("@github/create_issue", "web_*"), {"web_fetch", "web_search", "mcp"}),
         (("WebFetch",), _ALL),
         (("web_*",), {"web_fetch", "web_search", "mcp"}),
         (("execute_*",), {"mcp"}),
@@ -247,7 +250,7 @@ def test_one_confirm_hook_reads_in_the_singular():
 
 
 def test_a_kiro_cli_turn_is_not_gated_and_reads_no_spec(monkeypatch):
-    def must_not_read(_agent, _project_dir=None):
+    def must_not_read(_agent, _project_dir=None, **_kw):
         raise AssertionError("a kiro-cli turn must not read the spec")
 
     monkeypatch.setattr(spec_hooks, "crew_fired_spec_hooks", must_not_read)
@@ -500,7 +503,7 @@ def test_the_saved_hooks_are_read_once_under_the_writers_lock(tmp_path, monkeypa
     monkeypatch.setattr(hooks_mod, "get_global_hook_store", lambda: None)
     _save_page_hook(tmp_path, "web_fetch")
     events: list = []
-    real_read = Path.read_text
+    real_read = Path.read_bytes
 
     @contextmanager
     def locked(path):
@@ -508,13 +511,13 @@ def test_the_saved_hooks_are_read_once_under_the_writers_lock(tmp_path, monkeypa
         yield
         events.append(("unlock", path.name))
 
-    def read_text(self, *a, **k):
+    def read_bytes(self, *a, **k):
         if self.name == "hooks.json":
             events.append(("read", self.name))
         return real_read(self, *a, **k)
 
     monkeypatch.setattr(webhooks, "locked", locked)
-    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
     store = hooks_mod.persisted_hook_store()
     assert [h.matcher for h in store.list_all()] == ["web_fetch"]
     assert events == [("lock", "hooks.json"), ("read", "hooks.json"), ("unlock", "hooks.json")]
@@ -612,7 +615,7 @@ def _subagent_run(
     )
     from kiro_crew.subagent import SubagentInfo, SubagentManager
 
-    def read(agent, _project_dir=None):
+    def read(agent, _project_dir=None, **_kw):
         if unreadable:
             raise OSError("unreadable")
         if switch_to:
@@ -867,7 +870,7 @@ def _task_step(
     monkeypatch.setattr(
         spec_hooks,
         "crew_fired_spec_hooks",
-        lambda agent, _project_dir=None: (
+        lambda agent, _project_dir=None, **_kw: (
             [_agent_hook(agent) if switch_to else _spec_hook("*")],
             [],
             0,
@@ -1003,7 +1006,7 @@ def test_a_step_that_switched_and_failed_retries_under_the_switched_agents_hooks
     monkeypatch.setattr(
         spec_hooks,
         "crew_fired_spec_hooks",
-        lambda agent, _project_dir=None: ([_agent_hook(agent)], [], 0),
+        lambda agent, _project_dir=None, **_kw: ([_agent_hook(agent)], [], 0),
     )
     fired: list = []
 
@@ -1138,7 +1141,8 @@ def test_a_kiro_cli_task_step_is_not_gated_and_gets_no_spec_hooks(monkeypatch):
             ],
             {"web_fetch"},
         ),
-        ([{"capability": "mcp", "match": ["srv/*"], "effect": "allow"}], {"mcp"}),
+        ([{"capability": "mcp", "match": ["srv/*"], "effect": "allow"}], {"mcp", "mcp-server:srv"}),
+        ([{"capability": "mcp", "effect": "allow"}], {"mcp"}),
         ([{"capability": "web_search", "effect": "deny"}], set()),
     ],
 )
@@ -1195,6 +1199,39 @@ def test_a_new_hook_on_an_auto_approved_capability_makes_the_session_stale(agent
     assert asyncio.run(spec_hooks.hook_projection_stale(live, "a1")) is True
 
 
+def test_a_per_tool_mcp_hook_is_stale_only_until_its_ask_is_projected(
+    agents_dir, hooks_page, monkeypatch
+):
+    # The batch the projection sends for a hook on one MCP tool reads fresh, so the
+    # session is not reset on every turn; a hook on another MCP tool reads stale.
+    tools = {"srv": ["get_creds", "delete_all", "search"]}.get
+    monkeypatch.setattr(kas_permissions, "cached_mcp_tool_names", tools)
+    _write_spec(agents_dir, "a1", allowedTools=["@srv"])
+    _add_hooks_page_hook(hooks_page, "@srv/get_creds")
+    matchers = kas_agents.pre_tool_hook_matchers("a1", {"allowedTools": ["@srv"]})
+    entry = kas_agents.to_client_custom_agent(
+        "a1", {"allowedTools": ["@srv"]}, "p", pre_tool_hook_matchers=matchers
+    )
+    projected = kas_agents.projected_auto_approved([entry], "a1")
+    assert "mcp" in projected
+    assert (
+        asyncio.run(spec_hooks.hook_projection_stale(_live(ACP_BACKEND_KAS, projected), "a1"))
+        is False
+    )
+    unhooked = kas_agents.projected_auto_approved(
+        [kas_agents.to_client_custom_agent("a1", {"allowedTools": ["@srv"]}, "p")], "a1"
+    )
+    assert (
+        asyncio.run(spec_hooks.hook_projection_stale(_live(ACP_BACKEND_KAS, unhooked), "a1"))
+        is True
+    )
+    _add_hooks_page_hook(hooks_page, "@srv/delete_all")
+    assert (
+        asyncio.run(spec_hooks.hook_projection_stale(_live(ACP_BACKEND_KAS, projected), "a1"))
+        is True
+    )
+
+
 def test_a_new_spec_hook_makes_the_session_stale(agents_dir, hooks_page):
     _write_spec(agents_dir, "a1", allowedTools=["web_fetch"], hooks=_PRE)
     live = _live(ACP_BACKEND_KAS, frozenset({"web_fetch"}))
@@ -1220,6 +1257,73 @@ def test_staleness_is_false_off_kas_or_without_a_projection(agents_dir, hooks_pa
 def test_an_unreadable_spec_re_projects(agents_dir, hooks_page):
     (agents_dir / "a1.json").write_text("{not json", encoding="utf-8")
     live = _live(ACP_BACKEND_KAS, frozenset({"web_fetch"}))
+    assert asyncio.run(spec_hooks.hook_projection_stale(live, "a1")) is True
+
+
+def _point_user_hooks_dir(monkeypatch, tmp_path: Path) -> Path:
+    """Point ~/.kiro/hooks at a temp dir via the resolver's seam, return it."""
+    import kiro_crew.agent as agent_mod
+
+    hooks_dir = tmp_path / "userhome" / ".kiro" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(agent_mod, "_DEFAULT_KIRO_HOOKS_DIR", hooks_dir)
+    monkeypatch.setattr(agent_mod, "_mc_config_path", lambda: tmp_path / "no-config.json")
+    spec_hooks._user_file_cache.clear()
+    return hooks_dir
+
+
+def _write_user_file(hooks_dir: Path, name: str, matcher: str) -> None:
+    (hooks_dir / name).write_text(
+        json.dumps(
+            {
+                "version": "v1",
+                "hooks": [
+                    {
+                        "name": "guard",
+                        "trigger": "PreToolUse",
+                        "action": {"type": "command", "command": "guard.sh"},
+                        "matcher": matcher,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_the_projection_withholds_what_a_user_file_pre_tool_hook_covers(
+    tmp_path, monkeypatch, hooks_page
+):
+    """A user ~/.kiro/hooks PreToolUse hook on web_fetch keeps web_fetch out of
+    auto-approve, so the call reaches the gate and exit 2 can block it."""
+    hooks_dir = _point_user_hooks_dir(monkeypatch, tmp_path)
+    _write_user_file(hooks_dir, "guard.json", "web_fetch")
+    matchers = kas_agents.pre_tool_hook_matchers("a1", {"allowedTools": ["web_fetch"]})
+    assert "web_fetch" in matchers
+    gated = kas_agents.to_client_custom_agent(
+        "a1", {"allowedTools": ["web_fetch", "web_search"]}, "p", pre_tool_hook_matchers=matchers
+    )
+    assert ("web_fetch", "ask") in _rules(gated["permissions"])
+    assert ("web_search", "ask") not in _rules(gated["permissions"])
+
+
+def test_editing_a_user_file_hook_makes_an_auto_approved_session_stale(
+    tmp_path, monkeypatch, agents_dir, hooks_page
+):
+    """Adding/editing a ~/.kiro/hooks file so it matches an already-auto-approved
+    capability marks the KAS session stale, so the next turn re-projects."""
+    hooks_dir = _point_user_hooks_dir(monkeypatch, tmp_path)
+    _write_spec(agents_dir, "a1", allowedTools=["web_fetch"])
+    live = _live(ACP_BACKEND_KAS, frozenset({"web_fetch"}))
+    # No user file yet: not stale.
+    assert asyncio.run(spec_hooks.hook_projection_stale(live, "a1")) is False
+    # A user file on a DIFFERENT capability: still not stale.
+    _write_user_file(hooks_dir, "guard.json", "web_search")
+    spec_hooks._user_file_cache.clear()
+    assert asyncio.run(spec_hooks.hook_projection_stale(live, "a1")) is False
+    # Edit it to match the auto-approved web_fetch: now stale.
+    _write_user_file(hooks_dir, "guard.json", "web_fetch")
+    spec_hooks._user_file_cache.clear()
     assert asyncio.run(spec_hooks.hook_projection_stale(live, "a1")) is True
 
 
@@ -1625,7 +1729,7 @@ def test_a_shared_subagent_session_is_checked_after_it_is_created(monkeypatch):
 
     monkeypatch.setattr(subagent_mod, "replace_stale_shared_session", replace)
     monkeypatch.setattr(
-        spec_hooks, "crew_fired_spec_hooks", lambda agent, _project_dir=None: ([], [], 0)
+        spec_hooks, "crew_fired_spec_hooks", lambda agent, _project_dir=None, **_kw: ([], [], 0)
     )
     sessions = MagicMock()
     sessions.get_pid = MagicMock(return_value=None)

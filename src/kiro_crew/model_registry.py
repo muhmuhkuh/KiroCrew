@@ -40,11 +40,6 @@ from pathlib import Path
 from typing import Any, TypeGuard
 
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.model_registry_labels import ADVERTISED_LABEL_MAX_CHARS  # noqa: F401
-from kiro_crew.model_registry_labels import (
-    _admit_label_rows,
-    _payload_labels,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -155,12 +150,13 @@ _KIRO_WINDOWS: dict[str, int] = {}
 
 # Supplementary static windows for models the canonical registry does not carry
 # and kiro-cli does not advertise — chiefly fully-qualified provider model ids
-# and legacy Claude snapshots. Folded here (rather than a separate
-# ``model_tokens.json``, which would be a second, drifting source of truth) so
-# ``model_window`` is the ONE
-# authority. Consulted AFTER the canonical registry (so a canonical/alias hit
-# wins) but BEFORE the ``[1m]`` heuristic. Keys are matched exactly first, then
-# by longest-substring (these ids embed the dotted model name).
+# and legacy Claude snapshots. Kept in this module, not in a data file of its
+# own, so ``model_window`` is the ONE backend authority: the backend package
+# ships no ``model_tokens.json`` (that name is only the frontend's copy,
+# ``website/src/model_tokens.json``). Consulted AFTER the canonical registry
+# (so a canonical/alias hit wins) but BEFORE the ``[1m]`` heuristic. Keys are
+# matched exactly first, then by longest-substring (these ids embed the dotted
+# model name).
 _SUPPLEMENTARY_WINDOWS: dict[str, int] = {
     # Fully-qualified inference-profile + on-demand model ids.
     "anthropic.claude-sonnet-4-20250514-v1:0": 200_000,
@@ -288,6 +284,43 @@ def _admit_ids(values: Iterable[object], store: str) -> list[str]:
 # rather than the id-char limit: a backend's model description can be a sentence.
 # Over-long text is TRUNCATED (unlike an id, where truncation would name a
 # different model) because a clipped label is still a correct, if shorter, label.
+ADVERTISED_LABEL_MAX_CHARS = 400
+
+
+def _admit_label_rows(rows: object, kept_ids: Sequence[str]) -> dict[str, dict[str, str]]:
+    """Admit ``{id: {"name", "description"}}`` label rows for already-kept ids.
+
+    Labels are advisory: they decorate the id list the picker already trusts, so
+    this keeps a label ONLY for an id that passed :func:`_admit_ids` (``kept_ids``)
+    and silently drops anything else -- a label for a refused/unknown id, or a
+    non-dict row. Each field is coerced to ``str`` and clamped to
+    ``ADVERTISED_LABEL_MAX_CHARS``; an empty ``name`` AND empty ``description``
+    yields no entry (nothing to show). Never raises.
+    """
+    if not isinstance(rows, dict):
+        return {}
+    kept = set(kept_ids)
+    out: dict[str, dict[str, str]] = {}
+    for model_id, row in rows.items():
+        if model_id not in kept or not isinstance(row, dict):
+            continue
+        name = str(row.get("name", "") or "")[:ADVERTISED_LABEL_MAX_CHARS]
+        description = str(row.get("description", "") or "")[:ADVERTISED_LABEL_MAX_CHARS]
+        if not name and not description:
+            continue
+        out[model_id] = {"name": name, "description": description}
+    return out
+
+
+def _payload_labels(rows: Sequence[object]) -> dict[str, dict[str, object]]:
+    """``{id: {"name", "description"}}`` from a raw ``availableModels`` payload."""
+    raw: dict[str, dict[str, object]] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            model_id = row.get("modelId") or row.get("value") or ""
+            if isinstance(model_id, str) and model_id.strip():
+                raw[model_id] = {"name": row.get("name"), "description": row.get("description")}
+    return raw
 
 
 def _kiro_windows_cache_path() -> Path:

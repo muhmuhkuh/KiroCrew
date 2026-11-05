@@ -48,8 +48,9 @@ from typing import Any, Iterator
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write, read_bytes_with_retry
 from kiro_crew.config.loader import config_dir
-from kiro_crew.edition_locks import locked_off
+from kiro_crew.user_json import loads_user_json
 from kiro_crew.validation import sanitize_string
+from kiro_crew.webhook_sources import SOURCE_AGENT, source_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +286,7 @@ def registered_context_count(path: Path | None = None) -> tuple[int, bool]:
     """
     target = path if path is not None else context_registrations_path()
     try:
-        raw = json.loads(read_bytes_with_retry(target).decode("utf-8"))
+        raw = loads_user_json(read_bytes_with_retry(target).decode("utf-8"))
     except FileNotFoundError:
         return 0, True
     except (ValueError, OSError):
@@ -383,7 +384,7 @@ def _read_json(path: Path, default: Any) -> Any:
     to inspect or restore, at the cost of erroring the surface until they do.
     """
     try:
-        return json.loads(read_bytes_with_retry(path).decode("utf-8"))
+        return loads_user_json(read_bytes_with_retry(path).decode("utf-8"))
     except FileNotFoundError:
         return default
     except (ValueError, OSError) as exc:
@@ -473,9 +474,10 @@ class WebhookTokenStore:
     # exists, so default-on does not widen the surface on a fresh install.
 
     def is_switch_on(self) -> bool:
-        # Enterprise: inbound webhooks from every source stay off, whatever the
-        # stored switch says (RFC enterprise edition, Red "Webhooks by source").
-        if locked_off():
+        # The ``webhooks`` governance scope outranks the stored switch: a source the
+        # policy refuses reads as off (in an enterprise build, every source until a
+        # policy names it -- RFC enterprise edition, Red "Webhooks by source").
+        if source_refusal(SOURCE_AGENT):
             return False
         raw = _read_json(self.path, {})
         if not isinstance(raw, dict):
@@ -485,7 +487,8 @@ class WebhookTokenStore:
     def set_switch(self, enabled: bool) -> bool:
         """Persist the kill switch. Returns the switch as it now reads.
 
-        That is the stored value, except an enterprise build reads it as off.
+        That is the stored value, except it reads as off while the ``webhooks``
+        governance scope refuses :data:`SOURCE_AGENT`.
         """
         with locked(self.path):
             raw = _read_json(self.path, {})
@@ -503,7 +506,7 @@ class WebhookTokenStore:
             data["enabled"] = bool(enabled)
             data.setdefault("tokens", [])
             write_json_atomic(self.path, data)
-        return bool(enabled) and not locked_off()
+        return bool(enabled) and not source_refusal(SOURCE_AGENT)
 
     @staticmethod
     def _public_entry(entry: dict[str, Any], *, legacy: bool = False) -> dict[str, Any]:

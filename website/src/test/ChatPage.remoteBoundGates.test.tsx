@@ -10,7 +10,7 @@
  * is guaranteed to reject.
  *
  * This is a SOURCE-CONTRACT test, matching the existing ChatPage convention
- * (see ChatPage.reachability.test.tsx): ChatPage's message list is driven by a
+ * (see ChatPage.mcpOAuth.test.tsx): ChatPage's message list is driven by a
  * custom virtualizer that mounts an empty window under jsdom, so a full-page
  * render cannot exercise these offers. What regressed — and what must not come
  * back — is precisely the gate SHAPE: which condition each offer is guarded on.
@@ -18,16 +18,41 @@
  * matching assertion (the mutation check).
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const chatPageSrc = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
-const messageActionsSrc = readFileSync(resolve(here, '../pages/chat/page/messageActions.ts'), 'utf8')
-const turnActionsSrc = readFileSync(resolve(here, '../pages/chat/page/turnActions.ts'), 'utf8')
-const transcriptRenderingSrc = readFileSync(resolve(here, '../pages/chat/page/transcriptRendering.tsx'), 'utf8')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+const chatPageSrc = [
+  readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8'),
+  ...readdirSync(resolve(here, '../pages/chat/page'))
+    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => readFileSync(resolve(here, '../pages/chat/page', f), 'utf8')),
+  ...readdirSync(resolve(here, '../pages'))
+    .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => readFileSync(resolve(here, '../pages', f), 'utf8')),
+].join('\n')
 const sidebarSrc = readFileSync(resolve(here, '../pages/chat-sidebar/SessionRow.tsx'), 'utf8')
+// The interrupted line's label, which the row reads through `useInterruptedRowLabel`.
+const interruptedLabelSrc = readFileSync(resolve(here, '../pages/chat-sidebar/interruptedRowLabel.ts'), 'utf8')
+/** The sidebar's own files joined: the shell and the owners under pages/chat-sidebar/
+ *  it composes (the row and its status builders live in chat-sidebar/SessionRow.tsx). */
+function sidebarSource(): string {
+  const files = [resolve(here, '../pages/ChatSidebar.tsx')]
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      const p = resolve(dir, name)
+      if (statSync(p).isDirectory()) walk(p)
+      else if (/\.(ts|tsx)$/.test(name) && !/\.test\./.test(name)) files.push(p)
+    }
+  }
+  walk(resolve(here, '../pages/chat-sidebar'))
+  return files.map(f => readFileSync(f, 'utf8')).join('\n')
+}
+const sidebarSurface = sidebarSource()
 
 describe('ChatPage – crew-bound offer gates', () => {
   it('derives the crew-bound flag from the shared predicate on the active slot', () => {
@@ -38,19 +63,19 @@ describe('ChatPage – crew-bound offer gates', () => {
   })
 
   it('gates handleRegenerate on the crew-bound flag (early return)', () => {
-    expect(turnActionsSrc).toMatch(/if \(!activeSlot \|\| regenerating \|\| slotRunning \|\| activeSlotRemoteBound\) return/)
+    expect(chatPageSrc).toMatch(/if \(!activeSlot \|\| regenerating \|\| slotRunning \|\| activeSlotRemoteBound\) return/)
   })
 
   it('gates handleEditResend on the crew-bound flag (early return)', () => {
-    expect(messageActionsSrc).toMatch(/if \(!activeSlot \|\| slotRunning \|\| activeSlotRemoteBound\) return/)
+    expect(chatPageSrc).toMatch(/if \(!activeSlot \|\| slotRunning \|\| activeSlotRemoteBound\) return/)
   })
 
   it('withholds the Edit affordance (canEdit) on a crew-bound slot', () => {
-    expect(transcriptRenderingSrc).toMatch(/canEdit=\{!slotRunning && !regenerating && !!activeSlot && !activeSlotRemoteBound\}/)
+    expect(chatPageSrc).toMatch(/canEdit=\{!slotRunning && !regenerating && !!activeSlot && !activeSlotRemoteBound\}/)
   })
 
   it('withholds the Regenerate offer on a crew-bound slot', () => {
-    expect(transcriptRenderingSrc).toMatch(/onRegenerate=\{i === lastTextIdxRef\.current && !slotRunning && !regenerating && activeSlot && !activeSlotRemoteBound \? stableRegenerate : undefined\}/)
+    expect(chatPageSrc).toMatch(/onRegenerate=\{i === lastTextIdxRef\.current && !slotRunning && !regenerating && activeSlot && !activeSlotRemoteBound \? stableRegenerate : undefined\}/)
   })
 
   it('does NOT gate onSwitchVariant — the server allows switch-variant on a bound slot (no relay_archive_refusal)', () => {
@@ -58,11 +83,11 @@ describe('ChatPage – crew-bound offer gates', () => {
     // so gating it here would hide a control the server accepts. This pins the
     // ungated shape; if a future edit inserts the crew-bound guard before the
     // `?`, this exact condition no longer matches and the choice is revisited.
-    expect(transcriptRenderingSrc).toMatch(/onSwitchVariant=\{i === lastTextIdxRef\.current && m\.variants && m\.variants\.length > 1 && activeSlot \?/)
+    expect(chatPageSrc).toMatch(/onSwitchVariant=\{i === lastTextIdxRef\.current && m\.variants && m\.variants\.length > 1 && activeSlot \?/)
     // And the switch-variant offer must not carry the crew-bound flag.
-    const switchVariant = transcriptRenderingSrc.slice(
-      transcriptRenderingSrc.indexOf('onSwitchVariant={'),
-      transcriptRenderingSrc.indexOf('api.switchVariant('),
+    const switchVariant = chatPageSrc.slice(
+      chatPageSrc.indexOf('onSwitchVariant={'),
+      chatPageSrc.indexOf('api.switchVariant('),
     )
     expect(switchVariant).not.toContain('activeSlotRemoteBound')
   })
@@ -75,17 +100,19 @@ describe('ChatSidebar – the interrupted row shares the composer’s predicate'
   // per-call-site re-implementation this PR exists to remove, and it is what the
   // review caught: the row was gated inline while the predicate sat one file away.
   it('builds the interrupted label from slotIsRemoteBound, not an inline field read', () => {
-    expect(sidebarSrc).toMatch(/import \{[^}]*\bslotIsRemoteBound\b[^}]*\} from '(?:\.\.\/)+store\/dashboardSlice'/)
-    expect(sidebarSrc).toMatch(/const label = slotIsRemoteBound\(s\)/)
+    expect(sidebarSrc).toMatch(/const interruptedLabel = useInterruptedRowLabel\(s\)/)
+    expect(interruptedLabelSrc).toMatch(/import \{[^}]*\bslotIsRemoteBound\b[^}]*\} from '(?:\.\.\/)+store\/dashboardSlice'/)
+    expect(interruptedLabelSrc).toMatch(/const label = slotIsRemoteBound\(s\)/)
+    expect(interruptedLabelSrc).not.toMatch(/s\.executor === 'remote'/)
   })
 
   it('leaves no inline crew-bound spelling in the interrupted row builder', () => {
     // Scoped to the row builder, because the crew CHIP legitimately reads
     // `executor === 'remote'` (paired with instance_id) to answer a different
     // question: which crew the row runs on, not whether an action is refused.
-    const start = sidebarSrc.indexOf("key: 'interrupted'")
+    const start = sidebarSurface.indexOf("key: 'interrupted'")
     expect(start).toBeGreaterThan(-1)
-    const builder = sidebarSrc.slice(start, sidebarSrc.indexOf('},', sidebarSrc.indexOf('return (', start)))
+    const builder = sidebarSurface.slice(start, sidebarSurface.indexOf('},', sidebarSurface.indexOf('return (', start)))
     expect(builder).not.toMatch(/s\.executor === 'remote'/)
   })
 })

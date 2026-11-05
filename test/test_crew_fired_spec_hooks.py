@@ -32,8 +32,11 @@ from kiro_crew.agent_sdk.backends import (
 from kiro_crew.agent_sdk.capabilities import capabilities_for
 from kiro_crew.dashboard import chat_runner
 from kiro_crew.hooks import (
+    HOOK_EVENT_AGENT_SPAWN,
+    HOOK_EVENT_POST_TOOL_USE,
     HOOK_EVENT_PRE_TOOL_USE,
     HOOK_EVENT_STOP,
+    HOOK_EVENT_USER_PROMPT_SUBMIT,
     ScriptHook,
     ScriptHookResult,
     ScriptHookStore,
@@ -151,7 +154,7 @@ _PROMPT_AND_STOP_HOOKS = {
 _RUN_NOWHERE = "does not run an agent's hooks"
 
 
-@pytest.mark.parametrize("backend", [ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_PI])
+@pytest.mark.parametrize("backend", [ACP_BACKEND_CODEX, ACP_BACKEND_PI])
 def test_a_new_session_where_nothing_runs_spec_hooks_names_their_events(
     backend, agents_dir, notices
 ):
@@ -202,7 +205,7 @@ def test_pi_spec_hooks_count_as_run_nowhere_until_crew_fires_them(monkeypatch):
 
 def test_an_unreadable_spec_renders_no_run_nowhere_notice(agents_dir, notices):
     (agents_dir / "a1.json").write_text("{not json", encoding="utf-8")
-    assert _prepare(_client(ACP_BACKEND_CLAUDE), "a1", is_new=True) == ([], False, None)
+    assert _prepare(_client(ACP_BACKEND_CODEX), "a1", is_new=True) == ([], False, None)
     assert notices == []
 
 
@@ -280,10 +283,68 @@ def test_an_oversized_or_unsafe_matcher_drops_the_hook_and_retains_nothing():
     assert [(h.command, h.matcher) for h in hooks] == [("z", "exec*")]
 
 
+def test_an_object_form_command_past_4096_characters_still_runs():
+    # kiro-cli runs an object-form hook of this length, so KAS must too.
+    command = "echo " + "x" * 6000
+    hooks = spec_hooks.spec_script_hooks("a1", {"hooks": {"agentSpawn": [{"command": command}]}})
+    assert [h.command for h in hooks] == [command]
+
+
+def test_the_command_bound_is_the_shell_gate_scan_ceiling():
+    from kiro_crew.security.paths import MAX_SCANNABLE_COMMAND_CHARS
+
+    assert spec_hooks._MAX_COMMAND_LEN == MAX_SCANNABLE_COMMAND_CHARS
+
+
+def test_a_command_past_the_bound_is_dropped_with_its_length_and_the_fix(monkeypatch, caplog):
+    import kiro_crew.agent as agent_mod
+
+    audited: list = []
+    monkeypatch.setattr(
+        agent_mod, "_sel_hook_rejected", lambda event, value, reason: audited.append(reason)
+    )
+    command = "x" * (spec_hooks._MAX_COMMAND_LEN + 1)
+    with caplog.at_level("WARNING", logger=spec_hooks.logger.name):
+        hooks = spec_hooks.spec_script_hooks(
+            "a1", {"hooks": {"agentSpawn": [{"command": command}]}}
+        )
+    assert hooks == []
+    assert len(audited) == 1
+    for text in (audited[0], caplog.text):
+        assert f"{len(command)} characters" in text
+        assert f"{spec_hooks._MAX_COMMAND_LEN} limit" in text
+        assert "script file" in text
+        assert "no usable command" not in text
+
+
 def test_conversion_stops_at_the_hook_cap():
     entries = [{"command": f"c{i}"} for i in range(500)]
     hooks = spec_hooks.spec_script_hooks("a1", {"hooks": {"stop": entries}})
     assert len(hooks) == spec_hooks._MAX_SPEC_HOOKS
+
+
+def test_spec_array_over_the_cap_drops_the_remainder_and_audits(monkeypatch):
+    # A spec ``hooks`` ARRAY of 21 runnable command documents: _from_documents (no
+    # cap_overflow passed) keeps main's break, so _convert sees more than the cap
+    # and audits "more than 20 spec hooks, ignoring the remainder" -- the user-file
+    # side-count must not have changed this spec path.
+    import kiro_crew.agent as agent_mod
+
+    reasons: list = []
+    monkeypatch.setattr(agent_mod, "_sel_hook_rejected", lambda *a, **k: reasons.append(a[-1]))
+    docs = [
+        {
+            "name": f"h{n}",
+            "trigger": "UserPromptSubmit",
+            "action": {"type": "command", "command": f"echo {n}"},
+        }
+        for n in range(spec_hooks._MAX_SPEC_HOOKS + 1)  # 21
+    ]
+    hooks = spec_hooks.spec_script_hooks("a1", {"hooks": docs})
+    assert len(hooks) == spec_hooks._MAX_SPEC_HOOKS  # the 21st is dropped
+    assert any(
+        f"more than {spec_hooks._MAX_SPEC_HOOKS} spec hooks" in r for r in reasons
+    ), "the spec-array overflow must still audit as on main"
 
 
 def test_extra_hooks_fire_but_are_never_persisted(tmp_path, monkeypatch):
@@ -332,6 +393,168 @@ def test_a_spec_pre_tool_use_hook_exit_2_blocks(tmp_path, agents_dir, monkeypatc
     # Blocks, and ran in the session workspace rather than the gateway's cwd.
     assert [(r.exit_code, r.blocked) for r in results] == [(2, True)]
     assert Path(results[0].stderr).resolve() == workspace.resolve()
+
+
+def _session_id_probe(tmp_path: Path, out_name: str) -> str:
+    """A hook command that writes its ``KIRO_SESSION_ID`` env and stdin ``acp_session_id``."""
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import json, os, sys\n"
+        "event = json.load(sys.stdin)\n"
+        "out = sys.argv[1]\n"
+        "with open(out, 'w', encoding='utf-8') as f:\n"
+        "    json.dump({'env': os.environ.get('KIRO_SESSION_ID'),"
+        " 'stdin': event.get('acp_session_id', '<absent>'),"
+        " 'stdin_session_id': event.get('session_id', '<absent>'),"
+        " 'secret': os.environ.get('KC_TEST_HOOK_SECRET'),"
+        " 'spawned': os.environ.get('KIROCREW_SPAWNED')}, f)\n",
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}" "{tmp_path / out_name}"'
+
+
+_ALL_SPEC_HOOK_EVENTS = (
+    HOOK_EVENT_AGENT_SPAWN,
+    HOOK_EVENT_USER_PROMPT_SUBMIT,
+    HOOK_EVENT_PRE_TOOL_USE,
+    HOOK_EVENT_POST_TOOL_USE,
+    HOOK_EVENT_STOP,
+)
+
+
+def _fire_one(tmp_path, event, sid):
+    spec = ScriptHook(id="spec:a1:x", event=event, command=_session_id_probe(tmp_path, "x"))
+    tool = event in (HOOK_EVENT_PRE_TOOL_USE, HOOK_EVENT_POST_TOOL_USE)
+    asyncio.run(
+        ScriptHookStore(tmp_path).fire(
+            event,
+            "ctx",
+            tool_name="shell" if tool else "",
+            tool_input={} if tool else None,
+            session_key="dashboard:1",
+            extra_hooks=[spec],
+            acp_session_id=sid,
+        )
+    )
+    return json.loads((tmp_path / "x").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("event", _ALL_SPEC_HOOK_EVENTS)
+def test_every_spec_hook_event_gets_the_session_id_as_kiro_cli_names_it(
+    tmp_path, monkeypatch, event
+):
+    """KIRO_SESSION_ID in env and ``session_id`` on stdin, kiro-cli's names, on every event.
+
+    The gateway's other env is still not forwarded (an ambient secret does not
+    reach the hook). KIROCREW_SPAWNED is the sandbox spawn's own marker, set on
+    the hook even when the gateway's env has none, as kiro-cli's hooks inherit it.
+    """
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.setenv("KIRO_SESSION_ID", "ambient_bogus")
+    monkeypatch.setenv("KC_TEST_HOOK_SECRET", "s3cret")
+    monkeypatch.delenv("KIROCREW_SPAWNED", raising=False)
+    seen = _fire_one(tmp_path, event, "sess_abc")
+    assert seen == {
+        "env": "sess_abc",
+        "stdin": "sess_abc",
+        "stdin_session_id": "sess_abc",
+        "secret": None,
+        "spawned": "1",
+    }
+
+
+@pytest.mark.parametrize("event", _ALL_SPEC_HOOK_EVENTS)
+@pytest.mark.parametrize("sid", [None, ""])
+def test_no_session_id_means_no_key_and_no_env_on_every_event(tmp_path, monkeypatch, event, sid):
+    """No id: both stdin keys absent, KIRO_SESSION_ID unset, the ambient one not leaked."""
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.setenv("KIRO_SESSION_ID", "ambient_bogus")
+    seen = _fire_one(tmp_path, event, sid)
+    assert seen["env"] is None
+    assert seen["stdin"] == "<absent>"
+    assert seen["stdin_session_id"] == "<absent>"
+
+
+def test_a_spec_hook_gets_the_acp_session_id_and_a_stored_hook_does_not(tmp_path, monkeypatch):
+    """On KAS a spec hook sees the session id kiro-cli gives it as KIRO_SESSION_ID."""
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.delenv("KIRO_SESSION_ID", raising=False)
+    store = ScriptHookStore(tmp_path)
+    store._hooks["stored"] = ScriptHook(
+        id="stored", event=HOOK_EVENT_USER_PROMPT_SUBMIT, command=_session_id_probe(tmp_path, "s")
+    )
+    spec = ScriptHook(
+        id="spec:a1:x",
+        event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+        command=_session_id_probe(tmp_path, "x"),
+    )
+    asyncio.run(
+        store.fire(
+            HOOK_EVENT_USER_PROMPT_SUBMIT,
+            "hi",
+            session_key="dashboard:1",
+            extra_hooks=[spec],
+            acp_session_id="sess_abc",
+        )
+    )
+    spec_seen = json.loads((tmp_path / "x").read_text(encoding="utf-8"))
+    stored_seen = json.loads((tmp_path / "s").read_text(encoding="utf-8"))
+    assert (spec_seen["env"], spec_seen["stdin"], spec_seen["stdin_session_id"]) == (
+        "sess_abc",
+        "sess_abc",
+        "sess_abc",
+    )
+    assert (stored_seen["env"], stored_seen["stdin"], stored_seen["stdin_session_id"]) == (
+        None,
+        "<absent>",
+        "<absent>",
+    )
+
+
+def test_an_unknown_acp_session_id_leaves_kiro_session_id_unset(tmp_path, monkeypatch):
+    _passthrough_sandbox(monkeypatch)
+    monkeypatch.setattr(hooks_mod, "_script_hooks_capability_denied", lambda sk="": None)
+    monkeypatch.delenv("KIRO_SESSION_ID", raising=False)
+    spec = ScriptHook(
+        id="spec:a1:x",
+        event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+        command=_session_id_probe(tmp_path, "x"),
+    )
+    asyncio.run(
+        ScriptHookStore(tmp_path).fire(
+            HOOK_EVENT_USER_PROMPT_SUBMIT, "hi", extra_hooks=[spec], acp_session_id=None
+        )
+    )
+    seen = json.loads((tmp_path / "x").read_text(encoding="utf-8"))
+    assert (seen["env"], seen["stdin"], seen["stdin_session_id"]) == (None, "<absent>", "<absent>")
+
+
+@pytest.mark.parametrize(("sid", "expected"), [("sess_abc", "sess_abc"), ("", None)])
+def test_the_chat_turn_hands_the_spec_hooks_its_session_id(sid, expected):
+    from kiro_crew.dashboard.chat_turn import turn_spec_hooks
+
+    seen: dict = {}
+
+    class _Store:
+        async def fire(self, *a, **kw):
+            seen.update(kw)
+            return []
+
+    spec = ScriptHook(id="spec:a1:x", event=HOOK_EVENT_USER_PROMPT_SUBMIT, command="c")
+    turn = SimpleNamespace(
+        session_key="dashboard:1",
+        slot=SimpleNamespace(key="1"),
+        state=SimpleNamespace(_hook_store=_Store()),
+        client=SimpleNamespace(session_id=sid),
+        _spec_hooks=[spec],
+        _spec_hooks_unreadable=False,
+        _spec_hooks_cwd=None,
+    )
+    asyncio.run(turn_spec_hooks._fire(turn, HOOK_EVENT_USER_PROMPT_SUBMIT, "hi"))
+    assert seen["acp_session_id"] == expected
 
 
 def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):

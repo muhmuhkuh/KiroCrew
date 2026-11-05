@@ -11,7 +11,6 @@ and patch; this module never imports it.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from functools import lru_cache
@@ -509,18 +508,24 @@ def baseline_controls() -> Mapping[str, object]:
 
 @lru_cache(maxsize=1)
 def baseline_inner_lists() -> Mapping[str, Mapping[str, ScopedRuleset]]:
-    """Parse inner-list defaults with each capability's catalog matchers."""
-    return {
-        scope: {
-            name: ScopedRuleset.from_dict(raw, matcher=SCOPE_CATALOG[scope].scope_matchers[name])
+    """``baseline.BASELINE_INNER_LISTS``, parsed with each scope's catalog matcher."""
+    parsed: Dict[str, Mapping[str, ScopedRuleset]] = {}
+    for scope, lists in BASELINE_INNER_LISTS.items():
+        matchers = SCOPE_CATALOG[scope].scope_matchers
+        parsed[scope] = {
+            name: ScopedRuleset.from_dict(raw, matcher=matchers[name])
             for name, raw in lists.items()
         }
-        for scope, lists in BASELINE_INNER_LISTS.items()
-    }
+    return parsed
 
 
 def with_inner_baseline(scope: str, control: object) -> object:
-    """Fill omitted capability lists from this build's baseline registry."""
+    """*control* with each ``BASELINE_INNER_LISTS`` list it does not name filled in.
+
+    For a remote policy's control in an enterprise build: a policy that names a
+    capability but not one of these inner lists gets the list's baseline, not an
+    open list. Any other control, or one naming every list, is returned as is.
+    """
     lists = baseline_inner_lists().get(scope)
     if not lists or not isinstance(control, CapabilityGate):
         return control
@@ -567,6 +572,7 @@ def parse_policy(
     raw_updates = data.get("updates")
     if raw_updates is not None and not isinstance(raw_updates, dict):
         raise PlatformCompositionError("security policy 'updates' must be an object")
+    yolo_max_seconds = _parse_yolo_max_seconds(data.get("yolo_max_seconds"))
     raw_distribution = data.get("distribution")
     if raw_distribution is not None and not isinstance(raw_distribution, dict):
         raise PlatformCompositionError("security policy 'distribution' must be an object")
@@ -611,8 +617,23 @@ def parse_policy(
         agentcore_identity_posture=composed_posture,
         agentcore_gateway_url=composed_gateway_url,
         agentcore_workload_name=composed_workload_name,
-        yolo_max_seconds=_parse_yolo_max_seconds(data.get("yolo_max_seconds")),
+        yolo_max_seconds=yolo_max_seconds,
     )
+
+
+def _parse_yolo_max_seconds(raw: object) -> int:
+    """The policy's ``yolo_max_seconds``: a positive whole number, or absent (0).
+
+    Fails closed on any other value: a ``false``, a string or ``0`` that read as
+    "no cap" would silently lift the bound the policy meant to set.
+    """
+    if raw is None:
+        return 0
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        raise PlatformCompositionError(
+            f"security policy 'yolo_max_seconds' must be a positive integer, got {raw!r}"
+        )
+    return raw
 
 
 def parse_profile(data: Mapping[str, object]) -> Profile:
@@ -635,10 +656,6 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
     # profile's copy silently inert — so reject it loudly here instead. A profile
     # is narrow-only and there is no narrower version of pointing somewhere else:
     # a per-app profile redirecting the update source would be escalation.
-    if "yolo_max_seconds" in data:
-        raise PlatformCompositionError(
-            "profiles may not set 'yolo_max_seconds' — the auto-approve cap is policy-only"
-        )
     if "updates" in data:
         raise PlatformCompositionError(
             "profiles may not set 'updates' — update pins are policy-only "
@@ -663,6 +680,12 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
     # narrower "what an unusable profile falls back to", and a profile declaring its
     # own fallback would be nonsensical. Reject it loudly here (the loader turns this
     # into the deny-all fallback via Validation rule 5).
+    # ``yolo_max_seconds`` is POLICY-ONLY for the mechanical reason ``updates`` is:
+    # it is in _STRUCTURAL_KEYS, so a profile's copy would be skipped in silence.
+    if "yolo_max_seconds" in data:
+        raise PlatformCompositionError(
+            "profiles may not set 'yolo_max_seconds' — the auto-approve cap is policy-only"
+        )
     if "fallback" in data:
         raise PlatformCompositionError(
             "profiles may not set 'fallback' — the unusable-profile fallback is "
@@ -693,24 +716,16 @@ def parse_profile(data: Mapping[str, object]) -> Profile:
 
 
 def _read_json_file(path: Path) -> Dict[str, object]:
-    """Read + JSON-parse a governance file.  Raises on any failure (fail-closed)."""
+    """Read + JSON-parse a governance file.  Raises on any failure (fail-closed).
+
+    One leading UTF-8 byte-order mark (Windows editors save "UTF-8 with BOM") is
+    not content and is dropped, as for every hand-edited JSON file. Anything else
+    that is not valid UTF-8 JSON still raises.
+    """
+    from kiro_crew.user_json import loads_user_json
+
     text = path.read_text(encoding="utf-8")
-    data = json.loads(text)
+    data = loads_user_json(text)
     if not isinstance(data, dict):
         raise PlatformCompositionError(f"governance file {path} is not a JSON object")
     return data
-
-
-def _parse_yolo_max_seconds(raw: object) -> int:
-    """The policy's ``yolo_max_seconds``: a positive whole number, or absent (0).
-
-    Fails closed on any other value: a ``false``, a string or ``0`` that read as
-    "no cap" would silently lift the bound the policy meant to set.
-    """
-    if raw is None:
-        return 0
-    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-        raise PlatformCompositionError(
-            f"security policy 'yolo_max_seconds' must be a positive integer, got {raw!r}"
-        )
-    return raw

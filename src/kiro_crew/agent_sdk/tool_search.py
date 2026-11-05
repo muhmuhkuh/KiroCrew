@@ -169,6 +169,68 @@ def resume_takes_tool_search_replay(
     )
 
 
+#: The id separator KAS's ``neverDefer`` matches: it turns a tool's
+#: ``@<server>/<tool>`` tag into ``<server>::<tool>`` before the lookup.
+_KAS_TOOL_ID_SEPARATOR = "::"
+
+
+def kas_never_defer_ids(
+    spec: dict[str, Any] | None,
+    server_tools: Callable[[str], Iterable[str] | None],
+) -> list[str]:
+    """Every MCP tool *spec* can call, as KAS's ``neverDefer`` ids, sorted.
+
+    KAS keeps a tool direct only when ``<server>::<tool>`` is on that list, so
+    each ``tools`` entry is translated: ``@server/tool`` names its one tool;
+    ``@server`` and a tool glob (``@server/read_*``) are expanded from
+    *server_tools*, which answers the tool names Crew holds for a server, or
+    ``None`` when it holds none; ``"*"`` stands for every server the spec
+    declares in ``mcpServers``. ``@builtin`` and bare built-in names are not
+    MCP tools and are skipped. A server *server_tools* cannot list contributes
+    nothing -- KAS then defers it and reaches it through its own loader, which
+    is what it does with no list at all.
+
+    ``excludedTools`` is not subtracted: KAS drops an excluded tool before it
+    partitions, so an id for it on this list keeps nothing direct.
+    """
+    if not isinstance(spec, dict):
+        return []
+    raw = spec.get("tools")
+    if raw == "*":
+        entries = ["*"]
+    elif isinstance(raw, list):
+        entries = [t for t in raw if isinstance(t, str)]
+    else:
+        entries = []
+    ids: set[str] = set()
+
+    def expand(server: str, pattern: str) -> None:
+        names = server_tools(server)
+        for name in names or ():
+            if isinstance(name, str) and name and fnmatch.fnmatchcase(name, pattern):
+                ids.add(f"{server}{_KAS_TOOL_ID_SEPARATOR}{name}")
+
+    for entry in entries:
+        if entry == "*":
+            servers = spec.get("mcpServers")
+            for server in servers if isinstance(servers, dict) else ():
+                if isinstance(server, str) and server:
+                    expand(server, "*")
+            continue
+        if not entry.startswith("@") or entry == "@builtin" or entry.startswith("@builtin/"):
+            continue
+        server, sep, tool = entry[1:].partition("/")
+        if not server:
+            continue
+        if not sep:
+            expand(server, "*")
+        elif any(ch in tool for ch in "*?["):
+            expand(server, tool)
+        elif tool:
+            ids.add(f"{server}{_KAS_TOOL_ID_SEPARATOR}{tool}")
+    return sorted(ids)
+
+
 def kas_client_meta_settings(
     settings: ToolSearchSettings | None, *, loader_granted: bool
 ) -> dict[str, Any]:

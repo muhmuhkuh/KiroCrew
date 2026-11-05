@@ -203,7 +203,15 @@ class TranscriptReadProjection:
         return self._log._read_messages(key)
 
     def read_file_change_messages(self, key: str) -> list[dict]:
-        """Return lightweight rows carrying only ``meta.file_changes``."""
+        """Return lightweight rows carrying only ``ts`` and the changed paths.
+
+        Each row is ``{"ts", "role", "meta": {"file_changes": [{"path": str}, ...]}}``,
+        plus ``meta.file_changes_omitted_files`` when the row records files its
+        turn's budget left out;
+        change entries without a string ``path`` and rows left with none are
+        dropped, and every other field of a change (``before``/``after``) is
+        not kept.
+        """
         path = self._log._path(key)
         generation = self._log._cache_gen(key)
         try:
@@ -237,12 +245,34 @@ class TranscriptReadProjection:
                 file_changes = meta.get("file_changes")
                 if not isinstance(file_changes, list):
                     continue
-                messages.append(
-                    {
-                        "ts": data.get("ts"),
-                        "meta": {"file_changes": file_changes},
-                    }
-                )
+                # Keep only the string ``path`` of each change: the one reader
+                # (the Artifacts session-docs scan) uses nothing else, and the
+                # ``before``/``after`` bodies made the cache ~112 MB on a real
+                # store. Entries without a string path were skipped by that
+                # reader anyway, so dropping them here changes no output.
+                # ``omitted_reason`` is kept too, a short marker: the Files tab
+                # skips a write whose outcome was never proven.
+                paths = [
+                    {"path": fc["path"]}
+                    | (
+                        {"omitted_reason": fc["omitted_reason"]}
+                        if isinstance(fc.get("omitted_reason"), str)
+                        else {}
+                    )
+                    for fc in file_changes
+                    if isinstance(fc, dict) and isinstance(fc.get("path"), str)
+                ]
+                # How many changed files the turn's budget left out of
+                # ``file_changes``: a reader listing them must know the row is short.
+                omitted = meta.get("file_changes_omitted_files")
+                if not (isinstance(omitted, int) and not isinstance(omitted, bool) and omitted > 0):
+                    omitted = 0
+                if not paths and not omitted:
+                    continue
+                kept_meta: dict = {"file_changes": paths}
+                if omitted:
+                    kept_meta["file_changes_omitted_files"] = omitted
+                messages.append({"ts": data.get("ts"), "role": data.get("role"), "meta": kept_meta})
 
         try:
             after = path.stat()

@@ -11,8 +11,8 @@ never retrieved" message and a failure indistinguishable from the agent going
 quiet.
 
 The ceiling is an ordinary outcome of long-running work, not a rare edge case: a
-babysit loop polling a pull request reaches it routinely — ten review rounds at
-roughly five minutes of waiting each, plus the tool time in between.
+babysit loop polling a pull request reaches it routinely — ten rounds of feedback
+at roughly five minutes of waiting each, plus the tool time in between.
 
 This module owns the one dispatch path. Keeping the ceiling, the clamp against
 the transport's own timeout, and the visible-card guarantee together here is
@@ -334,16 +334,50 @@ def format_approval_timeout_card(timeout_secs: float) -> str:
     prompt as a generic turn timeout, stating neither the actual cause nor the
     fix, which is resending.
     """
-    if timeout_secs >= 3600:
-        waited = f"{timeout_secs / 3600:.1f}".rstrip("0").rstrip(".") + " hours"
-    else:
-        waited = f"{max(1, round(timeout_secs / 60))} minutes"
     return (
-        f"⏱️ A tool needed your approval and nothing came back within {waited}, "
+        f"⏱️ A tool needed your approval and nothing came back within "
+        f"{_approval_wait_phrase(timeout_secs)}, "
         "so I declined it on your behalf and carried on from the denial — nothing "
         "was rolled back. If you wanted that tool to run, send the message again "
         "and approve the prompt when it appears, or turn on YOLO mode first for an "
         "unattended run."
+    )
+
+
+def _approval_wait_phrase(timeout_secs: float) -> str:
+    """How long an approval prompt waited, in seconds, minutes or hours.
+
+    Picks the singular unit for a count of one, matching the minute/minutes
+    choice :func:`format_background_turn_abandoned_card` already makes, so the
+    note never reads "1 minutes" or "1 hours".
+    """
+    if timeout_secs >= 3600:
+        hours = f"{timeout_secs / 3600:.1f}".rstrip("0").rstrip(".")
+        return f"{hours} hour" if hours == "1" else f"{hours} hours"
+    if timeout_secs < 60:
+        seconds = max(1, round(timeout_secs))
+        return f"{seconds} second" if seconds == 1 else f"{seconds} seconds"
+    minutes = round(timeout_secs / 60)
+    return f"{minutes} minute" if minutes == 1 else f"{minutes} minutes"
+
+
+#: Title of the bell-feed note an approval prompt nobody answered leaves.
+APPROVAL_EXPIRED_NOTE_TITLE = "Tool approval expired"
+
+
+def format_approval_expired_note(tool_name: str, session_title: str, timeout_secs: float) -> str:
+    """Bell-feed body for an approval prompt nobody answered in time.
+
+    The card in the chat tells someone looking at the session; this note is for
+    someone who is not, so it names the session and the tool and says the turn
+    went on without it. It names the tool, not the command: the prompt's own
+    text is agent-authored and stays on the card.
+    """
+    tool = tool_name or "A tool"
+    session = session_title or "a session"
+    return (
+        f"{tool} in {session!r} waited {_approval_wait_phrase(timeout_secs)} for "
+        "approval and was declined. The turn carried on without it."
     )
 
 

@@ -25,6 +25,10 @@ owns memory).
 The memory posture tier (``resource_critical_gb``) is not one of them: spawns
 are not gated on it, only on the floor (``low_memory``). Cron still defers its
 firings on posture, through its own gate.
+
+:func:`stopped_before_start` lives here for the same reason: it tells every
+surface that starts a run (the dashboard routes, the channel ``spawn`` command,
+the app spawn SDK) that a start ended in the queue without running.
 """
 
 from __future__ import annotations

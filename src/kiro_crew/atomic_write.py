@@ -21,7 +21,7 @@ import time
 from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from kiro_crew import platform_compat
 from kiro_crew.owner_only_files import (
@@ -213,6 +213,8 @@ def _is_access_control_xattr(attr: str) -> bool:
 #: from being persisted. Losing reuse-detection state is a worse outcome there
 #: than a file whose permissions could not be tightened.
 RestrictErrorPolicy = Literal["raise", "warn"]
+
+_T = TypeVar("_T")
 
 _umask_lock = threading.Lock()
 _default_mode: int | None = None
@@ -471,9 +473,48 @@ def replace_with_retry(src: Path | str, dst: Path | str, *, budget_s: float | No
     if budget_s is not None:
         _replace_with_budget(src, dst, budget_s)
         return
+    _retry_sharing_window(os.replace, src, dst)
+
+
+def replace_with_retry_checked(
+    src: Path | str, dst: Path | str, before_each: Callable[[], None]
+) -> None:
+    """:func:`replace_with_retry`'s count arm, running *before_each* before EVERY attempt.
+
+    For a writer that checks the destination is still the file it read (a
+    compare-and-swap, a transcript repair) right before it renames. A check made
+    once, before the retry, goes stale during the backoff: a scanner holding the
+    temp fails the rename while the destination stays writable, so a save can
+    land in between and the next attempt would overwrite it. Anything
+    *before_each* raises ends the call with no rename; a ``PermissionError`` from
+    it is retried like the rename's own.
+    """
+
+    def _checked_replace(source: str, target: str) -> None:
+        before_each()
+        os.replace(source, target)
+
+    _retry_sharing_window(_checked_replace, src, dst)
+
+
+def rename_with_retry(src: Path | str, dst: Path | str) -> None:
+    """``os.rename(src, dst)``, retrying the same window as :func:`replace_with_retry`.
+
+    For a move that must never overwrite: on Windows ``os.rename`` refuses an
+    existing *dst* with ``FileExistsError``, which is not retried. The retry
+    budget, the Windows-only gate, the no-sleep-on-the-event-loop rule and the
+    final attempt outside the loop are the count arm's, shared through one loop.
+    """
+    _retry_sharing_window(os.rename, src, dst)
+
+
+def _retry_sharing_window(
+    rename: Callable[[str, str], None], src: Path | str, dst: Path | str
+) -> None:
+    """The count arm of :func:`replace_with_retry`, for any by-name rename."""
     for attempt in range(_REPLACE_MAX_ATTEMPTS - 1):
         try:
-            os.replace(str(src), str(dst))
+            rename(str(src), str(dst))
             return
         except PermissionError:
             if not platform_compat.IS_WINDOWS:
@@ -492,7 +533,7 @@ def replace_with_retry(src: Path | str, dst: Path | str, *, budget_s: float | No
                 _REPLACE_MAX_ATTEMPTS,
             )
             time.sleep(_REPLACE_BACKOFF_SECONDS)
-    os.replace(str(src), str(dst))
+    rename(str(src), str(dst))
 
 
 def _replace_with_budget(src: Path | str, dst: Path | str, budget_s: float) -> None:
@@ -726,9 +767,22 @@ def read_bytes_with_retry(path: Path | str, *, max_bytes: int | None = None) -> 
     ``None`` (the default) reads the whole file.
     """
     target = Path(path)
+    return retry_read_sharing_window(lambda: _read_bytes(target, max_bytes), target)
+
+
+def retry_read_sharing_window(read: Callable[[], _T], target: Path | str) -> _T:
+    """Call *read*, retrying the Windows sharing-violation window it can lose to.
+
+    The loop behind :func:`read_bytes_with_retry`, for a reader that must open
+    the file its own way (a descriptor-pinned, no-reparse open, say) and so
+    cannot hand over a bare path. *read* is called again only on
+    ``PermissionError``, only on Windows, and only off the event loop, with the
+    same budget and the same final attempt outside the loop. *target* names the
+    file in the debug lines.
+    """
     for attempt in range(_REPLACE_MAX_ATTEMPTS - 1):
         try:
-            return _read_bytes(target, max_bytes)
+            return read()
         except PermissionError:
             if not platform_compat.IS_WINDOWS:
                 raise
@@ -746,7 +800,7 @@ def read_bytes_with_retry(path: Path | str, *, max_bytes: int | None = None) -> 
                 _REPLACE_MAX_ATTEMPTS,
             )
             time.sleep(_REPLACE_BACKOFF_SECONDS)
-    return _read_bytes(target, max_bytes)
+    return read()
 
 
 def _read_bytes(target: Path, max_bytes: int | None) -> bytes:
@@ -1191,6 +1245,7 @@ def atomic_write(
     preserve_access_control_from: int | None = None,
     parent_dir_fd: int | None = None,
     replace_budget_s: float | None = None,
+    on_staged: Callable[[int], None] | None = None,
 ) -> None:
     """Write *content* to *path* atomically via unique temp file + rename.
 
@@ -1300,6 +1355,12 @@ def atomic_write(
     through ``replace_with_retry``, and no transcript caller pins a parent, so
     a budget alongside *parent_dir_fd* would silently do nothing -- it is
     REFUSED there rather than ignored.
+
+    *on_staged* is called with the staged file's open descriptor once its content
+    is complete and before the rename publishes it. It names the exact object that
+    will appear at *path*, which a stat of *path* after the rename cannot: another
+    writer may have replaced it by then. An exception it raises aborts the write
+    like any other staging failure.
     """
     binary = isinstance(content, bytes)
     if binary and newline is not None:
@@ -1388,6 +1449,7 @@ def atomic_write(
         restrict_on_error=restrict_on_error,
         src_xattrs=src_xattrs,
         pin=pin,
+        on_staged=on_staged,
     )
     if pin is None:
         # Inside a try of its own, so an interrupt that lands after staging
@@ -1445,6 +1507,7 @@ def _stage_temp(
     restrict_on_error: RestrictErrorPolicy,
     src_xattrs: list[tuple[str, bytes]],
     pin: int | None,
+    on_staged: Callable[[int], None] | None = None,
 ) -> str:
     """Write *content* to a new temp file beside *path*, closed; return its name.
 
@@ -1498,6 +1561,8 @@ def _stage_temp(
             _carry_xattrs(fd, src_xattrs, path)
         if fsync:
             os.fsync(fd)
+        if on_staged is not None:
+            on_staged(fd)
         # Close BEFORE the rename: on Windows os.replace cannot swap a file that
         # still has an open handle. Give up ownership of fd first, so a close
         # that itself fails is not retried below; its error still removes the

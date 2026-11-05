@@ -210,6 +210,7 @@ _BASE_SHAPE_DIGEST = "869ba96660ec8f4ea710d6c3dcbbbec3cfcd25827358d3bac7a597102d
 #: ``docs/system-specs/modules/memory-skills-hooks.md``'s "Hook runtime owners".
 _FACADE_DEFS = (
     "uncounted_gate",
+    "unattended_turn",
     "_fail_closed_on_gate_crash",
     "GateRule",
     "GateTier",
@@ -482,7 +483,7 @@ def test_every_base_definition_is_in_exactly_one_place() -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
     assert defined == set(_FACADE_DEFS)
-    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 93
+    assert len(defined | _MOVED) == len(defined) + len(_MOVED) == 94
 
 
 def test_the_owners_log_as_the_facade() -> None:

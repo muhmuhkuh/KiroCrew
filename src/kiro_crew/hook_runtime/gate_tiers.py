@@ -58,7 +58,9 @@ if TYPE_CHECKING:
         is_read_only_bash,
         is_sensitive_bash_command,
         is_unverifiable_path_refusal,
+        logger,
         mcp_identity_ref,
+        mcp_title_to_ref,
         policy_alias_split,
         policy_aliases,
         security,
@@ -101,6 +103,7 @@ class GateFacts:
         app: str,
         classifier_only: bool,
         trust_reads: bool = False,
+        deny_waivers: frozenset[str] = frozenset(),
     ) -> None:
         self.manager = manager
         self.call = call
@@ -108,7 +111,19 @@ class GateFacts:
         self.agent = agent
         self.app = app
         self.classifier_only = classifier_only
+        #: Refusal keys a person overrode on the dashboard approval card, for this
+        #: call or this session. Read by the deny-rules tier alone
+        #: (:func:`_tier_deny_rules`), which drops any key a governance policy
+        #: pins before it reaches ``is_denied``; no other tier consults it.
+        self.deny_waivers = deny_waivers
+        #: The surface's Reads approval mode is on for this call. Read by the
+        #: read-only tier alone (``_tier_read_only``), for the first-party MCP
+        #: proof; no deny tier, governance or grant tier consults it.
         self.trust_reads = trust_reads
+        #: Why this call will ask when no row decides it, for the person who
+        #: answers the prompt. Set only by :func:`grant_spec_builtin`; the gate's
+        #: fall-through ``allow`` carries it as its reason. Never read to decide.
+        self.ask_note = ""
         self._memo: dict[str, Any] = {}
 
     def _once(self, key: str, compute: Callable[[], Any]) -> Any:
@@ -180,9 +195,9 @@ class GateFacts:
         ``is_shell``/``command``, so this can refuse a call but never grant one. A
         call that names its MCP server is left out: its ``command``-named arguments
         are not shell text, and it is governed by ``@server/tool`` rules. A harness
-        that names no server for its MCP calls (claude-agent-acp, opencode, dsh, pi)
-        cannot be told apart here, so such a call's ``command`` argument is checked
-        too.
+        that names no server for its MCP calls (opencode, dsh, pi, and claude-agent-acp
+        for a server Crew did not place) cannot be told apart here, so such a call's
+        ``command`` argument is checked too.
         """
 
         def compute() -> list[str]:
@@ -428,6 +443,42 @@ class GateFacts:
         feeding it there would widen matching by accident instead of by grammar.
         """
         return mcp_identity_ref(self.call.mcp_server, self.call.mcp_tool)
+
+    @property
+    def governance_own_scopes(self) -> tuple[str, ...]:
+        """The scopes governance judges this call in, when that is proven.
+
+        ``("mcp",)`` for an MCP-served call, ``("tools", *row)`` for a host
+        built-in whose ``BUILTIN_TOOL_SCOPES`` row has no ``commands``, ``()``
+        otherwise (``gate_decision``'s ``own_scopes``). Proven only from the trusted identity
+        of a call the client did not classify as a shell call: the title and the
+        ACP ``kind`` are agent-influenced. A KAS id is read under the kiro-cli
+        names it may be admitted as, never a deny-only one, and every name with a
+        row must lack ``commands`` (``code`` keeps it). Enterprise only, so the
+        ``oss`` gate is unchanged.
+        """
+        from kiro_crew import edition
+        from kiro_crew.platform.governance import BUILTIN_TOOL_SCOPES
+
+        call = self.call
+        if (
+            not edition.is_enterprise()
+            or not call.identity_trusted
+            or call.identity_unreadable
+            or call.is_shell
+            or call.command is not None
+            or not call.mcp_tool
+        ):
+            return ()
+        if call.mcp_server:
+            return ("mcp",)
+        names = [_host_builtin_alias(call.mcp_tool, call.mcp_server) or call.mcp_tool]
+        if self.policy_alias_names:
+            names.extend(policy_alias_split(call.mcp_tool)[0])
+        rows = [BUILTIN_TOOL_SCOPES[name] for name in names if name in BUILTIN_TOOL_SCOPES]
+        if rows and all("commands" not in row for row in rows):
+            return ("tools", *dict.fromkeys(scope for row in rows for scope in row))
+        return ()
 
 
 # ── deny tiers ────────────────────────────────────────────────────────────────
@@ -694,16 +745,47 @@ def _tier_deny_rules(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     the trusted identities. It reuses the ONE snapshot taken by the targets tier --
     a second read here would let a ceiling refresh split this call's verdict across
     two policy states.
+
+    A person's in-session overrides (:attr:`GateFacts.deny_waivers`) reach
+    ``is_denied`` only after every key a governance policy pins is dropped: the
+    active ceiling's pins and every loaded profile's
+    (``security.pinned_builtin_command_ids_for_snapshot``), so a pin that lands
+    mid-session, in the ceiling or in the bound profile, takes effect on the next
+    call even over a waiver granted before it. The union over-locks a profile
+    the session is not bound to, which only ever keeps a refusal. Every pattern
+    the companion ``SecurityOverlay`` adds (``authority.effective_patterns``) is
+    dropped the same way, and ``PolicyAuthority`` drops them once more itself.
     """
     authority = facts.authority
     denied_regexes = facts.denied_regexes
     denied_notes = facts.denied_notes
+    waived: frozenset[str] = frozenset()
+    if facts.deny_waivers:
+        from kiro_crew.security.deny_waiver import waivable_keys
+
+        try:
+            waived = waivable_keys(
+                facts.deny_waivers,
+                security.pinned_builtin_command_ids_for_snapshot(),
+                # The companion overlay's patterns are as hard as a pin.
+                authority.effective_patterns(),
+            )
+        except Exception:
+            # Pins or an overlay that cannot be read waive nothing: the override
+            # is the one input here that only ever loosens, so it is what a
+            # failure drops.
+            logger.warning(
+                "governance pins or security overlay unreadable; deny overrides ignored",
+                exc_info=True,
+            )
+            waived = frozenset()
     for target in facts.deny_targets:
         reason = authority.is_denied(
             target,
             facts.config.auto_deny_tools,
             denied_regexes=denied_regexes,
             reason_notes=denied_notes,
+            waived=waived,
         )
         if reason:
             return ToolHookResult.deny(reason)
@@ -737,6 +819,7 @@ def _tier_deny_rules(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
                 extra_patterns=sent_title_globs,
                 reason_notes=denied_notes,
                 segments=True,
+                waived=waived,
             )
             if reason:
                 return ToolHookResult.deny(reason)
@@ -745,8 +828,7 @@ def _tier_deny_rules(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
 
 def _tier_mcp_auto_deny(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     """The operator's own ``auto_deny_tools`` GLOBS, and only those, against the
-    ``_meta.kiro`` server/tool identity (verified or not) in the ``@server/tool``
-    spelling the grant tier uses.
+    call's MCP identity in the ``@server/tool`` spelling the grant tier uses.
 
     Plus ``Running: @server/tool`` and the bare ``@server``, so a server-level rule
     binds to every tool. A user who writes both lists in one spelling --
@@ -757,13 +839,30 @@ def _tier_mcp_auto_deny(facts: GateFacts, tier: GateTier) -> ToolHookResult | No
     shell text, and running them over a synthesized reference is the accidental
     widening :attr:`GateFacts.governance_mcp_ref` forbids. Not gated on
     provenance: a deny can only ever deny.
+
+    The identity is the ``_meta.kiro`` server/tool pair when the call carries one
+    (verified or not). A call with no server whose title is ``mcp__<server>__<tool>``
+    -- the only place a harness that sends no ``_meta.kiro`` (claude) names its MCP
+    tool -- is read through ``mcp_title_to_ref``, the last-``__`` split the
+    governance ceilings use. That reading feeds this deny and nothing else: the
+    title is agent-influenced, so no grant tier ever sees it.
     """
     call = facts.call
-    if call.mcp_server and facts.config.auto_deny_tools:
+    if not facts.config.auto_deny_tools:
+        return None
+    if call.mcp_server:
         tool_ref = mcp_identity_ref(call.mcp_server, call.mcp_tool)
-        for ref in (tool_ref, f"Running: {tool_ref}", mcp_identity_ref(call.mcp_server, "")):
-            if ref and any(_tool_matches(pattern, ref) for pattern in facts.config.auto_deny_tools):
-                return ToolHookResult.deny(f"Blocked by security policy: {ref}")
+        server_ref = mcp_identity_ref(call.mcp_server, "")
+    elif facts.normalized.startswith("mcp__"):
+        tool_ref = mcp_title_to_ref(facts.normalized)
+        server_ref = tool_ref.partition("/")[0]
+        if server_ref == "@":
+            return None
+    else:
+        return None
+    for ref in (tool_ref, f"Running: {tool_ref}", server_ref):
+        if ref and any(_tool_matches(pattern, ref) for pattern in facts.config.auto_deny_tools):
+            return ToolHookResult.deny(f"Blocked by security policy: {ref}")
     return None
 
 
@@ -863,12 +962,20 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     elif alias and call.identity_trusted:
         alias_groups = ((call.mcp_tool, alias),)
     else:
+        from kiro_crew.platform.tool_names import is_harness_read_alias
+
         # claude states no _meta.kiro identity: its read built-in is named by
         # harness_builtin_tool, so a ceiling's deny on web_search binds it too.
+        # A title that is the harness's own name for that built-in (pi's
+        # ``read`` beside ``fs_read``) is the same ONE tool,
+        # asked as one identity as deepseek's is below; any other title is still
+        # asked on its own.
+        builtin = call.harness_builtin_tool
+        if not call.mcp_server and is_harness_read_alias(call.title, builtin):
+            alias_groups = ((call.title, builtin),)
+            builtin = ""
         identity = tuple(
-            name
-            for name in dict.fromkeys((call.mcp_tool, call.harness_builtin_tool))
-            if name and name != call.title
+            name for name in dict.fromkeys((call.mcp_tool, builtin)) if name and name != call.title
         )
         if alias:
             deny_aliases = (alias,)
@@ -882,6 +989,11 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
                 alias_groups = ((deepseek, deepseek_alias),)
             elif deepseek != call.title:
                 identity = (*identity, deepseek)
+    # A proven built-in is judged on its identity under ``tools``, so the identity
+    # is passed even when it equals the title (whose ``tools`` pair is then off-scope).
+    own_scopes = facts.governance_own_scopes
+    if "tools" in own_scopes and not alias_groups and call.mcp_tool not in identity:
+        identity = (*identity, call.mcp_tool)
     gov_reason = _governance_denial(
         facts.ctx,
         call.title,
@@ -896,6 +1008,7 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
         alias_groups=alias_groups,
         deny_aliases=deny_aliases,
         spawn_target=call.spawn_target,
+        own_scopes=own_scopes,
     )
     if gov_reason:
         return ToolHookResult.deny_policy(gov_reason)
@@ -1111,10 +1224,10 @@ def _spec_command_granted(call: ToolCall, names: tuple[str, ...]) -> bool:
     """Whether a spec's ``toolsSettings.shell.allowedCommands`` grants this call.
 
     Only a shell call (kiro-cli's ``execute_bash`` among its names) with its
-    command recovered by the host, holding none of
-    :data:`kiro_crew.platform.allowed_commands.UNGRANTABLE_COMMAND_CHARS`, that one of ``spec_granted_commands``
+    command recovered by the host and plain
+    (:func:`kiro_crew.platform.allowed_commands.plain_command`), that one of ``spec_granted_commands``
     matches whole, as kiro-cli anchors each entry at both ends. Each entry is read
-    by :mod:`kiro_crew.platform.allowed_commands`, which accepts only the subset
+    by :mod:`kiro_crew.platform.allowed_commands`, which accepts only the syntax
     both engines read alike and matches it in linear time; any other grants nothing.
     """
     if not call.spec_granted_commands or "execute_bash" not in names or not call.is_shell:
@@ -1122,20 +1235,29 @@ def _spec_command_granted(call: ToolCall, names: tuple[str, ...]) -> bool:
     return _command_matches_any(call.command, call.spec_granted_commands)
 
 
+def _spec_command_composed(call: ToolCall, names: tuple[str, ...], patterns: Sequence[str]) -> bool:
+    """Whether a shell call is kept from *patterns* only by its shell composition
+    (:func:`kiro_crew.platform.allowed_commands.composition_blocks_match`). It only
+    explains a prompt or a refusal; it never grants."""
+    if not patterns or "execute_bash" not in names or not call.is_shell:
+        return False
+    from kiro_crew.platform import allowed_commands
+
+    return allowed_commands.composition_blocks_match(tuple(patterns), call.command)
+
+
 def _command_matches_any(command: str | None, patterns: Sequence[str]) -> bool:
-    """Whether *command* is plain (no character of
-    :data:`kiro_crew.platform.allowed_commands.UNGRANTABLE_COMMAND_CHARS`) and one
-    of *patterns*, each read by :mod:`kiro_crew.platform.allowed_commands`, matches
-    it whole. ``None`` (no recovered command) matches nothing."""
+    """Whether *command* is plain
+    (:func:`kiro_crew.platform.allowed_commands.plain_command`: no chaining, pipe,
+    redirect or substitution character anywhere, no ``( ) { }`` outside a quoted
+    argument) and one of *patterns*, each read by
+    :mod:`kiro_crew.platform.allowed_commands`, matches it whole. ``None`` (no
+    recovered command) matches nothing."""
     from kiro_crew.platform import allowed_commands
 
     if not isinstance(command, str) or not allowed_commands.plain_command(command):
         return False
-    for pattern in patterns:
-        segments = allowed_commands.parse(pattern)
-        if segments is not None and allowed_commands.matches(segments, command):
-            return True
-    return False
+    return allowed_commands.matches_any(tuple(patterns), command)
 
 
 def _tier_spec_shell_allowlist(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
@@ -1163,6 +1285,12 @@ def _tier_spec_shell_allowlist(facts: GateFacts, tier: GateTier) -> ToolHookResu
         return None
     if _command_matches_any(call.command, allowlist):
         return None
+    if _spec_command_composed(call, ("execute_bash",), allowlist):
+        return ToolHookResult.deny_policy(
+            "Blocked by this agent's spec: toolsSettings.execute_bash.denyByDefault is set "
+            "and this command matches allowedCommands, but commands with |, >, <, &&, ;, $() "
+            "or backticks never match. Run the script alone, or move the pipeline into the script."
+        )
     return ToolHookResult.deny_policy(
         "Blocked by this agent's spec: toolsSettings.execute_bash.denyByDefault is set "
         "and the command matches none of its allowedCommands"
@@ -1343,6 +1471,10 @@ def grant_spec_builtin(
         return None
     names = _spec_builtin_names(call)
     if not any(name in granted for name in names) and not _spec_command_granted(call, names):
+        if _spec_command_composed(call, names, call.spec_granted_commands):
+            from kiro_crew.platform.allowed_commands import COMPOSITION_NOTICE
+
+            facts.ask_note = COMPOSITION_NOTICE
         return None
     from kiro_crew.platform.governance import may_grant_builtin_at_gate
 
@@ -1393,6 +1525,14 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     ``kind="read"`` or titled ``Read …`` is not auto-approved; an MCP-served tool,
     which carries no host-trusted read-only marker, is not provable either. Off the
     flag the interactive path keeps its ACP-kind allow-list and title fallback.
+
+    One MCP identity IS a host-trusted marker, and only under the surface's Reads
+    approval mode (``GateFacts.trust_reads``): Kiro Crew's own read-only tools,
+    the exact ``(server, tool)`` pairs of ``_FIRST_PARTY_READ_ONLY_MCP_TOOLS``
+    carried with ``identity_trusted`` (``_is_first_party_read_only_mcp_tool``).
+    That proof runs after the confirm-list check and before the kind logic, so a
+    confirm-listed call still asks and the kind kiro-cli omits on an MCP frame
+    cannot refuse it.
     """
     call = facts.call
     # A session whose own approver must judge every read (heartbeat: no human behind
@@ -1427,6 +1567,17 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
         return None
     from kiro_crew.slack.gateway import _is_read_only_tool
 
+    # Reads mode's one MCP proof: Kiro Crew's OWN read-only tools, named by the
+    # host-trusted ``(server, tool)`` pair (``_FIRST_PARTY_READ_ONLY_MCP_TOOLS``).
+    # Only when the surface said its Reads approval mode is on (``trust_reads``):
+    # under Normal the call still asks, and Trust / YOLO approve it on their own
+    # terms. Keyed on identity alone -- the ACP ``kind`` is not consulted because
+    # kiro-cli stamps none on an MCP tool_call frame, and the title never proves
+    # anything. Sits AFTER the confirm-list check above, so an operator who
+    # listed ``@kirocrew-core`` or the tool still gets the prompt, and after every
+    # deny tier and governance, so nothing a tier refused is re-admitted. The same
+    # tool name on another server, an untrusted identity, and every other
+    # ``kirocrew-core`` tool fall through unchanged.
     if facts.trust_reads and _is_first_party_read_only_mcp_tool(
         call.mcp_tool, call.mcp_server, mcp_identity_trusted=call.identity_trusted
     ):

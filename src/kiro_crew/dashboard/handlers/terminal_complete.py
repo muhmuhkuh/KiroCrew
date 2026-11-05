@@ -1,8 +1,8 @@
 """The vetting and listing steps of terminal path completion: splitting the typed token,
 resolving and vetting the directory it names, and filtering protected or unsafe entries.
 
-``api_terminal_complete`` and the listing it ranks stay in the facade; this module holds
-the steps they call. An owner of :mod:`kiro_crew.dashboard.handlers.terminal`: callers
+``api_terminal_complete`` stays in the facade; this module holds the steps it calls and
+the listing it ranks. An owner of :mod:`kiro_crew.dashboard.handlers.terminal`: callers
 and tests import and patch these names through that facade, which mirrors a patch into
 every module of the family that holds the name.
 """

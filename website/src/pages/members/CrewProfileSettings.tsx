@@ -106,10 +106,14 @@ export default function CrewProfileSettings({ member, slotKey, waiting = false }
   // The Settings page (the group) is open over the card.
   const [open, setOpen] = useState(false)
   const models = useAvailableModelsQuery({ enabled: true })
-  const { data: resolved, error: resolvedError } = useQuery({
+  const { data: served, error: resolvedError } = useQuery({
     queryKey: ['agent-resolved-model', member.name],
     queryFn: () => api.agentResolvedModel(member.name),
   })
+  // The crewmate's own harness can be another harness's member route: its model is
+  // `harness_model`, not the configured backend's `model`.
+  const resolved = served?.harness_model === undefined ? served : { ...served, model: served.harness_model }
+  // A developer preview (Settings > Developer > Feature Previews): the Harness row.
   const stored = {
     approval_mode: String(member.approval_mode || 'trust'),
     acp_backend: String(resolved?.acp_backend || INHERIT_HARNESS),

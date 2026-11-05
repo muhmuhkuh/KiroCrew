@@ -137,8 +137,15 @@ vi.mock('../components/FlyingQuote', async () => {
 
 // The split grid is stubbed to a prop recorder: what matters here is the
 // `openSideChat` capability ChatPage hands its panes (and when it withholds
-// it), not the grid's own layout, which SessionGridView's suite covers.
-interface GridProps { openSideChat?: (slot: string) => boolean | void | Promise<boolean | void> }
+// it) and the seed it opens the grid with, not the grid's own layout, which
+// SessionGridView's suite covers.
+interface GridProps {
+  openSideChat?: (slot: string) => boolean | void | Promise<boolean | void>
+  onCollapse?: (slot: string, anchorTs?: string, anchorMid?: string, gesture?: boolean) => void
+  seedSlot?: string | null
+  seedDir?: 'right' | 'down'
+  onClose?: () => void
+}
 let gridProps: GridProps | null = null
 vi.mock('../components/SessionGridView', async () => {
   const React = await import('react')
@@ -266,7 +273,9 @@ vi.mock('../api/client', () => ({
       if (!(prop in apiMocks)) {
         apiMocks[prop] = vi.fn().mockResolvedValue(
           prop === 'chatSlotDetail' ? { messages: [], has_more: false, total: 0 }
-            : prop === 'pendingQuestions' || prop === 'approvals' ? [] : {},
+            : prop === 'pendingQuestions' || prop === 'approvals' ? []
+              // Every chat here runs on this machine: Run in terminal waits for that.
+              : prop === 'chatSlotEnvironment' ? { profile: null, profiles: [] } : {},
         )
       }
       return apiMocks[prop]
@@ -705,6 +714,22 @@ describe('ChatPage row callbacks — quote and ask', () => {
     expect(store.getState().chat.activityTab).not.toBe('side')
   })
 
+  // #23564: a recorded open marks that chat's cron notes read, so only the
+  // pane's own open-full click may record one. The grid collapsing itself after
+  // the other pane closes leaves the survivor on screen but is not an open.
+  it('a split collapsing on its own records no chat open', async () => {
+    const { store } = await renderSplit()
+    await act(async () => { gridProps!.onCollapse!('chat-2') })
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('chat-2'))
+    expect(store.getState().chat.userOpen?.key).not.toBe('chat-2')
+  })
+
+  it('a pane\'s open-full click records the chat open', async () => {
+    const { store } = await renderSplit()
+    await act(async () => { gridProps!.onCollapse!('chat-2', undefined, undefined, true) })
+    await waitFor(() => expect(store.getState().chat.userOpen?.key).toBe('chat-2'))
+  })
+
   it('withholds Ask from the panes while disconnected instead of switching slots offline', async () => {
     const { store } = await renderSplit()
     const askWhileConnected = gridProps!.openSideChat!
@@ -757,6 +782,35 @@ describe('ChatPage row callbacks — quote and ask', () => {
     await act(async () => { release({ ...OTHER_SLOT, key: 'chat-new', title: 'new' }); await pending })
     expect(store.getState().chat.activeSlot).toBe('chat-2')
     expect(screen.getByTestId('session-grid')).toBeTruthy()
+  })
+})
+
+describe('ChatPage split view entry direction', () => {
+  // The session menu reads the folder list while open; the default `{}` stub is not a list.
+  beforeEach(() => { apiSpy('chatFolders').mockResolvedValue([]) })
+  async function openSessionMenu(grid: boolean) {
+    apiSpy('dashboardConfig').mockResolvedValue({ session_grid: grid })
+    await renderTurn({ slots: [SLOT, OTHER_SLOT] })
+    const trigger = await screen.findByRole('button', { name: 'Session options' })
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false })
+    fireEvent.click(trigger)
+  }
+
+  it('seeds the first split below from the session menu, and the next button entry beside', async () => {
+    await openSessionMenu(true)
+    expect(screen.queryByRole('menuitem', { name: 'Split right' })).toBeNull()
+    fireEvent.click(await screen.findByRole('menuitem', { name: 'Split down' }))
+    await waitFor(() => expect(gridProps?.seedDir).toBe('down'))
+    expect(gridProps?.seedSlot).toBe('chat-1')
+    act(() => { gridProps!.onClose!() })
+    fireEvent.click(await screen.findByRole('button', { name: 'Enter split view' }))
+    await waitFor(() => expect(gridProps?.seedDir).toBe('right'))
+  })
+
+  it('offers no Split down row while the split feature is off', async () => {
+    await openSessionMenu(false)
+    await screen.findAllByRole('menuitem')
+    expect(screen.queryByRole('menuitem', { name: 'Split down' })).toBeNull()
   })
 })
 
@@ -925,12 +979,10 @@ describe('ChatPage window-event listeners', () => {
     await waitFor(() => expect(localStorage.getItem('mc-sidebar-pinned')).not.toBe(first))
   })
 
-  it('leaves the activity panel alone when the agent runs a playwright-cli shell command', async () => {
-    // A shell `playwright-cli` call drives an agent-owned headless Chromium that
-    // the Browser panel has no way to frame: the native view is reached only by
-    // `browser` MCP ops (surfaced by `browser:agent-opened`), and the gateway's
-    // framed `show` server lives in its own session namespace. Opening the
-    // panel here could only land on the "not running" card, so it must not.
+  it('leaves the activity panel alone when the agent runs a browser-ish shell command', async () => {
+    // A shell command that drives a browser lands nowhere the side panel can
+    // frame: the agent's browser is shown in the chat, so a tool-call preview
+    // must not open the panel.
     delete (window as unknown as { browserAPI?: unknown }).browserAPI
     const { store } = await renderTurn()
     expect(store.getState().chat.activityOpen).toBe(false)
@@ -940,39 +992,13 @@ describe('ChatPage window-event listeners', () => {
         detail: {
           slot: 'chat-1',
           is_shell: true,
-          input_preview: 'playwright-cli open https://example.test',
+          input_preview: 'chromium --headless=new https://example.test',
         },
       }))
     })
 
     await act(async () => { await new Promise((r) => setTimeout(r, 20)) })
     expect(store.getState().chat.activityOpen).toBe(false)
-  })
-
-  it('leaves the activity panel alone on a playwright-cli shell command even when the native bridge is present', async () => {
-    // Bridge presence is not evidence the shell browse landed in the native
-    // view — it never does. The desktop path opens the panel from the main
-    // process's `browser:agent-opened` signal, not from the tool-call preview.
-    ;(window as unknown as { browserAPI?: unknown }).browserAPI = {
-      trackSession: vi.fn(async () => ({ ok: true })),
-      onAgentOpened: vi.fn(() => () => {}),
-    }
-    try {
-      const { store } = await renderTurn()
-      act(() => {
-        window.dispatchEvent(new CustomEvent('kirocrew-tool-call', {
-          detail: {
-            slot: 'chat-1',
-            is_shell: true,
-            input_preview: 'playwright-cli snapshot',
-          },
-        }))
-      })
-      await act(async () => { await new Promise((r) => setTimeout(r, 20)) })
-      expect(store.getState().chat.activityOpen).toBe(false)
-    } finally {
-      delete (window as unknown as { browserAPI?: unknown }).browserAPI
-    }
   })
 
   it('ignores a run-in-terminal request that carries no command', async () => {

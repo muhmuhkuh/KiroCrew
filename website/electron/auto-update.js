@@ -592,13 +592,23 @@ function channelForVersion(version) {
  * About panel's "you are running prerelease bytes" note is keyed on); only the
  * followed feed is decoupled from it here.
  *
+ * A channel the policy requires (`required`, see runtime/update/policy-channel.js)
+ * replaces the preference. A build that cannot follow it (a nightly install
+ * asked for another lane, or a production install asked for nightly, which is a
+ * separate side-by-side app) has no lane: null, so updates stay off.
+ *
  * @param {"nightly"|"insider"|"stable"|null} stamped - channelForVersion(version)
  * @param {"insider"|"stable"|""|null|undefined} preference - user opt-in, falsy = default
+ * @param {"nightly"|"insider"|"stable"|""} [required] - policy channel, "" = none
  * @returns {"nightly"|"insider"|"stable"|null}
  */
-function resolveChannel(stamped, preference) {
-  if (stamped === "nightly") return "nightly";
+function resolveChannel(stamped, preference, required = "") {
   if (stamped === null) return null;
+  if (required) {
+    if (stamped === "nightly") return required === "nightly" ? "nightly" : null;
+    return required === "insider" || required === "stable" ? required : null;
+  }
+  if (stamped === "nightly") return "nightly";
   if (preference === "insider" || preference === "stable") return preference;
   return "stable";
 }
@@ -613,6 +623,11 @@ function resolveChannel(stamped, preference) {
  * `fs`/`child_process` requires elsewhere in this module — so the pure helper
  * stays loadable outside an Electron runtime; a stubbed/absent semver yields
  * null (fail-open) rather than throwing.
+ *
+ * A packager can number its builds with a fourth part (`0.12.0.3`, then
+ * `0.12.0.4`). semver has no fourth part and coerces both to `0.12.0`, so when
+ * the first three parts tie the fourth decides; a version without one counts
+ * as `.0`.
  *
  * @param {string} candidate
  * @param {string} current
@@ -630,10 +645,17 @@ function isNewerVersion(candidate, current) {
   const b = semver.valid(current) || semver.valid(semver.coerce(current));
   if (!a || !b) return null;
   try {
+    if (semver.eq(a, b)) return fourthVersionPart(candidate) > fourthVersionPart(current);
     return semver.gt(a, b);
   } catch {
     return null;
   }
+}
+
+// The fourth part of a four-part build number (`0.12.0.4` -> 4), else 0.
+function fourthVersionPart(version) {
+  const match = /^v?\d+\.\d+\.\d+\.(\d+)$/.exec(String(version).trim());
+  return match ? Number(match[1]) : 0;
 }
 
 /**
@@ -959,6 +981,9 @@ function classifyError(err) {
  *   the "writable external disk still updates" case is unassertable.
  * @param {object} [deps.nativeAutoUpdater]     - Electron's native autoUpdater, observed
  *   for `before-quit-for-update` to know the installer took over (tests inject a stub)
+ * @param {() => Array<{isDestroyed:Function, destroy:Function}>} [deps.getAllWindows]
+ *   - every open window, so a darwin install can close one that refuses to
+ *   (defaults to Electron's BrowserWindow.getAllWindows)
  * @param {string} [deps.feedBase]             - override feed host
  * @param {(state:object) => void} [deps.onUpdateState] - if provided, the
  *   in-app UI drives the install prompt: state transitions are pushed here
@@ -974,6 +999,9 @@ function initAutoUpdate(deps) {
     Notification,
     getFlavor,
     getChannelPreference = () => "",
+    // The channel the policy requires, "" when none (an oss build). Read fresh,
+    // like the preference, which it replaces (resolveChannel).
+    getRequiredChannel = () => "",
     // Whether discovery may proceed straight to a download without a click.
     // Read FRESH per event, like getChannelPreference, so toggling it in
     // Settings takes effect on the next check with no re-init.
@@ -1025,9 +1053,26 @@ function initAutoUpdate(deps) {
     nativeAutoUpdater = (() => {
       try { return require("electron").autoUpdater || null; } catch { return null; }
     })(),
+    // Every open BrowserWindow. On darwin Squirrel hands the swap to ShipIt only
+    // once ALL windows have closed (see forceExitFailsafe), so the lane needs to
+    // reach a window that refuses to close. Resolved lazily for the same reason
+    // as nativeAutoUpdater; outside Electron there are no windows.
+    getAllWindows = () => {
+      try {
+        const { BrowserWindow } = require("electron");
+        return BrowserWindow && typeof BrowserWindow.getAllWindows === "function"
+          ? BrowserWindow.getAllWindows()
+          : [];
+      } catch { return []; }
+    },
     feedBase = process.env.KIROCREW_UPDATE_FEED || DEFAULT_FEED_BASE,
     onUpdateState = null,
     log = console,
+    // Whether a security policy provider currently governs this install's
+    // updates, making the Electron feed lane stand down. Wired by the
+    // caller (ipc-registrar.js) to a variable the renderer updates via
+    // update:notify-policy-governed once the gateway status is known.
+    isPolicyGoverned = () => false,
   } = deps;
 
   // Linux install shape. Resolved once, and BEFORE getInfo() is defined: the
@@ -1057,6 +1102,7 @@ function initAutoUpdate(deps) {
     app,
     getFlavor,
     getChannelPreference,
+    getRequiredChannel,
     getAutoDownloadPreference,
     onUpdateState,
     uiDriven,
@@ -1073,7 +1119,7 @@ function initAutoUpdate(deps) {
     isNewerVersion,
     manualDownloadUrl,
   });
-  const { currentChannel, getInfo } = reporter;
+  const { currentChannel, getInfo, policyRefusal } = reporter;
 
   // An operator or distro packager that dropped the EXTERNALLY-MANAGED marker
   // owns this install's update lifecycle: the external package manager replaces
@@ -1105,6 +1151,10 @@ function initAutoUpdate(deps) {
       managedPath,
       launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
       checkIntervalMs: CHECK_INTERVAL_MS,
+      isPolicyGoverned,
+      getMainWindow,
+      Notification,
+      osPlatform,
       log,
     });
   }
@@ -1130,6 +1180,12 @@ function initAutoUpdate(deps) {
   // Evaluated once at init, while currentChannel() is read per check: switching
   // channels in Settings mid-session surfaces the ordinary failure card until
   // the next launch, which the UI already handles.
+  // The policy requires a channel this build cannot follow: updates off, rather
+  // than the stable fallback currentChannel() reports for display.
+  if (policyRefusal()) {
+    log.info(`[update] ${policyRefusal()} — auto-update disabled`);
+    return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "policy-channel" };
+  }
   if (!channelHasLane(currentChannel())) {
     log.info(`[update] ${osPlatform} has no ${currentChannel()} publish lane — auto-update disabled`);
     return { check: () => {}, download: async () => {}, install: async () => {}, getInfo, disabled: "channel" };
@@ -1206,6 +1262,7 @@ function initAutoUpdate(deps) {
     linux,
     macDistArch,
     nativeAutoUpdater,
+    getAllWindows,
     getMainWindow,
     feedBase,
     uiDriven,
@@ -1218,6 +1275,7 @@ function initAutoUpdate(deps) {
     channelForVersion,
     launchCheckDelayMs: LAUNCH_CHECK_DELAY_MS,
     checkIntervalMs: CHECK_INTERVAL_MS,
+    isPolicyGoverned,
   });
 }
 

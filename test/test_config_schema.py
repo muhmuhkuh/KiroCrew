@@ -583,7 +583,6 @@ class TestAgentWorkspaceBindingsSchema:
         """
         top_props = JSON_SCHEMA.get("properties", {})
 
-        # agents
         agents_schema = top_props.get("agents", {})
         assert (
             "additionalProperties" in agents_schema
@@ -594,7 +593,6 @@ class TestAgentWorkspaceBindingsSchema:
         assert "workspace" in agents_ap.get("properties", {})
         assert "memory_store" in agents_ap.get("properties", {})
 
-        # workspaces
         ws_schema = top_props.get("workspaces", {})
         assert (
             "additionalProperties" in ws_schema
@@ -603,7 +601,6 @@ class TestAgentWorkspaceBindingsSchema:
         assert ws_ap.get("type") == "object"
         assert "dir" in ws_ap.get("properties", {})
 
-        # memory_stores
         ms_schema = top_props.get("memory_stores", {})
         assert (
             "additionalProperties" in ms_schema

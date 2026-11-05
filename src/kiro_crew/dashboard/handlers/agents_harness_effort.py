@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from kiro_crew.acp_backends import (
+    ACP_BACKENDS_DEFAULT_PSEUDO_MODEL,
     ACP_BACKENDS_EFFORT_BUILD_WIDE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
@@ -86,6 +87,10 @@ def harness_effort(
     ``session/new`` with the same vocabulary regardless of the served model, so it
     answers for any *model* and needs no live session: the shared vocabulary is the
     answer (a live session's advertised list only refines it).
+
+    A harness whose unpinned session serves a pseudo-model (``ACP_BACKENDS_DEFAULT_PSEUDO_MODEL``)
+    answers an ``auto`` or empty *model* with ``None`` too: no id the registry can name
+    is known yet, and the adapter's own effort option decides once the session reports.
     """
     if backend in ACP_BACKENDS_EFFORT_BUILD_WIDE:
         live = _live_on(state, backend, crew)
@@ -125,6 +130,8 @@ def harness_effort(
             levels = []
     elif not model_answers or model is None:
         return {}
+    elif backend in ACP_BACKENDS_DEFAULT_PSEUDO_MODEL and model in ("", "auto"):
+        supported, levels = None, []
     else:
         supported = model_supports_effort(model)
         levels = list(EFFORT_LEVELS) if supported else []

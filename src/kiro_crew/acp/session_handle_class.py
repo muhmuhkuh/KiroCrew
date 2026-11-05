@@ -1,7 +1,7 @@
 """``class AcpSessionHandle``: the session handle's constructor, state, properties and members.
 
 The class body binds each member an owner module defines (``prompt = _sh_turn.prompt``) and
-keeps the constructor, the properties and the class default. ``_own_methods`` names each bound
+keeps the constructor, the properties and the class default. ``own_methods`` names each bound
 function after its class attribute. ``kiro_crew.acp.session_handle`` re-exports the class,
 which keeps that module as its ``__module__``: the facade is the import path callers, pickles
 and reprs name.
@@ -13,7 +13,8 @@ import asyncio
 from collections.abc import Callable
 from typing import Any
 
-from kiro_crew.acp import kas_wire
+from kiro_crew._facade_bindings import own_methods
+from kiro_crew.acp import batch_guard, kas_wire
 from kiro_crew.acp import session_handle_compaction as _sh_compaction
 from kiro_crew.acp import session_handle_dispatch as _sh_dispatch
 from kiro_crew.acp import session_handle_elicitation as _sh_elicitation
@@ -29,6 +30,7 @@ from kiro_crew.acp import session_handle_updates as _sh_updates
 from kiro_crew.acp import session_handle_watchdog as _sh_watchdog
 from kiro_crew.acp._dispatch import MAX_ACTIVE_TOOL_CALLS
 from kiro_crew.acp.elicitation import ElicitationRequest
+from kiro_crew.acp.engine_fallback import EngineFallbackTracker
 from kiro_crew.acp.liveness import (
     InFlightToolTracker,
     InteractiveClassification,
@@ -46,6 +48,7 @@ from kiro_crew.acp.session_handle_watchdog import (
 from kiro_crew.acp.skill_reads import SkillReadTracker
 from kiro_crew.acp.types import (
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_RETRACT,
     ACP_BACKENDS_STEERING_REQUEST,
     AcpEvent,
     AcpPromptStats,
@@ -54,28 +57,28 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.recovery.ladder import InfraError
 
-_OWNER_PREFIX = "kiro_crew.acp.session_handle_"
+#: The owner modules whose functions ``AcpSessionHandle`` binds as its members, this
+#: shell included.
+_MEMBER_OWNERS = frozenset(
+    {
+        "kiro_crew.acp.session_handle_class",
+        "kiro_crew.acp.session_handle_compaction",
+        "kiro_crew.acp.session_handle_dispatch",
+        "kiro_crew.acp.session_handle_elicitation",
+        "kiro_crew.acp.session_handle_kas",
+        "kiro_crew.acp.session_handle_lifecycle",
+        "kiro_crew.acp.session_handle_mcp",
+        "kiro_crew.acp.session_handle_model_selection",
+        "kiro_crew.acp.session_handle_native_children",
+        "kiro_crew.acp.session_handle_permissions",
+        "kiro_crew.acp.session_handle_steering",
+        "kiro_crew.acp.session_handle_turn",
+        "kiro_crew.acp.session_handle_updates",
+        "kiro_crew.acp.session_handle_watchdog",
+    }
+)
 
 
-def _own_methods(cls: type) -> type:
-    """Make each member *cls* binds from an owner module read as a method of *cls*.
-
-    A bound function annotates ``self`` so mypy checks its body as a method body;
-    this drops that annotation from the runtime object and names the function after
-    the class attribute (``AcpSessionHandle._run_turn``), so its ``inspect.signature``
-    and ``__qualname__`` are what the one-module class had, and so are the reprs of
-    the coroutines and tasks it starts. Only ``__module__`` moves: it names the owner
-    module that holds the body.
-    """
-    for name, member in vars(cls).items():
-        function = getattr(member, "__func__", member)
-        if getattr(function, "__module__", "").startswith(_OWNER_PREFIX):
-            function.__annotations__.pop("self", None)
-            function.__qualname__ = f"{cls.__qualname__}.{name}"
-    return cls
-
-
-@_own_methods
 class AcpSessionHandle:
     """Handle for a single ACP session on a shared runtime.
 
@@ -108,6 +111,7 @@ class AcpSessionHandle:
     _input_wait_status = _sh_watchdog._input_wait_status
     # The session's MCP servers: ``kiro_crew.acp.session_handle_mcp``.
     _remote_flat_launches = _sh_mcp._remote_flat_launches
+    _mcp_attribution_launches = _sh_mcp._mcp_attribution_launches
     record_mcp_launches = _sh_mcp.record_mcp_launches
     queued_frame_count = _sh_mcp.queued_frame_count
     _owns_mcp_frame = _sh_mcp._owns_mcp_frame
@@ -151,8 +155,6 @@ class AcpSessionHandle:
     _push_model_config_option = _sh_models._push_model_config_option
     set_config_option = _sh_models.set_config_option
     _advertised_model_ids = _sh_models._advertised_model_ids
-    _feed_advertised_model_cache = _sh_models._feed_advertised_model_cache
-    _persist_advertised_models_if_changed = _sh_models._persist_advertised_models_if_changed
     supports_config_option = _sh_models.supports_config_option
     get_valid_effort_levels = _sh_models.get_valid_effort_levels
     _crew_agent_name = _sh_models._crew_agent_name
@@ -161,10 +163,13 @@ class AcpSessionHandle:
     _normalize_models = staticmethod(_sh_models._normalize_models)
     refresh_available_models = _sh_models.refresh_available_models
     _mark_available_models_captured = _sh_models._mark_available_models_captured
+    _feed_advertised_model_cache = _sh_models._feed_advertised_model_cache
+    _persist_advertised_models_if_changed = _sh_models._persist_advertised_models_if_changed
     maybe_refresh_available_models = _sh_models.maybe_refresh_available_models
     _sync_effort_levels = _sh_models._sync_effort_levels
     # Steering a live turn: ``kiro_crew.acp.session_handle_steering``.
     steer = _sh_steering.steer
+    clear_pending_steers = _sh_steering.clear_pending_steers
     _steer_via_steering_request = _sh_steering._steer_via_steering_request
     _settle_abandoned_steering = _sh_steering._settle_abandoned_steering
     _take_injected_steers = _sh_steering._take_injected_steers
@@ -199,6 +204,11 @@ class AcpSessionHandle:
     _codex_compaction_event = _sh_compaction._codex_compaction_event
     # Permission requests and in-band refusals: ``kiro_crew.acp.session_handle_permissions``.
     approve_tool = _sh_permissions.approve_tool
+
+    def take_batch_refusal(self, request_id: str | int) -> str | None:
+        """The batch write guard's reason for refusing *request_id*, taken once."""
+        return batch_guard.take_refusal(self, request_id)
+
     _restore_withdrawn = _sh_permissions._restore_withdrawn
     reject_tool = _sh_permissions.reject_tool
     _deny_spec_disabled_tool = _sh_permissions._deny_spec_disabled_tool
@@ -228,6 +238,7 @@ class AcpSessionHandle:
     wait_turn_done = _sh_turn.wait_turn_done
     prompt = _sh_turn.prompt
     stream_command = _sh_turn.stream_command
+    command_is_native = _sh_turn.command_is_native
     _run_turn = _sh_turn._run_turn
     _close_abandoned_turn = _sh_turn._close_abandoned_turn
     # The per-turn event loop: ``kiro_crew.acp.session_handle_dispatch``.
@@ -245,7 +256,6 @@ class AcpSessionHandle:
         bound_cwd: str = "",
     ) -> None:
         self._session_id = session_id
-        self.request_vault_identity: str = ""
         # The Kiro Crew session that OWNS this ACP session, threaded from the
         # runtime's create/load paths the way ``crew_agent`` is, and rebound on a
         # warm-pool claim. The hooks execute path keys its listed-id record and
@@ -290,6 +300,11 @@ class AcpSessionHandle:
         # answered ``startedNewTurn``, whose untargeted cancel could then land on
         # the prompt about to go out, so no steer is sent until it is set.
         self._prompt_written: bool = False
+        # Prompts this handle has written to the adapter, over its whole life.
+        # Never reset, so a caller that snapshots it before a turn can tell,
+        # after that turn timed out or was cancelled, whether the prompt reached
+        # the backend.
+        self.prompts_written: int = 0
         self.native_context_documents: dict[str, str] = {}
         self.native_context_documents_fit: Callable[[], bool] | None = None
         # Whether THIS session's array carries the member session-control entry.
@@ -315,6 +330,7 @@ class AcpSessionHandle:
         # The release ``destroy()`` started, kept so a second ``destroy()`` waits for
         # it instead of releasing again (``_release_ending``).
         self._release_task: asyncio.Future[None] | None = None
+        self._cloud_replayed_permissions: set[str | int | None] = set()
         # Token carried by THIS session's injected broker-stub entries
         # (``mcp_gateway.claim.mint_stub_session_token``), set by the runtime
         # that created the session. It is what a later claim-push names so
@@ -338,13 +354,15 @@ class AcpSessionHandle:
         self._watchdog = watchdog if watchdog is not None else _load_watchdog_settings(crew_agent)
         # How this session launched its stdio MCP servers, recorded by the
         # runtime once the session's array is final (``record_mcp_launches``).
-        # The oracle's remote_flat scan reads it to find the in-flight tool's
-        # own server process; empty means no server can be found, which keeps
-        # the full window.
+        # The oracle reads it to find the in-flight tool's own server process:
+        # the movement sample covers that server alone, and the remote_flat
+        # scan looks at its sockets. Empty means no server can be found, which
+        # keeps the whole-tree sample and the full window.
         self._mcp_launches: dict[str, tuple[tuple[str, ...], ...]] = {}
         self._oracle = LivenessOracle(
             sample_min_secs=self._watchdog.wellness_sample_secs,
             server_launches=self._remote_flat_launches,
+            attribution_launches=self._mcp_attribution_launches,
         )
         # Keep the executor future, not an await-scoped flag: wait_for can time
         # out while the underlying thread continues its /proc walk. A pending
@@ -367,6 +385,9 @@ class AcpSessionHandle:
         # kept, so the oracle keeps reporting the tool actually in flight rather
         # than failing permissive on stall detection.
         self._tool_tracker = InFlightToolTracker(max_calls=MAX_ACTIVE_TOOL_CALLS)
+        # The current parallel tool batch, for the opt-in batch write guard
+        # that ``approve_tool`` consults (``acp.batch_guard``).
+        self._batch_window = batch_guard.BatchWindow()
         # toolCallIds that streamed output (a non-final tool_call_update with
         # content) this turn. A command that already produced output may have
         # already acted, so a non-interactive retry of it is never ``safe_retry``.
@@ -680,6 +701,10 @@ class AcpSessionHandle:
         # The upgrade notice when that batch's prompt is dropped by the KAS this
         # process runs (``harness.kas.kas_agent_prompt_issue``); "" otherwise.
         self.kas_agent_prompt_notice: str = ""
+        # The notice naming the MCP servers this session's projection sent without
+        # part of their env or headers, by key name only
+        # (``kas_agents.withheld_credentials_notice``); "" otherwise.
+        self.kas_withheld_credentials_notice: str = ""
         # JSON-RPC request id -> {"once","always","reject"} optionId map, so
         # approve_tool / reject_tool echo the exact ids the agent advertised
         # (kiro "allow_once"/"allow_always"; claude-agent-acp "allow"/"reject").
@@ -697,12 +722,22 @@ class AcpSessionHandle:
         # State tracking (populated from session/new response via store_session_config)
         self._model: str = ""
         self.active_agent: str = ""
+        # The vault identity fingerprint read as THIS session's ``session/new``
+        # or ``session/load`` went out (``kas_model_catalog.request_vault_identity``);
+        # ``""`` on a handle whose request was never stamped, which records
+        # nothing. The KAS catalog recorder keeps it with the response's
+        # ``model`` select: the engine answers for the account in the vault when
+        # it was asked, and the picker serves the rows only to that account.
+        self.request_vault_identity: str = ""
         # Model id kiro-cli RESOLVED the session to (from currentModelId in the
         # session/new|load response), kept separate from _model (the user-picked
         # alias) so it feeds ONLY the context-window backfill — never slot.model
         # (mirrors AcpClient._resolved_model_id; avoids the profile-id
         # pinning trap where a resolved profile id poisons slot.model).
         self._resolved_model_id: str = ""
+        # Keeps the two fields above in step with a fallback the ENGINE made
+        # mid-turn (acp/engine_fallback.py).
+        self._engine_fallback = EngineFallbackTracker()
         # True after set_mode switched a live session's agent, until the model
         # kiro-cli reported for that activation has been judged against the
         # served list (see _served_default_after_set_mode).
@@ -718,7 +753,11 @@ class AcpSessionHandle:
         self.model_pin_partial: str = ""
         self._config_options: list[dict[str, Any]] = []
         self._available_models: list[dict[str, str]] = []
-        self._advertised_models_changed = False
+        # Set by ``_feed_advertised_model_cache`` when the capture changed the
+        # cross-session advertised-model cache, so the async init caller can
+        # offload the disk persist off the event loop. Mirrors
+        # ``AcpClient._advertised_models_changed`` on the direct-spawn path.
+        self._advertised_models_changed: bool = False
         # Read by KAS only: the listed id a session born on an unlisted ``auto`` moves to,
         # or "". One answer read from the ``model`` select, never the list itself:
         # nobody has shown that list to be the account's complete served set, so
@@ -762,6 +801,11 @@ class AcpSessionHandle:
     @property
     def session_id(self) -> str:
         return self._session_id
+
+    @property
+    def session_activity_at(self) -> float | None:
+        """Monotonic time the runtime last routed a frame for this session."""
+        return self._runtime.session_activity_at(self._session_id)
 
     @property
     def prompt_or_tool_seen(self) -> bool:
@@ -848,6 +892,10 @@ class AcpSessionHandle:
     # mixing the two clocks is how a suspend-resume silently reorders them.
     _last_steer_monotonic: float = 0.0
 
+    # Set once kiro-cli refuses ``_session/steer/clear`` (a build without it), so
+    # the session stops offering a pending steer back. See ``clear_pending_steers``.
+    _steer_clear_refused: bool = False
+
     @property
     def last_steer_monotonic(self) -> float:
         """Monotonic time of the last steer written to the backend (0.0 if none)."""
@@ -873,6 +921,19 @@ class AcpSessionHandle:
             return True
         return backend in ACP_BACKENDS_STEERING_REQUEST and steering_advertised(
             self.initialize_result
+        )
+
+    @property
+    def supports_steer_retract(self) -> bool:
+        """True when a steer this session has not read yet can be taken back.
+
+        Membership in ``ACP_BACKENDS_STEER_RETRACT``, read from the runtime's own
+        backend id, and False once the host refused the request
+        (:meth:`clear_pending_steers`), so a build without it is not offered again.
+        """
+        return (
+            self._runtime.acp_backend in ACP_BACKENDS_STEER_RETRACT
+            and not self._steer_clear_refused
         )
 
     @property
@@ -1028,3 +1089,6 @@ class AcpSessionHandle:
         de-duplicating an id means remembering it, which is the one thing the
         cap exists to refuse."""
         return self._native_child_overflow
+
+
+own_methods(AcpSessionHandle, _MEMBER_OWNERS)

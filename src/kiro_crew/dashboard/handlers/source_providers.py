@@ -50,6 +50,7 @@ from urllib.parse import quote, urlparse, urlunparse  # noqa: F401
 
 from aiohttp import web
 
+from kiro_crew.config.fields import _coerce_bool
 from kiro_crew.dashboard.source_providers.contract import (
     ConfirmationRequired,
     SourceCapacityError,
@@ -577,6 +578,15 @@ def _provider_error_response(
     return web.json_response({"error": str(exc), "code": code}, status=503)
 
 
+def _body_refresh(body: dict) -> bool:
+    """Read ``refresh``: a spelled "false"/"0"/"no"/"off" means False.
+
+    Any other value keeps the truthiness it has always been read with.
+    """
+    raw = body.get("refresh")
+    return _coerce_bool(raw, bool(raw))
+
+
 async def api_pull_request_source(request: web.Request) -> web.Response:
     """Owner-only POST ``/api/source/pull-request`` with ``{url, refresh?}``."""
     denied = _authorize_owner_request(request, "source.pull_request.read")
@@ -593,7 +603,7 @@ async def api_pull_request_source(request: web.Request) -> web.Response:
         body = {}
     try:
         data = await _submodule("cache").fetch_pull_request(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.pull_request.read", "failed", "request_cancelled")
@@ -628,7 +638,7 @@ async def api_issue_source(request: web.Request) -> web.Response:
         body = {}
     try:
         data = await _submodule("cache").fetch_issue(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.issue.read", "failed", "request_cancelled")
@@ -670,7 +680,7 @@ async def api_app_contributors(request: web.Request) -> web.Response:
         body = {}
     try:
         contributors = await _submodule("cache").fetch_app_contributors(
-            str(body.get("url") or ""), refresh=bool(body.get("refresh"))
+            str(body.get("url") or ""), refresh=_body_refresh(body)
         )
     except asyncio.CancelledError:
         _audit_source_api(request, "source.contributors.read", "failed", "request_cancelled")

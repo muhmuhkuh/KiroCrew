@@ -34,6 +34,12 @@ vi.mock('../api/client', async importOriginal => {
 const patchConfig = vi.mocked(api.patchConfig)
 const kirocrewConfig = vi.mocked(api.kirocrewConfig)
 
+// The flow saves its first-run step in localStorage so a reload resumes it;
+// the store outlives a test, so start each one from step 1.
+beforeEach(() => {
+  localStorage.removeItem('mc-onboarding-step')
+})
+
 const advanceToStep2 = () => {
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
   expect(screen.getByText('Tell Kiro about you')).toBeInTheDocument()
@@ -56,16 +62,16 @@ describe('OnboardingFlow — About You step', () => {
     expect(screen.getByText('Pick your look')).toBeInTheDocument()
     advanceToStep2()
     expect(screen.getByText('Your role')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'UX Designer' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'UX Designer' })).toBeInTheDocument()
     expect(screen.getByText('How technical are you?')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'I write code' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'I write code' })).toBeInTheDocument()
   })
 
   it('persists selected role + technical level on Next and advances to the tour', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Somewhat' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Somewhat' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() => {
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'designer')
@@ -86,24 +92,68 @@ describe('OnboardingFlow — About You step', () => {
     expect(patchConfig).not.toHaveBeenCalled()
   })
 
-  it('deselecting an answer before Next results in no write', async () => {
+  it('a second click on the selected answer keeps it selected', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    const chip = screen.getByRole('button', { name: 'Developer' })
+    const chip = screen.getByRole('radio', { name: 'Developer' })
     fireEvent.click(chip)
-    expect(chip).toHaveAttribute('aria-pressed', 'true')
-    fireEvent.click(chip) // toggle off — back to the initial ''
-    expect(chip).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(chip)
+    expect(chip).toHaveAttribute('aria-checked', 'true')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
+    expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'developer')
+  })
+
+  it('on a replay, clicking the preselected answer again does not clear it', async () => {
+    kirocrewConfig.mockResolvedValue({
+      dashboard: { user_role: 'developer', user_technical_level: 'codes' },
+    })
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    advanceToStep2()
+    const chip = await screen.findByRole('radio', { name: 'Developer', checked: true })
+    fireEvent.click(chip)
+    expect(chip).toHaveAttribute('aria-checked', 'true')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
     expect(patchConfig).not.toHaveBeenCalled()
+  })
+
+  it('a reload during the tour resumes the same step instead of step 1', async () => {
+    const first = renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    advanceToStep2()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
+    first.unmount()
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+    expect(await screen.findByText('Work that runs on time')).toBeInTheDocument()
+    expect(screen.queryByText('Pick your look')).not.toBeInTheDocument()
+  })
+
+  it('finishing the flow forgets the saved step', async () => {
+    const onComplete = vi.fn()
+    renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
+    advanceToStep2()
+    fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
+    await waitFor(() => expect(onComplete).toHaveBeenCalled())
+    expect(localStorage.getItem('mc-onboarding-step')).toBeNull()
+  })
+
+  it('ignores a saved step once the user is onboarded (a /onboarding replay starts at step 1)', () => {
+    localStorage.setItem('mc-onboarding-step', '4')
+    localStorage.setItem('mc-onboarded', '1')
+    try {
+      renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
+      expect(screen.getByText('Pick your look')).toBeInTheDocument()
+    } finally {
+      localStorage.removeItem('mc-onboarded')
+    }
   })
 
   it('Skip on the About You step still persists answers already selected', async () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Product Manager' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Product Manager' }))
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     await waitFor(() => {
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'product-manager')
@@ -116,7 +166,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValue(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     // First Skip: save fails → informed, NOT dismissed
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     expect(await screen.findByRole('alert')).toHaveTextContent(/Skip again/)
@@ -142,12 +192,12 @@ describe('OnboardingFlow — About You step', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Developer' })).toHaveAttribute(
-        'aria-pressed',
+      expect(screen.getByRole('radio', { name: 'Developer' })).toHaveAttribute(
+        'aria-checked',
         'true',
       )
-      expect(screen.getByRole('button', { name: 'I write code' })).toHaveAttribute(
-        'aria-pressed',
+      expect(screen.getByRole('radio', { name: 'I write code' })).toHaveAttribute(
+        'aria-checked',
         'true',
       )
     })
@@ -161,7 +211,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     // Error surfaces, still on step 2, tour NOT shown
     expect(await screen.findByRole('alert')).toHaveTextContent(/Couldn't save/)
@@ -173,7 +223,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await screen.findByRole('alert')
     // Baseline must NOT have advanced on failure — retry re-sends the field.
@@ -192,15 +242,15 @@ describe('OnboardingFlow — About You step', () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     // In-flight: every input frozen — changing a chip now would advance the
     // flow with a stale value persisted.
     await screen.findByRole('button', { name: 'Saving…' })
-    const designerChip = screen.getByRole('button', { name: 'UX Designer' })
+    const designerChip = screen.getByRole('radio', { name: 'UX Designer' })
     expect(designerChip).toBeDisabled()
     fireEvent.click(designerChip) // no-op while frozen
-    expect(designerChip).toHaveAttribute('aria-pressed', 'false')
+    expect(designerChip).toHaveAttribute('aria-checked', 'false')
     expect(screen.getByRole('button', { name: /Skip/ })).toBeDisabled()
     fireEvent.keyDown(document, { key: 'Escape' }) // dismissal frozen too
     expect(onComplete).not.toHaveBeenCalled()
@@ -219,16 +269,16 @@ describe('OnboardingFlow — About You step', () => {
     const onComplete = vi.fn()
     renderWithProviders(<OnboardingFlow initialOpen onComplete={onComplete} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     fireEvent.click(screen.getByRole('button', { name: /Skip/ }))
     // Skip's save is in flight: chips must be frozen so the completion that
     // follows can't silently drop an edit made mid-flight.
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: 'UX Designer' })).toBeDisabled(),
+      expect(screen.getByRole('radio', { name: 'UX Designer' })).toBeDisabled(),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'UX Designer' })) // no-op
-    expect(screen.getByRole('button', { name: 'UX Designer' })).toHaveAttribute(
-      'aria-pressed',
+    fireEvent.click(screen.getByRole('radio', { name: 'UX Designer' })) // no-op
+    expect(screen.getByRole('radio', { name: 'UX Designer' })).toHaveAttribute(
+      'aria-checked',
       'false',
     )
     release({})
@@ -243,7 +293,7 @@ describe('OnboardingFlow — About You step', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     expect(input).toBeInTheDocument()
     expect(input).toHaveFocus()
@@ -256,7 +306,7 @@ describe('OnboardingFlow — About You step', () => {
   it('caps the typed role by code point, never splitting a surrogate pair', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role') as HTMLInputElement
     // 59 BMP chars + an astral char: a code-unit slice at 60 would keep only
     // the high surrogate and persist a broken character.
@@ -271,7 +321,7 @@ describe('OnboardingFlow — About You step', () => {
   it('persists the typed role alongside the other slug', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: '  solutions architect  ' },
     })
@@ -289,7 +339,7 @@ describe('OnboardingFlow — About You step', () => {
   it('Enter in the field advances instead of leaving the answer unsaved', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     fireEvent.change(input, { target: { value: 'SRE' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -313,7 +363,7 @@ describe('OnboardingFlow — About You step', () => {
     await waitFor(() =>
       expect(screen.getByLabelText('Describe your role')).toHaveValue('solutions architect'),
     )
-    fireEvent.click(screen.getByRole('button', { name: 'Developer' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' }))
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() =>
@@ -329,7 +379,7 @@ describe('OnboardingFlow — About You step', () => {
   it('Other with an empty field writes only the slug', async () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     await waitFor(() =>
       expect(patchConfig).toHaveBeenCalledWith('dashboard.user_role', 'other'),
@@ -345,7 +395,7 @@ describe('OnboardingFlow — About You step', () => {
     // going to "Skip all".
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     const input = screen.getByLabelText('Describe your role')
     fireEvent.change(input, { target: { value: 'S' } })
     expect(input).toHaveFocus()
@@ -392,7 +442,7 @@ describe('OnboardingFlow — About You step', () => {
     patchConfig.mockRejectedValueOnce(new Error('gateway down'))
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    fireEvent.click(screen.getByRole('button', { name: 'Other' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Other' }))
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: 'founder' },
     })
@@ -402,15 +452,15 @@ describe('OnboardingFlow — About You step', () => {
     expect(screen.getByRole('button', { name: /Skip/ })).toHaveFocus()
   })
 
-  it('keeps typed text when Other is toggled off and back on', () => {
+  it('keeps typed text when the user picks another role and comes back to Other', () => {
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     advanceToStep2()
-    const other = screen.getByRole('button', { name: 'Other' })
+    const other = screen.getByRole('radio', { name: 'Other' })
     fireEvent.click(other)
     fireEvent.change(screen.getByLabelText('Describe your role'), {
       target: { value: 'founder' },
     })
-    fireEvent.click(other) // toggle off — field hides
+    fireEvent.click(screen.getByRole('radio', { name: 'Developer' })) // field hides
     expect(screen.queryByLabelText('Describe your role')).not.toBeInTheDocument()
     fireEvent.click(other) // back on — the answer is still there
     expect(screen.getByLabelText('Describe your role')).toHaveValue('founder')
@@ -428,7 +478,7 @@ describe('OnboardingFlow — Pick your look offers the Translucent panels switch
     renderWithProviders(<OnboardingFlow initialOpen onComplete={vi.fn()} />)
     const sw = screen.getByRole('switch', { name: 'Translucent panels' })
     // Reads in order: mode row (Dark) -> the switch -> the COLOR THEME heading.
-    const dark = screen.getByRole('button', { name: 'Dark' })
+    const dark = screen.getByRole('radio', { name: 'Dark' })
     const heading = screen.getByText('Color theme')
     expect(dark.compareDocumentPosition(sw) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(sw.compareDocumentPosition(heading) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -528,7 +578,7 @@ describe('OnboardingFlow — Pick your look previews the real dashboard', () => 
     expect(frame).toHaveAttribute('inert')
     expect(frame).toHaveAttribute('tabindex', '-1')
     // Above the mode row, so the picture sits over what changes it.
-    const system = screen.getByRole('button', { name: 'System' })
+    const system = screen.getByRole('radio', { name: 'System' })
     expect(box.compareDocumentPosition(system) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
 })
