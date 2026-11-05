@@ -24,6 +24,8 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
+    ACP_BACKENDS_EFFORT_BUILD_WIDE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
 )
 from kiro_crew.agent_sdk.capabilities import capabilities_for
@@ -327,6 +329,19 @@ async def test_the_crew_editor_judges_the_pick_off_a_pair_id_route(tmp_path, mem
 
 
 @pytest.mark.asyncio
+async def test_the_crew_editor_offers_an_effort_pin_for_a_build_wide_vibe_route():
+    """vibe's ``thinking`` select sits on every session/new, so any pick takes a level.
+
+    The editor gets the server answer even with no vibe session live — otherwise the
+    foreign model aliases fall through to the name heuristic and read as incapable.
+    """
+    body = await _resolved(member=ACP_BACKEND_VIBE)
+
+    assert body["effort_supported"] is True
+    assert body["effort_levels"] == list(EFFORT_LEVELS)
+
+
+@pytest.mark.asyncio
 async def test_the_crew_editor_offers_only_the_levels_a_crew_pin_can_save():
     """A codex build's own levels can include off and minimal, which the crew-pin write refuses."""
     live = MagicMock()
@@ -456,7 +471,10 @@ async def test_opencode_borrowed_answer_requires_the_same_served_model(
     )
 
 
-@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION))
+@pytest.mark.parametrize(
+    "backend",
+    sorted(ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION - ACP_BACKENDS_EFFORT_BUILD_WIDE),
+)
 @pytest.mark.parametrize("supported", [True, False])
 @pytest.mark.parametrize("served", ["target", "other", "", "auto"])
 def test_model_scoped_borrowing_checks_served_identity_even_for_own_crew(
@@ -478,4 +496,30 @@ def test_model_scoped_borrowing_checks_served_identity_even_for_own_crew(
     assert answer == {
         "effort_supported": supported if served == "target" else None,
         "effort_levels": ["low", "high"] if served == "target" and supported else [],
+    }
+
+
+@pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_EFFORT_BUILD_WIDE))
+@pytest.mark.parametrize("served", ["target", "other", "", "auto"])
+@pytest.mark.parametrize("with_live", [True, False], ids=["live", "cold"])
+def test_a_build_wide_option_answers_for_any_model_with_or_without_a_live_session(
+    backend, served, with_live
+):
+    """vibe's ``thinking`` select sits on every session/new, so any pick is one the build takes."""
+    from kiro_crew.dashboard.handlers.agents_harness_effort import harness_effort
+
+    live = MagicMock()
+    live.capabilities = capabilities_for(backend)
+    live.served_model = served
+    live.supports_effort.return_value = True
+    live.get_valid_effort_levels.return_value = ["off", *EFFORT_LEVELS]
+    own = _ChatSlot("member-writer", agent="writer")
+    state = _state(own, (live,) if with_live else ())
+    state.sessions.get_provider.return_value = live if with_live else None
+
+    answer = harness_effort(state, backend, "target", "writer")
+
+    assert answer == {
+        "effort_supported": True,
+        "effort_levels": list(EFFORT_LEVELS),
     }

@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 from kiro_crew.acp_backends import (
+    ACP_BACKENDS_EFFORT_BUILD_WIDE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
     backend_to_stored,
@@ -80,7 +81,24 @@ def harness_effort(
     even for the crew's own session: its slot can override the crew's pin. A pair-id
     harness (codex) instead supplies build-level option vocabulary and keeps support
     unknown when levels exist; the target model still decides whether it takes them.
+
+    A build-wide advertised option (vibe's ``thinking`` select) sits on every
+    ``session/new`` with the same vocabulary regardless of the served model, so it
+    answers for any *model* and needs no live session: the shared vocabulary is the
+    answer (a live session's advertised list only refines it).
     """
+    if backend in ACP_BACKENDS_EFFORT_BUILD_WIDE:
+        live = _live_on(state, backend, crew)
+        levels = list(EFFORT_LEVELS)
+        if live is not None:
+            advertised = [lvl for lvl in live.get_valid_effort_levels() if isinstance(lvl, str)]
+            refined = [lvl for lvl in advertised if lvl in get_reasoning_effort_values()]
+            if refined and live.supports_effort():
+                levels = refined
+        return {
+            "effort_supported": True,
+            "effort_levels": cap_effort_capability_levels(levels, source="harness"),
+        }
     if backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION | ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS:
         live = _live_on(state, backend, crew)
         if live is None or (

@@ -179,6 +179,10 @@ with no row here.
    * - ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION``
      - driver-internal (whether the ADVERTISED option, rather than Crew's model
        registry, answers that this session takes an effort level and which ones)
+   * - ``ACP_BACKENDS_EFFORT_BUILD_WIDE``
+     - driver-internal (whether that advertised option sits on every
+       ``session/new`` with the same vocabulary, so it answers for any model and
+       needs no live session -- vibe's ``thinking`` select)
    * - ``ACP_BACKENDS_ADVERTISED_MODEL_SELECTION``
      - semantic question (``SessionCapabilities.resolves_model_from_advertised_list``)
    * - ``ACP_BACKENDS_SEED_LOCAL_SETTINGS``
@@ -1105,6 +1109,7 @@ from kiro_crew.agent_sdk.backends_models import (  # noqa: E402,F401 - re-export
     _MODEL_REGISTRY_NAMESPACE_BY_BACKEND,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_EFFORT_AT_LAUNCH,
+    ACP_BACKENDS_EFFORT_BUILD_WIDE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_MODEL_AT_LAUNCH,

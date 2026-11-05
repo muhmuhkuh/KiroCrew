@@ -288,6 +288,17 @@ ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION = frozenset(
     }
 )
 
+#: Members of :data:`ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION` whose advertised
+#: effort option is BUILD-wide: the select sits on every ``session/new`` with the
+#: same vocabulary regardless of the served model, so any pick is one the build
+#: takes and the served-model match the model-scoped members need does not apply.
+#: vibe is the member: its ``thinking`` select offers off/low/medium/high/xhigh/max
+#: on every ``session/new`` (captured on mistral-vibe 3.0.3,
+#: ``test/fixtures/acp_frames/vibe/routing-live.jsonl``), and Crew's levels are
+#: spelled identically there, so the shared vocabulary is the answer with or
+#: without a live session.
+ACP_BACKENDS_EFFORT_BUILD_WIDE: FrozenSet[str] = frozenset({ACP_BACKEND_VIBE})
+
 
 def effort_config_option_id(backend: str) -> str:
     """The ``configId`` *backend* exposes its reasoning effort under.

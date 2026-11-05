@@ -133,7 +133,10 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
         "effort_pinned": bool(crew_effort),
     }
 
-    from kiro_crew.acp_backends import ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+    from kiro_crew.acp_backends import (
+        ACP_BACKENDS_EFFORT_BUILD_WIDE,
+        ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
+    )
     from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling_on
     from kiro_crew.crewmate_harness import CrewmateHarnessUnavailable
     from kiro_crew.dashboard.handlers.agents_harness_effort import (
@@ -156,11 +159,12 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
         pin_backend = None
     if pin_backend is not None:
         own = own_models_backend(pin_backend, cfg.agent.acp_backend)
-        # Only a pair-id harness (codex) answers for its build, which holds for any pick the
-        # editor makes; every other answer would be one model's, so the editor judges the pick.
+        # A pair-id harness (codex) and a build-wide advertised option (vibe's ``thinking``
+        # select) answer for their build, which holds for any pick the editor makes;
+        # every other answer would be one model's, so the editor judges the pick.
         effort = (
             harness_effort(request.app.get("state"), pin_backend, None, alias, model_answers=False)
-            if pin_backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS
+            if pin_backend in ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS | ACP_BACKENDS_EFFORT_BUILD_WIDE
             else {}
         )
         if "effort_levels" in effort:
@@ -186,8 +190,9 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             body["pin_served_as"] = resolve_pin_spelling_on(
                 model_pin, advertised, backend=pin_backend
             )
-        # Whether and at which levels a pair-id harness's build takes an effort pin; null
-        # until a live session on it answers. Otherwise the editor judges the model.
+        # Whether and at which levels a pair-id or build-wide harness takes an effort
+        # pin; null until a live session on a pair-id harness answers. Otherwise the
+        # editor judges the model.
         body.update(effort)
 
     # The crewmate's harness pin is read HERE and nowhere else on the dashboard
