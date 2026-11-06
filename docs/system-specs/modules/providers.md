@@ -1466,6 +1466,14 @@ are the entries of `agent.py:_MANAGED_MCP_SERVERS` (see also
 `kirocrew-work`, `kirocrew-crew-log`) are opt-in per their entry.
 User-configured servers from the agent config are merged in.
 
+For a mirror-less backend whose projection is `EXTERNAL` (vibe), the array is
+not only Crew's own managed servers: vibe-acp consumes the array itself
+(`SessionOptions.mcp_servers`), so `acp/client_mcp_array.py` composes the
+translated agent spec's own servers — and, on a crewmate worker session, the
+per-session worker spec — into it (`_mirrorless_member_mounts`). A per-tool
+deny set has no channel on an array of servers, so a narrowed server is
+withheld whole there, as on any transport without a deny channel.
+
 ## SessionManager (`session.py`)
 
 - Provider-agnostic via factory (one provider, `AcpProvider`, over the resolved backend)

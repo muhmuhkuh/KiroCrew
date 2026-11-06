@@ -22,6 +22,7 @@ from kiro_crew.agent_sdk.backends import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
 )
 
 # Backends that can verify an enrolled member's saved spec at spawn.
@@ -81,6 +82,20 @@ from kiro_crew.agent_sdk.backends import (
 # (``internal_secret_missing``). Fail closed until a host-side control-plane transport
 # exists; letting the child read the credential widens the mask, which this set does
 # not decide.
+#
+# vibe is a member on the pi pattern, with no mirror behind it: vibe-acp consumes the
+# ``session/new`` ``mcpServers`` array itself (captured live on mistral-vibe 3.0.3,
+# ``test/fixtures/acp_frames/vibe/routing-live.jsonl`` — a stdio element in the array
+# was spawned and asked ``initialize`` / ``tools/list``), so Crew composes that array
+# for it from the one ``session_mcp_projection`` parse in
+# ``AcpClient._mirrorless_member_mounts`` (projection kind ``EXTERNAL``), and the
+# consumed spec is recorded from that same parse for
+# ``confirm_member_projection``, exactly as pi records ``_session_agent_spec``. Its
+# per-tool deny set still has no channel — the array carries servers, not tool
+# rules — so a narrowed server is withheld whole (``_session_mcp_unhonoured``), the
+# same cost the BROKER_ONLY kind declares. Its routing is
+# ``Routing.VERIFIED_SEEDED_SETTINGS``, which ``tool_gate.is_enforced`` holds
+# enforced, so the permission surface needs no ownership fence here.
 ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
     {
         ACP_BACKEND_KIRO,
@@ -89,6 +104,7 @@ ACP_BACKENDS_MEMBER_CAPABILITIES = frozenset(
         ACP_BACKEND_CODEX,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_PI,
+        ACP_BACKEND_VIBE,
     }
 )
 
@@ -152,15 +168,33 @@ ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS = frozenset({ACP_BACKEND_KAS})
 # the worker's ``kirocrew-core`` would run inside the sandbox with the gateway
 # credential hidden by the enforced mask, so its control plane would be refused. A
 # worker allocated on strands is refused before spawn (``capability_harness_unsupported``).
-ACP_BACKENDS_MATE_WORKER_KIT = frozenset({ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+# vibe IS here: vibe-acp takes the ``session/new`` ``mcpServers`` array itself, so
+# Crew composes the worker's array from the one ``session_mcp_projection`` parse keyed
+# by the worker's session (``AcpClient._mirrorless_member_mounts``, projection kind
+# ``EXTERNAL``) — the worker's own servers reach the session the same way the pooled
+# broker stubs already do (captured live on mistral-vibe 3.0.3,
+# ``test/fixtures/acp_frames/vibe/routing-live.jsonl``). Its prompt travels no such
+# wire: the array carries servers, not text, and vibe's agent profiles are
+# file-discovered while the routing seed pins the session to ``ask``, so the prompt
+# rides the context block (see ``ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT`` below).
+# Switched-off single tools still do not: vibe has no per-tool deny channel on the
+# array, so a crewmate file that narrows one tool refuses the worker on vibe through
+# ``ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS`` exactly as on claude and codex.
+ACP_BACKENDS_MATE_WORKER_KIT = frozenset(
+    {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_VIBE}
+)
 
 # Backends of the set above whose worker gets its prompt only from the
 # ``[AGENT SYSTEM PROMPT]`` context block: their mirrors project no spec prompt
 # (``Concern.PROMPT`` is ``WITHHELD``), so the block carries the worker's own
 # principles and its crewmate's prompt (``context_assembly.agent_spec
-# ._crewmate_worker_prompt``). claude and codex are both here. KAS is not: its wire
-# spec already carries both, so its block stays the base.
-ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT = frozenset({ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX})
+# ._crewmate_worker_prompt``). claude and codex are both here, and vibe joins them:
+# it has no mirror, and its one kit channel (the ``session/new`` array) carries no
+# prompt, so the context block is the only place the worker's prompt can ride.
+# KAS is not: its wire spec already carries both, so its block stays the base.
+ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT = frozenset(
+    {ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_VIBE}
+)
 
 # Backends that can mount a DIFFERENT MCP tool set on one session than the
 # on-disk agent template declares — the capability crew-member dispatch rides
@@ -379,6 +413,12 @@ ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT = frozenset({ACP_BACKEND_CLAUDE, ACP_
 # With the member entry on ``session/new`` and the ``member_dispatch=True`` projection, the
 # model called ``@kirocrew-dashboard/session_status`` with no permission request, and the
 # server answered it (``identity_unattested``, as the probe key names no live session).
+# vibe is a member on codex's two preconditions, held for THIS harness: its array is
+# one this core composes (vibe has no mirror; ``AcpClient._mirrorless_member_mounts``
+# builds it from ``session_mcp_projection`` and vibe-acp consumes the ``session/new``
+# array natively), and its routing (``Routing.VERIFIED_SEEDED_SETTINGS``) is one of
+# ``tool_gate.ENFORCED_ROUTINGS``, so a non-gated session is refused before its first
+# prompt and no permission-file ownership fence is needed.
 ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -388,6 +428,7 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_PI,
+        ACP_BACKEND_VIBE,
     }
 )
 
@@ -457,6 +498,9 @@ ACP_BACKENDS_MEMBER_DISPATCH = frozenset(
 # that key on ``ACP_BACKENDS_MEMBER_DISPATCH``. So this set decides whether a
 # member session that EXISTS gets a panel; whether one exists at all is that
 # gate's decision, and a backend must clear both.
+# vibe clears this one on the same two preconditions as its dispatch membership:
+# the array is one this core composes and consumed by the harness natively, and its
+# routing is enforced (see the dispatch set above).
 ACP_BACKENDS_MEMBER_PANEL = frozenset(
     {
         ACP_BACKEND_CLAUDE,
@@ -466,5 +510,6 @@ ACP_BACKENDS_MEMBER_PANEL = frozenset(
         ACP_BACKEND_GOOSE,
         ACP_BACKEND_DEEPSEEK,
         ACP_BACKEND_PI,
+        ACP_BACKEND_VIBE,
     }
 )

@@ -140,8 +140,9 @@ pointer; and `native` and `external` are checked
 against `agent_sdk/mcp_refs.py`, which has to know the same fact to resolve a
 `@server` ref at all — it satisfies a ref from the spec's OWN `mcpServers` for a
 backend whose spec servers reach the session off the wire
-(`ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE`: the harness reads the file itself, or Crew
-projects it down a channel that is not the array) and from the wire array for
+(`ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE`: the harness reads the file itself, Crew
+projects it down a channel that is not the array, or — vibe — Crew builds the
+array itself out of the spec, so the spec's own servers are what the wire carries) and from the wire array for
 every other. A declaration and the resolver acting on it may not diverge, in
 either direction. A selectable backend
 whose projection was not written could previously sit under one name with an
@@ -298,6 +299,7 @@ a tool they switched off answers anyway.
 | `pi` | `broker-only` | — | `pi-acp` accepts the session array but does not forward it to the pi process, so Crew's gate extension carries the same composition in through a per-session handoff file and registers it with pi's built-in MCP support; the shared broker's stubs are reachable, the agent spec's own servers and per-tool deny set are not projected, and `registry.py` tracks the missing projection |
 | `goose` | `mirror` | `whole-server` | `goose.py`, wire face only — a live adapter round trip proves stdio tools are reachable; narrowed servers are withheld whole, Crew's control plane included. A per-call refusal by `_meta.goose.toolCall` is reachable but not yet safe: it must trust only that `_meta` pair, and the sandbox must deny writes to goose's config directory, because a `permission.yaml` `always_allow` entry written mid-session makes goose run the tool without asking. `hooks` is `translated`: Crew's turn loop runs the spec's hooks on every permission request, and `harness_tool_names.py` maps its tool names back to kiro-cli's |
 | `deepseek` | `broker-only` | — | the shared broker's stdio stubs are reachable, but the agent spec's own servers and per-tool deny set are not projected; `registry.py` tracks the missing projection |
+| `vibe` | `external` | — | `acp/client_mcp_array.py` (`_mirrorless_member_mounts` for an `EXTERNAL` kind): vibe-acp consumes the `session/new` `mcpServers` array itself (`SessionOptions.mcp_servers`, captured live in `test/fixtures/acp_frames/vibe/routing-live.jsonl`), so the array Crew composes there — the agent spec's own servers, and a crewmate worker's per-session spec keyed by its session — IS the channel. A per-tool deny set has no place on an array of servers, so a narrowed server is withheld whole (`per_tool_deny=whole-server` behaviour, same as goose) |
 
 ## Verify against the adapter, not against the last mirror
 

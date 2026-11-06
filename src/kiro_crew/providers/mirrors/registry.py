@@ -311,19 +311,24 @@ PROJECTIONS: dict[str, McpProjection] = {
         per_tool_deny=PerToolDeny.SETTINGS_FILE,
     ),
     ACP_BACKEND_VIBE: McpProjection(
-        kind=ProjectionKind.BROKER_ONLY,
+        kind=ProjectionKind.EXTERNAL,
         reason=(
             "vibe-acp consumes the ``session/new`` ``mcpServers`` array itself "
             "(``vibe.acp.agent`` hands it to the session as "
-            "``SessionOptions.mcp_servers``), so the array IS the channel and "
-            "carries Crew's pooled broker stubs -- captured live on mistral-vibe "
-            "3.0.3: a stdio element in the array was spawned and asked "
-            "``initialize``, ``notifications/initialized`` and ``tools/list`` "
-            "(``test/fixtures/acp_frames/vibe/routing-live.jsonl``). What does not "
-            "travel is the agent spec's own server list or its per-tool deny set: "
-            "no mirror translates them for this harness, so a dashboard tool-off "
-            "withholds the whole server stub rather than one tool of it"
+            "``SessionOptions.mcp_servers``), so the array IS the channel -- "
+            "captured live on mistral-vibe 3.0.3: a stdio element in the array was "
+            "spawned and asked ``initialize``, ``notifications/initialized`` and "
+            "``tools/list`` (``test/fixtures/acp_frames/vibe/routing-live.jsonl``). "
+            "The translation lives outside this folder, in "
+            "``acp/client_mcp_array.py`` (``_mirrorless_member_mounts`` running "
+            "``session_mcp_projection`` for an EXTERNAL kind): the agent spec's own "
+            "server list, and a crewmate worker's per-session spec keyed by its "
+            "session, are composed into that array there. What still does not "
+            "travel is a per-tool deny set -- the array carries servers, not tool "
+            "rules -- so a dashboard tool-off withholds the whole server rather "
+            "than one tool of it"
         ),
+        projection="kiro_crew.acp.client_mcp_array",
         tracking="docs/system-specs/modules/providers.md#mcp-server-registration",
     ),
     ACP_BACKEND_PI: McpProjection(

@@ -300,24 +300,31 @@ def overlay_project_scope(backend: str, work_dir: Any) -> dict[str, Any]:
 # array-backed host that is the wire array: what is not in it, Crew did not mount
 # (the harness may still mount a same-named server from a configuration of its
 # own, which the detector never reads -- so its line says "may", never "absent").
-# These two hosts mount the spec's servers by another channel, so for them the
+# These hosts mount the spec's servers by another channel, so for them the
 # spec's own server names are satisfied by construction and only a ref naming a
 # server the spec does NOT declare is unresolved. kiro-cli resolves ``--agent``
 # itself and loads the spec's servers from disk, which is why Crew hands it an
 # empty array. KAS receives the spec's servers as a projected agent definition in
 # ``_meta.kiro.customAgents`` (``acp/kas_agents.py``), with only the broker stubs
-# on the array. codex is NOT a member: the array Crew sends is the whole of what
-# it mounts, so judging its refs against that array is exactly right. Read by
-# membership rather than as "is kiro": a host added later that mounts a spec's
-# servers by its own channel joins here, and the detector says nothing wrong about
-# it on day one.
-# Both members are captured live with an EMPTY session/new mcpServers array and the
+# on the array. vibe's projection (``acp/client_mcp_array.py``) builds the
+# ``session/new`` array ITSELF out of the spec's servers, so the ref is satisfied
+# by the spec's own definition even though the channel is the wire. codex is NOT
+# a member: the array Crew sends is the whole of what it mounts, so judging its
+# refs against that array is exactly right. Read by membership rather than as
+# "is kiro": a host added later that mounts a spec's servers by its own channel
+# joins here, and the detector says nothing wrong about it on day one.
+# The members are captured live with an EMPTY session/new mcpServers array and the
 # spec's own server still reached: kiro-cli 2.35.1 ``--agent probe`` off disk,
 # ``test/fixtures/acp_frames/kiro/spec-servers-off-wire-live.jsonl``; KAS 0.66.70
 # via ``_meta.kiro.customAgents``, ``test/fixtures/acp_frames/kas/client-meta-settings-live.jsonl``
 # (same run: the projected probe server's tool ran off the empty array). In each
 # the model called ``@probe/probe_codeword`` and it returned ``tangerine-42``.
-ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+# vibe is captured accepting a non-empty ``session/new`` ``mcpServers`` array
+# natively, ``test/fixtures/acp_frames/vibe/routing-live.jsonl`` (mistral-vibe
+# 3.0.3 ``session/new`` -> ``SessionOptions.mcp_servers``).
+ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE = frozenset(
+    {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_VIBE}
+)
 
 # Backends on which an agent spec's ``"tools": []`` is honoured as a total ban --
 # no MCP server AND no harness-native tool (Bash, file edit, ...) is callable --

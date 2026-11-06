@@ -646,6 +646,7 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
             *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
             *(self._copilot_session_mcp_servers() if self._is_copilot else []),
             *(self._pi_session_mcp_servers() if self._is_pi else []),
+            *(self._vibe_session_mcp_servers() if self._is_vibe else []),
             *(await asyncio.to_thread(self._pooled_mcp_servers)),
         ],
     }
@@ -730,6 +731,7 @@ async def _new_session_following_substitution(self: AcpClient) -> dict:
             *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
             *(self._copilot_session_mcp_servers() if self._is_copilot else []),
             *(self._pi_session_mcp_servers() if self._is_pi else []),
+            *(self._vibe_session_mcp_servers() if self._is_vibe else []),
             *(await asyncio.to_thread(self._pooled_mcp_servers)),
         ]
         if self.backend in ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP:
@@ -964,6 +966,7 @@ async def _initialize_session(self: AcpClient) -> None:
                         *(self._deepseek_session_mcp_servers() if self._is_deepseek else []),
                         *(self._copilot_session_mcp_servers() if self._is_copilot else []),
                         *(self._pi_session_mcp_servers() if self._is_pi else []),
+                        *(self._vibe_session_mcp_servers() if self._is_vibe else []),
                         *(await asyncio.to_thread(self._pooled_mcp_servers)),
                     ],
                 }

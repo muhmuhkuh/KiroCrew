@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+import test_member_mount_deepseek as deepseek_mount
 
 from kiro_crew import mate_worker
 from kiro_crew.acp_backends import (
@@ -21,9 +22,13 @@ from kiro_crew.acp_backends import (
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
+    ACP_BACKEND_VIBE,
+    ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
 )
 from kiro_crew.mate_worker import MATE_WORKER_AGENT
+
+agents_dir = deepseek_mount.agents_dir
 
 BASE = {
     "name": MATE_WORKER_AGENT,
@@ -171,6 +176,41 @@ def test_codex_carries_the_worker_kit(pixel_worker):
     assert "jira" in names(session_key="dashboard:chat-9")
     # Without the session the projection is the bare base every worker shares.
     assert "jira" not in names()
+
+
+def test_vibe_carries_the_worker_kit_on_its_session_new_array(pixel_worker, agents_dir, tmp_path):
+    """vibe is in the kit set (``vibe/routing-live.jsonl``: ``session/new`` accepts an
+    ``mcpServers`` array natively), and with no mirror its array is composed by
+    ``_mirrorless_member_mounts`` as kind=EXTERNAL, so the crewmate's per-session
+    worker spec rides the same array -- the prompt rides the context block instead."""
+    from kiro_crew.acp.session_provider import AcpSessionProvider
+    from kiro_crew.providers.acp import AcpProvider
+
+    assert mate_worker.worker_kit_backend_refusal(ACP_BACKEND_VIBE) is None
+    session = SimpleNamespace(_runtime=SimpleNamespace(acp_backend=ACP_BACKEND_VIBE))
+    assert AcpSessionProvider.mate_worker_kit_supported.fget(session) is True
+    assert AcpSessionProvider.mate_worker_prompt_in_context.fget(session) is True
+    assert AcpSessionProvider.mate_worker_tool_limits_supported.fget(session) is False
+    assert ACP_BACKEND_VIBE in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+    assert ACP_BACKEND_VIBE not in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
+    client = SimpleNamespace(backend=ACP_BACKEND_VIBE)
+    assert AcpProvider.mate_worker_kit_supported.fget(SimpleNamespace(_client=client)) is True
+
+    vibe = deepseek_mount._client(tmp_path, "dashboard:chat-9", backend=ACP_BACKEND_VIBE)
+    vibe._agent = MATE_WORKER_AGENT
+    names = {e.get("name") for e in vibe._vibe_session_mcp_servers()}
+    # The worker session's per-session spec: the crewmate's own server and the
+    # worker base's own server both ride the array vibe consumes natively.
+    assert "jira" in names
+    assert "kirocrew-core" in names
+    # The consumed spec is recorded from the one parse that built the array.
+    assert vibe._session_agent_spec is not None
+
+    # Not a worker session: no kit, so no crewmate server on the array.
+    plain = deepseek_mount._client(tmp_path, "dashboard:chat-1", backend=ACP_BACKEND_VIBE)
+    plain._agent = MATE_WORKER_AGENT
+    plain_names = {e.get("name") for e in plain._vibe_session_mcp_servers()}
+    assert "jira" not in plain_names
 
 
 @pytest.mark.parametrize(

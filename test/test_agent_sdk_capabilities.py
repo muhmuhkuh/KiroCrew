@@ -683,8 +683,11 @@ def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
     """``ACP_BACKENDS_HONOR_ZERO_TOOL_BAN`` is recomputed from the rule's own inputs.
 
     Rule: routing is ``Routing.AGENT_SPEC``, or it is in ``tool_gate.ENFORCED_ROUTINGS``
-    with a mirror or ``ProjectionKind.BROKER_ONLY`` mounts (pi), and the backend is
-    not in ``ACP_BACKENDS_ACP_RUNTIME`` (the refusal lives only on ``AcpClient``).
+    with a mirror or a spec-reading projection (``ProjectionKind.BROKER_ONLY`` (pi) or
+    ``ProjectionKind.EXTERNAL`` (vibe, whose mirror-less path reads ``"tools": []``
+    from the same ``session_mcp_projection`` parse that builds its array)), and the
+    backend is not in ``ACP_BACKENDS_ACP_RUNTIME`` (the refusal lives only on
+    ``AcpClient``).
     """
     from kiro_crew.agent_sdk.tool_gate import ENFORCED_ROUTINGS
     from kiro_crew.providers.mirrors.registry import MIRRORS, ProjectionKind, projection_for
@@ -707,7 +710,9 @@ def test_honor_zero_tool_ban_membership_matches_the_rule() -> None:
             or (
                 routing in ENFORCED_ROUTINGS
                 and (
-                    backend in MIRRORS or projection_for(backend).kind is ProjectionKind.BROKER_ONLY
+                    backend in MIRRORS
+                    or projection_for(backend).kind
+                    in (ProjectionKind.BROKER_ONLY, ProjectionKind.EXTERNAL)
                 )
                 and backend not in sdk_backends.ACP_BACKENDS_ACP_RUNTIME
                 and backend not in reads_unasked

@@ -128,7 +128,13 @@ exact spec consumed by their MCP projection after session creation or load
 mirror: the consumed spec is the parse its member mounts and zero-tool answer
 come from (`AcpClient._mirrorless_member_mounts`), and since its projection is
 `BROKER_ONLY` a declared server that is not pooled never reaches pi and leaves
-the session unverified rather than applied. On a member session pi's pooled stubs
+the session unverified rather than applied. vibe's projection is `EXTERNAL`
+(`kiro_crew.acp.client_mcp_array`): vibe-acp consumes the `session/new`
+`mcpServers` array natively (captured live, `vibe/routing-live.jsonl`), so the
+array Crew composes in `_mirrorless_member_mounts` carries the translated spec's
+own servers — and, on a crewmate's worker session, the per-session worker spec
+read by session key — and the consumed spec is recorded from that same parse, the
+pi pattern. On a member session pi's pooled stubs
 pass the spec's `tools` allowlist, as a mirror's do. strands is outside every
 member-facing set (`ACP_BACKENDS_MEMBER_CAPABILITIES`, `ACP_BACKENDS_MEMBER_DISPATCH`,
 `ACP_BACKENDS_MEMBER_PANEL`, `ACP_BACKENDS_MATE_WORKER_KIT`): a member or worker
@@ -150,9 +156,11 @@ one whose tag equals an `excludedTools` entry. A member DM whose
 it honours them too. A crewmate's WORKER runs a spec built per session
 from the worker base plus that crewmate's file (`mate_worker.worker_session_spec`,
 the one harness-neutral seam), carried the way a member chat's saved spec is.
-`ACP_BACKENDS_MATE_WORKER_KIT` (KAS, claude, codex) names the hosts that
+`ACP_BACKENDS_MATE_WORKER_KIT` (KAS, claude, codex, vibe) names the hosts that
 carry it: KAS's projection reads the seam; the mirrored hosts read it through the
-session MCP projection, keyed by the session (`acp.session_mcp._crewmate_worker_spec`).
+session MCP projection, keyed by the session (`acp.session_mcp._crewmate_worker_spec`);
+vibe has no mirror, but its `session/new` array is composed from that same
+projection (kind `EXTERNAL`), so the worker spec's servers ride the array.
 kiro-cli is a member backend but not in the set: it reads `--agent` off disk from
 `~/.kiro/agents/`, where the worker spec is not, and has no per-session channel. A
 worker takes its crewmate's backend (`members.select_provider_backend` routes a
@@ -174,13 +182,18 @@ is not, and neither is codex, whose worker capture shows no single-tool limit
 held. codex is in the kit set on its own live capture
 (`codex/worker-kit-live.jsonl`): its mirror hands the session key to the
 projection, so the worker's array carried the crewmate's server and the worker
-called it. deepseek builds its array through the same projection but is outside
+called it. vibe is in the kit set on the same capture that shows its array
+channel (`vibe/routing-live.jsonl`): with no mirror, `_mirrorless_member_mounts`
+composes its array from the worker spec keyed by the session, so the crewmate's
+server rides the `session/new` array. deepseek builds its array through the same
+projection but is outside
 `ACP_BACKENDS_MATE_WORKER_KIT` until a live capture of a worker session lands, so
 a worker there is refused. Both providers answer `mate_worker_kit_supported` and
 `mate_worker_tool_limits_supported` from the two sets. The worker's prompt (its
 principles, then its crewmate's) rides the `[AGENT SYSTEM PROMPT]` block only on
-`ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT` (claude, codex), the kit
-hosts whose mirror rules `Concern.PROMPT` `WITHHELD`; KAS's wire spec carries it.
+`ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT` (claude, codex, vibe), the kit
+hosts whose wire carries no prompt — a mirror rules `Concern.PROMPT` `WITHHELD`,
+and vibe's array is servers only; KAS's wire spec carries it.
 Which channel a worker session uses is its live provider's answer
 (`mate_worker_prompt_in_context`), recorded at allocation, so a later change to
 `agent.member_acp_backend` does not move a running worker's prompt. The

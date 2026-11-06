@@ -39,6 +39,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
     ACP_BACKEND_PI,
+    ACP_BACKEND_VIBE,
     ACP_BACKENDS_ACP_RUNTIME,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_HOST_AUTH_CALLBACK,
@@ -285,6 +286,8 @@ def test_member_capabilities_are_opt_in() -> None:
             ACP_BACKEND_CLAUDE,
             ACP_BACKEND_CODEX,
             ACP_BACKEND_DEEPSEEK,
+            ACP_BACKEND_PI,
+            ACP_BACKEND_VIBE,
         }
     )
     assert ACP_BACKENDS_MEMBER_CAPABILITIES is not ACP_BACKENDS_SESSION_SHARING
@@ -312,7 +315,7 @@ def test_the_mate_worker_takes_the_member_rule() -> None:
         source = inspect.getsource(provider.mate_worker_kit_supported.fget)
         assert "in ACP_BACKENDS_MATE_WORKER_KIT" in source
     assert ACP_BACKENDS_MATE_WORKER_KIT == frozenset(
-        {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX}
+        {ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE, ACP_BACKEND_CODEX, ACP_BACKEND_VIBE}
     )
     assert ACP_BACKENDS_MATE_WORKER_KIT <= ACP_BACKENDS_MEMBER_CAPABILITIES
     assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MATE_WORKER_KIT
@@ -324,11 +327,17 @@ def test_the_mate_worker_takes_the_member_rule() -> None:
     assert ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT <= ACP_BACKENDS_MATE_WORKER_KIT
     for backend in ACP_BACKENDS_MATE_WORKER_KIT:
         mirror = mirror_for(backend)
-        withheld = (
-            mirror is not None
-            and mirror.rulings()[Concern.PROMPT].disposition is Disposition.WITHHELD
-        )
-        assert withheld is (backend in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT), backend
+        if mirror is not None:
+            wire_carries_prompt = (
+                mirror.rulings()[Concern.PROMPT].disposition is not Disposition.WITHHELD
+            )
+        else:
+            # No mirror: the wire channel decides. KAS's customAgents spec carries
+            # the prompt; vibe's session/new array carries servers, not text.
+            wire_carries_prompt = backend == ACP_BACKEND_KAS
+        assert (not wire_carries_prompt) is (
+            backend in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+        ), backend
     allocation = inspect.getsource(get_or_create)
     assert "if is_crewmate_worker_session(key):" in allocation
     assert "provider.mate_worker_kit_supported is not True" in allocation
@@ -994,7 +1003,7 @@ def test_codex_resolves_its_own_adapter_and_declares_its_own_handshake() -> None
 #: harness. Declared rather than discovered so a DELETED splice fails the test below
 #: -- codex is absent because this PR moved its seam onto the harness, and kiro-cli
 #: has none (``--agent`` carries its servers).
-_MCP_SEAM_HOOKS = ["claude", "deepseek", "goose", "opencode", "pi"]
+_MCP_SEAM_HOOKS = ["claude", "copilot", "deepseek", "goose", "opencode", "pi", "vibe"]
 
 
 def test_each_mcp_seam_is_spliced_only_for_its_own_harness() -> None:

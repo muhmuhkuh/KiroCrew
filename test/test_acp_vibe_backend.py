@@ -146,7 +146,9 @@ def test_vibe_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
 
     Each of these would make a claim the wire does not support: a shared process,
     a steer method, an internal sandbox that would displace the credential mask,
-    session sharing, or an effort channel.
+    session sharing, or an effort channel. (``ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE``
+    is NOT here: vibe's projection builds the array out of the spec's own servers,
+    so its refs resolve from the spec -- see the positive test below.)
     """
     assert VIBE not in ACP_BACKENDS_ACP_RUNTIME
     assert VIBE not in ACP_BACKENDS_STEER
@@ -161,11 +163,36 @@ def test_vibe_is_not_in_the_capability_sets_it_has_no_evidence_for() -> None:
     assert VIBE not in ACP_BACKENDS_KIRO_SLASH_COMMANDS
     assert VIBE not in ACP_BACKENDS_MARKDOWN_AGENT_SPECS
     assert VIBE not in ACP_BACKENDS_USER_LEVEL_AGENT_SPECS_ONLY
-    assert VIBE not in ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
-    assert VIBE not in ACP_BACKENDS_MEMBER_CAPABILITIES
-    assert VIBE not in ACP_BACKENDS_MEMBER_DISPATCH
-    assert VIBE not in ACP_BACKENDS_MEMBER_PANEL
     assert VIBE not in ACP_BACKENDS_META_IDENTITY
+
+
+def test_vibe_is_in_the_member_capability_sets_its_array_supports() -> None:
+    """Vibe's ``session/new`` ``mcpServers`` array is a real channel (captured live on
+    mistral-vibe 3.0.3, ``test/fixtures/acp_frames/vibe/routing-live.jsonl``), and its
+    routing is enforced, so Crew composes that array for it
+    (``AcpClient._mirrorless_member_mounts``, projection kind ``EXTERNAL``): the saved
+    member spec, the member dispatch/panel mounts and a crewmate worker's per-session
+    spec all ride it. The worker's prompt rides the context block instead, because the
+    array carries servers, not text. Single-tool limits still have no channel, so vibe
+    stays out of both tool-limits sets and a narrowed worker is refused there.
+    """
+    from kiro_crew.agent_sdk.backends_members import (
+        ACP_BACKENDS_MATE_WORKER_KIT,
+        ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
+        ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
+        ACP_BACKENDS_MEMBER_TOOL_LIMITS,
+    )
+
+    assert VIBE in ACP_BACKENDS_MEMBER_CAPABILITIES
+    assert VIBE in ACP_BACKENDS_MEMBER_DISPATCH
+    assert VIBE in ACP_BACKENDS_MEMBER_PANEL
+    assert VIBE in ACP_BACKENDS_MATE_WORKER_KIT
+    assert VIBE in ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT
+    assert VIBE not in ACP_BACKENDS_MEMBER_TOOL_LIMITS
+    assert VIBE not in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
+    # Crew builds vibe's array out of the spec's own servers, so a ``@server``
+    # ref resolves from the spec itself, not from the array.
+    assert VIBE in ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE
 
 
 # ── The launch record ──

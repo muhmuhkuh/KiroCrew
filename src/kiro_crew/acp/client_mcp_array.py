@@ -388,10 +388,27 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
     (``registry.PROJECTIONS``), the record that states it per backend, rather
     than of a membership set: the caller has already resolved that record
     through ``mirror_for``, so an undeclared backend raised before this point.
+
+    A backend whose declared projection is ``ProjectionKind.EXTERNAL`` (vibe) gets
+    the translated spec's own servers too, not only Crew's own mounts: the harness
+    consumes the ``session/new`` ``mcpServers`` array natively, so the array Crew
+    composes HERE is the only channel the agent spec's servers — and, for a
+    crewmate's worker session, the per-session worker spec ``session_mcp_projection``
+    reads by ``session_key`` — have onto the session. The per-tool deny set still has
+    no channel on the array, so a narrowed server is withheld WHOLE (recorded as
+    UNHONOURED, as below), never mounted un-narrowed. The consumed spec is recorded
+    from this same parse (``_session_agent_spec``), which is what
+    ``confirm_member_projection`` digests against the saved intent — the pi pattern.
     """
-    records_zero_tools = projection_for(self.backend).kind is ProjectionKind.BROKER_ONLY
+    declared = projection_for(self.backend)
+    records_zero_tools = declared.kind in (
+        ProjectionKind.BROKER_ONLY,
+        ProjectionKind.EXTERNAL,
+    )
+    translates_spec = declared.kind is ProjectionKind.EXTERNAL
     if (
         not records_zero_tools
+        and not translates_spec
         and self.backend not in ACP_BACKENDS_MEMBER_DISPATCH
         and self.backend not in ACP_BACKENDS_MEMBER_PANEL
     ):
@@ -420,16 +437,30 @@ def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list
         return []
     if records_zero_tools:
         self._spec_zero_tools = projection.zero_tools
-    if (
-        self.backend not in ACP_BACKENDS_MEMBER_DISPATCH
-        and self.backend not in ACP_BACKENDS_MEMBER_PANEL
-    ):
-        return []
     narrowed = frozenset(server for server, _tool in projection.disabled_tools)
     self._session_mcp_unhonoured = narrowed
     disabled = projection.disabled_servers
+    servers: list[dict[str, Any]] = []
+    if translates_spec:
+        # The consumed spec, from the one parse that built the array — never a
+        # re-read: an entry that gains ``disabledTools`` between two reads must not
+        # mount un-narrowed on one generation and ban on the other.
+        self._session_agent_spec = projection.agent_spec
+        servers = [
+            element
+            for element in projection.servers
+            if isinstance(element, dict)
+            and element.get("name") not in narrowed
+            and element.get("name") not in disabled
+        ]
+    if (
+        not translates_spec
+        and self.backend not in ACP_BACKENDS_MEMBER_DISPATCH
+        and self.backend not in ACP_BACKENDS_MEMBER_PANEL
+    ):
+        return []
     return self._append_member_panel_server(
-        self._append_member_dispatch_server([], narrowed, disabled),
+        self._append_member_dispatch_server(servers, narrowed, disabled),
         narrowed,
         disabled,
     )
@@ -926,6 +957,21 @@ def _pi_session_mcp_servers(self: AcpClient) -> list:
     servers is the handoff file the spawn wrote from the same composition
     (:func:`kiro_crew.acp.harness.pi.pi_mcp_handoff_payload`). The wire copy is
     what the session report reads its roster from. In-memory only.
+    """
+    return self._session_mcp_servers()
+
+
+def _vibe_session_mcp_servers(self: AcpClient) -> list:
+    """MCP server array passed to a vibe ``session/new`` / ``session/load``.
+
+    The whole translated spec, not only the member mounts: vibe-acp consumes the
+    wire array itself (``SessionOptions.mcp_servers``), so the array Crew composes
+    in :meth:`_mirrorless_member_mounts` -- agent spec's own servers, and for a
+    crewmate's worker session the per-session worker spec read by session key -- is
+    the only channel those servers have onto a vibe session. The pooled broker
+    stubs a spec entry references are already substituted into that array by the
+    projection, and the shared append drops any stub whose name the cache already
+    carries, so nothing mounts twice. In-memory only.
     """
     return self._session_mcp_servers()
 

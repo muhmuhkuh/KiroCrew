@@ -447,8 +447,10 @@ row on the session's MCP report (`unresolved_refs`) at the one point that array 
 composed, when a ref names nothing in Crew's projection for the session — the §5
 failure this bucket keeps describing, made visible instead of re-diagnosed. Satisfaction is per
 backend, by membership in `ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE`: kiro-cli reads the
-spec itself via `--agent` and KAS receives it as a projected agent definition in
-`_meta`, so their refs resolve against the spec's own `mcpServers`, while a harness
+spec itself via `--agent`, KAS receives it as a projected agent definition in
+`_meta`, and vibe's `session/new` array is composed by Crew out of the spec's own
+servers (`acp/client_mcp_array.py`, projection kind `EXTERNAL`), so their refs
+resolve against the spec's own `mcpServers`, while a harness
 that Crew reaches only through the array it is sent is satisfied, as far as Crew
 can see, only by that array (a broker stub counts on either, since it arrives under
 the name it wraps). What the line CLAIMS about an unresolved ref is the same on
