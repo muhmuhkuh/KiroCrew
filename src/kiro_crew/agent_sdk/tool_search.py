@@ -31,6 +31,8 @@ they are forwarded verbatim either way so one setting means one thing.
 from __future__ import annotations
 
 import copy
+import fnmatch
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 

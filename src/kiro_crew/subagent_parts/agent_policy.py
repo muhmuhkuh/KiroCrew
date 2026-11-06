@@ -7,6 +7,7 @@ an agent, the governance vetting of a spawn, the parent spec's
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from typing import TYPE_CHECKING
 
@@ -28,7 +29,6 @@ if TYPE_CHECKING:
         _kiro_agents_dir,
         _read_agent_spec,
         cached_project_agent_names,
-        fnmatch,
         is_internal_agent_spec,
         is_markdown_spec,
         is_registered_agent_name,
