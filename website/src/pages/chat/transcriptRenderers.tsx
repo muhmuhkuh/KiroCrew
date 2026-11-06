@@ -102,9 +102,10 @@ export interface TranscriptRendererOptions {
   /** The transcript is scrolling / streaming hard; tool rows defer their
    *  heavier work. */
   transcriptHot?: boolean
-  /** What to draw for a `file` row whose content is not JSON. Default: nothing
-   *  (a pane); the single-chat surface has always fallen through to its
-   *  conversational bubble for one and passes that. */
+  /** What to draw for a `file` row whose content is not a file record (see
+   *  lib/fileRecord.ts: not JSON, or no non-empty `filename`, or malformed
+   *  metadata). Default: nothing (a pane); the single-chat surface falls
+   *  through to its conversational bubble for one and passes that. */
   renderUnparsedFile?: (m: ChatMessage, ctx: MessageRenderContext) => React.ReactNode
   /** Session routing for EVERY row this factory draws: open a session chip, and
    *  the title map + active key the chip resolver needs. The completion cards
@@ -560,7 +561,9 @@ export function createTranscriptRenderers(
       render: (m, ctx) => (hasReasoningContent(m) ? ctx.row(<ThinkingBlock content={m.content} disclosureKey={ctx.key} />) : null),
     },
     {
-      // Replaces the default's null with the player / download card.
+      // Same card and the same record check as the default (lib/fileRecord.ts);
+      // only the fallback differs: a row that is not a file record goes to
+      // renderUnparsedFile instead of drawing nothing.
       id: 'file',
       roles: ['file'],
       render: (m, ctx) => {

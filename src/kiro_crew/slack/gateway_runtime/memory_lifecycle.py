@@ -4,8 +4,8 @@ The one gateway-lifetime preparation worker behind ``MemoryStartup`` and its fen
 the paced member-store repair loop, in-process embeddings with the model download,
 and the one-shot legacy markdown-to-vector migration with its re-embed sweep.
 
-The service construction itself (``_init_services``) stays in the facade: the
-memory-store seam and hot-reload audits read it there.
+The service construction itself (``_init_services``) lives in ``service_boot.py``,
+where the memory-store seam and hot-reload audits read it.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
 see :mod:`kiro_crew.slack.gateway_runtime`.
@@ -113,13 +113,26 @@ def _initialize_memory_worker(self: GatewayOrchestrator) -> bool:
                 except Exception:  # noqa: BLE001 -- a hint only
                     logger.debug("Memory page prefetch skipped", exc_info=True)
                 if "default" not in startup.store_errors:
+                    opening_vectors = False
                     try:
                         memory.init()
+                        opening_vectors = True
                         self.vector_memory.init()
+                        opening_vectors = False
                         indexed = memory.rebuild_index()
                         logger.info("Global memory ready: FTS indexed %d files", indexed)
                     except Exception as exc:
-                        startup.fail_store("default", exc)
+                        from kiro_crew.memory_startup import damaged_database_remedy
+
+                        # The remedy names memory.db, so only its own open earns it.
+                        remedy = (
+                            damaged_database_remedy(
+                                getattr(self.vector_memory, "_db_path", None), exc
+                            )
+                            if opening_vectors
+                            else ""
+                        )
+                        startup.fail_store("default", exc, remedy=remedy)
                         self.vector_memory.close()
                 if restored:
                     logger.info("Activated memory restores for %s", ", ".join(restored))
@@ -207,7 +220,12 @@ def _schedule_memory_preparation(self: GatewayOrchestrator) -> "asyncio.Task[Non
 
 async def _wait_for_memory_preparation(self: GatewayOrchestrator) -> bool:
     """Keep consumers dormant during recovery while observing owner shutdown."""
-    from kiro_crew.memory_startup import MemoryStartupUnavailable, require_memory_prepared
+    from kiro_crew.memory_startup import (
+        MEMORY_PREPARATION_DEADLINE_SECONDS,
+        MemoryStartupUnavailable,
+        memory_startup_preparing,
+        require_memory_prepared,
+    )
 
     task = self._schedule_memory_preparation()
     if task is None:
@@ -219,10 +237,41 @@ async def _wait_for_memory_preparation(self: GatewayOrchestrator) -> bool:
         )
     stopping = asyncio.create_task(shutdown_event.wait())
     try:
-        done, _ = await asyncio.wait({task, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            {task, stopping},
+            timeout=MEMORY_PREPARATION_DEADLINE_SECONDS,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         if stopping in done or shutdown_event.is_set():
             startup.stop()
             return False
+        if task not in done:
+            # The preparation pass crossed its last-resort backstop with no
+            # result. The ceiling sits well above the realistic worst case (see
+            # MEMORY_PREPARATION_DEADLINE_SECONDS), so crossing it means a
+            # wedged file lock or a stuck store open that will not return on its
+            # own, not merely a slow pass. The worker thread cannot be
+            # cancelled, so flip the fence to a terminal failure instead of
+            # leaving it preparing forever — turns then get an actionable error
+            # naming a restart rather than endlessly answering that recovery is
+            # "still running". Keep the owner recovery shell reachable until the
+            # owner requests shutdown.
+            if memory_startup_preparing():
+                startup.fail(
+                    MemoryStartupUnavailable(
+                        "Memory preparation did not finish within "
+                        f"{int(MEMORY_PREPARATION_DEADLINE_SECONDS)}s and appears stuck "
+                        "(a restore or store open is not returning)."
+                    )
+                )
+                logger.error(
+                    "Memory preparation exceeded its %ss deadline; marking it failed so "
+                    "agent turns stop blocking. Dashboard recovery remains available.",
+                    int(MEMORY_PREPARATION_DEADLINE_SECONDS),
+                )
+                await stopping
+                startup.stop()
+                return False
         await task
         if startup.stopped:
             return False
@@ -489,6 +538,15 @@ async def _auto_migrate_memory(self: GatewayOrchestrator) -> None:
             reconcile_store_embedding_space(store)
             return store.backfill_missing_embeddings()
 
+        # memory_background_executor(), NOT maintenance_executor(): pacing
+        # turns this from a ~72-minute worst case into a multi-hour one, and
+        # mc-maint is a 4-worker pool documented as "reserved for the FAST
+        # periodic sweeps + overlay rewrites" — parking one of its four slots
+        # (mostly asleep) for a working day contradicts that reservation. Nor
+        # mc-embed: turn context assembly runs there, and a sweep that
+        # holds one of its workers for hours is one fewer for every turn. The
+        # small mc-membg pool is shared only with consolidation, and the same
+        # atexit shutdown hook covers it.
         from kiro_crew.executors import memory_background_executor
 
         await loop.run_in_executor(memory_background_executor(), _wait_then_backfill)

@@ -1167,6 +1167,10 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     env = {**os.environ}
     # Before any configured layer: only the INHERITED value can be foreign.
     drop_foreign_inherited_port(env)
+    # Likewise the scratch exports of the agent shell that started this gateway:
+    # they name a tree another process owns and the sweep reclaims, and a spawn
+    # whose own allocation failed above would otherwise hand them to the child
+    # as its temp (``agent_scratch.drop_inherited_scratch_env``).
     dropped_scratch = tools.agent_scratch.drop_inherited_scratch_env(env)
     if dropped_scratch:
         tools.logger.debug(

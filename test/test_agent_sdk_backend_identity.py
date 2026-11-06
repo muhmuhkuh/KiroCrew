@@ -187,7 +187,7 @@ def test_acp_client_keeps_its_own_comparison() -> None:
     backend-install registry its ``__init__`` builds -- into every client import.
     If the layering changes, delete this test deliberately.
     """
-    body = (SRC / "acp" / "client.py").read_text(encoding="utf-8")
+    body = "".join(p.read_text(encoding="utf-8") for p in sorted((SRC / "acp").glob("client*.py")))
     assert "is_claude_backend_name" not in body, (
         "acp/client.py now imports the agent_sdk helper; that inverts the "
         "acp -> agent_sdk layering. If this is intended, remove this test."

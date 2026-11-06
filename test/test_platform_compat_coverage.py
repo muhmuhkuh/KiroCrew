@@ -65,7 +65,12 @@ from kiro_crew import platform_compat as pc
 # This costs ZERO coverage: ci.yml measures coverage on the ubuntu 3.12 shards
 # only (the Windows lane runs --no-cov), so every line here is still counted on
 # the lane that reports the number.
-pytestmark = _POSIX_ONLY
+pytestmark = [
+    _POSIX_ONLY,
+    # This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+    # so the shared macOS handle caches are put back after each one (see conftest.py).
+    pytest.mark.usefixtures("fresh_darwin_libc_handles"),
+]
 
 # ---------------------------------------------------------------------------
 # Windows / macOS fakes
@@ -245,6 +250,7 @@ class TestEnsureUtf8Console:
         monkeypatch.setattr(pc.sys, "stdout", None)
         monkeypatch.setattr(pc.sys, "stderr", None)
         pc.ensure_utf8_console()
+        assert pc.sys.stdout is None and pc.sys.stderr is None
 
 
 # ---------------------------------------------------------------------------
@@ -386,14 +392,17 @@ class TestWindowsLocking:
     def test_release_lock_swallows_an_unlock_error(self, monkeypatch, tmp_path):
         class _Failing(_FakeMsvcrt):
             def locking(self, _fd: int, mode: int, _nbytes: int) -> None:
+                self.calls.append(mode)
                 raise OSError(13, "not locked")
 
+        failing = _Failing([])
         _fake_windows(monkeypatch)
-        monkeypatch.setattr(pc, "msvcrt", _Failing([]), raising=False)
+        monkeypatch.setattr(pc, "msvcrt", failing, raising=False)
         lock = tmp_path / "i.lock"
         lock.write_text("")
         with open(lock, "r+") as handle:
             pc.release_lock(handle.fileno())  # must not raise
+        assert failing.calls == [_FakeMsvcrt.LK_UNLCK]
 
     def test_try_acquire_lock_reports_both_outcomes(self, monkeypatch, tmp_path):
         fake = _FakeMsvcrt([True, False])
@@ -428,7 +437,11 @@ def _fake_libproc(
     ret: int,
     library: str | None = "libproc.dylib",
 ) -> None:
-    """Pretend to be macOS with a ``libproc`` that answers ``proc_pidinfo``."""
+    """Pretend to be macOS with a ``libproc`` that answers ``proc_pidinfo``.
+
+    The handle cache must start unbuilt, which the module's
+    ``fresh_darwin_libc_handles`` request gives every test here.
+    """
 
     monkeypatch.setattr(pc.sys, "platform", "darwin")
     monkeypatch.setattr(pc.ctypes.util, "find_library", lambda _n: library)
@@ -439,8 +452,6 @@ def _fake_libproc(
         return ret
 
     lib = types.SimpleNamespace(proc_pidinfo=_Fn(_proc_pidinfo))
-    monkeypatch.setattr(pc, "_darwin_libproc", None)
-    monkeypatch.setattr(pc, "_darwin_libproc_loaded", False)
     monkeypatch.setattr(pc.ctypes, "CDLL", lambda _p: lib)
 
 

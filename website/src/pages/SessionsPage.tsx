@@ -251,7 +251,6 @@ export default function SessionsPage() {
           <EmptyState
             icon={<MessagesSquare size={40} />}
             title={i18nT('pages.sessionsPage.empty_title')}
-            subtitle={i18nT('pages.sessionsPage.empty_subtitle')}
             action={
               <Btn primary onClick={onNew} disabled={creating} data-testid="sessions-empty-new">
                 <Plus size={15} strokeWidth={2.5} />

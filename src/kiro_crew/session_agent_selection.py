@@ -153,6 +153,7 @@ def resolve_session_agent_bindings(
     # No name and no record is the default TEMPLATE, not the default crewmate
     # alias: the resolver answers an empty name with that session.
     selected = agent_name or ""
+    # The member's CURRENT bound ``kiro_agent`` from config, when its record names one.
     bound_kiro_agent = ""
     if execution is not None:
         # Member display labels may change; the durable ID and store do not.
@@ -188,9 +189,8 @@ def resolve_session_agent_bindings(
         raise UnknownMemoryStore("Conversation agent selection is unavailable") from exc
     if execution is not None:
         bindings.memory_store_name = execution.store.store_id
-        # Both recorded kinds can need a skill-view repair. Only a MEMBER's
-        # template id came from a crewmate row that may hold a package filename;
-        # a template id is already the provider selection and must stay exact.
+        # Both recorded kinds can need a skill-view repair. A template id is
+        # already the provider selection and must stay exact.
         kiro_agent = _source_of_view(execution.template_id)
         if execution.selection_kind == "member":
             kiro_agent = _member_record_agent(bound_kiro_agent, kiro_agent)

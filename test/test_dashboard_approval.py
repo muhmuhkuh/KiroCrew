@@ -684,7 +684,14 @@ class TestPreToolUseHookBlockRecovery:
         Structural: denying without the hook's reason leaves the model stalled while every
         behavioural assertion passes, so all paths must use the one helper.
         """
-        source = Path(chat_runner.__file__).read_text(encoding="utf-8")
+        source = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         deny_branches = source.count("if _pre_tool_hooks_should_block(pre_hook_results):")
         helper_calls = source.count("await _reject_hook_blocked(")
 
@@ -996,7 +1003,14 @@ class TestDenyRowTitleRedaction:
         Structural: a new path that inlines ``reject`` + row + audit would publish the raw
         title while every behavioral case passes, so each deny shape renders in one helper.
         """
-        source = Path(chat_runner.__file__).read_text(encoding="utf-8")
+        source = "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(chat_runner.__file__).with_name("chat_turn").glob("*.py")),
+                Path(chat_runner.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
         assert source.count("🚫 {event.title}") == 0, (
             "a transcript row interpolates the raw model-authored title -- "
             "route the deny through _reject_invalid_tool/_reject_hook_error"

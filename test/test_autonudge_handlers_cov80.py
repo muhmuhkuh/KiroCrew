@@ -1,6 +1,6 @@
 """Coverage tests for the auto-nudge HTTP mapping (``dashboard/handlers/autonudge.py``).
 
-``test_autonudge.py`` drives ``AutoNudgeService`` itself and ``test_autonudge_stop_auth.py``
+``test_autonudge*.py`` drives ``AutoNudgeService`` itself and ``test_autonudge_stop_auth.py``
 drives the transport-agnostic authorizer. What neither touches is the thin HTTP layer
 between them: the read routes (list / get), the "service is absent" 503+``enabled: false``
 shapes, the malformed-body 400s, and the DELETE route's audit record — which has to name
@@ -1514,9 +1514,13 @@ async def test_start_carries_the_gate_opt_out_to_the_authorizer(
     authorize = AsyncMock(return_value=(_loop("lp-new"), None, 200))
     monkeypatch.setattr(h, "authorize_and_add_nudge", authorize)
 
-    await h.api_autonudge_start(
+    response = await h.api_autonudge_start(
         _mk("POST", "/api/autonudge", body={"slot_key": "s", "message": "m", "gate": False})
     )
+    assert response.status == 200
+    body = _body(response)
+    assert body["ok"] is True
+    assert body["loop"]["id"] == "lp-new"
     assert authorize.await_args.kwargs["gate"] is False
 
     authorize.reset_mock()

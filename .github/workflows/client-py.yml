@@ -53,6 +53,7 @@ jobs:
     runs-on: ${{ github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         # The package's floor and the main package's current floor.

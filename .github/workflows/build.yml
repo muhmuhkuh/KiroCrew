@@ -436,6 +436,7 @@ jobs:
     # Its healthy build already takes ~35 min, so it gets 60 and Linux keeps 45.
     timeout-minutes: ${{ matrix.os == 'macos-15' && 60 || 45 }}
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         # Resolved by the desktop-matrix job: on a PR or merge group both Linux

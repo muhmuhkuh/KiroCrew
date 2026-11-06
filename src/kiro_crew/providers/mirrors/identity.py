@@ -102,6 +102,8 @@ def control_plane_identity_env(
         env["KIROCREW_SESSION_KEY"] = session_key
     if channel_id:
         env["KIROCREW_CHANNEL_ID"] = channel_id
+        # Beside the channel, its Slack workspace (slack/team_ids.py); absent
+        # when unknown or when the channel is not a Slack conversation.
         team_id = slack_team_id_for(channel_id)
         if team_id:
             env[SLACK_TEAM_ID_ENV] = team_id

@@ -225,6 +225,11 @@ def _note_eager(
                 entry_type,
                 traceback.format_exc().rstrip(),
             )
+    # The board above this unit hears about the same commit here, for the same reason
+    # the eager wake does: the entry is on disk and nothing has read it yet. A charge or
+    # a sub-board record is copied into the parent board's own log, which is the only
+    # log that board's folds read (``work_relay``). Its own membership test returns at
+    # once for every other type.
     from kiro_crew.crew_log import work_relay
 
     work_relay.relay(entry, entry_type, session_id, data)

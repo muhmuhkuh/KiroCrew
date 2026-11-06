@@ -153,6 +153,7 @@ export function FeaturePreviewsSection() {
   const remoteCrewChat = useRemoteCrewChat()
   const layoutHarness = usePreviewFlag(PREVIEW_LAYOUT_HARNESS)
   const folderConductor = usePreviewFlag(PREVIEW_FOLDER_CONDUCTOR)
+  const crewmateHarness = usePreviewFlag(PREVIEW_CREWMATE_HARNESS)
   const sessionEnvironments = usePreviewFlag(PREVIEW_SESSION_ENVIRONMENTS)
   const crewMode = usePreviewFlag(PREVIEW_CREW_MODE)
   const explore = usePreviewFlag(PREVIEW_EXPLORE)

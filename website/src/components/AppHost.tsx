@@ -15,7 +15,9 @@ import React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ArrowLeft, RefreshCw, PowerOff, AlertTriangle, Package, Bot } from 'lucide-react'
 import { AppApiProvider, type AppUpdate } from '../app-sdk'
-import { ContentSkeleton, Btn, PageHeader } from './ui'
+import { Btn, PageHeader } from './ui'
+import AppLoadingFallback from './AppLoadingFallback'
+import { importAppBundle } from './appBundleImport'
 import ErrorNotice from './ErrorNotice'
 import { errMessage } from '../utils/thunkError'
 
@@ -50,6 +52,10 @@ export interface AppHostProps {
       ui?: {
         entry?: string
         pages?: { route: string; label: string; icon?: string }[]
+        /** Placeholder shape while the bundle loads, e.g. `{ layout: 'rail' }`.
+         *  Typed `unknown` on purpose: it is read straight from `app.json` and
+         *  `AppLoadingFallback` validates it against a closed set. */
+        loading?: unknown
       }
       permissions?: {
         api?: string[]
@@ -75,6 +81,9 @@ export interface AppHostProps {
    *  `SessionControlHost` passes it. The routed `/apps/<name>` page uses the
    *  core API client's `dashboard:ui` page identity rather than a chat key. */
   sessionKey?: string
+  /** The name the route asked for, shown when `app` is absent. The not-found
+   *  title is "<name> isn't installed", so it needs the requested name. */
+  requestedName?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -152,21 +161,6 @@ function AppCrashFallback({
 }
 
 // ---------------------------------------------------------------------------
-// Loading skeleton
-// ---------------------------------------------------------------------------
-
-function AppLoadingSkeleton({ appName }: { appName: string }) {
-  return (
-    <div className="px-6 pt-6 pb-8">
-      <div className="skeleton h-7 w-48 rounded mb-2" />
-      <div className="skeleton h-4 w-72 rounded mb-6" />
-      <ContentSkeleton rows={6} />
-      <p className="text-[12px] text-muted mt-4">{i18nT('components.appHost.loading')} {appName}…</p>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Not found / not enabled
 // ---------------------------------------------------------------------------
 
@@ -174,7 +168,7 @@ function AppNotFound({ name }: { name: string }) {
   const navigate = useNavigate()
   return (
     <>
-      <PageHeader title={i18nT('components.appHost.app_not_found')} subtitle={i18nT('components.appHost.not_installed', { name })} />
+      <PageHeader title={i18nT('components.appHost.not_installed', { name })} />
       <div className="flex-1 flex items-center justify-center p-8">
         <div className="text-center">
           <div className="text-[48px] mb-4 opacity-20"><Package size={48} /></div>
@@ -190,10 +184,7 @@ function AppDisabled({ app }: { app: AppHostProps['app'] }) {
   const navigate = useNavigate()
   return (
     <>
-      <PageHeader
-        title={appDisplayName(app)}
-        subtitle={i18nT('components.appHost.this_app_is_disabled')}
-      />
+      <PageHeader title={appDisplayName(app)} />
       <div className="flex-1 flex items-center justify-center p-8">
         <div className="text-center max-w-md">
           <PowerOff size={48} className="text-muted mx-auto mb-4 opacity-30" />
@@ -281,7 +272,7 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
   // Dynamically import the app bundle. Keyed on resetKey so retry works.
   const LazyApp = useMemo(
     () => lazy(() =>
-      import(/* @vite-ignore */ bundlePath).catch(err => {
+      importAppBundle(bundlePath).catch(err => {
         // eslint-disable-next-line no-console -- surface bundle load failures for debugging
         console.error(`[AppHost] Failed to load ${app.name} from ${bundlePath}:`, err)
         // Return a module with a default export that shows the error
@@ -352,7 +343,12 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
         sessionKey={sessionKey}
         slotPush={slotPush}
       >
-        <Suspense fallback={<AppLoadingSkeleton appName={appDisplayName(app)} />}>
+        {/* Delayed and shaped: nothing for the first 300 ms, then the layout the
+            manifest declares in `ui.loading` (default "page"). See AppLoadingFallback. */}
+        {/* `ui.loading` describes the app's routed page. A side-panel tab mounts
+            its own bundle (`entry` override) in a narrow panel, so it keeps the
+            default shape rather than borrowing the page's rail or split. */}
+        <Suspense fallback={<AppLoadingFallback appName={appDisplayName(app)} loading={entryOverride ? undefined : app.manifest?.ui?.loading} />}>
           <LazyApp />
         </Suspense>
       </AppApiProvider>
@@ -360,9 +356,9 @@ function AppHostInner({ app, entry: entryOverride, active = true, sessionKey }: 
   )
 }
 
-export default function AppHost({ app, entry, active, sessionKey }: AppHostProps) {
+export default function AppHost({ app, entry, active, sessionKey, requestedName }: AppHostProps) {
   // Guard: not installed
-  if (!app) return <AppNotFound name="unknown" />
+  if (!app) return <AppNotFound name={requestedName || 'unknown'} />
   // Guard: disabled
   if (app.enabled === false) return <AppDisabled app={app} />
   // Guard: skipped at boot. Its bundle may load, but every route behind it is missing.

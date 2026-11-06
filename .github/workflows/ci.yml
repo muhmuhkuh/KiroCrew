@@ -552,6 +552,7 @@ jobs:
     runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}
     timeout-minutes: 10
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         machine: [x86_64, aarch64]
@@ -773,6 +774,7 @@ jobs:
     # and bundle-size already run on, and leaves headroom for runner variance.
     timeout-minutes: 25
     strategy:
+      max-parallel: 4
       matrix:
         python-version: ["3.12"]
     steps:
@@ -1004,6 +1006,16 @@ jobs:
           python3 scripts/check_subprocess_encoding.py --test
           python3 scripts/check_subprocess_encoding.py
 
+      # No hand-written code file over 2,000 lines (AGENTS.md), behind the
+      # shrink-only .github/file-line-cap-baseline.txt. The verdict is scoped to
+      # this change through scripts/ratchet_scope.py, which needs the full
+      # history checked out above: a file the change does not touch is reported
+      # as main drift, never failed. Self-test first, same reason as above.
+      - name: Check file line cap (gate, baselined)
+        run: |
+          python3 scripts/check_file_line_cap.py --test
+          python3 scripts/check_file_line_cap.py
+
       # A committed ACP frame fixture carries what the WIRE carried. The class that
       # gets through a credential scrub is an ENUMERATION -- a provider catalog, a
       # command inventory -- because it reads as product data while describing what
@@ -1158,6 +1170,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Depth 2 keeps the merge commit's parents (a push or merge-queue
+          # commit's parent), which is all test_flake_pattern_ratchet.py needs to
+          # compare a change with its base. At depth 1 it compares nothing.
           fetch-depth: 2
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -1560,6 +1575,7 @@ jobs:
     runs-on: ${{ matrix.os == 'ubuntu-latest' && (github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-linux-4-core' || 'ubuntu-latest') || matrix.os == 'windows-latest' && (github.repository == 'kirodotdev/KiroCrew' && 'kirocrew-windows-4-core' || 'windows-latest') || matrix.os }}
     timeout-minutes: 15
     strategy:
+      max-parallel: 4
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
@@ -2215,7 +2231,7 @@ jobs:
   # pre-exec hardlink scan arming on every spawn (1.5s per sandboxed spawn), since fixed.
   # MEASURED afterwards under this job's own environment -- real sandbox, no gh token, no
   # user session bus -- all eleven: 694 passed, 1 skipped, 38s.
-  #
+
   backend-test-sandbox:
     name: Backend Tests (namespace sandbox)
     needs: [changes, await-fast-gate, lint-gate]
@@ -3155,9 +3171,29 @@ jobs:
     runs-on: ${{ needs.changes.outputs.linux_runner || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
-      # persist-credentials retained: frontend-lint/Check for new hardcoded UI strings runs `git fetch origin`
-      # against the same remote, through the shared diff-base resolver script.
+      # Nothing in THIS job reads history or the remote: tsc and eslint judge
+      # the checked-out tree alone. Every gate that resolved a diff base here --
+      # the file line cap through scripts/ratchet_scope.py, and the i18n and
+      # phantom-classes gates through their own `git fetch origin` -- now runs
+      # in `frontend-ratchets`, whose checkout carries what they need. So the
+      # bounded deepening step this job used to run for the cap gate is gone
+      # with it.
+      #
+      # Because nothing here reads the remote, nothing here needs the token
+      # either. The retention rationale this checkout carried on `main` belonged
+      # to the hardcoded-UI-strings gate, which has moved to
+      # `frontend-ratchets`; the credential moved with it. Opting out rather
+      # than leaving it unexplained is what
+      # test_workflow_checkout_credentials.py requires, and `backend-lint`
+      # already runs this way.
+      #
+      # The depth is the bounded one #26131 set while the cap gate still lived
+      # here. Nothing in this job needs even that now; tightening it further is
+      # a separate change from the gate split.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
 
       # CodeBuild images have no tool cache, so setup-node would resolve the
       # major through a GitHub API manifest call on every run; seed the cache
@@ -3660,6 +3696,7 @@ jobs:
     # fleet keeps 25, so this costs the fast path nothing.
     timeout-minutes: ${{ startsWith(needs.changes.outputs.linux_runner_large, 'codebuild-') && 25 || 35 }}
     strategy:
+      max-parallel: 4
       # Don't cancel sibling shards when one fails -- we want the full failure
       # picture across the suite, not just the first shard to break.
       fail-fast: false
@@ -4635,6 +4672,7 @@ jobs:
               && needs.await-fast-gate.result == 'success'
               && needs.lint-gate.result == 'success')) }}
     strategy:
+      max-parallel: 4
       # Each OS is its own verdict. A Windows-only regression must not hide
       # behind a cancelled macOS leg, which is exactly the shape of the escape
       # this job exists for.

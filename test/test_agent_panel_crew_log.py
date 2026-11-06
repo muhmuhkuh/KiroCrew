@@ -677,7 +677,8 @@ def test_no_panel_prose_claims_the_count_identifies_the_evicted_crew():
     Matched on one exact phrase, since the prose wraps and negates across lines. The
     ``history_omitted`` claim ("those cycles") is true: that field is per owner.
     """
-    source = Path(crew_log.__file__).read_text(encoding="utf-8")
+    folds = sorted(Path(crew_log.__file__).parent.glob("projection*.py"))
+    source = "".join(path.read_text(encoding="utf-8") for path in folds)
 
     assert "exactly like a crew that never published on this slot" not in source
     # The correction is present, so this pin cannot pass by the prose being deleted.

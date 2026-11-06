@@ -466,7 +466,6 @@ class TestStreamingResponse:
             "stream": True,
         }
         request = _make_request(body, state)
-        # Mock resp.prepare and resp.write
         written = []
 
         async def fake_prepare(req):

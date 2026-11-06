@@ -268,7 +268,7 @@ class TestHealthTransitionsRefuseAStaleRecord:
 
 
 class TestStartupProbeCannotPromoteAReplacement:
-    """The startup poll must promote only the record it actually probed (review finding).
+    """The startup poll must promote only the record it actually probed.
 
     Resolving the record by name AFTER the probe let a stop/start landing mid-probe hand
     back the successor, which was then marked healthy — and therefore routed to, and MCP
@@ -540,13 +540,12 @@ class TestHealthProbeSecurity:
 
 
 class TestProbeSurvivesAMalformedHttpResponse:
-    """`http.client.HTTPException` is not an `OSError` (review finding).
+    """`http.client.HTTPException` is not an `OSError`.
 
     An app backend is arbitrary third-party code — an `exec` backend, or an adopted
     process we do not own — so a non-HTTP first line on the port is a real condition.
     `BadStatusLine` escaping `_health_probe` would kill the standing daemon watch and
-    freeze `healthy` at its last value: the write-once behaviour this PR removes,
-    silently restored.
+    silently freeze `healthy` at its last value.
     """
 
     def _serve_garbage(self, payload: bytes) -> int:
@@ -865,7 +864,7 @@ class TestWatchSurvivesAnUnexpectedSweepFault:
 
 
 class TestSupervisorIsBoundAtSpawn:
-    """The supervisor carries its record, not a name to re-resolve (review finding).
+    """The supervisor carries its record, not a name to re-resolve.
 
     A stop/restart between the spawn and the thread's first statement would resolve the
     name to the SUCCESSOR while the port still named the predecessor, so the poll would

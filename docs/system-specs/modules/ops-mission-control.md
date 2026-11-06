@@ -2285,9 +2285,11 @@ to "pause the armed crons" would pause exactly the cron that turns the instance 
 silently ending the team's incident response until a human noticed. The only thing
 preventing it was a sentence of SOP prose saying "never pause an always-tier cron".
 
-Prose is not an enforcement mechanism, and neither is the manifest: `permissions.mcpTools`
-is **declarative only** — `check_tool_permission` exists but nothing calls it at runtime —
-so listing `cron_pause` there never gated anything either. One misfollowed LLM turn was
+Prose is not an enforcement mechanism, and for this app neither is the manifest:
+`permissions.mcpTools` is enforced only on an app's OWN agents (undeclared managed tools
+land in their `managedToolPolicy.exclude`), and ops-mission-control ships no agent — its
+crons run on the host default agent, which the declaration does not scope — so leaving
+`cron_pause` out of it gates nothing here either. One misfollowed LLM turn was
 the whole distance between "armed" and "permanently dead", which is the same
 quiet-versus-broken conflation this app refuses everywhere else ("a source that failed is
 shown as failed, never as quiet").
@@ -3054,7 +3056,7 @@ the base rule cannot see.
 **Label tables hold catalog KEYS, not English.** The `Record<…, string>` label tables
 (`STATUS_LABEL_KEY`, `MODE_HELP_KEY`, `CHANNEL_WHEN_KEY`, `BLOCKED_LABEL_KEY`, and the two
 `SegmentedControl` segment lists) follow the `FILTER_LABEL_KEY` pattern from
-`pages/ChatSidebar.tsx`, because `eslint-plugin-i18next` exempts anything inside an ALL-CAPS
+`pages/chat-sidebar/SearchDock.tsx`, because `eslint-plugin-i18next` exempts anything inside an ALL-CAPS
 module constant by default, and English literals there would be invisible to the i18n gate.
 Three non-obvious constraints:
 

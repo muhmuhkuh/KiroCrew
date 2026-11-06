@@ -524,9 +524,13 @@ def _board(unit: str, board: str, worker: str) -> None:
     _write(unit, **base, action="bind", item_id="it_p", worker_session_key=worker)
 
 
+#: Each board's own unit, where the report route writes the board's copy of a report.
+_BOARD_UNITS = {CONDUCTOR: "acp-c", OTHER: "acp-o"}
+
+
 def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "done") -> None:
-    _write(
-        unit,
+    """A worker's report as the route records it: the worker's copy, then the board's."""
+    fields = dict(
         slot=board,
         actor="worker",
         by=worker,
@@ -536,6 +540,9 @@ def _report(unit: str, board: str, worker: str, stamp: str, *, status: str = "do
         summary="s",
         last_report_at=stamp,
     )
+    _write(unit, **fields)
+    if _BOARD_UNITS[board] != unit:
+        _write(_BOARD_UNITS[board], **fields)
 
 
 async def _until(predicate, timeout: float | None = None) -> bool:
@@ -548,6 +555,15 @@ async def _sync_and_join(svc) -> None:
     """Sync the subscriptions, then wait for every join it started to land."""
     conductor_wake.sync_subscriptions(svc)
     await asyncio.gather(*list(conductor_wake._subscriptions.joining.values()))
+    # A board with no warm cell gets no baseline on the join: one background prime folds
+    # it and its first push is the board's first sight. Wait for that prime, then for the
+    # observations it scheduled on this loop, so every case starts from the board's
+    # first sight already recorded.
+    from kiro_crew.crew_log import slot_prime
+
+    assert await asyncio.to_thread(slot_prime.drain, 30.0), "a background prime never finished"
+    live = set(conductor_wake._subscriptions.live)
+    await _until(lambda: live <= set(conductor_wake._registry.boards))
 
 
 def _on_this_loop(monkeypatch, svc) -> None:
@@ -784,10 +800,17 @@ def test_a_worker_session_closing_reaches_no_wake():
     reported -- and that same flag is the only cover for a worker whose process dies
     with its slot still open.
     """
-    from kiro_crew.dashboard import chat_handlers
-    from kiro_crew.dashboard.chat_api import slot_lifecycle
+    import importlib
+    import pkgutil
 
-    for module in (slot_lifecycle, chat_handlers):
+    from kiro_crew.dashboard import chat_api, chat_handlers
+
+    # The handlers facade and every ``chat_api`` owner it composes.
+    owners = [
+        importlib.import_module(f"{chat_api.__name__}.{info.name}")
+        for info in pkgutil.iter_modules(chat_api.__path__)
+    ]
+    for module in (chat_handlers, *sorted(owners, key=lambda owner: owner.__name__)):
         source = inspect.getsource(module)
         assert "conductor_wake" not in source, f"{module.__name__} reaches the wake again"
 

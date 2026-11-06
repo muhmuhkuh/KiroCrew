@@ -27,7 +27,7 @@ VETTED: frozenset[tuple[str, str]] = frozenset(
     {
         ("emit_runtime.py", "_reap_child_origin"),
         ("holders.py", "holders"),
-        ("read.py", "dispatch_view"),
+        ("read.py", "_scanned_view"),
         ("session_tree.py", "reading"),
         ("session_tree.py", "chain"),
         # The projection names no handle, but ``record_opened``, ``record_adopted``,

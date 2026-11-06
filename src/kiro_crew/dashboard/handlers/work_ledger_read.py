@@ -171,6 +171,9 @@ async def api_work_ledger_get(request: web.Request) -> web.Response:
     # conductor tells the user once), both read off the same header.
     # Advisory: the compact read carries them so a patrol that reads only the
     # status columns still sees a goal spending past what the user expected.
+    # ``max_depth`` is the conducting depth cap in force right now (never stored),
+    # so a conductor can see how many levels may still dispatch below its own.
+    # Read off the loop: it consults the config file.
     depth_cap = await asyncio.to_thread(work_ledger.max_depth)
     conductor = dict(
         record.to_dict(),

@@ -168,6 +168,7 @@ from kiro_crew.platform.policy_distribution_source import (
     _body_digest,
     _source_identity,
     _split_url,
+    cache_only,
     resolve_distribution,
 )
 
@@ -316,6 +317,12 @@ def refresh_now(*, force: bool = False) -> RefreshOutcome:
     """
     from kiro_crew.platform.governance import active_policy_distribution
 
+    if cache_only():
+        # A cache-only process inherits the gateway's ceiling and never fetches.
+        return RefreshOutcome(
+            REFRESH_REJECTED,
+            "this process takes its ceiling from the gateway's cache and does not fetch one",
+        )
     try:
         dist = resolve_distribution(active_policy_distribution())
     except PlatformCompositionError as exc:
@@ -1196,7 +1203,6 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _NoRedirects,
         _open,
         _opener_handlers,
-        cache_only,
         host_pinned_source,
         register_policy_fetcher,
         registered_policy_schemes,

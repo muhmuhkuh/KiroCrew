@@ -158,8 +158,6 @@ async def _handle_review_approve(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
-    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
-        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
@@ -234,8 +232,6 @@ async def _handle_review_edit(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
-    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
-        return
 
     from kiro_crew.slack.blocks import review_edit_modal
     from kiro_crew.slack.handler import _review_drafts_get
@@ -282,8 +278,6 @@ async def _handle_review_cancel(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
-    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
-        return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
 
@@ -338,6 +332,8 @@ async def _handle_review_edit_submit(payload: dict) -> None:
         return
     channel, thread_ts, draft_key = parsed
     if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        # The channel itself (``channels.posture.slack.allowed_channel_ids``).
+        logger.info("slack review-edit submit dropped: channel refused by policy")
         return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
@@ -388,8 +384,6 @@ async def _handle_review_revise(payload: dict, action: dict) -> None:
     if not parsed:
         return
     channel, thread_ts, draft_key = parsed
-    if channel_refusal(channel, operation="slack.review_submit", caller=caller):
-        return
 
     from kiro_crew.slack.blocks import review_revise_modal
     from kiro_crew.slack.handler import _review_drafts_get
@@ -443,6 +437,8 @@ async def _handle_review_revise_submit(payload: dict) -> None:
         return
     channel, thread_ts, draft_key = parsed
     if channel_refusal(channel, operation="slack.review_submit", caller=caller):
+        # The channel itself (``channels.posture.slack.allowed_channel_ids``).
+        logger.info("slack review-revise submit dropped: channel refused by policy")
         return
 
     from kiro_crew.slack.handler import _review_drafts_get, _review_drafts_pop
