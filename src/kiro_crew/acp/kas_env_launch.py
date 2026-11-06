@@ -42,6 +42,7 @@ import logging
 import secrets
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit, urlunsplit
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -52,6 +53,7 @@ from kiro_crew.kas_env_shim import (
     SNAPSHOT_MARKER,
     snapshot_name,
 )
+from kiro_crew.kas_http_bridge import _LOOPBACK_HOSTS, _normalized_host
 
 logger = logging.getLogger(__name__)
 
@@ -226,20 +228,87 @@ def relay_withheld_env(
     return entry, True, every <= set(env)
 
 
+def kas_accepts_url(url: Any) -> bool:
+    """Whether KAS connects to *url*: ``https``, or ``http`` to a loopback host.
+
+    The same test as KAS's ``isHttpsOrLocalhost`` (``mcp/url-validation.ts``),
+    which refuses any other url as ``insecure-url``.
+    """
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urlsplit(url.strip())
+        host = parts.hostname
+        parts.port  # noqa: B018 -- raises on a port KAS's URL parser also refuses
+    except ValueError:
+        return False
+    scheme = parts.scheme.lower()
+    return scheme == "https" or (scheme == "http" and _normalized_host(host) in _LOOPBACK_HOSTS)
+
+
+def bridge_url(url: str) -> str:
+    """*url* as the bridge must dial it: a plain ``http`` loopback host in its
+    canonical spelling (``127.0.0.1``, ``[::1]``, ``localhost``).
+
+    The loopback test normalises spellings such as ``127.0.0.1.``, which the OS
+    resolver does not read as numeric and would look up through DNS. Dialling
+    the canonical host keeps the headers on this machine. Port, path and query
+    are kept; any other url is returned stripped, as :func:`bridgeable` read it.
+    """
+    url = url.strip()
+    parts = urlsplit(url)
+    if parts.scheme.lower() != "http":
+        return url
+    host = _normalized_host(parts.hostname)
+    if host not in _LOOPBACK_HOSTS:
+        return url
+    # Userinfo is dropped: urllib would hand ``user@host`` to the resolver as the
+    # host name, and it never sends userinfo as credentials anyway.
+    netloc = f"[{host}]" if ":" in host else host
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+    return urlunsplit(("http", netloc, parts.path, parts.query, parts.fragment))
+
+
+def refuses_plain_http_headers() -> bool:
+    """Whether ``agent.kas_refuse_plain_http_mcp_headers`` is a JSON ``true``.
+
+    Off by default, and off when the config cannot be loaded, so a header-bearing
+    ``http://`` server on another host keeps connecting through the bridge.
+    """
+    try:
+        # Call-time: the config loader pulls in the config plane this leaf stays off.
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        return KiroCrewConfig.load().agent.kas_refuse_plain_http_mcp_headers is True
+    except Exception:
+        logger.debug("config unavailable; relaying plain-http MCP headers", exc_info=True)
+        return False
+
+
 def bridgeable(entry: Mapping[str, Any]) -> bool:
     """Whether a projected entry is a remote server the launcher can bridge to.
 
     Streamable HTTP only: an ``sse`` entry speaks the older two-endpoint transport,
     which the bridge (:mod:`kiro_crew.kas_http_bridge`) does not, so its headers
-    stay withheld.
+    stay withheld. A url KAS itself would accept (:func:`kas_accepts_url`) is
+    bridged. So is plain ``http`` to another host, which KAS refuses but reaches
+    as the bridge's local stdio server, unless :func:`refuses_plain_http_headers`:
+    that bridge sends the headers in cleartext.
     """
     url = entry.get("url")
-    return (
-        isinstance(url, str)
-        and url.lower().startswith(("https://", "http://"))
-        and not entry.get("command")
-        and entry.get("type") != "sse"
-    )
+    if not isinstance(url, str) or entry.get("command") or entry.get("type") == "sse":
+        return False
+    url = url.strip()  # as kas_accepts_url and bridge_url read it
+    if not url.lower().startswith(("https://", "http://")):
+        return False
+    if kas_accepts_url(url):
+        return True
+    try:
+        urlsplit(url.strip()).port  # noqa: B018 -- a url that does not parse is not dialled
+    except ValueError:
+        return False
+    return not refuses_plain_http_headers()
 
 
 def relay_withheld_headers(
@@ -274,7 +343,10 @@ def relay_withheld_headers(
     stdio = {k: v for k, v in projected.items() if k not in ("url", "type", "headers", "env")}
     try:
         version = _write_snapshot(
-            {"url": projected["url"], "headers": dict(_expand_env_map(headers, server=server))},
+            {
+                "url": bridge_url(projected["url"]),
+                "headers": dict(_expand_env_map(headers, server=server)),
+            },
             session_key=session_key,
             agent_id=agent_id,
             server=server,

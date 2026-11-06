@@ -34,6 +34,7 @@ import AgentPanelSlot from './components/AgentPanelSlot'
 import AgentPillBar from './components/AgentPillBar'
 import BroadcastBar from './components/BroadcastBar'
 import MeetingAudioControl from './components/MeetingAudioControl'
+import ExportMenuItems from './components/ExportMenuItems'
 import MeetingTitle from './components/MeetingTitle'
 import MeetingWorkspace from './components/MeetingWorkspace'
 import NoteSidebar from './components/NoteSidebar'
@@ -77,6 +78,7 @@ export default function MeetingView({
     else setSidebarOpen(false)
   }
   const [attachMenuOpen, setAttachMenuOpen] = useState(false)
+  const [exportError, setExportError] = useState<string | null>(null)
 
   const {
     meta,
@@ -142,10 +144,16 @@ export default function MeetingView({
         provider={config?.task_provider ?? ''}
         filing={pending.filing}
         filingIds={pending.filingIds}
+        closing={pending.stopping}
+        // The stop route has no 409, so a failed End is always the plain stop failure.
+        closeError={session.stopError ? i18nT('apps.meetings.session.stopFailed') : null}
+        leaving={pending.settingStatus !== null}
         onBack={actions.backToMeeting}
+        // Leave the meeting once the stop has landed, through the same note
+        // check as Back; the control reads as pending until then, and a stop
+        // that failed keeps the view, with its notice, so End can be tried again.
         onClose={() => {
-          actions.stop()
-          void leave()
+          void actions.stop().then(landed => { if (landed) void leave() })
         }}
         onFile={actions.fileTask}
         onArchive={actions.archiveTask}
@@ -343,6 +351,13 @@ export default function MeetingView({
                     {tasks.length > 0 ? ` (${tasks.length})` : ''}
                   </span>
                 </DropdownMenuItem>
+                <ExportMenuItems
+                  agents={enabledAgents}
+                  outputs={outputs}
+                  title={meta?.title ?? ''}
+                  date={meta?.started_at || meta?.created_at}
+                  onError={setExportError}
+                />
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -368,6 +383,12 @@ export default function MeetingView({
             }
           />
         )}
+        {/* No hand-off: the minutes drafts in the AgentPanel below are unsaved. */}
+        <ErrorNotice
+          message={exportError}
+          onDismiss={() => setExportError(null)}
+          className="mx-4 mt-2 animate-rise"
+        />
         {/* No hand-off: the minutes drafts in the AgentPanel below are unsaved. */}
         {startError && startErrorMessage && (
           <ErrorNotice

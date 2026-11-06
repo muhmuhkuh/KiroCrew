@@ -117,15 +117,15 @@ class _ManagedEssentialSourceError(MemberEssentialContextError):
 
 
 class _UnreadableEssentialSourceError(MemberEssentialContextError):
-    """An admitted, contained source the no-follow descriptor read refused.
+    """An admitted, contained source the no-follow descriptor read refused, or not UTF-8.
 
     Raised only after the path screen, the admitted-root containment check and
     the managed-state isolation have all passed, when
-    :func:`safe_read_file_bytes_nolink` still returns nothing: the file is a hard
+    :func:`safe_read_file_bytes_nolink` still returns nothing (the file is a hard
     link, carries a reparse point the read does not open, changed shape between
-    the walk and the open, or is otherwise not a regular file it may read. A
-    steering document refused this way is left out unread and named; every other
-    source keeps failing closed.
+    the walk and the open, or is otherwise not a regular file it may read), or
+    when the bytes it returns are not UTF-8 text. A steering document refused
+    this way is left out and named; every other source keeps failing closed.
     """
 
 
@@ -379,7 +379,14 @@ def _read(path: Path, root: Path) -> str:
         # Left in, the mark sits in front of the frontmatter fence, the column-0
         # grammar finds no block, and a manual or fileMatch file reads as always.
         # A file without the mark decodes exactly as with plain utf-8.
-        return data.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            # UTF-16 or an ANSI code page (Windows PowerShell 5.1's defaults).
+            raise _UnreadableEssentialSourceError(
+                f"Essential source {path}: not UTF-8 text ({exc})"
+            ) from exc
+        return text.replace("\r\n", "\n").replace("\r", "\n")
     except (_UnreadableEssentialSourceError, _OutsideRootEssentialSourceError):
         raise
     except (OSError, ValueError) as exc:
@@ -637,10 +644,11 @@ def _matches(
     it is appended there and left out, unread and not descended into. The implicit
     steering scan passes *linked* alone, so it leaves a link out wherever it
     points. A declared steering glob also passes *confined*: only a link whose
-    target the path screen resolves inside *root* is left out, and any other link
-    still refuses.
+    target the path screen resolves inside *root* goes to *linked*, and any other
+    link refuses unless *outside* takes it.
 
-    An ABSOLUTE declaration also passes *outside*: a link the path screen resolves
+    An ABSOLUTE declaration passes *outside*, and a relative steering glob passes
+    its *linked* list as *outside*: a link the path screen resolves
     to a target outside *root* (``~/workplace`` linked to another volume) is appended
     there and left out, unread and not descended into, instead of refusing. A
     target that is managed memory state still refuses, and so does a link the
@@ -1127,9 +1135,9 @@ def documents_for_member(
                 if not steering:
                     raise
                 # Contained and admitted, but the descriptor read refused it (a
-                # hard link an installer placed, a non-link reparse point) or it
-                # is over the read cap. Left out unread and named, as a linked
-                # steering entry is. The read precedes the inclusion check, so
+                # hard link an installer placed, a non-link reparse point), it is
+                # over the read cap, or it is not UTF-8. Left out and named, as a
+                # linked steering entry is. The read precedes the inclusion check, so
                 # this holds for every inclusion mode.
                 logger.warning("Steering %s not loaded: %s", path, exc)
                 if isinstance(exc, _OversizedEssentialSourceError):
@@ -1397,12 +1405,14 @@ def _resource_paths(
     A caller that passes *linked* has a steering glob (a ``steering`` component in
     its pattern, the test :func:`documents_for_member` applies to a match) leave a
     link that stays inside its root out and name it there, as the implicit steering
-    scan does. A link that resolves elsewhere, and a link under any other glob,
-    still refuses, as it does for a caller that passes none.
+    scan does. A relative steering glob names a link that leaves its root there too,
+    unless the screen refuses its target or the target is managed state (see
+    *outside* in :func:`_matches`). A link under any other relative glob still
+    refuses, as it does for a caller that passes none.
 
     A caller that passes *outside* has an ABSOLUTE declaration leave out a link
     whose target resolves outside its root and name it there (see
-    :func:`_matches`). A relative declaration never does.
+    :func:`_matches`). A relative declaration never uses *outside*.
     """
     paths: list[tuple[Path, Path]] = []
     absent: list[Path] = [] if missing is None else missing
@@ -1420,7 +1430,7 @@ def _resource_paths(
         else:
             pattern = str(path)
         left_out = linked if "steering" in Path(pattern).parts else None
-        escaping = outside if path.is_absolute() else None
+        escaping = outside if path.is_absolute() else left_out
         for match in _matches(
             root, pattern, skipped, left_out, absent, confined=True, outside=escaping
         ):
@@ -1525,7 +1535,7 @@ def projected_resource_documents(definition: dict, cwd: str) -> dict[str, str]:
     Conditional inclusion stays with the native selector; skill URI resources
     and object-form ``knowledgeBase`` declarations keep their on-demand
     behavior and are never treated as full text. A link a steering glob reaches
-    inside its root is left out unread, as in the snapshot, which names it. So is
+    is left out unread, as in the snapshot, which names it. So is
     a steering document the no-follow descriptor read refuses (a hard link, a
     non-link reparse point).
     """

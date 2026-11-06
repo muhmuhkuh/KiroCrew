@@ -286,6 +286,7 @@ class _ChatSlot:
         "_disk_window_len",
         "_disk_meta_created_at",
         "_disk_meta_observed",
+        "_disk_meta_key",
         "_disk_tail_ts",
         "_frozen_prefix_cache",
         "_foreign_reported",
@@ -333,6 +334,7 @@ class _ChatSlot:
         "_turn_channel_origin",
         "_turn_user_sent",
         "_turn_owner_sent",
+        "_turn_agent_started",
         "_steer_admissions",
         "_steer_decision_strips",
         "_steer_possibly_delivered",
@@ -633,6 +635,9 @@ class _ChatSlot:
     _turn_channel_origin: bool
     _turn_user_sent: bool
     _turn_owner_sent: bool
+    #: The turn running now is one the agent started on its own between prompts
+    #: (``chat_turn.agent_started``); its assistant rows carry ``meta.origin``.
+    _turn_agent_started: bool
     _steer_admissions: dict[str, dict]
     _steer_decision_strips: dict[str, dict]
     _steer_possibly_delivered: set[str]
@@ -731,6 +736,16 @@ class _ChatSlot:
         # legacy sessions; the identity COMPARISON still requires a non-empty
         # ``created_at`` on both sides.
         self._disk_meta_observed: bool = False
+        # The transcript key under which the identity above was observed. The
+        # delete witnesses resolve the CURRENT write target with
+        # ``slot_history_key(slot)``, which can drift to a different file than
+        # the one observed (a cron-born slot whose ``linked_session_key``
+        # lapses falls back to the ``dashboard:`` spelling). When this recorded
+        # key differs from the current target, the observed identity
+        # describes a different file, so a ``created_at`` mismatch is "different
+        # file", not "deleted and recreated". Empty means the
+        # observation predates this field; the guards then keep prior behavior.
+        self._disk_meta_key: str = ""
 
     @property
     def project(self) -> str:
@@ -1040,7 +1055,10 @@ class _ChatSlot:
         so two concurrent callers targeting the same slot cannot both observe
         ``running == False`` within a single loop iteration.
         """
-        if self.running:
+        # An Ultra Mode "Pause all" holds this session: queue, never start.
+        from kiro_crew import crew_pause
+
+        if self.running or crew_pause.holds_slot(self):
             # circular import: session_control imports this module at module level.
             from kiro_crew.dashboard.chat_delivery import start_queue_persist
             from kiro_crew.dashboard.session_control import containment_meta

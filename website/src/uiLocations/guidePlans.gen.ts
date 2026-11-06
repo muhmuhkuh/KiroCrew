@@ -3,7 +3,7 @@
 import type { UiGuidePlan } from './types'
 
 /** The `build_digest` of the packaged index this bundle was built with (see `guideBuildDigest`). */
-export const GUIDE_BUILD_DIGEST = "sha256:c97b827d602f95217353d2752c42427f31a489a96fbd16117a87dd600f3ddcad"
+export const GUIDE_BUILD_DIGEST = "sha256:5a660daf3a790cce2a2675a2a176e5bf0dcfaa841571622dead75aee7af21b8c"
 
 /** Curated location ids: the only ids a live observation may name. */
 export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
@@ -76,6 +76,7 @@ export const GUIDE_OBSERVABLE_IDS: readonly string[] = [
   "members.add-menu.import",
   "members.add-menu.new",
   "members.back",
+  "members.dashboard-tab",
   "members.details",
   "members.edit",
   "members.empty.import",
@@ -172,6 +173,11 @@ export const GUIDE_REVEAL_SCOPES = {
     "kind": "state",
     "revealer": "composer.expand",
     "state": "composer_collapsed"
+  },
+  "members.panel": {
+    "kind": "state",
+    "revealer": "members.details",
+    "state": "crewmate_panel_closed"
   },
   "members.profile": {
     "kind": "state",
@@ -1084,7 +1090,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
   },
   "composer.add-menu.reference-file": {
     "version": 2,
-    "label_key": "components.chatInput.file",
+    "label_key": "components.chatInput.reference_a_file",
     "placements": [
       {
         "id": "desktop",
@@ -1129,7 +1135,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
           {
             "id": "desktop:composer.add-menu.reference-file",
             "location": "composer.add-menu.reference-file",
-            "label_key": "components.chatInput.file"
+            "label_key": "components.chatInput.reference_a_file"
           }
         ]
       }
@@ -1190,7 +1196,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
   },
   "composer.add-menu.skill": {
     "version": 2,
-    "label_key": "components.chatInput.skill",
+    "label_key": "components.chatInput.use_a_skill",
     "placements": [
       {
         "id": "desktop",
@@ -1235,7 +1241,7 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
           {
             "id": "desktop:composer.add-menu.skill",
             "location": "composer.add-menu.skill",
-            "label_key": "components.chatInput.skill"
+            "label_key": "components.chatInput.use_a_skill"
           }
         ]
       }
@@ -1959,6 +1965,69 @@ export const GUIDE_PLANS: Readonly<Record<string, UiGuidePlan>> = {
             "id": "mobile:members.back",
             "location": "members.back",
             "label_key": "pages.membersPage.toggle_roster"
+          }
+        ]
+      }
+    ]
+  },
+  "members.dashboard-tab": {
+    "version": 2,
+    "label_key": "pages.membersPage.dashboard_tab",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/members",
+        "steps": [
+          {
+            "id": "any:select:crewmate_selected",
+            "kind": "select",
+            "location": "members.roster-list",
+            "label_key": "pages.membersPage.title",
+            "selection": "crewmate_selected",
+            "entity": "crewmate"
+          },
+          {
+            "id": "any:members.details",
+            "location": "members.details",
+            "label_key": "pages.membersPage.panel_toggle",
+            "when": "crewmate_panel_closed",
+            "scope": "members.panel",
+            "requires": [
+              "crewmate_panel_not_docked"
+            ]
+          },
+          {
+            "id": "any:members.dashboard-tab",
+            "location": "members.dashboard-tab",
+            "label_key": "pages.membersPage.dashboard_tab"
+          }
+        ]
+      }
+    ]
+  },
+  "members.details": {
+    "version": 2,
+    "label_key": "pages.membersPage.panel_toggle",
+    "placements": [
+      {
+        "id": "any",
+        "route": "/members",
+        "steps": [
+          {
+            "id": "any:select:crewmate_selected",
+            "kind": "select",
+            "location": "members.roster-list",
+            "label_key": "pages.membersPage.title",
+            "selection": "crewmate_selected",
+            "entity": "crewmate"
+          },
+          {
+            "id": "any:members.details",
+            "location": "members.details",
+            "label_key": "pages.membersPage.panel_toggle",
+            "requires": [
+              "crewmate_panel_not_docked"
+            ]
           }
         ]
       }

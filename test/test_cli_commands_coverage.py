@@ -316,23 +316,25 @@ class TestSpawnCli:
 
 
 class TestAppCli:
-    def test_install_success_reports_registrations(
+    def test_install_success_registers_nothing_and_points_at_enable(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         with (
             patch("kiro_crew.cli_commands.install_app", return_value=_result(True, name="demo")),
-            patch("kiro_crew.cli_commands.get_app", return_value={"name": "demo"}),
+            patch(
+                "kiro_crew.cli_commands.get_app",
+                return_value={"name": "demo", "enabled": False},
+            ),
             patch(
                 "kiro_crew.cli_commands.register_app",
-                return_value=_registration(
-                    agents=["a"], skills=["s"], crons=["c"], errors=["partial"]
-                ),
-            ),
+                return_value=_registration(agents=["a"]),
+            ) as register,
         ):
             cc._handle_app(_ns(app_action="install", source="/pkg"))
+        register.assert_not_called()
         out = capsys.readouterr().out
-        assert "Agents: a" in out and "Skills: s" in out and "Crons:  c" in out
-        assert "partial" in out and "kirocrew app enable demo" in out
+        assert "Agents:" not in out
+        assert "kirocrew app enable demo" in out
 
     def test_install_failure_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -833,9 +835,8 @@ class TestAppCli:
 
         assert urlopen.call_args.kwargs["socket_path"].name == "dashboard-5476.sock"
         local_install.assert_called_once_with("/pkg")
-        local_register.assert_called_once_with("demo")
+        local_register.assert_not_called()
         out = capsys.readouterr().out
-        assert "Agents: a" in out
         assert "kirocrew app enable demo" in out
 
     def test_install_missing_local_secret_keeps_file_only_path(
@@ -1318,6 +1319,20 @@ class TestAppCli:
         )
         out = capsys.readouterr().out
         assert "Scaffolded app" in out and "npm install" in out and "app install" in out
+
+    def test_init_ui_steps_are_one_command_per_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Windows PowerShell 5.1 rejects `&&`, so no printed step chains.
+        with patch("kiro_crew.cli_commands.scaffold_app", return_value=tmp_path / "a"):
+            cc._handle_app(
+                _ns(app_action="init", name="a", dir=str(tmp_path), backend=False, ui=True)
+            )
+        out = capsys.readouterr().out
+        lines = [line.strip() for line in out.splitlines()]
+        assert "&&" not in out
+        assert f"cd {tmp_path / 'a'}/ui" in lines
+        assert "npm install" in lines and "npm run build" in lines
 
     def test_init_without_ui_skips_npm_hint(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

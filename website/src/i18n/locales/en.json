@@ -87,10 +87,12 @@
       "restart_exhausted_message_other": "{{app}} has failed to restart {{count}} times in a row and will keep retrying every few minutes. To retry now, disable and re-enable {{app}}."
     },
     "builtinAppRoute": {
+      "could_not_load_the_app_list": "Could not load the app list",
       "refused_page_detail_label": "Details for whoever assembled this copy",
       "refused_page_handoff_note": "Asking the agent opens a chat with these details already attached.",
       "refused_page_lead": "{{productName}} rejected this page when it started, because it is set up wrongly in this copy. Retrying will not bring it back — whoever assembled this copy has to fix it.",
-      "refused_page_title": "{{route}} could not load"
+      "refused_page_title": "{{route}} could not load",
+      "retry": "Retry"
     },
     "agentWorlds": {
       "manifest": {
@@ -267,7 +269,15 @@
         "findings_tally_one": "{{count}} finding",
         "findings_tally_other": "{{count}} findings",
         "cycles_count_one": "{{count}} cycle",
-        "cycles_count_other": "{{count}} cycles"
+        "cycles_count_other": "{{count}} cycles",
+        "cycles": "cycles,",
+        "cycles_2": "cycles",
+        "findings": "findings",
+        "min": "min",
+        "s_idle": "s idle. ~",
+        "sub_questions_2": "sub-questions",
+        "suggested_from": "suggested from",
+        "up_to": "Up to"
       }
     },
     "autoTriagePipeline": {
@@ -284,7 +294,7 @@
         "titleblock_live": "IN FLIGHT",
         "notes_heading": "NOTES",
         "note_1": "A lane runs left to right across the phase columns; the head marks the item's live phase.",
-        "note_2": "A #N pill means the item has a PR; a lane with no PR shows no #N pill.",
+        "note_2": "A {{sigil}}N pill is the item's {{changeRequest}}; a lane with no {{changeRequest}} shows no {{sigil}}N pill.",
         "note_3": "A dot-dash span means the item skipped a phase; an under-lane arc is a re-entered phase.",
         "note_4": "A stub off the lane is an exit — skipped, yielded, handed back, preempted, or awaiting a reply.",
         "note_5": "A dwell over an hour is flagged; the open dwell counts from the most recent entry into the current phase.",
@@ -580,7 +590,8 @@
           "invalid_namespace_name_char": "“{{char}}” can’t be used in a namespace name. Use lowercase a–z, 0–9, . -⁠ _",
           "invalid_namespace_name_letter": "“{{char}}” ({{script}}, {{code}}) can’t be used in a namespace name. Use lowercase a–z, 0–9, . -⁠ _",
           "pending_count_one": "{{count}} pending",
-          "pending_count_other": "{{count}} pending"
+          "pending_count_other": "{{count}} pending",
+          "pending": "pending"
         },
         "leftRail": {
           "code_review_sage": "Code Review Sage",
@@ -705,7 +716,10 @@
           "passed_count_one": "{{count}} passed",
           "passed_count_other": "{{count}} passed",
           "failing_count_one": "{{count}} failing",
-          "failing_count_other": "{{count}} failing"
+          "failing_count_other": "{{count}} failing",
+          "failing": "failing",
+          "passed": "passed",
+          "running": "running"
         },
         "repoSwitcher": {
           "add_a_repo": "Add a repo",
@@ -745,7 +759,9 @@
           "blocking_count_one": "{{count}} blocking",
           "blocking_count_other": "{{count}} blocking",
           "should_fix_count_one": "{{count}} should-fix",
-          "should_fix_count_other": "{{count}} should-fix"
+          "should_fix_count_other": "{{count}} should-fix",
+          "blocking": "blocking",
+          "should_fix": "should-fix"
         },
         "reviewChat": {
           "error_generic": "The follow-up session could not be opened. Try again.",
@@ -792,7 +808,8 @@
           "worth_a_glance_count_one": "{{count}} worth a glance",
           "worth_a_glance_count_other": "{{count}} worth a glance",
           "more_count_one": "+{{count}} more",
-          "more_count_other": "+{{count}} more"
+          "more_count_other": "+{{count}} more",
+          "more": "more"
         },
         "runDetail": {
           "cancelled_before_any_finished": "It was cancelled before any pull request finished.",
@@ -808,7 +825,8 @@
           "this_review_produced_no_report": "This review produced no report.",
           "you_can_leave_this_page_a_notification_will_tell": "You can leave this page — a notification will tell you when it lands.",
           "more_count_one": "+{{count}} more",
-          "more_count_other": "+{{count}} more"
+          "more_count_other": "+{{count}} more",
+          "more": "more"
         },
         "runList": {
           "new_review": "New review"
@@ -829,7 +847,10 @@
           "failed_count_one": "{{count}} failed",
           "failed_count_other": "{{count}} failed",
           "cancelled_count_one": "{{count}} cancelled",
-          "cancelled_count_other": "{{count}} cancelled"
+          "cancelled_count_other": "{{count}} cancelled",
+          "cancelled": "cancelled",
+          "failed": "failed",
+          "reviewed": "reviewed"
         },
         "runStatusPill": {
           "cancelled": "Cancelled",
@@ -999,7 +1020,8 @@
         "link_placeholder_staged": "Using your screenshots — clear them to critique a link instead",
         "link_placeholder": "Figma link · git repo · a folder on this machine · a running URL (localhost or a deployed preview)",
         "link_label": "Link to critique",
-        "render_before_judging": "I render everything before judging it — never from code alone. If your app is already running, paste its URL and I can measure real colours and sizes instead of estimating them."
+        "render_before_judging": "I render everything before judging it — never from code alone. If your app is already running, paste its URL and I can measure real colours and sizes instead of estimating them.",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "designCritiquePage": {
         "a_critique_is_still_running_click_to_watch_it": "A critique is still running — click to watch it",
@@ -1083,7 +1105,9 @@
         "fix": "Fix",
         "suggestion": "Suggestion",
         "what_i_saw": "What I saw",
-        "where": "Where"
+        "where": "Where",
+        "steps_range": "steps {{range}}",
+        "flow_badge": "flow"
       },
       "manifest": {
         "description": "A design critique you can run before you ask a colleague. Give it one screenshot, a whole multi-screen flow, a Figma file, a git repo, or a URL that is already serving, and it finds the candidate screens, lets you choose what to look at, then reports back the way an experienced designer would: an overall read, what is working, and the things worth tightening, each tied to a named heuristic. Multi-screen flows also get cross-screen findings that a single screen cannot show — inconsistent controls, missing progress, no way back, dead ends. It renders code and Figma before judging them, so it never critiques visuals it has not actually seen, and it says plainly which screens it could not get to instead of guessing.",
@@ -1113,7 +1137,20 @@
         "screens": "Screens",
         "start_over": "Start over",
         "suggested_flows": "Suggested flows",
-        "what_should_i_audit": "What should I audit?"
+        "what_should_i_audit": "What should I audit?",
+        "screens_found_count_one": "{{n}} screen found · {{m}} I can render",
+        "screens_found_count_other": "{{n}} screens found · {{m}} I can render",
+        "flow_n": "Flow {{n}}",
+        "picked_count_one": "{{n}} picked",
+        "picked_count_other": "{{n}} picked",
+        "hint_order": "Numbers are the order I’ll walk them — drag a row to reorder, or use ‹ › from the keyboard.",
+        "hint_pick": "Click a screen to pick it. Pick several to critique them as a flow.",
+        "cant_render_title": "I can’t render this one",
+        "cant_render_short": "can’t render",
+        "group_fallback": "Screens",
+        "tag_from_links": "From links",
+        "tag_guess": "Guess",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "utils": {
         "i_ll_capture_it_and_measure_real_contrast_and_si": "I’ll capture it and measure real contrast and sizes.",
@@ -1121,11 +1158,23 @@
         "i_ll_list_the_screens_only_pages_that_render_wit": "I’ll list the screens. Only pages that render without a server can be seen.",
         "i_ll_pull_the_frames": "export the frames as PNGs and drop them in — I critique the exported images.",
         "it_must_be_running_right_now_i_ll_capture_it_liv": "it must be running right now. I’ll capture it live and measure real contrast and sizes.",
-        "not_something_i_recognise_give_me_a_figma_link_a": "Not something I recognise. Give me a Figma link, a GitHub repo, an absolute local path, or a URL that’s already serving."
+        "not_something_i_recognise_give_me_a_figma_link_a": "Not something I recognise. Give me a Figma link, a GitHub repo, an absolute local path, or a URL that’s already serving.",
+        "screen_fallback": "Screen"
       },
       "waitingScreen": {
         "cancel_this_run": "Cancel this run",
-        "stop_this_run_and_discard_it": "Stop this run and discard it"
+        "stop_this_run_and_discard_it": "Stop this run and discard it",
+        "getting_screens_ready": "Getting the screens ready…",
+        "title_scanning": "Looking for screens to audit",
+        "title_uploading_screens_one": "Uploading {{n}} screen…",
+        "title_uploading_screens_other": "Uploading {{n}} screens…",
+        "title_uploading_one": "Uploading your screenshot…",
+        "title_reading_flow_one": "Reading your flow · {{n}} screen",
+        "title_reading_flow_other": "Reading your flow · {{n}} screens",
+        "title_reading_screen": "Reading your screen",
+        "title_getting_pixels": "Getting real pixels first",
+        "foot_still_going": "Still going — a dense flow can take a couple of minutes. You can navigate away; the critique keeps running and will be here when you come back.",
+        "foot_navigate_away": "You can navigate away — the critique keeps running."
       }
     },
     "designTweak": {
@@ -1308,7 +1357,8 @@
           "timeline": "Timeline",
           "unassign_me": "Unassign me",
           "unassigned": "unassigned",
-          "updated": "Updated"
+          "updated": "Updated",
+          "by": "· by"
         },
         "issueList": {
           "clear_search": "Clear search",
@@ -1333,7 +1383,9 @@
           "remove_this_label_no_longer_exists_on_the_repo": "Remove — this label no longer exists on the repo",
           "saved_but_no_longer_on_this_repo": "Saved but no longer on this repo:",
           "add_suggested_one": "Add {{count}} suggested",
-          "add_suggested_other": "Add {{count}} suggested"
+          "add_suggested_other": "Add {{count}} suggested",
+          "add": "Add",
+          "suggested": "suggested"
         },
         "leftRail": {
           "dashboards": "Dashboards",
@@ -1478,7 +1530,10 @@
           "passed_count_one": "{{count}} passed",
           "passed_count_other": "{{count}} passed",
           "skipped_count_one": "{{count}} skipped",
-          "skipped_count_other": "{{count}} skipped"
+          "skipped_count_other": "{{count}} skipped",
+          "failing": "failing",
+          "passed": "passed",
+          "running": "running"
         },
         "prFiltersSection": {
           "assigned_to_me": "Assigned to me",
@@ -1527,7 +1582,8 @@
           "open_this_item_in_the_workspace": "Open this item in the workspace",
           "deep_count_one": "{{count}} deep",
           "deep_count_other": "{{count}} deep",
-          "dialog_label": "{{kind}} {{ref}} in {{repo}}"
+          "dialog_label": "{{kind}} {{ref}} in {{repo}}",
+          "deep": "deep"
         },
         "repoSwitcher": {
           "repositories": "Repositories"
@@ -1764,7 +1820,8 @@
             "propose_labels_this_repo_is_missing_from_its_ope": "Propose labels this repo is missing, from its open issues",
             "suggested_new_labels_not_created_until_you_say_s": "Suggested new labels — not created until you say so",
             "labels_defined_one": "{{count}} defined · by open-issue count",
-            "labels_defined_other": "{{count}} defined · by open-issue count"
+            "labels_defined_other": "{{count}} defined · by open-issue count",
+            "defined_by_open_issue_count": "defined · by open-issue count"
           },
           "untaggedIssueCard": {
             "add": "Add",
@@ -1775,19 +1832,22 @@
         "taggingView": {
           "applying_is_disabled_until_they_load_because_a_s": "applying is disabled until they load, because a suggestion naming a\n            label the repo no longer has would be rejected for the whole batch.",
           "applying_needs_write_access": "applying needs write access",
-          "carries_at_least_one_label_nothing_to_tag": "carries at least one label. Nothing to tag.",
-          "couldn_t_load": "Couldn't load",
+          "couldn_t_load_repo_labels": "Couldn't load {{repo}}'s labels",
           "couldn_t_reload_the_queue": "Couldn't reload the queue:",
-          "defines_no_labels_yet_so_there_is_nothing_to_ass": "defines no labels yet, so there is nothing to assign. Suggest a few above,\n            create the ones you want, then come back and suggest labels here.",
-          "every_open_issue_in": "Every open issue in",
+          "repo_defines_no_labels_yet": "{{repo}} defines no labels yet, so there is nothing to assign. Suggest a few above, create the ones you want, then come back and suggest labels here.",
+          "every_open_issue_in_repo_is_labeled": "Every open issue in {{repo}} carries at least one label. Nothing to tag.",
           "loading_the_untagged_queue": "Loading the untagged queue…",
           "newest_first": "newest first",
           "reload_the_untagged_queue": "Reload the untagged queue",
           "repo_labels": "Repo labels",
-          "s_labels": "'s labels:",
           "untagged": "Untagged",
           "untagged_issues": "Untagged issues",
-          "what_you_see_below_is_the_previous_result_not_th": "what you see below is the previous result, not the current state."
+          "what_you_see_below_is_the_previous_result_not_th": "what you see below is the previous result, not the current state.",
+          "carries_at_least_one_label_nothing_to_tag": "carries at least one label. Nothing to tag.",
+          "couldn_t_load": "Couldn't load",
+          "defines_no_labels_yet_so_there_is_nothing_to_ass": "defines no labels yet, so there is nothing to assign. Suggest a few above,\n            create the ones you want, then come back and suggest labels here.",
+          "every_open_issue_in": "Every open issue in",
+          "s_labels": "'s labels:"
         },
         "registry": {
           "graph": "Graph",
@@ -1841,7 +1901,9 @@
           "aria_tree_one": "Dependency tree of {{kind}}-{{number}}: {{nodes}} node, {{edges}}",
           "aria_tree_other": "Dependency tree of {{kind}}-{{number}}: {{nodes}} nodes, {{edges}}",
           "live_edges_one": "{{n}} live edge",
-          "live_edges_other": "{{n}} live edges"
+          "live_edges_other": "{{n}} live edges",
+          "tree_stat": "tree of {{kind}}-{{number}}: {{nodes}} nodes · {{edges}} live edges",
+          "aria_tree": "Dependency tree of {{kind}}-{{number}}: {{nodes}} nodes, {{edges}} live edges"
         },
         "groupReviewsView": {
           "title": "Review requests",
@@ -2150,6 +2212,7 @@
         "back": "Back",
         "endAndReview": "End and review",
         "ended": "Ended",
+        "exportMarkdown": "Export {{name}} output as Markdown",
         "live": "Live",
         "loadFailed": "Could not open this meeting",
         "moreActions": "More actions",
@@ -2202,6 +2265,7 @@
         "closeBlocked_one": "{{count}} still needs a decision",
         "closeBlocked_other": "{{count}} still need a decision",
         "closeMeeting": "Close the meeting",
+        "closing": "Saving the transcript…",
         "file": "File",
         "filedSection": "Filed to {{provider}}",
         "filing": "Filing…",
@@ -2370,6 +2434,7 @@
       },
       "chat": {
         "ask_placeholder": "Ask {{name}}...",
+        "message_label": "Message {{name}}",
         "edit_cancel": "Cancel",
         "edit_mode": "Editing — send to replace, or cancel",
         "load_earlier": "Load earlier messages",
@@ -2826,7 +2891,13 @@
         "walks_one": "{{n}} step",
         "walks_other": "{{n}} steps",
         "busiest_day_one": "Chattiest day: {{date}} ({{n}} msg)",
-        "busiest_day_other": "Chattiest day: {{date}} ({{n}} msgs)"
+        "busiest_day_other": "Chattiest day: {{date}} ({{n}} msgs)",
+        "busiest_day": "Chattiest day: {{date}} ({{count}} msgs)",
+        "drags": "Dragged {{count}} times",
+        "longest_chat": "Longest chat: {{count}} messages",
+        "peeks": "Peeked {{count}} times",
+        "screenshots": "Looked at your screen {{count}} times",
+        "walks": "{{count}} steps"
       },
       "tip": {
         "bedtime": "Try: \"tell me to wind down at 11\"",
@@ -3317,7 +3388,11 @@
         "cleared_count_one": "{{count}} cleared ·",
         "cleared_count_other": "{{count}} cleared ·",
         "unclaimed_count_one": "{{count}} not yet claimed",
-        "unclaimed_count_other": "{{count}} not yet claimed"
+        "unclaimed_count_other": "{{count}} not yet claimed",
+        "cleared": "cleared ·",
+        "firing_2": "firing ·",
+        "not_yet_claimed": "not yet claimed",
+        "parked_at_provider": "parked at provider ·"
       }
     },
     "papyrus": {
@@ -3459,6 +3534,7 @@
         "no_sessions_matching": "No sessions matching \"{{query}}\"",
         "purchased": "Purchased",
         "search_past_sessions": "Search past sessions...",
+        "search_label": "Search past sessions",
         "skipped": "Skipped",
         "your_past_advisor_conversations_and_recommendati": "Your past advisor conversations and recommendations will appear here.",
         "mark_liked": "Mark as liked",
@@ -3487,6 +3563,7 @@
         "delete_group_keeps_preferences": "Delete group (keeps preferences)",
         "edit": "Edit",
         "group_name": "Group name",
+        "new_preference_label": "New preference",
         "loading_preferences": "Loading preferences...",
         "no_items_in_this_group": "No items in this group",
         "no_preferences_yet": "No preferences yet",
@@ -3512,6 +3589,8 @@
         "remove_site": "Remove site",
         "shopping_sources_the_advisor_can_browse_login_en": "The advisor cannot read this list. Name a store in chat and it will research that one — this is your own reference list.",
         "site_name_e_g_example_store": "Site name (e.g. Example Store)",
+        "site_name_label": "Site name",
+        "site_url_label": "Site URL",
         "the_advisor_only_visits_sites_you_ve_enabled_her": "Nothing here leaves your machine.",
         "the_advisor_opens_sites_in_the_browser_panel_dur": "The advisor reads public store pages only. It cannot sign in to a store or use your session, so prices and stock come from the public page.",
         "url_e_g_store_example_com": "URL (e.g. store.example.com)",
@@ -3890,7 +3969,8 @@
           "starting": "Starting…",
           "task_progress": "Task progress",
           "done_of_total_one": "{{done}} of {{total}} task done",
-          "done_of_total_other": "{{done}} of {{total}} tasks done"
+          "done_of_total_other": "{{done}} of {{total}} tasks done",
+          "done_of_total": "{{done}} of {{total}} tasks done"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "Describe what you want to build, answer a few questions, and get a reviewed plan — requirements, design, and tasks — that an agent can execute for you.",
@@ -4120,7 +4200,7 @@
         "backup_others_on_drive": "Other installs backing up to this drive: {{count}}",
         "backup_show_others": "Include archives from other installs",
         "backup_others_truncated": "Only the first {{max}} other installs are shown.",
-"backup_archives_truncated": "Some {{kind}} archives could not be listed. The newest may be missing.",
+        "backup_archives_truncated": "Some {{kind}} archives could not be listed. The newest may be missing.",
         "backup_shared_note": "One drive shared by two installs is not shared memory and not shared sessions. Each backup is a separate archive of one point in time, and a restore only downloads that file to a staging folder — you replace files yourself, with the gateway stopped.",
         "backup_restore_foreign_confirm": "This archive was uploaded by another install ({{install}}). Restoring it downloads that install's data, not this install's. Download it anyway?",
         "backup_restore_unverified_confirm": "This archive is stored under this install's own folder, but this install has no record of uploading it. Anything that can write to the drive can create that folder, so it may not be this install's. Download it anyway?",
@@ -4281,7 +4361,8 @@
         "totals_summary_one": "{{accounts}} account · {{keys}}",
         "totals_summary_other": "{{accounts}} accounts · {{keys}}",
         "keys_healthy_one": "{{healthy}} of {{n}} key healthy",
-        "keys_healthy_other": "{{healthy}} of {{n}} keys healthy"
+        "keys_healthy_other": "{{healthy}} of {{n}} keys healthy",
+        "totals_summary": "{{accounts}} accounts · {{healthy}} of {{keys}} keys healthy"
       },
       "rail": {
         "accounts": "Accounts & credentials",
@@ -4416,7 +4497,9 @@
       "items_selected_count_one": "{{count}} item selected",
       "items_selected_count_other": "{{count}} items selected",
       "found_count_one": "{{count}} found",
-      "found_count_other": "{{count}} found"
+      "found_count_other": "{{count}} found",
+      "found": "found",
+      "items_selected": "items selected"
     },
     "agentSpecNotRewrittenNotice": {
       "saved_but_not_applied": "Saved, but this copy of {{productName}} could not update the agent config, so new chats keep the old setup. Open the Logs page to see why."
@@ -4452,7 +4535,8 @@
       "loading": "Loading",
       "retry": "Retry",
       "this_app_is_disabled": "This app is disabled",
-      "this_app_provides_agents_and_skills_but_no_visua": "This app provides agents and skills but no visual interface.\n            Use its agents from chat."
+      "this_app_provides_agents_and_skills_but_no_visua": "This app provides agents and skills but no visual interface.\n            Use its agents from chat.",
+      "app_not_found": "App Not Found"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "Pop out app to its own window",
@@ -4470,7 +4554,8 @@
       "rejected": "Rejected",
       "tool_approval_requested": "Tool approval requested:",
       "trusted_auto_approving_future_calls": "Trusted — auto-approving future calls",
-      "title_wants_to_run": "<title/> wants to run"
+      "title_wants_to_run": "<title/> wants to run",
+      "running": "Running:"
     },
     "approvalModePicker": {
       "nudge_body": "This is where you adjust how {{productName}} asks for approval. Choosing \"Trust\" here lets it work in this chat without asking first — you can switch back anytime.",
@@ -4524,14 +4609,17 @@
         "remote_environment_detected": "Remote environment detected",
         "run_this_on_your_local_machine": "Run this on your local machine:",
         "uninstall": "Uninstall",
-        "update": "Update"
+        "update": "Update",
+        "open": "Open"
       },
       "sourcesPopover": {
-        "developer_install_of_a_local_app_directory_equiv": "Developer install of a local app directory (equivalent to",
+        "developer_install_equivalent_to_command": "Developer install of a local app directory (equivalent to <command/>).",
         "install_from_path": "Install from Path",
         "kirocrew_app_install_path": "kirocrew app install <path>",
         "manage_app_sources": "Manage app sources",
-        "path_to_app_directory": "/path/to/app-directory"
+        "path_to_app_directory": "/path/to/app-directory",
+        "app_directory_path_label": "App directory path",
+        "developer_install_of_a_local_app_directory_equiv": "Developer install of a local app directory (equivalent to"
       }
     },
     "artifactBody": {
@@ -4659,7 +4747,10 @@
       "used": "Used",
       "sketch": "Sketch",
       "sketch_desc": "Draw on a whiteboard, send it as an image",
-      "more_actions": "More actions"
+      "more_actions": "More actions",
+      "apply_a_ready_made_set_of_instructions": "Apply a ready-made set of instructions",
+      "let_the_agent_read_one_of_your_files": "Let the agent read one of your files",
+      "quick_actions_like_clearing_the_chat_or_checking": "Quick actions like clearing the chat or checking usage"
     },
     "chatPane": {
       "agent_list": "Agent list",
@@ -4669,7 +4760,8 @@
       "split_right": "Split right",
       "split_right_d": "Split right (⌘D)",
       "type_to_filter": "Type to filter…",
-      "preparing_catch_up": "Preparing your catch-up…"
+      "preparing_catch_up": "Preparing your catch-up…",
+      "session_ready_type_a_message_to_start": "Session ready. Type a message to start."
     },
     "cliPanel": {
       "copy_selection": "Copy selection"
@@ -4752,7 +4844,9 @@
       "resolved_count_one": "{{count}} resolved",
       "resolved_count_other": "{{count}} resolved",
       "messages_count_one": "{{count}} message",
-      "messages_count_other": "{{count}} messages"
+      "messages_count_other": "{{count}} messages",
+      "messages": "messages",
+      "open": "open ·"
     },
     "commentsSidebar": {
       "add_a_comment_on_the_whole_artifact": "Add a comment on the whole artifact…",
@@ -4786,7 +4880,8 @@
       "show_resolved_count_one": "Show {{count}} resolved",
       "show_resolved_count_other": "Show {{count}} resolved",
       "hide_resolved_count_one": "Hide {{count}} resolved",
-      "hide_resolved_count_other": "Hide {{count}} resolved"
+      "hide_resolved_count_other": "Hide {{count}} resolved",
+      "resolved": "resolved"
     },
     "contentRenderer": {
       "changes_update_svg_preview_as_you_type": "Changes update the preview as you type.",
@@ -4885,7 +4980,9 @@
       "this_document_is_tracked_as_a_session_artifact_n": "This document is tracked as a session artifact, not a source-file change",
       "toggle_diff": "Show or hide the diff for {{path}}",
       "show_more_count_one": "Show {{count}} more",
-      "show_more_count_other": "Show {{count}} more"
+      "show_more_count_other": "Show {{count}} more",
+      "more": "more",
+      "show": "Show"
     },
     "openFileChips": {
       "open_file": "Open file"
@@ -4917,7 +5014,12 @@
       "lines_count_one": "{{count}} line",
       "lines_count_other": "{{count}} lines",
       "more_count_one": "{{count}} more",
-      "more_count_other": "{{count}} more"
+      "more_count_other": "{{count}} more",
+      "items": "items",
+      "lines": "lines",
+      "more": "more",
+      "rows": "rows",
+      "showing_500_of": "Showing 500 of"
     },
     "folderProjectHint": {
       "differs": "Commands, files and search here use {{current}}, not this folder's {{folder}}.",
@@ -4958,6 +5060,7 @@
       "import_from_file": "Import a session from a file",
       "refusal_damaged_file": "This file could not be read. It may be damaged, or not an exported session.",
       "refusal_not_a_session": "This file is not an exported session.",
+      "refusal_zip_archive": "This file is a zip archive, such as a Kiro IDE export. Only sessions exported from {{productName}} can be imported.",
       "refusal_too_large": "This file is too large to import.",
       "refusal_upload_failed": "This file could not be uploaded. The connection may have dropped.",
       "refusal_busy": "Too many imports are running right now. Try again in a moment.",
@@ -5600,7 +5703,8 @@
       "sent": "Sent",
       "sent_transcript_only": "Sent (transcript only)",
       "transcript_only_hint": "That crew could not restore the full conversation context, so this copy resumes from the transcript alone.",
-      "unknown_error": "Unknown error"
+      "unknown_error": "Unknown error",
+      "failed": "Failed"
     },
     "sessionActionsMenu": {
       "bring_back_to_main": "Bring back to main",
@@ -5737,7 +5841,8 @@
       "installed_files_one": "Installed {{count}} file",
       "installed_files_other": "Installed {{count}} files",
       "popular_skills": "Popular skills",
-      "search_failed": "Couldn’t load skills. Try again."
+      "search_failed": "Couldn’t load skills. Try again.",
+      "by": "by"
     },
     "skillDirectoryBrowser": {
       "description": "Description",
@@ -5822,7 +5927,8 @@
       "screen_capture_drag_the_area_you_want_it_attache": "Screen capture — drag the area you want; it attaches automatically on release"
     },
     "tagManagerList": {
-      "new_tag": "New tag… ↵"
+      "new_tag": "New tag… ↵",
+      "new_tag_label": "New tag name"
     },
     "terminalCompletion": {
       "path_completions": "Path completions"
@@ -5867,7 +5973,8 @@
       "dismiss_tip": "Dismiss tip",
       "feature_tip": "Feature tip",
       "learn_more": "Learn more",
-      "turn_off_tips": "Turn off tips"
+      "turn_off_tips": "Turn off tips",
+      "tip_settings": "Tip settings"
     },
     "toolInputPreview": {
       "collapse": "Collapse",
@@ -5930,6 +6037,7 @@
       "open_settings": "Open settings",
       "pick_an_installed_provider_under_settings_voice": "Pick an installed provider under Settings → Voice, or install the current one.",
       "provider_is_not_installed_on_this_machine": "Speech-to-text is on, but the \"{{provider}}\" provider isn't installed on this machine, so recordings can't be transcribed.",
+      "provider_off_open_settings": "Speech recognition is turned off: no speech provider is selected. Open settings and pick one to use the mic.",
       "run_the_command_below_in_a_terminal_to_install_v": "Run the command below in a terminal to install voice support, then reload the page.",
       "settings_voice": "Settings → Voice",
       "speech_to_text_is_not_enabled_yet_so_the_microph": "Speech-to-text is not enabled yet, so the microphone cannot turn your voice into text.",
@@ -6032,7 +6140,20 @@
       "annotate_update_failed": "Couldn’t update the notes — try again",
       "annotations_count_one": "{{count}} note",
       "annotations_count_other": "{{count}} notes",
-      "browser_live": "Browser — live"
+      "browser_live": "Browser — live",
+      "browser_view": "Browser view",
+      "browser_view_is_not_running": "Browser view is not running",
+      "browser_view_unavailable": "Browser view unavailable",
+      "can_t_embed_an_http_page_here": "Can't embed an http:// page here",
+      "couldn_t_start_the_browser_view": "Couldn't start the browser view.",
+      "http": "http://",
+      "live_browser_session": "Live browser session",
+      "loading_the_browser_view": "Loading the browser view…",
+      "page_mixed_content": "page (mixed content).",
+      "start_browser_view": "Start browser view",
+      "start_it_to_watch_and_drive_the_agent_s_browser": "Start it to watch and drive the agent's browser session in this panel.",
+      "the_browser_view_isn_t_available_on_this_gateway": "The browser view isn't available on this gateway.",
+      "this_dashboard_is_served_over_https_so_the_brows": "This dashboard is served over HTTPS, so the browser blocks embedding an"
     },
     "welcomeView": {},
     "widgetFrame": {
@@ -6386,6 +6507,22 @@
       "next_match": "Next match",
       "close_search": "Close search"
     },
+    "codeChannelBadge": {
+      "label": "Slack code channel",
+      "label_short": "Code channel",
+      "archived": "Channel archived",
+      "wrapped_up": "Task done",
+      "open_named": "Open {{channel}} in Slack",
+      "open_unnamed": "Open this code channel in Slack",
+      "opens_in_slack": "(opens in Slack)",
+      "about": "This session runs in a Slack code channel. Messages there and here are one conversation.",
+      "archived_hint": "Archived in Slack. The channel is read-only.",
+      "wrapped_up_hint": "Wrapped up. The task is done and the channel stays open for follow-ups.",
+      "thread_label": "Slack thread",
+      "thread_open": "Open this Slack thread",
+      "thread_paused": "Replies paused",
+      "thread_paused_hint": "Replies from this session are paused in the thread. Messages sent there still reach it."
+    },
     "runYourselfCard": {
       "copy_failed": "Couldn't copy, so select the command and copy it by hand.",
       "no_terminal": "Running commands isn't available here, so copy it into the Terminal app on your computer.",
@@ -6571,7 +6708,14 @@
       "updating": "Updating…",
       "v": "v",
       "v_2": "· v",
-      "websocket_events": "WebSocket Events"
+      "websocket_events": "WebSocket Events",
+      "installed": "Installed:",
+      "lifecycle": "| Lifecycle:",
+      "memory": "Memory:",
+      "min_kirocrew_v": "Min {{productName}}: v",
+      "origin": "Origin:",
+      "platform": "Platform:",
+      "resources_2": "| Resources:"
     },
     "appPage": {
       "loading_app": "Loading app…"
@@ -6590,7 +6734,6 @@
       "agent_other": "{{count}} agents",
       "app_one": "{{count}} app",
       "app_other": "{{count}} apps",
-      "available": "available",
       "backend_refused_notice": "The backend of {{name}} did not start: {{reason}}",
       "cancel": "Cancel",
       "category": "Category",
@@ -6619,15 +6762,17 @@
       "try_a_different_search_or_category": "Try a different search or category.",
       "uninstall_app_title": "Uninstall “{{name}}”?",
       "uninstall": "Uninstall",
-      "update_one": "{{count}} update",
-      "update_other": "{{count}} updates",
       "v": "v",
       "installed_app_find_in_library_and_enable": "Installed {{name}}. Enable it in Library.",
       "synced_from_its_source_directory": "Synced {{name}} from its source directory.",
       "updated_from_the_registry": "Updated {{name}} from the registry.",
       "updated_needs_session_approval_consent": "{{name}} is disabled because it newly asks to control your chats. Review the permission in the app details, then enable it.",
       "refresh_store": "Refresh the store",
-      "refreshing_store": "Refreshing the store…"
+      "refreshing_store": "Refreshing the store…",
+      "available": "available",
+      "kept": "Kept —",
+      "update_one": "{{count}} update",
+      "update_other": "{{count}} updates"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/mo",
@@ -6751,7 +6896,9 @@
       "more_count_other": "+{{n}} more",
       "account_short": "acct {{account}}",
       "profile_reachable": "{{profile}}: access reachable",
-      "profile_reachable_account": "{{profile}}: access reachable (account {{account}})"
+      "profile_reachable_account": "{{profile}}: access reachable (account {{account}})",
+      "access_reachable": ": access reachable",
+      "more": "more"
     },
     "artifactDetailPage": {
       "a_newer_version_is_available_in_the_remote_copy": "· a newer version is available in the remote copy",
@@ -6828,7 +6975,12 @@
       "content_copied_from_version": "content copied from v{{version}}",
       "version_label": "v{{version}}",
       "to_version": "→ v{{version}}",
-      "version_change": "v{{from}} → v{{to}}"
+      "version_change": "v{{from}} → v{{to}}",
+      "by": "by",
+      "content_copied_from_v": "content copied from v",
+      "updated": "· Updated",
+      "v": "v",
+      "v_2": "→ v"
     },
     "artifactPopoutFrame": {
       "return": "Return",
@@ -6890,7 +7042,9 @@
       "widgets_files_and_snippets_live_tracked_with_ver": "Widgets, files, and snippets — live-tracked with version history",
       "your_artifacts": "Your Artifacts",
       "local_preview": "Local preview",
-      "folder_renamed_to": "Folder renamed to {{name}}"
+      "folder_renamed_to": "Folder renamed to {{name}}",
+      "by": "by",
+      "on": "On"
     },
     "capabilitiesPage": {
       "agent_capabilities": "Customize"
@@ -7074,7 +7228,8 @@
         "trusted": "Trusted",
         "view_full_activity": "View Full Activity →",
         "approvals_pending_count_one": "{{count}} approval pending",
-        "approvals_pending_count_other": "{{count}} approvals pending"
+        "approvals_pending_count_other": "{{count}} approvals pending",
+        "approvals_pending": "approvals pending"
       },
       "cronAckBar": {
         "acknowledge": "Acknowledge",
@@ -7119,7 +7274,9 @@
         "selected_count_one": "{{count}} selected",
         "selected_count_other": "{{count}} selected",
         "tokens_count_one": "{{count}} token",
-        "tokens_count_other": "{{count}} tokens"
+        "tokens_count_other": "{{count}} tokens",
+        "selected": "selected ·",
+        "tokens": "tokens"
       },
       "mcpInfoButton": {
         "disabled": "disabled",
@@ -7272,7 +7429,8 @@
         "waiting_for_your_approval_to_start": "Waiting for your approval to start",
         "waiting_to_start_queued_behind_the_concurrency_l": "Waiting to start — queued behind the concurrency limit",
         "more_running_normally_count_one": "{{count}} more running normally…",
-        "more_running_normally_count_other": "{{count}} more running normally…"
+        "more_running_normally_count_other": "{{count}} more running normally…",
+        "more_running_normally": "more running normally…"
       },
       "subagentQueued": {
         "low_memory": "waiting to start — needs {{required}} of free memory, {{available}} free now; free up memory to continue",
@@ -7299,7 +7457,8 @@
         "done_of_total": "{{done}} of {{total}}",
         "task_completion": "Task completion",
         "more_count_one": "+ {{n}} more…",
-        "more_count_other": "+ {{n}} more…"
+        "more_count_other": "+ {{n}} more…",
+        "more": "more…"
       },
       "thinkingBlock": {
         "thinking": "Thinking",
@@ -7379,8 +7538,14 @@
         "agent_switch_blocked_channel": "Switching to {{agent}} was blocked — this chat is linked to a Slack channel served by {{channel_agent}}. The next turn restarts on that agent.",
         "channel_message_not_run": "A message from a Slack channel was not run: this session's agent is not the agent that channel uses.",
         "crew_name_undispatchable": "This thread's crew name cannot be dispatched. Rename or recreate the Bot.",
+        "code_channel_worktree_not_ready": "This code channel's worktree is not ready, so the message was not run. Send it again in a moment.",
         "remote_crew_read_only": "This chat ran on a remote crew and is read-only now. Open the crew's own session to keep going.",
-        "archive_failed_turn_cancelled": "Archiving this tab failed after its running turn was cancelled. The tab was kept, but that turn did not finish — send your message again to continue."
+        "archive_failed_turn_cancelled": "Archiving this tab failed after its running turn was cancelled. The tab was kept, but that turn did not finish — send your message again to continue.",
+        "kas_signed_out": "Not signed in to Kiro. Sign in from Settings → Agent Harness → Kiro sign-in, then start a new chat.",
+        "kas_signed_out_sign_in_below": "Not signed in to Kiro. Sign in below, then start a new chat.",
+        "kas_route_relay": "Your agent runs through kiro-cli.",
+        "kas_route_bundle": "Your agent runs on {{productName}}'s own engine.",
+        "kas_route_lead": "{{route}} {{message}}"
       },
       "userMessage": {
         "cancel": "Cancel",
@@ -7410,7 +7575,8 @@
       "workflowSidebarRow": {
         "could_not_load_snapshot": "Could not load snapshot:",
         "events_count_one": "{{n}} event",
-        "events_count_other": "{{n}} events"
+        "events_count_other": "{{n}} events",
+        "events": "events"
       },
       "pins": {
         "pinned_messages": "Pinned messages",
@@ -7640,6 +7806,44 @@
       "jump_to_new_other": "{{count}} new · Jump to latest"
     },
     "chatSidebar": {
+      "needsMeCard": {
+        "card_label": "{{title}}: needs you",
+        "recap": "Recap",
+        "recap_none": "No recap yet.",
+        "needs_you": "Needs you",
+        "kind_approval": "Approval",
+        "kind_question": "Question",
+        "kind_form": "Form",
+        "kind_reply": "Reply",
+        "no_arguments": "(no arguments)",
+        "approved": "Approved",
+        "denied": "Denied",
+        "expired": "Expired. The agent moved on.",
+        "decision_failed": "Could not send that decision.",
+        "deny": "Deny",
+        "deny_aria": "Deny {{tool}}",
+        "approve": "Approve",
+        "approve_aria": "Approve {{tool}}",
+        "answer_in_session": "Open the session in the list to answer.",
+        "required": "required",
+        "reply_placeholder": "Reply to this session…",
+        "reply_aria": "Quick reply to {{title}}",
+        "send": "Send reply",
+        "sent": "Sent.",
+        "queued": "Queued. Sends when the agent finishes its current step.",
+        "reply_not_approval": "Replies go to the chat. Use Approve or Deny above.",
+        "reply_keys": "Enter to send · Shift+Enter for a new line · Esc to close",
+        "send_failed": "Could not send the reply.",
+        "decide_on_conductor": "Decide this on the conductor’s approval card.",
+        "recap_failed": "Could not load the recap.",
+        "asks_failed": "Could not load the approvals. Click the session to see them.",
+        "unconfirmed": "Not confirmed yet. Check the session before sending again.",
+        "decision_hint": "Approve lets the agent do this once. Deny skips it.",
+        "send_race": "Someone else replied first, so this reply was not sent.",
+        "approved_elsewhere": "Approved elsewhere",
+        "denied_elsewhere": "Denied elsewhere",
+        "unknown_tool": "Unknown tool"
+      },
       "add_column_after_this_one": "Add column after this one",
       "agent_finished_your_turn": "Agent finished — your turn",
       "also_show_sessions_that_have_no_tags_at_all": "Also show sessions that have no tags at all",
@@ -7799,6 +8003,20 @@
       "crew_attention_go_question": "Open chat needing your answer",
       "crew_attention_go_working": "Open working chat",
       "crew_attention_name": "{{target}}. {{counts}}",
+      "code_channel_crew_waiting": "Waiting on you",
+      "code_channel_crew_waiting_title_one": "{{count}} session in this channel is waiting on you",
+      "code_channel_crew_waiting_title_other": "{{count}} sessions in this channel are waiting on you",
+      "code_channel_crew_interrupted_one": "{{count}} interrupted",
+      "code_channel_crew_interrupted_other": "{{count}} interrupted",
+      "code_channel_crew_show_one": "Show {{count}} worker session",
+      "code_channel_crew_show_other": "Show {{count}} worker sessions",
+      "code_channel_crew_hide_one": "Hide {{count}} worker session",
+      "code_channel_crew_hide_other": "Hide {{count}} worker sessions",
+      "code_channel_crew_stuck_one": "{{count}} stuck",
+      "code_channel_crew_stuck_other": "{{count}} stuck",
+      "code_channel_crew_done_one": "{{count}} of {{total}} done",
+      "code_channel_crew_done_other": "{{count}} of {{total}} done",
+      "code_channel_crew_done_plain": "Done",
       "remote_instances_list_unavailable": "Remote crews could not be listed, so their sessions are not shown.",
       "clean_up_empty_folders": "Clean up empty folders",
       "clean_up_empty_folders_menu": "Clean up empty folders…",
@@ -7877,7 +8095,10 @@
       "show_sessions_count_one": "Show {{n}} session",
       "show_sessions_count_other": "Show {{n}} sessions",
       "hide_sessions_count_one": "Hide {{n}} session",
-      "hide_sessions_count_other": "Hide {{n}} sessions"
+      "hide_sessions_count_other": "Hide {{n}} sessions",
+      "skip": "Skip",
+      "will_be_moved_to_older_sessions": "will be moved to older sessions.",
+      "broadcast_crewmates_hint": "Chats run by your mates, the AI agents in your crew"
     },
     "contextBreakdown": {
       "axis_turn_n": "Turn {{n}}",
@@ -7972,6 +8193,10 @@
       "turn_picker": "Pick a turn",
       "unit_chars": "characters",
       "unit_tokens": "tokens",
+      "n_chars_one": "{{n}} character",
+      "n_chars_other": "{{n}} characters",
+      "n_tokens_one": "{{n}} token",
+      "n_tokens_other": "{{n}} tokens",
       "window_usage": "{{percent}} of the {{size}}-token window",
       "block_your_message": "Your message",
       "block_memory": "Memory of you",
@@ -7998,7 +8223,21 @@
       "start_row_show": "Show",
       "start_row_shown": "Shown above",
       "picked_gone": "Turn {{n}} has left the chart, so the newest turn is shown.",
-      "turn_start_latest": "Turn {{n}} · session start · latest"
+      "turn_start_latest": "Turn {{n}} · session start · latest",
+      "delta_down": "−{{n}} vs previous",
+      "delta_same": "same as previous",
+      "delta_up": "+{{n}} vs previous",
+      "engine_calls": "Model requests this turn: {{n}}.",
+      "engine_heading": "Measured by the agent loop",
+      "engine_hist_all": "Conversation history",
+      "engine_hist_crew": "{{productName}} prompts, every turn still in context",
+      "engine_not_measured": "The agent loop did not measure this turn.",
+      "engine_note": "Characters, as the agent loop counted them in the turn's last model request. {{productName}} prompts use {{productName}}'s own count.",
+      "engine_total": "This turn's last model request held {{chars}} characters in total. \"{{productName}} prompts\" below is the part {{productName}} wrote, for every turn still in context.",
+      "engine_ttft_detail": "First output after {{total}} (first model token after {{model}}).",
+      "footer": "Counts only what {{productName}} sent this turn, including your message. Not the total sent so far, and not the model's whole context.",
+      "rebuild_row": "Turn {{n}} · context rebuilt",
+      "start_note": "Session-start and rebuild turns are listed above the chart so later turns stay readable."
     },
     "devFleetPage": {
       "actions": "Actions",
@@ -8354,7 +8593,10 @@
       "workspace": "workspace",
       "workspace_2": "Workspace",
       "workspace_hint_member": "The folder this Bot reads and writes. Switch it and new chats start fresh in the new folder; the old one is kept.",
-      "yes_delete_it": "Yes, delete it"
+      "yes_delete_it": "Yes, delete it",
+      "inherited_from_the_agent_template": "taken from the custom agent it is built from.",
+      "no_pin_anywhere_the_backend_chooses": "nothing chosen here or on the custom agent, so {{productName}} picks one for you.",
+      "resolves_to": "Using {{model}}"
     },
     "knowledge": {
       "detailView": {
@@ -8381,7 +8623,8 @@
         "shared_count_one": "{{n}} shared",
         "shared_count_other": "{{n}} shared",
         "status_active": "Active",
-        "status_archived": "Archived"
+        "status_archived": "Archived",
+        "shared": "shared"
       },
       "embeddingStatus": {
         "embedding_engine_ready_knowledge_items_need_embe": "Embedding engine ready — knowledge items need embedding.",
@@ -8447,7 +8690,8 @@
         "type_policy": "policy",
         "type_personal_notes": "personal notes",
         "type_external_reference": "external reference",
-        "type_document": "document"
+        "type_document": "document",
+        "selected": "selected"
       },
       "knowledgeGraph": {
         "ingest_documents_to_build_the_entity_graph": "Ingest documents to build the entity graph",
@@ -8466,7 +8710,9 @@
         "nodes_count_other": "{{count}} nodes",
         "edges_count_one": "{{count}} edge",
         "edges_count_other": "{{count}} edges",
-        "graph_counts": "{{nodes}}, {{edges}}"
+        "graph_counts": "{{nodes}}, {{edges}}",
+        "edges": "edges",
+        "nodes": "nodes,"
       },
       "sourceGroup": {
         "next": "Next →",
@@ -8541,7 +8787,8 @@
         "word_count_approx_one": "~{{n}} words",
         "word_count_approx_other": "~{{n}} words",
         "items_count_one": "{{n}} item",
-        "items_count_other": "{{n}} items"
+        "items_count_other": "{{n}} items",
+        "items": "items"
       }
     },
     "localStorageDebug": {
@@ -8576,7 +8823,8 @@
       "matches_only": "Matches only",
       "real_time_application_output": "Real-time application output",
       "matches_count_one": "{{count}} match",
-      "matches_count_other": "{{count}} matches"
+      "matches_count_other": "{{count}} matches",
+      "matches": "matches"
     },
     "mcpGatewayCard": {
       "backends": "Backends",
@@ -8593,7 +8841,8 @@
       "status_stopped": "stopped",
       "status_unhealthy": "unhealthy",
       "with_shared_gateway_pooled": "With shared gateway (pooled)",
-      "without_gateway_per_session_copies": "Without gateway (per-session copies)"
+      "without_gateway_per_session_copies": "Without gateway (per-session copies)",
+      "s": "s"
     },
     "membersPage": {
       "details": "Details",
@@ -9079,14 +9328,41 @@
       "recap_reason_needs_human": "needs a person",
       "recap_state_accepted": "accepted",
       "recap_state_rejected": "rejected",
-      "recap_state_abandoned": "abandoned"
+      "recap_state_abandoned": "abandoned",
+      "driving_idle": "Idle",
+      "member_count_filtered": "{{shown}} of {{count}} mates",
+      "switcher_unread": "Unread",
+      "profile_monitor": "Monitor",
+      "profile_monitor_active": "Active",
+      "profile_monitor_cycle": "Checks",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "Every",
+      "profile_monitor_inactive": "Stopped",
+      "profile_monitor_loading": "Checking monitor status…",
+      "profile_monitor_next": "Next check",
+      "profile_monitor_no_limit": "No limit",
+      "profile_monitor_none": "Not watching anything",
+      "profile_monitor_reason_unknown": "Stopped",
+      "profile_monitor_runtime": "Time used",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "Runtime started",
+      "profile_monitor_state": "State",
+      "profile_monitor_stopped": "Stopped because",
+      "profile_monitor_subject": "Subject",
+      "profile_monitor_subject_goal": "Goal loop",
+      "profile_monitor_subject_ledger": "Task list",
+      "profile_monitor_subject_pull_request": "Pull request",
+      "profile_monitor_type": "Type",
+      "profile_monitor_type_bounded": "Monitor",
+      "profile_monitor_unavailable": "Monitor status unavailable",
+      "profile_monitor_unknown": "Unknown"
     },
     "migrationPage": {
       "app_migration": "App Migration",
       "back_to_apps": "Back to Apps",
       "cleanup_complete": "Cleanup Complete",
       "coming_soon_this_app_is_not_yet_available_in_app": "Coming soon — this app is not yet available in Apps. Check back after the next update.",
-      "has_moved_to_a_standalone_app": "has moved to a standalone app",
+      "name_has_moved_to_a_standalone_app": "{{name}} has moved to a standalone app",
       "install_from_apps": "Install from Apps",
       "install_the_standalone_version_to_continue_using": "Install the standalone version to continue using this feature.",
       "migration_complete": "Migration Complete",
@@ -9095,7 +9371,8 @@
       "the_standalone_version_is_installed_and_ready_to": "The standalone version is installed and ready to use.",
       "this_feature_was_previously_built_into_kirocrew": "This feature was previously built into {{productName}} but has been extracted into a standalone app package.\n                The builtin version has been removed from this {{productName}} release.",
       "you_can_clean_up_the_old_builtin_entry_to_remove": "You can clean up the old builtin entry to remove it from the sidebar.",
-      "your_data_has_been_preserved_and_will_be_availab": "Your data has been preserved and will be available in the standalone version."
+      "your_data_has_been_preserved_and_will_be_availab": "Your data has been preserved and will be available in the standalone version.",
+      "has_moved_to_a_standalone_app": "has moved to a standalone app"
     },
     "notificationsPage": {
       "activity_feed": "Activity Feed",
@@ -9249,7 +9526,8 @@
         "declared": "Declared",
         "mcp_deny_spared": "This is one of {{productName}}'s own servers, so on {{name}} turning off one tool here stops only that tool.",
         "tools_count_one": "{{n}} tool",
-        "tools_count_other": "{{n}} tools"
+        "tools_count_other": "{{n}} tools",
+        "tools_2": "tools"
       },
       "memoryGraphTab": {
         "loading_graph_data": "Loading graph data…",
@@ -9350,7 +9628,8 @@
         "share_memory_warning": "Memory can hold anything the agent was told, such as names, file paths or a pasted password. Nothing is redacted. Anyone who gets the file can read all of it.",
         "skills": "Skills:",
         "upload_a_kirocrew_export_zip_to_restore_settings": "Upload a {{productName}} export zip to restore settings on this instance. Chats in the archive are added; existing chats are never replaced.\n          Existing data will be merged by default (duplicates are skipped).",
-        "workspace_files": "Workspace files:"
+        "workspace_files": "Workspace files:",
+        "kb": "KB"
       },
       "promptsTab": {
         "agent_sop_name": "@agent-sop:name",
@@ -9673,7 +9952,11 @@
       "today_messages_one": "{{amount}} message",
       "today_messages_other": "{{amount}} messages",
       "today_tokens_one": "{{amount}} token",
-      "today_tokens_other": "{{amount}} tokens"
+      "today_tokens_other": "{{amount}} tokens",
+      "messages": "messages",
+      "sessions": "sessions ·",
+      "today": "Today:",
+      "tokens": "tokens"
     },
     "performanceTab": {
       "builder_mcp_procs": "Builder MCP",
@@ -9713,7 +9996,8 @@
       "graph_scale_network": "Full scale {{max}} · last {{seconds}}",
       "graph_scale_percent": "Full scale 100% · last {{seconds}}",
       "session_storage_detail_one": "{{sessions}} session · {{reclaimable}} reclaimable",
-      "session_storage_detail_other": "{{sessions}} sessions · {{reclaimable}} reclaimable"
+      "session_storage_detail_other": "{{sessions}} sessions · {{reclaimable}} reclaimable",
+      "session_storage_detail": "{{sessions}} sessions · {{reclaimable}} reclaimable"
     },
     "projectDetailPage": {
       "analyzing_task_and_building_step_by_step_plan": "Analyzing task and building step-by-step plan",
@@ -9935,7 +10219,8 @@
       "tool_count_one": "{{n}} tool",
       "tool_count_other": "{{n}} tools",
       "unknown_agent": "sub-agent",
-      "unknown_model": "unknown"
+      "unknown_model": "unknown",
+      "tool_count": "{{count}} tools"
     },
     "sessionMemoryCard": {},
     "sessionStorage": {
@@ -10006,7 +10291,8 @@
       "unknown_session": "an unlisted session",
       "busy_emptying": "Emptying the Trash. Some actions are paused until it finishes.",
       "empty_failed_next_step": "Try Delete forever again. Details are in the gateway log.",
-      "kept_identity_changed": "One batch changed on disk after you selected it, so it was kept."
+      "kept_identity_changed": "One batch changed on disk after you selected it, so it was kept.",
+      "refused_heading": "{{count}} sessions could not be moved"
     },
     "sessionsTab": {
       "agent": "Agent",
@@ -10149,18 +10435,41 @@
         "backfill_folder_gone_nothing_filed": "The {{folder}} folder was removed while this ran, so nothing was filed. Save these settings to create it again first.",
         "loading_channel_config": "Loading {{channel}} config…",
         "cannot_load_channel_config": "Cannot load {{channel}} config. Is the gateway running?",
-        "channel_settings_read_only": "{{channel}} settings are managed on the machine running {{productName}} and are read-only from remote sessions."
+        "channel_settings_read_only": "{{channel}} settings are managed on the machine running {{productName}} and are read-only from remote sessions.",
+        "cannot_load": "Cannot load",
+        "config": "config…",
+        "config_is_the_gateway_running": "config. Is the gateway running?",
+        "loading": "Loading",
+        "settings_are_managed_on_the_machine_running_kiro": "settings are managed on the machine running {{productName}} and are read-only from remote sessions."
       },
       "browserPanel": {
         "cannot_load": "Cannot load the browser status. Is the gateway running?",
-        "installing": "Installing…"
+        "installing": "Installing…",
+        "browsing": "Browsing",
+        "use_builtin_label": "Use the built-in browser",
+        "use_builtin_desc": "Open pages in {{productName}}'s built-in panel. Turn off to browse with playwright-cli instead.",
+        "presence_is_consent": "Browsing is available because the Playwright CLI is installed. Removing it is what takes the capability away.",
+        "not_installed": "The agent cannot browse yet.",
+        "install_explains": "Installing the Playwright CLI lets the agent open pages, read them, and fill forms. You can watch and take over from the Browser panel.",
+        "install": "Install Playwright CLI",
+        "install_takes_a_while": "This downloads a browser, so it can take a few minutes. You can leave this page.",
+        "needs_node": "Needs Node.js 20 or newer to install (found {{version}}).",
+        "get_the_extension": "Get the extension",
+        "token_label": "Extension token (optional)",
+        "token_placeholder": "Paste from the extension",
+        "token_set": "Saved",
+        "token_save": "Save",
+        "token_clear": "Clear",
+        "token_explains": "Without a token the browser asks you to approve each attach. With one, it connects silently. Copy it from the Playwright extension in your browser."
       },
       "channelDisabledPanel": {
         "checking_your_organization_s_channel_policy": "Checking your organization's channel policy…",
         "kirocrew_couldn_t_confirm_whether_your_organizat": "{{productName}} couldn't confirm whether your organization's security policy\n          permits this channel. Its settings are hidden until the status resolves —\n          enforcement is unaffected. Try reloading.",
         "your_organization_s_security_policy_disables_thi": "Your organization's security policy disables this channel. Its settings\n        are unavailable and any configuration here would not take effect.",
         "channel_policy_status_unavailable": "{{channel}} policy status unavailable",
-        "channel_turned_off": "{{channel}} is turned off by your administrator"
+        "channel_turned_off": "{{channel}} is turned off by your administrator",
+        "is_turned_off_by_your_administrator": "is turned off by your administrator",
+        "policy_status_unavailable": "policy status unavailable"
       },
       "channelsPanel": {
         "channels": "Messaging Channels",
@@ -10338,7 +10647,11 @@
         "default_session_folder_none": "None (unfiled)",
         "default_session_folder_deleted": "Deleted folder",
         "default_session_folder_save_failed": "The default folder could not be saved. Try again.",
-        "default_session_folder_load_failed": "Your sidebar folders could not be loaded, so they are not listed here."
+        "default_session_folder_load_failed": "Your sidebar folders could not be loaded, so they are not listed here.",
+        "default_defers_to_your_agent_config_and_then_to": "Agents with their own configured model ignore this setting. 'Default' uses the model from the agent configuration, or the system default when none is configured. Changing this does not affect sessions that are already open.",
+        "which_model_new_sessions_start_with_pick_a_model": "Which model new sessions start with when their agent pins none. Set a model per agent under Customize → Mates, or pick one inside a session to override it there.",
+        "default_session_folder_desc": "The sidebar folder new chats are filed into when you start one without choosing a folder. It groups chats in the sidebar; it is not a folder on disk.",
+        "default_session_folder_hint": "The chat uses the folder's linked project and agent, as New chat in folder does."
       },
       "computerUsePanel": {
         "accessibility": "Accessibility",
@@ -10390,6 +10703,8 @@
         "installed_theme_could_not_be_loaded": "The installed theme could not be loaded. Reinstall it or choose another theme.",
         "custom_theme_could_not_be_loaded": "This theme could not be loaded. Choose another theme or edit this one.",
         "local_folder": "Local folder",
+        "browse_theme_folder": "Browse…",
+        "browse_theme_folder_failed": "The folder chooser could not open. Type the path instead.",
         "zip_file": "Zip file",
         "mode": "Mode",
         "new_theme": "+ New Theme",
@@ -10506,7 +10821,11 @@
         "remote_port_ttl": "· remote port {{port}} · ttl {{ttl}}",
         "warm_cap_count_one": "Up to {{count}} remote crew stays warm (live tunnel) at once; the rest reconnect on demand. Tune with",
         "warm_cap_count_other": "Up to {{count}} remote crews stay warm (live tunnel) at once; the rest reconnect on demand. Tune with",
-        "remote_port_value": "· remote port {{port}}"
+        "remote_port_value": "· remote port {{port}}",
+        "instances_stay_warm_live_tunnel_at_once_the_rest": "remote crews stay warm (live tunnel) at once; the rest reconnect on\n                demand. Tune with",
+        "port_2": "· remote port",
+        "ttl": "· ttl",
+        "up_to": "Up to"
       },
       "notificationsPanel": {
         "app": "app",
@@ -10561,7 +10880,9 @@
         "count_token_auth_one": "{{count}} auth control",
         "count_token_auth_other": "{{count}} auth controls",
         "show_more_count_one": "Show {{count}} more",
-        "show_more_count_other": "Show {{count}} more"
+        "show_more_count_other": "Show {{count}} more",
+        "more": "more",
+        "show": "Show"
       },
       "releases": {
         "badge_unreleased": "Unreleased",
@@ -10636,7 +10957,10 @@
         "categories_count_one": "{{n}} category ·",
         "categories_count_other": "{{n}} categories ·",
         "rules_count_one": "{{n}} rule",
-        "rules_count_other": "{{n}} rules"
+        "rules_count_other": "{{n}} rules",
+        "categories": "categories ·",
+        "rules": "rules",
+        "file_delivery_section": "File delivery"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "Bind chat-tab switching to Ctrl+digit instead of Option+digit. Option+digit does not switch chats while a text field has focus.",
@@ -10762,7 +11086,8 @@
         "ptt_try_desc": "Press your shortcut key to check that this keyboard sends it properly.",
         "ptt_heading_desc_other": "Press a key to start talking instead of clicking the microphone button. Alt + Shift + Space works out of the box — you can leave everything here as it is.",
         "ptt_key_desc_other": "Pick a key that doesn't type anything on its own, so it won't interfere with what you're writing. Right Alt is left out because most layouts use it to compose characters.",
-        "ptt_save_refused": "Not saved: the browser's storage is full. Free some space and try again."
+        "ptt_save_refused": "Not saved: the browser's storage is full. Free some space and try again.",
+        "aws_region_for_transcribe": "AWS region for Transcribe"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "above. Unlike Slack, the Bot Framework has no\n              outbound-only mode.",
@@ -10918,6 +11243,7 @@
         "changed_outside_this_form": "This crew changed outside this form ({{fields}}). Check the row above — if it is not the crew you started editing, cancel.",
         "checking": "Checking…",
         "checking_against": "Checked against profile {{profile}} in {{region}}.",
+        "checking_against_no_region": "Checked against profile {{profile}}, with no region set.",
         "cloud_crew_name": "{{productName}} Cloud ({{tag}})",
         "code_ready": "Your sign-in code is ready",
         "code_ready_for": "The sign-in code for {{name}} is ready",
@@ -10975,10 +11301,13 @@
         "keep_setting_up": "Keep setting up",
         "keeps_running": "Keeps running if you leave this page.",
         "launch": "Launch",
+        "launch_another": "Launch another crew",
         "launch_done": "Done — your new crew is ready and now appears in Your crews.",
         "launch_done_unsigned": "The crew is ready and appears in Your crews, but Kiro is not signed in on it yet. Finish the sign-in above.",
         "launch_failed_title": "Launch failed",
+        "launch_wait_for_setup": "A crew setup is running below. You can launch another crew once it finishes.",
         "launched_by_kiro_crew": "Launched by {{productName}}",
+        "launched_same_settings": "Launched. Its progress is shown below. To start a second crew with the same settings, choose Launch another crew.",
         "launching": "Launching…",
         "more_actions": "More actions for {{name}}",
         "more_sizes": "Smaller and x86_64 sizes",
@@ -11024,6 +11353,8 @@
         "recheck_not_yet": "Not signed in yet — approve the code in your browser, then check again.",
         "recheck_sign_in": "I approved it — check now",
         "region": "Region",
+        "region_placeholder": "e.g. us-east-1",
+        "region_required": "Enter an AWS Region, for example us-east-1.",
         "remove": "Remove…",
         "remove_warning": "Remove only takes it off this list. If this is a cloud crew, its EC2 instance keeps running and billing — delete it from the AWS console.",
         "runs_on_gateway": "This runs on the gateway, not in this tab — leave the page or switch crews and it keeps going. Keep {{productName}} running until it finishes.",
@@ -11178,7 +11509,8 @@
       "state_waiting_infra": "Waiting for infrastructure",
       "state_retry_wait": "Waiting to retry",
       "state_recovering": "Retrying now",
-      "state_stalled": "Stalled"
+      "state_stalled": "Stalled",
+      "age_tip": "Time spent in the state the badge names."
     },
     "telemetryPanel": {
       "agent_col": "Agent",
@@ -11304,7 +11636,12 @@
       "no_telemetry_in_window": "No telemetry recorded in this period ({{period}}).",
       "otel_retention_cap": "Turn, latency and startup figures cover only the last {{days}}d; older metrics are deleted (<settingRef/>).",
       "daily_trend_point_one": "{{date}} · cold {{cold}} · warm {{warm}} · {{n}} start",
-      "daily_trend_point_other": "{{date}} · cold {{cold}} · warm {{warm}} · {{n}} starts"
+      "daily_trend_point_other": "{{date}} · cold {{cold}} · warm {{warm}} · {{n}} starts",
+      "daily_trend_point": "{{date}} · cold {{cold}} · warm {{warm}} · {{count}} starts",
+      "local_only_no_egress": "· local-only, no egress",
+      "shard_s_source": "shard(s) · source",
+      "window_footer": "OTEL sections · period: {{period}} ·",
+      "top_spenders_link_to_chat": "Named dashboard sessions link to the chat"
     },
     "terminalPopoutFrame": {
       "return": "Return to dock",
@@ -11475,7 +11812,14 @@
       "slots_open_one": "{{n}} slot open",
       "slots_open_other": "{{n}} slots open",
       "summary": "{{present}} · {{active}} · {{open}}",
-      "scene_button": "{{label}} scene: {{desc}}"
+      "scene_button": "{{label}} scene: {{desc}}",
+      "active": "active,",
+      "agent_one": "{{count}} agent",
+      "agent_other": "{{count}} agents",
+      "open": "open",
+      "present": "present,",
+      "slot_one": "{{count}} slot",
+      "slot_other": "{{count}} slots"
     },
     "layoutEditorHarness": {
       "title": "Layout editor harness",
@@ -11742,6 +12086,28 @@
     "first_share_laptop_no_keep_awake": "This computer is a laptop. When it sleeps, they lose access until it wakes.",
     "direct_link_note": "Anyone allowed by Tailscale access rules can open this link.",
     "raised_by": "Raised by {{name}}",
-    "take_over_keeps_draft": "Take over to type. {{name}}'s draft stays with them."
+    "take_over_keeps_draft": "Take over to type. {{name}}'s draft stays with them.",
+    "approval_waiting": "{{name}}'s action awaits approval",
+    "collab_region": "Session activity",
+    "decisions_list": "Approvals and questions",
+    "person_typing": "{{name}} is typing",
+    "person_viewing": "{{name}} is here",
+    "composer_locked_hint": "You can type again when they send or pause.",
+    "question_waiting": "Kiro is waiting for {{name}}'s answer",
+    "sent_by": "Sent by {{name}}",
+    "several_typing": "Several people are typing",
+    "invite_title": "Invite over Tailscale",
+    "invite_single_use": "Single-use link",
+    "invite_list_title": "Invites",
+    "invite_empty": "No invites yet.",
+    "invite_status_pending": "Waiting",
+    "people_tip": "To remove someone, remove them in Tailscale.",
+    "composer_taken_over_hint": "Your draft is kept. You can type again when they send or pause.",
+    "take_over_typing_label": "Take over typing from {{name}}. Their draft stays with them.",
+    "step_share": "Share this machine on Tailscale",
+    "step_send": "Send them the Crew link",
+    "not_joined": "Not joined",
+    "approval_waiting_you": "Your action awaits approval",
+    "question_waiting_you": "Kiro is waiting for your answer"
   }
 }

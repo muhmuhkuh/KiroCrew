@@ -342,7 +342,9 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         backend_value = body["acp_backend"]
         if backend_value is None:
             backend_value = ""
-        backend_reason = harness_pin_rejected(backend_value)
+        backend_reason = harness_pin_rejected(
+            backend_value, await asyncio.to_thread(KiroCrewConfig.load)
+        )
         if backend_reason:
             return web.json_response(
                 {"error": backend_reason, "code": "invalid_acp_backend"}, status=400

@@ -1018,6 +1018,8 @@ mounts or gates on it.
 | Google Docs | collaboration-docs | 2 | **no** / yes — pre-registered client (`auth.mode`) | request `documents.readonly` + `drive.readonly` | shown as "needs configuration" until an operator enters a client; Connect after | Google Workspace Developer Preview enrollment of the Cloud project; manual launch-gate check with an operator-registered client ([runbook](../../guides/oauth-app-registration/google-docs.md)) |
 | Google Slides | collaboration-docs | 2 | **no** / yes — pre-registered client (`auth.mode`) | request `presentations.readonly` + `drive.readonly` | shown as "needs configuration" until an operator enters a client; Connect after | Google Workspace Developer Preview enrollment of the Cloud project; manual launch-gate check with an operator-registered client ([runbook](../../guides/oauth-app-registration/google-slides.md)) |
 | TickTick | project-management | 2 | yes / yes | none — `tasks:read` and `tasks:write` are the whole `scopes_supported` list and there is no read-only endpoint; the entry's `gotcha_copy` names the delete tools | gated | manual launch-gate check, including a `tools/list` against the 58-tool roster the card copy describes |
+| Railway | developer-tools | 2 | yes / yes | none — `workspace:member` is the only scope the resource metadata publishes; the consent screen picks the workspaces, and the entry's `gotcha_copy` names the deploy and delete tools | gated | manual launch-gate check, including a `tools/list` against the hosted tool roster Railway documents and a session held past the access-token expiry (Railway documents refresh tokens only for `offline_access`, which the entry does not request) |
+| Quo | calendar-email | 2 | yes / yes | request `read:account`, `read:conversations` and `read:calls` only | gated | manual launch-gate check, including which tools a read-only grant can still call and whether Quo lists the grant anywhere a user can revoke it (its docs name the client's Disconnect and an RFC 7009 revocation endpoint) |
 
 Tier is provider *categorization* (see the tiers note above), never mint
 latency: tier 3 means the vendor gates clients by allowlist or waitlist, so
@@ -1198,7 +1200,7 @@ schema with no slot for it (#27711). The Connections mint itself runs on
 kiro-cli, so Connect stays on every backend and the grant it writes is real for
 kiro-cli chats; whether a KAS chat can use that grant is #24693 / #24677's
 question. So while the resolved `agent.acp_backend`
-lacks the capability (crewmate threads are not read: that field resolves to KAS on every install),
+lacks the capability (Bot threads are not read: that field resolves to KAS on every install),
 `/api/connections/status` marks every pre-registered row `backendLacksOauth`,
 connected or not. The card states it without adding a tip or heading key
 (connection-card-caveat-tip): inside the tip beside Connect; on a connected row
@@ -1212,6 +1214,14 @@ for chats that support it and some chats cannot use it yet. A Kiro CLI pick can 
 v3 relay), so naming a switch would point at a route that does not help.
 An unreadable config makes no
 claim.
+
+While `agent.acp_backend` is KAS (`chat_backend_is_kas`), every other connected row
+carries `signInInChat`: the card's grant is real for Kiro CLI chats, and a KAS chat
+signs in on its own once the user's message names the server (`acp-client.md`). The
+card shows it in the same "In chats" line, or inside the shared-grant tip: "Chats
+sign in separately: type <slug> in a chat once." Like the `backendLacksOauth`
+copy it names no harness: the line shows only while chats run on KAS, so the
+reader need not know which harness they have. Kiro CLI chats and an unreadable config get no line.
 
 **What the user sees.** `get_visible_providers` shows a pre-registered entry
 regardless of `launch_gate_passed` (vendor approval still hides), because until

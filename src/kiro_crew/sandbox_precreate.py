@@ -42,6 +42,8 @@ from kiro_crew.sandbox_leaves import (
 #:      extends trust by nothing for ``{}``;
 #:    * ``aws_service_consent.json`` — ``aws_consent._read_all`` returns ``{}`` for
 #:      both absent and empty, so every service stays unconfirmed;
+#:    * ``denied_commands.json`` — ``hooks.load_denied_commands_state`` returns ``{}``
+#:      for both, so nothing is opted out (criterion 2 is argued at its entry);
 #:    * ``decisions_consent.json`` — ``decisions.consent.load_state`` reads ``{}``
 #:      as NOT CONSENTED, which is what an absent keystone means;
 #:    * ``shared_crew_preview.json`` — ``shared_crew.preview.read_stored`` reads
@@ -64,13 +66,8 @@ from kiro_crew.sandbox_leaves import (
 #:    or unlinked. The empty ``profiles`` dir is exempt from the concern entirely: a
 #:    directory bind shows live contents, so a profile added later is visible.
 #:
-#: DELIBERATELY EXCLUDED, and each for a different one of those two reasons:
+#: DELIBERATELY EXCLUDED:
 #:
-#:   * ``denied_commands.json`` — clears (1) but fails (2), which is the direction
-#:     that matters: in-sandbox ``mcp_cron`` reads it to decide whether a command is
-#:     denied, so a pinned ``{}`` would report "nothing is denied" for the rest of the
-#:     sandbox's life even after the operator denies a command. Sealing it would trade
-#:     an agent-authored deny list for a stale one, so it keeps the pre-existing gap;
 #:   * ``security_policy.json`` — fails (1). ``governance.load_security_policy`` reads
 #:     the file whenever it exists and fails CLOSED on a parse or version mismatch, so
 #:     a ``{}`` stub raises ``PlatformCompositionError`` out of a function that runs at
@@ -140,6 +137,15 @@ _CREW_PRECREATE_READONLY_DIR_LEAVES: tuple[str, ...] = (
     # The redaction allow-list, on the same argument: no file means no host
     # allowed, which is what an empty directory means too, and the bind is live.
     "redaction-allow",
+    # Host-exec authorization grants (``apps/host_exec_grants.py``). Absent until the
+    # first host-exec app is enabled, so without pre-creation the read-only seal is
+    # skipped on every install that has not enabled one -- and a sandboxed shell could
+    # then create the directory and plant its own grant marker, which the pod gate
+    # reads as authorization to run code outside the sandbox. An empty directory reads
+    # as "no app granted", exactly as an absent one does, and the bind is live so a
+    # grant the gateway writes later is seen. Pre-created here as a mount point so it
+    # cannot be renamed around either.
+    "host-exec-grants",
     # Pi's gate launcher and sealed extension. Materialised here rather than only by
     # the adapter so the directory is a read-only mountpoint before ANY sandbox starts,
     # including the first pi spawn on a fresh install.
@@ -197,6 +203,7 @@ _CREW_NOFOLLOW_READONLY_DIR_LEAVES: tuple[str, ...] = (
     "models",
     "kirocrew-bin",
     "redaction-allow",
+    "host-exec-grants",
     "pi-gate",
     "kas-mcp-launch",
     "mcp-launch-approvals",
@@ -276,6 +283,11 @@ _DELEGATED_OVERLAP_LEAF_REASONS: "dict[str, tuple[str, str]]" = {
         "sealed redaction allow-list",
         "the agent could allow the host it wants to send conversation data to",
     ),
+    "host-exec-grants": (
+        "sealed host-exec grant directory",
+        "the agent could plant a grant that authorizes running a pod's code outside "
+        "the sandbox without an owner enable",
+    ),
     "pi-gate": (
         "sealed pi gate runtime",
         "the agent could plant the launcher a later pi session execs out of",
@@ -346,6 +358,11 @@ _CREW_PRECREATE_READONLY_FILE_LEAVES: tuple[str, ...] = (
     "computer_use.json",
     "oauth_endpoints.json",
     "aws_service_consent.json",
+    # Absent until the operator first saves a deny setting, and while absent a sandbox
+    # could create it with ``disable_all`` set. Criterion 2 is moot here: the host saves
+    # by rename, which detaches this seal in a running sandbox (the ``config.json``
+    # residual below), so in-sandbox readers see the saved rules, never a pinned ``{}``.
+    "denied_commands.json",
     "decisions_consent.json",
     # The Shared Crew preview switch: ``preview.read_stored`` reads an absent,
     # empty and unreadable store alike as OFF, so a pre-created ``{}`` means

@@ -179,10 +179,12 @@ class AcpClient:
         self.memory_mode = "persistent"
         self._acp_backend = acp_backend
         # Claude backend permission mode (Auto-mode / permission-UI parity).
-        # Inert on the kiro-cli path. None = the backend's own default
-        # ("default", i.e. every tool decision is forwarded to the host), which is
-        # what _write_claude_local_settings leaves in place when nothing asked
-        # for a mode.
+        # Inert on the kiro-cli path. None = nothing asked for a mode:
+        # _write_claude_local_settings seeds no defaultMode, so the session starts
+        # in the mode the user's own settings name. With
+        # KIROCREW_CC_PIN_INHERITED_MODE on, _pin_claude_starting_mode then moves a
+        # session carrying Crew's tools that starts in "auto" or
+        # "bypassPermissions" to "default".
         self._permission_mode = permission_mode
         # A Side Chat session that may run read-only tools. On claude it starts
         # with only the read built-ins and no MCP server, and its mode is pinned
@@ -304,6 +306,12 @@ class AcpClient:
         # file Crew writes (claude's ``permissions.deny``) leaves it empty, and an
         # empty set makes the refusal a no-op. Cleared on reset with the array.
         self._spec_denied_tools: frozenset[tuple[str, str]] = frozenset()
+        # The spec's `toolsSettings` shell and write allowlists, stamped on this
+        # session's own permission requests on a backend Crew enforces them for
+        # (`spec_tools_allowlists`); None when the spec sets none.
+        self._spec_shell_allowlist: tuple[str, ...] | None = None
+        self._spec_write_allowlist: tuple[str, ...] | None = None
+        self._spec_write_cwd = ""
         # The mirror's other CLIENT OBLIGATION from the same parse
         # (``SessionProjection.zero_tools``): the spec declares ``"tools": []``, a
         # total ban the array and ``denied_tools`` above have no way to express --

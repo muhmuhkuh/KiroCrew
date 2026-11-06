@@ -73,6 +73,7 @@ from kiro_crew.dashboard.chat_api import pending_context as _owner_pending_conte
 from kiro_crew.dashboard.chat_api import project_lists as _owner_project_lists
 from kiro_crew.dashboard.chat_api import prompt_queue as _owner_prompt_queue
 from kiro_crew.dashboard.chat_api import resume as _owner_resume
+from kiro_crew.dashboard.chat_api import resume_window as _owner_resume_window
 from kiro_crew.dashboard.chat_api import session_relaunch as _owner_session_relaunch
 from kiro_crew.dashboard.chat_api import slot_approval as _owner_slot_approval
 from kiro_crew.dashboard.chat_api import slot_create as _owner_slot_create
@@ -200,13 +201,15 @@ from kiro_crew.dashboard.chat_api.resume import (  # noqa: F401
     _live_slot_resume_payload,
     _materialise_slot_from_history,
     _normalise_structured_content,
-    _reconcile_slot_window,
     _redact_history_rows,
     _resume_refusal_response,
     _resume_session_identity,
     _resume_slot_from_history_noted,
     api_chat_slot_resume,
     resume_slot_from_history,
+)
+from kiro_crew.dashboard.chat_api.resume_window import (  # noqa: F401
+    _reconcile_slot_window,
 )
 from kiro_crew.dashboard.chat_api.session_relaunch import (  # noqa: F401
     _resolve_project_directory,
@@ -562,6 +565,7 @@ from kiro_crew.dashboard.slot_retention import (  # noqa: F401
 )
 from kiro_crew.dashboard.state import (  # noqa: F401
     _MAX_DISMISSED_SOURCE_LINKS,
+    TURN_OPENING_INJECT_KINDS,
     DashboardState,
     _ChatSlot,
     _mark_permission_resolved,
@@ -941,13 +945,16 @@ def _orphan_in_current_turn(slot: _ChatSlot, stop_id: str) -> bool:
     for msg in reversed(slot.messages):
         if msg.get("role") in _TURN_OPENER_ROLES:
             return False
-        # The grouping's SECOND turn-flushing path is not role-based: a
-        # synthesis injection (role "inject" stamped meta.injectKind ==
-        # "synthesis" by _run_pending_synthesis) closes the open batch too —
-        # mirrors isSynthesisInjection in groupDisplayItems.ts, keyed on the
-        # meta wire contract exactly as it is. Plain inject rows
-        # (cron/recovery notes) are passive on both sides and walked past.
-        if msg.get("role") == "inject" and (msg.get("meta") or {}).get("injectKind") == "synthesis":
+        # An inject row that dispatched a turn of its own (a cron delivery, an
+        # app message, an automation notice, a synthesis) opens a turn in the
+        # grouping too -- mirrors opensDisplayTurn / injectOpensTurn in
+        # groupDisplayItems.ts, keyed on the meta.injectKind wire contract. A
+        # recovery or user_replay inject continues the turn above it, and an
+        # unstamped inject (a note) dispatches nothing; both are walked past.
+        if (
+            msg.get("role") == "inject"
+            and (msg.get("meta") or {}).get("injectKind") in TURN_OPENING_INJECT_KINDS
+        ):
             return False
         cls_val = msg.get("cls", "")
         if not cls_val or not isinstance(cls_val, str) or "stop_event" not in cls_val:
@@ -1421,6 +1428,7 @@ _facade_compose(
         _owner_project_lists,
         _owner_prompt_queue,
         _owner_resume,
+        _owner_resume_window,
         _owner_session_relaunch,
         _owner_slot_approval,
         _owner_slot_create,

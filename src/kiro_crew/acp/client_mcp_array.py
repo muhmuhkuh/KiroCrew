@@ -15,6 +15,7 @@ Instance fields written: ``_capability_projection_gaps``, ``_copilot_mcp_config_
 ``_pi_mcp_handoff``, ``_session_agent_spec``, ``_session_harness_deny_rules``,
 ``_session_mcp_cache``, ``_session_mcp_excludes_local``, ``_session_mcp_inline_settings``,
 ``_session_mcp_snapshot``, ``_session_mcp_unhonoured``, ``_spec_denied_tools``,
+``_spec_shell_allowlist``, ``_spec_write_allowlist``, ``_spec_write_cwd``,
 ``_spec_zero_tools``.
 
 Instance fields read: ``_agent``, ``_channel_id``, ``_claude_inline_settings``,
@@ -22,17 +23,20 @@ Instance fields read: ``_agent``, ``_channel_id``, ``_claude_inline_settings``,
 ``_mcp_notifications``, ``_mcp_ref_spec``, ``_mcp_report``, ``_native_skill_projection``,
 ``_opencode_config_mcp_servers``, ``_opencode_denies_in_force``, ``_pi_gate_nonce``,
 ``_pi_mcp_server_names``, ``_session_id``, ``_session_key``, ``_side_read_only``,
-``_stub_session_token``, ``_work_dir``.
+``_spawn_work_dir``, ``_stub_session_token``, ``_work_dir``, ``member_context``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+import weakref
 from typing import TYPE_CHECKING, Any, Collection
 
 from kiro_crew import acp_tool_gate
+from kiro_crew.acp.ipc_pickup import with_ipc_pickups
 from kiro_crew.acp.mcp_mount_check import schedule_mount_check
 from kiro_crew.acp.mcp_ref_guard import warn_remote_header_secret_refs, warn_unresolved_server_refs
 from kiro_crew.acp.mcp_session_report import BUCKET_CAP as MCP_REPORT_BUCKET_CAP
@@ -40,8 +44,15 @@ from kiro_crew.acp.mcp_session_report import ERROR_CAP as MCP_REPORT_ERROR_CAP
 from kiro_crew.acp.mcp_session_report import NAME_CAP as MCP_REPORT_NAME_CAP
 from kiro_crew.acp.mcp_session_report import McpSessionReport, sanitize_sink_text
 from kiro_crew.acp.mcp_startable import PrunedServer, prune_unstartable
-from kiro_crew.acp.session_mcp import agent_spec_snapshot
+from kiro_crew.acp.session_mcp import ToolsAllowlist, agent_spec_snapshot
+from kiro_crew.acp.session_mcp_crewmate import worker_array_outruns_seed
+from kiro_crew.acp.spec_tools_allowlists import (
+    session_allowlist_spec,
+    spec_shell_patterns,
+    spec_write_globs,
+)
 from kiro_crew.acp.types import (
+    ACP_BACKEND_CLAUDE,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_DISPATCH,
@@ -54,6 +65,7 @@ from kiro_crew.acp.types import (
     overlay_project_scope,
 )
 from kiro_crew.agent_discovery import _read_agent_spec
+from kiro_crew.agent_sdk.backends import ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS
 from kiro_crew.mcp_gateway.session_servers import (
     attach_stub_session_token,
     injection_server_names,
@@ -296,7 +308,7 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
         stubbed = frozenset()
     mirror = mirror_for(self.backend)
     if mirror is None:
-        return self._mirrorless_member_mounts(stubbed)
+        return _with_own_ipc_pickups(self, self._mirrorless_member_mounts(stubbed))
     # Recorded BEFORE the projection reads the governed flag, and beside the
     # array it authorizes: the session/new envelope reads this record, so an
     # array delivered under the exclusion always ships with it.
@@ -334,6 +346,19 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
         harness_denies_in_force=getattr(self, "_opencode_denies_in_force", None),
     )
     self._spec_denied_tools = projection.denied_tools
+    if self.backend in ACP_BACKENDS_CREW_ENFORCES_SPEC_TOOLS_SETTINGS:
+        # The spec's `toolsSettings` shell and write allowlists, which this harness
+        # never reads: stamped on the session's own permission requests for the
+        # gate to refuse what they do not cover. A withheld array carries no spec,
+        # but the native shell and write tools still run, so the spec is read again,
+        # through the same mirrored resolution, rather than the allowlists dropped.
+        allowlist_spec = projection.agent_spec
+        if allowlist_spec is None and self._agent:
+            allowlist_spec = session_allowlist_spec(self._agent, self._work_dir)
+        cwd = str(getattr(self, "_spawn_work_dir", "") or self._work_dir or "")
+        self._spec_shell_allowlist = spec_shell_patterns(allowlist_spec)
+        self._spec_write_allowlist = spec_write_globs(allowlist_spec, cwd)
+        self._spec_write_cwd = cwd
     self._session_mcp_unhonoured = projection.unhonoured_servers
     self._session_harness_deny_rules = projection.harness_deny_rules
     self._spec_zero_tools = projection.zero_tools
@@ -343,16 +368,77 @@ def _resolve_session_mcp_servers(self: AcpClient) -> list[dict[str, Any]]:
     self._session_agent_spec = projection.agent_spec
     servers = projection.params.get("mcpServers") or []
     out = list(servers) if isinstance(servers, list) else []
+    if _claude_worker_settings_lag(self, projection.agent_spec):
+        logger.warning(
+            "session MCP: withholding the whole mcpServers array -- the claude settings "
+            "this worker ships lack a deny rule its crewmate file asks for (the file "
+            "changed after they were written, or the re-seed was declined). The worker "
+            "runs without MCP tools; the next start reads the file again.",
+        )
+        return []
     # The restriction half of the projection's withhold set, from the SAME parse the
     # array came out of: the member append must not re-add a name this projection
     # refused on a transport where the withhold is the whole of the enforcement.
-    return self._append_member_panel_server(
-        self._append_member_dispatch_server(
-            out, projection.restricted_servers, projection.disabled_servers
+    return _with_own_ipc_pickups(
+        self,
+        self._append_member_panel_server(
+            self._append_member_dispatch_server(
+                out, projection.restricted_servers, projection.disabled_servers
+            ),
+            projection.restricted_servers,
+            projection.disabled_servers,
         ),
-        projection.restricted_servers,
-        projection.disabled_servers,
     )
+
+
+def _with_own_ipc_pickups(client: AcpClient, servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """*servers* with this client's agent-socket pickups (``acp/ipc_pickup.py``).
+
+    The sessions an ``AcpClient`` drives (opencode, goose and the other backends the
+    shared runtime does not host) build their array here, so an enforced harness's
+    ``kirocrew-core`` gets its pickup on this path as it does on the runtime's. Bound
+    to this client's stub token and its own root pid, and dropped with the client.
+    """
+    client_ref = weakref.ref(client)
+
+    def _own_root_pid() -> int | None:
+        live_client = client_ref()
+        if live_client is None:
+            return None
+        return live_client._pid  # pid-owner-ok: the client reads its own root
+
+    return with_ipc_pickups(
+        servers,
+        backend=str(client.backend or ""),
+        session_token=client._stub_session_token,
+        runtime_pid=_own_root_pid,
+        owner=client,
+    )
+
+
+def _claude_worker_settings_lag(client: AcpClient, spec: dict[str, Any] | None) -> bool:
+    """Whether *client*, a claude worker session, ships settings missing a rule *spec* asks for.
+
+    Judged on what Claude Code will read: the inline settings when the project's
+    file is excluded, else ``settings.local.json`` on disk, read only as the bytes
+    Crew's durable seed record names (no link followed, bounded); a file that is
+    not that seed counts as no rules. No spec, or any other session, is never held.
+    """
+    from kiro_crew.acp import seed_provenance
+    from kiro_crew.mate_worker import MATE_WORKER_AGENT
+
+    is_worker = client._agent == MATE_WORKER_AGENT and bool(client._session_key)
+    if not (client.backend == ACP_BACKEND_CLAUDE and is_worker) or not isinstance(spec, dict):
+        return False
+    in_force: Any = client._session_mcp_inline_settings
+    if not client._session_mcp_excludes_local:
+        path = client._claude_local_settings_path()
+        raw = client._settings_path_bytes(path, seed_provenance.recorded_durable(path))
+        try:
+            in_force = json.loads(raw.decode("utf-8")) if raw is not None else None
+        except ValueError:
+            in_force = None
+    return worker_array_outruns_seed(in_force, spec)
 
 
 def _mirrorless_member_mounts(self: AcpClient, stubbed: Collection[str]) -> list[dict[str, Any]]:

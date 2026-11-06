@@ -342,10 +342,12 @@
       "restart_exhausted_message_other": "{{app}} 已连续 {{count}} 次重启失败，并将每隔几分钟继续重试。要立即重试，请先禁用 {{app}} 再重新启用。"
     },
     "builtinAppRoute": {
+      "could_not_load_the_app_list": "加载应用列表失败",
       "refused_page_detail_label": "供组装此副本的人员参考的详细信息",
       "refused_page_handoff_note": "询问代理会打开一个已附带这些详细信息的对话。",
       "refused_page_lead": "{{productName}} 启动时拒绝了此页面，因为它在此副本中的设置有误。重试无法恢复它——需要由组装此副本的人员来修正。",
-      "refused_page_title": "无法加载 {{route}}"
+      "refused_page_title": "无法加载 {{route}}",
+      "retry": "重试"
     },
     "agentWorlds": {
       "manifest": {
@@ -576,7 +578,15 @@
         "suggested_from_sub_questions_other": "根据 {{count}} 个子问题建议",
         "estimate_other": "最多 {{count}} 个周期，每次空闲 {{idle}} 秒。约 {{minutes}} 分钟",
         "findings_tally_other": "{{count}} 项发现",
-        "cycles_count_other": "{{count}} 个周期"
+        "cycles_count_other": "{{count}} 个周期",
+        "cycles": "轮，",
+        "cycles_2": "轮",
+        "findings": "条结论",
+        "min": "分钟",
+        "s_idle": "秒空闲。~",
+        "sub_questions_2": "个子问题",
+        "suggested_from": "建议来自",
+        "up_to": "最多"
       }
     },
     "autoTriagePipeline": {
@@ -593,7 +603,7 @@
         "titleblock_live": "进行中",
         "notes_heading": "注释",
         "note_1": "泳道自左向右穿过各阶段列；道头标示该项的实时阶段。",
-        "note_2": "#N 标签表示该条目有 PR；没有 PR 的泳道不显示 #N 标签。",
+        "note_2": "{{sigil}}N 标签表示该条目有 {{changeRequest}}；没有 {{changeRequest}} 的泳道不显示 {{sigil}}N 标签。",
         "note_3": "点划线段表示该项跳过了某阶段；泳道下方的弧线表示重新进入的阶段。",
         "note_4": "从泳道伸出的短枝是出口 -- 跳过、让出、退回、被抢占或等待回复。",
         "note_5": "停留超过一小时会被标记；进行中的停留从最近一次进入当前阶段起计。",
@@ -880,7 +890,8 @@
           "invalid_namespace_name": "namespace 名称会用作文件夹名称，因此只能包含小写拉丁字母（a–z）、数字（0–9）、点、短横线或下划线，必须以字母或数字开头和结尾，长度为 2 到 64 个字符。",
           "invalid_namespace_name_char": "namespace 名称中不能使用“{{char}}”。只能使用小写 a–z、0–9、. -⁠ _。",
           "invalid_namespace_name_letter": "namespace 名称中不能使用“{{char}}”（{{script}}，{{code}}）。只能使用小写 a–z、0–9、. -⁠ _。",
-          "pending_count_other": "{{count}} 个待处理"
+          "pending_count_other": "{{count}} 个待处理",
+          "pending": "待处理"
         },
         "leftRail": {
           "code_review_sage": "Code Review Sage",
@@ -994,7 +1005,10 @@
           "open": "开着",
           "running_count_other": "{{count}} 个进行中",
           "passed_count_other": "{{count}} 个通过",
-          "failing_count_other": "{{count}} 个失败"
+          "failing_count_other": "{{count}} 个失败",
+          "failing": "失败",
+          "passed": "通过",
+          "running": "进行中"
         },
         "repoSwitcher": {
           "add_a_repo": "添加仓库",
@@ -1030,7 +1044,9 @@
           "step_solution_fit": "方案契合度",
           "step_why_it_matters": "为什么重要",
           "blocking_count_other": "{{count}} 个阻塞项",
-          "should_fix_count_other": "{{count}} 个建议修复"
+          "should_fix_count_other": "{{count}} 个建议修复",
+          "blocking": "阻塞项",
+          "should_fix": "建议修复"
         },
         "reviewChat": {
           "error_generic": "无法打开追问会话。请重试。",
@@ -1073,7 +1089,8 @@
           "review_of": "{{label}} 的评审",
           "review_of_with_more_other": "{{label}} 及另外 {{count}} 个的评审",
           "worth_a_glance_count_other": "{{count}} 项值得一看",
-          "more_count_other": "另外 +{{count}} 个"
+          "more_count_other": "另外 +{{count}} 个",
+          "more": "个"
         },
         "runDetail": {
           "cancelled_before_any_finished": "它在任何 pull request 完成之前就被取消了。",
@@ -1086,7 +1103,8 @@
           "started": "开始于",
           "this_review_produced_no_report": "这次评审没有生成报告。",
           "you_can_leave_this_page_a_notification_will_tell": "你可以离开这个页面——完成时会有通知告诉你。",
-          "more_count_other": "另外 +{{count}} 个"
+          "more_count_other": "另外 +{{count}} 个",
+          "more": "个"
         },
         "runList": {
           "new_review": "新建评审"
@@ -1104,7 +1122,10 @@
           "working": "工作中",
           "reviewed_of_other": "已评审 {{done}} / {{count}}",
           "failed_count_other": "{{count}} 个失败",
-          "cancelled_count_other": "{{count}} 个已取消"
+          "cancelled_count_other": "{{count}} 个已取消",
+          "cancelled": "已取消",
+          "failed": "失败",
+          "reviewed": "已评审"
         },
         "runStatusPill": {
           "cancelled": "已取消",
@@ -1590,7 +1611,8 @@
         "link_placeholder_staged": "正在使用你的截图——清除截图即可改为评审链接",
         "link_placeholder": "Figma 链接 · git 仓库 · 本机文件夹 · 运行中的 URL（localhost 或已部署预览）",
         "link_label": "要评审的链接",
-        "render_before_judging": "我会先渲染再评判，绝不只看代码。如果应用已在运行，粘贴它的 URL，我就能测量真实颜色和尺寸，而不是估算。"
+        "render_before_judging": "我会先渲染再评判，绝不只看代码。如果应用已在运行，粘贴它的 URL，我就能测量真实颜色和尺寸，而不是估算。",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "constants": {
         "blocked_figma_app_missing_hint": "在 Figma 桌面版中打开该文件后重试，或把画板导出为 PNG 拖到这里。",
@@ -1712,7 +1734,9 @@
         "fix": "修复方法",
         "suggestion": "建议",
         "what_i_saw": "我看到的",
-        "where": "位置"
+        "where": "位置",
+        "steps_range": "第 {{range}} 步",
+        "flow_badge": "流程"
       },
       "manifest": {
         "use_case_1": "根据可见区域，以严重程度和设计准则为依据，评审单个界面或完整产品流程。",
@@ -1741,7 +1765,18 @@
         "screens": "界面",
         "start_over": "重新开始",
         "suggested_flows": "推荐流程",
-        "what_should_i_audit": "我该评审什么？"
+        "what_should_i_audit": "我该评审什么？",
+        "screens_found_count_other": "找到 {{n}} 个界面 · 可渲染 {{m}} 个",
+        "flow_n": "流程 {{n}}",
+        "picked_count_other": "已选 {{n}} 个",
+        "hint_order": "数字是我查看它们的顺序——拖动某行可调整顺序，也可以用键盘上的 ‹ ›。",
+        "hint_pick": "点击界面即可选中。选中多个即可作为一个流程进行评审。",
+        "cant_render_title": "这个界面无法渲染",
+        "cant_render_short": "无法渲染",
+        "group_fallback": "界面",
+        "tag_from_links": "来自链接",
+        "tag_guess": "推测",
+        "critique_this_flow_count_screens": "Critique this flow · {{count}} screens"
       },
       "utils": {
         "i_ll_capture_it_and_measure_real_contrast_and_si": "我会截取它，并测量真实对比度和尺寸。",
@@ -1749,11 +1784,21 @@
         "i_ll_list_the_screens_only_pages_that_render_wit": "我会列出界面。只有无需服务器即可渲染的页面才能看到。",
         "i_ll_pull_the_frames": "I’ll pull the frames.",
         "it_must_be_running_right_now_i_ll_capture_it_liv": "它必须正在运行。我会实时截取，并测量真实对比度和尺寸。",
-        "not_something_i_recognise_give_me_a_figma_link_a": "我无法识别。请提供 Figma 链接、GitHub 仓库、本地绝对路径，或已在提供服务的 URL。"
+        "not_something_i_recognise_give_me_a_figma_link_a": "我无法识别。请提供 Figma 链接、GitHub 仓库、本地绝对路径，或已在提供服务的 URL。",
+        "screen_fallback": "界面"
       },
       "waitingScreen": {
         "cancel_this_run": "取消本次运行",
-        "stop_this_run_and_discard_it": "停止并丢弃本次运行"
+        "stop_this_run_and_discard_it": "停止并丢弃本次运行",
+        "getting_screens_ready": "正在准备界面…",
+        "title_scanning": "正在查找要审查的界面",
+        "title_uploading_screens_other": "正在上传 {{n}} 个界面…",
+        "title_uploading_one": "正在上传你的截图…",
+        "title_reading_flow_other": "正在读取你的流程 · {{n}} 个界面",
+        "title_reading_screen": "正在读取你的界面",
+        "title_getting_pixels": "先获取真实像素",
+        "foot_still_going": "仍在进行——界面较多的流程可能需要几分钟。你可以离开此页面；评审会继续进行，回来时就能看到。",
+        "foot_navigate_away": "你可以离开此页面——评审会继续进行。"
       }
     },
     "devFleet": {
@@ -2109,7 +2154,8 @@
           "timeline": "时间线",
           "unassign_me": "取消指派给我",
           "unassigned": "取消分配",
-          "updated": "更新时间"
+          "updated": "更新时间",
+          "by": "· 由"
         },
         "issueList": {
           "clear_search": "清除搜索",
@@ -2142,7 +2188,9 @@
           "remove_this_label_no_longer_exists_on_the_repo": "移除 — 此标签在仓库中已不存在",
           "saved_but_no_longer_on_this_repo": "已保存但仓库中已不存在：",
           "this_repo_has_no_labels": "此仓库没有标签。",
-          "add_suggested_other": "添加 {{count}} 个建议"
+          "add_suggested_other": "添加 {{count}} 个建议",
+          "add": "添加",
+          "suggested": "建议"
         },
         "leftRail": {
           "click_to_expand_the_sidebar": "{{name}} — 点击展开侧边栏",
@@ -2316,7 +2364,10 @@
           "failing_count_other": "{{count}} 个失败",
           "running_count_other": "{{count}} 个运行中",
           "passed_count_other": "{{count}} 个通过",
-          "skipped_count_other": "{{count}} 个跳过"
+          "skipped_count_other": "{{count}} 个跳过",
+          "failing": "失败中",
+          "passed": "通过",
+          "running": "运行中"
         },
         "prFiltersSection": {
           "assigned_to_me": "分配给我",
@@ -2385,7 +2436,8 @@
           "open_in_the_list_detail_column": "在列表 + 详情栏中打开",
           "open_this_item_in_the_workspace": "在工作区中打开此项",
           "deep_count_other": "{{count}} 层",
-          "dialog_label": "{{repo}} 中的 {{kind}} {{ref}}"
+          "dialog_label": "{{repo}} 中的 {{kind}} {{ref}}",
+          "deep": "层"
         },
         "repoSwitcher": {
           "repositories": "仓库"
@@ -2930,7 +2982,8 @@
             "suggested_new_labels_not_created_until_you_say_s": "建议的新标签 — 未经你确认不会创建",
             "re_fetch_this_repo_s_labels_from": "从 {{provider}} 重新获取此仓库的标签",
             "create_this_label_on": "在 {{provider}} 上创建此标签",
-            "labels_defined_other": "已定义 {{count}} 个 · 按待处理 issue 数量"
+            "labels_defined_other": "已定义 {{count}} 个 · 按待处理 issue 数量",
+            "defined_by_open_issue_count": "已定义 · 按待处理 issue 数量"
           },
           "untaggedIssueCard": {
             "add": "添加",
@@ -2952,13 +3005,12 @@
           "applying_is_disabled_until_they_load_because_a_s": "在加载完成前无法应用，因为若建议指定了仓库已不存在的\n            标签，整批都会被拒绝。",
           "applying_needs_write_access": "应用需要写入权限",
           "available_to_assign": "可分配",
-          "carries_at_least_one_label_nothing_to_tag": "都至少有一个标签。无需标记。",
           "clear_selection": "清除选择",
-          "couldn_t_load": "无法加载",
+          "couldn_t_load_repo_labels": "无法加载 {{repo}} 的标签",
           "couldn_t_reload_the_queue": "无法重新加载队列：",
           "created_but_settings_not_updated": "“{{name}}”已在 GitHub 上创建，但此仓库的本地分类设置无法更新：{{error}}",
-          "defines_no_labels_yet_so_there_is_nothing_to_ass": "尚未定义任何标签，因此无可分配项。请先在上方提出几个建议，\n            创建你需要的标签，然后回到这里推荐标签。",
-          "every_open_issue_in": "以下位置的每个待处理 issue：",
+          "repo_defines_no_labels_yet": "{{repo}} 尚未定义任何标签，因此无可分配项。请先在上方提出几个建议，创建你需要的标签，然后回到这里推荐标签。",
+          "every_open_issue_in_repo_is_labeled": "{{repo}} 中的每个待处理 issue 都至少有一个标签。无需标记。",
           "labelled_issue_other": "已为 {{count}} 个 issue 添加标签。",
           "labelled_issue_with_failures_other": "已为 {{count}} 个 issue 添加标签；{{failed}} 个未能更新（见下方行）。",
           "loading_the_untagged_queue": "正在加载未标记队列…",
@@ -2967,14 +3019,18 @@
           "reanalyse_issues_other": "重新分析已有提案的 {{count}} 个 issue",
           "reload_the_untagged_queue": "重新加载未标记队列",
           "repo_labels": "仓库标签",
-          "s_labels": "的标签：",
           "select_all": "全选",
           "suggest_again": "再次建议（{{n}}）",
           "suggest_labels_next": "建议标签（接下来 {{n}} 个）",
           "untagged": "未标记",
           "untagged_issues": "未标记的 issue",
           "what_you_see_below_is_the_previous_result_not_th": "下方显示的是上一次的结果，而非当前状态。",
-          "write_every_staged_label_to": "将所有暂存的标签写入 {{provider}}"
+          "write_every_staged_label_to": "将所有暂存的标签写入 {{provider}}",
+          "carries_at_least_one_label_nothing_to_tag": "都至少有一个标签。无需标记。",
+          "couldn_t_load": "无法加载",
+          "defines_no_labels_yet_so_there_is_nothing_to_ass": "尚未定义任何标签，因此无可分配项。请先在上方提出几个建议，\n            创建你需要的标签，然后回到这里推荐标签。",
+          "every_open_issue_in": "以下位置的每个待处理 issue：",
+          "s_labels": "的标签："
         },
         "graphView": {
           "header": "依赖",
@@ -3021,7 +3077,9 @@
           "retry": "重试",
           "tree_stat_other": "{{kind}}-{{number}} 的树：{{nodes}} 个节点 · {{edges}}",
           "aria_tree_other": "{{kind}}-{{number}} 的依赖树：{{nodes}} 个节点，{{edges}}",
-          "live_edges_other": "{{n}} 条活跃边"
+          "live_edges_other": "{{n}} 条活跃边",
+          "tree_stat": "{{kind}}-{{number}} 的树：{{nodes}} 个节点 · {{edges}} 条活跃边",
+          "aria_tree": "{{kind}}-{{number}} 的依赖树：{{nodes}} 个节点，{{edges}} 条活跃边"
         },
         "groupReviewsView": {
           "title": "审查请求",
@@ -3360,6 +3418,7 @@
         "endAndReview": "结束并复核",
         "ended": "已结束",
         "endingReview": "正在结束 — 准备审阅…",
+        "exportMarkdown": "将 {{name}} 的输出导出为 Markdown",
         "live": "进行中",
         "loadFailed": "无法打开这场会议",
         "moreActions": "更多操作",
@@ -3412,6 +3471,7 @@
         "backToMeeting": "返回会议",
         "closeBlocked_other": "还有 {{count}} 项待决定",
         "closeMeeting": "关闭会议",
+        "closing": "正在保存转录……",
         "file": "提交",
         "filedSection": "已提交至 {{provider}}",
         "filing": "正在提交……",
@@ -3591,6 +3651,7 @@
       },
       "chat": {
         "ask_placeholder": "问问{{name}}…",
+        "message_label": "给 {{name}} 发消息",
         "edit_cancel": "取消",
         "edit_mode": "编辑中 — 发送以替换原消息，或取消",
         "load_earlier": "加载更早的消息",
@@ -4044,7 +4105,13 @@
         "thinking_time": "想了 {{time}}",
         "title": "回忆",
         "walks_other": "走了 {{n}} 步",
-        "busiest_day_other": "最话多的一天：{{date}}（{{n}} 句）"
+        "busiest_day_other": "最话多的一天：{{date}}（{{n}} 句）",
+        "busiest_day": "最话多的一天：{{date}}（{{count}} 句）",
+        "drags": "被拽了 {{count}} 次",
+        "longest_chat": "最长一次聊了 {{count}} 句",
+        "peeks": "偷瞄了 {{count}} 次",
+        "screenshots": "帮你看了 {{count}} 次屏幕",
+        "walks": "走了 {{count}} 步"
       },
       "tip": {
         "bedtime": "试试：“11点提醒我该睡了”",
@@ -4521,7 +4588,11 @@
         "firing_count_other": "{{count}} 个报警中 ·",
         "parked_count_other": "{{count}} 个在提供方处挂起 ·",
         "cleared_count_other": "{{count}} 个已恢复 ·",
-        "unclaimed_count_other": "{{count}} 个尚未接手"
+        "unclaimed_count_other": "{{count}} 个尚未接手",
+        "cleared": "已恢复 ·",
+        "firing_2": "报警中 ·",
+        "not_yet_claimed": "尚未接手",
+        "parked_at_provider": "在提供方处挂起 ·"
       }
     },
     "papyrus": {
@@ -4662,6 +4733,7 @@
         "no_sessions_matching": "没有匹配“{{query}}”的会话",
         "purchased": "已购买",
         "search_past_sessions": "搜索历史会话…",
+        "search_label": "搜索过往会话",
         "skipped": "已跳过",
         "your_past_advisor_conversations_and_recommendati": "你与顾问的历史对话和推荐会显示在这里。",
         "mark_liked": "标记为已点赞",
@@ -4690,6 +4762,7 @@
         "delete_group_keeps_preferences": "删除分组（保留偏好）",
         "edit": "编辑",
         "group_name": "分组名称",
+        "new_preference_label": "新偏好",
         "loading_preferences": "正在加载偏好…",
         "no_items_in_this_group": "该分组暂无内容",
         "no_preferences_yet": "暂无偏好",
@@ -4715,6 +4788,8 @@
         "remove_site": "移除网站",
         "shopping_sources_the_advisor_can_browse_login_en": "顾问读不到这个清单。你在对话里说出哪家店，它就查那家——这里只是你自己的参考清单。",
         "site_name_e_g_example_store": "网站名称（例如 Example Store）",
+        "site_name_label": "网站名称",
+        "site_url_label": "网站网址",
         "the_advisor_only_visits_sites_you_ve_enabled_her": "这里的内容不会离开你的机器。",
         "the_advisor_opens_sites_in_the_browser_panel_dur": "顾问只读公开的商店页面。它无法登录，也用不了你的登录状态，所以价格和库存都来自公开页面。",
         "url_e_g_store_example_com": "URL（例如 store.example.com）",
@@ -5092,7 +5167,8 @@
           "run_task": "运行任务：{{task}}",
           "starting": "正在启动…",
           "task_progress": "任务进度",
-          "done_of_total_other": "已完成 {{done}} / {{total}} 个任务"
+          "done_of_total_other": "已完成 {{done}} / {{total}} 个任务",
+          "done_of_total": "已完成 {{done}} / {{total}} 个任务"
         },
         "workspace": {
           "describe_what_you_want_to_build_answer_a_few_que": "描述你想构建的内容，回答几个问题，然后获得一份经过审阅的方案——需求、设计和任务——供代理执行。",
@@ -5438,7 +5514,7 @@
         "backup_others_on_drive": "备份到此云盘的其他安装实例：{{count}} 个",
         "backup_show_others": "包含其他安装实例的存档",
         "backup_others_truncated": "只显示前 {{max}} 个其他安装实例。",
-"backup_archives_truncated": "部分{{kind}}存档未能列出，最新的存档可能未显示。",
+        "backup_archives_truncated": "部分{{kind}}存档未能列出，最新的存档可能未显示。",
         "backup_shared_note": "两个安装实例共用一个云盘，并不意味着共享记忆或共享会话。每个备份都是某一时刻的独立存档，恢复只是把该文件下载到一个暂存文件夹 — 文件由你自己替换，且需在 gateway 停止时进行。",
         "backup_restore_foreign_confirm": "此存档由另一个安装实例（{{install}}）上传。恢复它会下载那个安装实例的数据，而不是此安装实例的数据。仍要下载吗？",
         "backup_restore_unverified_confirm": "此存档存放在此安装实例自己的文件夹里，但此安装实例没有上传它的记录。任何能写入云盘的东西都能创建那个文件夹，所以它未必来自此安装实例。仍要下载吗？",
@@ -5591,7 +5667,8 @@
         "forget_key_confirm": "忘记这一行的密钥“{{name}}”？AWS 和你的 AWS CLI 配置不会有任何改动。",
         "forget_key_action": "忘记密钥",
         "totals_summary_other": "{{accounts}} 个账户 · {{keys}}",
-        "keys_healthy_other": "{{n}} 个密钥中 {{healthy}} 个正常"
+        "keys_healthy_other": "{{n}} 个密钥中 {{healthy}} 个正常",
+        "totals_summary": "{{accounts}} 个账户 · {{keys}} 个密钥中 {{healthy}} 个正常"
       },
       "rail": {
         "accounts": "账户与凭证",
@@ -5766,7 +5843,9 @@
       "value_question": "有问题待答",
       "value_rejected": "已拒绝",
       "value_review_required": "待审查",
-      "why": "原因"
+      "why": "原因",
+      "progress": "进度",
+      "progress_count": "{{total}} 项中已完成 {{accepted}} 项"
     },
     "voicePlaybackNotice": {
       "failed": "{{speak}}失败。请检查文字转语音设置后重试。",
@@ -6065,7 +6144,9 @@
       "category_count_other": "{{count}} 个类别",
       "source_categories": "{{name}} 的类别",
       "items_selected_count_other": "已选择 {{count}} 项",
-      "found_count_other": "已找到 {{count}} 项"
+      "found_count_other": "已找到 {{count}} 项",
+      "found": "已找到",
+      "items_selected": "已选项目"
     },
     "agentSpecNotRewrittenNotice": {
       "saved_but_not_applied": "已保存，但此 {{productName}} 无法更新智能体配置，新聊天会继续使用之前的设置。请打开“日志”页面查看原因。"
@@ -6111,7 +6192,8 @@
       "not_installed": "“{{name}}”未安装",
       "retry": "重试",
       "this_app_is_disabled": "此应用已停用",
-      "this_app_provides_agents_and_skills_but_no_visua": "此应用提供代理和技能，但没有可视界面。\n            请在聊天中使用它的代理。"
+      "this_app_provides_agents_and_skills_but_no_visua": "此应用提供代理和技能，但没有可视界面。\n            请在聊天中使用它的代理。",
+      "app_not_found": "未找到应用"
     },
     "appPopoutControl": {
       "pop_out_app_to_its_own_window": "把应用弹出到独立窗口",
@@ -6135,7 +6217,8 @@
       "trusted_channel_all": "已信任 — 此频道中的所有工具将自动批准，重启后仍然有效",
       "trusted_channel_base": "已信任 — {{base}} 命令将对 @{{role}} 自动批准，{{productName}} 重启前有效",
       "trusted_channel_command": "已信任 — “{{cmd}}”将对 @{{role}} 自动批准，{{productName}} 重启前有效",
-      "title_wants_to_run": "<title/> 请求运行"
+      "title_wants_to_run": "<title/> 请求运行",
+      "running": "正在运行："
     },
     "approvalModePicker": {
       "nudge_body": "在这里可以调整 {{productName}} 的审批模式——选择这里的“信任”后，它在此对话中无需先询问即可工作，随时可以改回。",
@@ -6151,9 +6234,9 @@
       "enable": "启用",
       "normal_desc": "{{productName}} 在做任何事之前都会与你确认",
       "normal_label": "常规",
-      "reads_desc": "{{productName}} 会自行运行只读 shell 命令，但其他任何操作都会先询问",
+      "reads_desc": "在此对话及其启动的会话中，{{productName}} 会自行运行只读 shell 命令，但其他任何操作都会先询问",
       "reads_label": "读取",
-      "trust_desc": "在此对话中，{{productName}} 无需先询问即可工作",
+      "trust_desc": "在此对话及其启动的会话中，{{productName}} 无需先询问即可工作",
       "trust_label": "信任",
       "chat_mode_hint": "对话模式",
       "trust_scope_tooltip": "此对话由应用授权信任；授权会自行过期。在此菜单中选择“常规”可立即结束；在该应用中关闭之前，应用可能会再次授权。",
@@ -6162,7 +6245,11 @@
       "yolo_expiration_until_shutdown": "在 {{productName}} 重启前保持开启 — 不会按时间过期。",
       "yolo_label": "YOLO",
       "mode_disabled_by_policy": "已被组织的安全策略禁用",
-      "yolo_mode_is_an_app_wide_setting": "YOLO 模式是全应用级设置"
+      "yolo_mode_is_an_app_wide_setting": "YOLO 模式是全应用级设置",
+      "normal_tooltip": "{{productName}} 在执行任何操作前都会先询问你",
+      "reads_tooltip": "{{productName}} 会自行运行只读 shell 命令，但其他任何操作都会先询问",
+      "trust_tooltip": "在此对话中，{{productName}} 无需先询问即可工作",
+      "yolo_tooltip": "在每个对话中，{{productName}} 无需先询问即可工作"
     },
     "appstore": {
       "appListRow": {
@@ -6222,17 +6309,20 @@
         "run_this_on_your_local_machine": "在本地机器上运行：",
         "uninstall": "卸载",
         "update": "更新",
-        "update_to": "更新到 v{{version}}"
+        "update_to": "更新到 v{{version}}",
+        "open": "打开"
       },
       "sourcesPopover": {
-        "developer_install_of_a_local_app_directory_equiv": "以开发者方式安装本地应用目录（等同于",
+        "developer_install_equivalent_to_command": "以开发者方式安装本地应用目录（等同于 <command/>）。",
         "install": "安装",
         "install_failed": "安装失败",
         "install_from_path": "从路径安装",
         "installing": "正在安装…",
         "kirocrew_app_install_path": "kirocrew app install <path>",
         "manage_app_sources": "管理应用来源",
-        "path_to_app_directory": "/path/to/app-directory"
+        "path_to_app_directory": "/path/to/app-directory",
+        "app_directory_path_label": "应用目录路径",
+        "developer_install_of_a_local_app_directory_equiv": "以开发者方式安装本地应用目录（等同于"
       },
       "types": {
         "built_in": "内置",
@@ -6460,10 +6550,15 @@
       "release_to_transcribe": "松手转文字",
       "hold_to_talk": "按住说话",
       "release_to_cancel": "松手取消",
-      "slide_up_to_cancel": "上滑取消",
       "release_to_send": "松手发送",
       "release_to_keep_draft": "松手保留为草稿",
+      "slide_up_to_cancel": "上滑取消",
       "slide_up_to_cancel_sideways_to_keep_draft": "上滑取消，侧滑保留为草稿",
+      "release_to_steer": "松手引导",
+      "steer_reads_it_before_next_step": "代理会在下一步之前读取",
+      "up_left_to_cancel": "左上取消",
+      "up_right_to_send": "右上发送",
+      "up_right_to_steer": "右上引导",
       "stop_and_send": "停止并发送（按住 Shift 点击可保留草稿）",
       "switch_to_keyboard": "切换到键盘",
       "switch_to_voice": "切换到语音",
@@ -6635,7 +6730,10 @@
       "composer_action_footer_host": "{{productName}} 检查了草稿。{{app}} 仍然看不到它。",
       "composer_action_needs_empty": "{{app}} 只能插入到空消息中。请先清空草稿。",
       "composer_action_would_resolve": "{{app}} 的文本以 /、! 或 @ 开头，或包含 $skill、文件或图片，因此会被执行而不是作为文本发送。没有插入。",
-      "composer_action_footer": "{{app}} 看不到你的草稿。它的文字按原样插入，是否发送由你决定。"
+      "composer_action_footer": "{{app}} 看不到你的草稿。它的文字按原样插入，是否发送由你决定。",
+      "apply_a_ready_made_set_of_instructions": "套用现成的指令集",
+      "let_the_agent_read_one_of_your_files": "让代理读取你的某个文件",
+      "quick_actions_like_clearing_the_chat_or_checking": "清空聊天、查看用量等快捷操作"
     },
     "chatPane": {
       "agent_list": "代理列表",
@@ -6660,7 +6758,8 @@
       "type_to_filter": "输入以筛选…",
       "earlier_conversation_show": "{{time}} 重新开始 · 显示之前的消息（{{count}}）",
       "earlier_conversation_hide": "{{time}} 重新开始 · 隐藏之前的消息（已不再记得）",
-      "preparing_catch_up": "正在整理你的进展摘要…"
+      "preparing_catch_up": "正在整理你的进展摘要…",
+      "session_ready_type_a_message_to_start": "会话就绪。输入消息即可开始。"
     },
     "cliPanel": {
       "copied": "已复制",
@@ -6827,7 +6926,9 @@
       "write_a_comment_to_send": "写一条评论……{{keys}} 发送",
       "open_count_other": "{{count}} 个未解决",
       "resolved_count_other": "{{count}} 个已解决",
-      "messages_count_other": "{{count}} 条消息"
+      "messages_count_other": "{{count}} 条消息",
+      "messages": "条消息",
+      "open": "未解决 ·"
     },
     "commentsSidebar": {
       "add_a_comment_on_the_whole_artifact": "对整个产物添加评论…",
@@ -6867,7 +6968,10 @@
       "draft_a_prompt_in_chat": "在聊天中起草提示",
       "draft_a_prompt_in_chat_hint": "打开聊天，并在输入框中放入一条关于这些评论的提示。你自己发送之前，不会发送任何内容。",
       "show_resolved_count_other": "展开 {{count}} 条已解决",
-      "hide_resolved_count_other": "隐藏 {{count}} 条已解决"
+      "hide_resolved_count_other": "隐藏 {{count}} 条已解决",
+      "hide": "隐藏",
+      "resolved": "已解决",
+      "show": "展开"
     },
     "computerUseLiveView": {
       "close": "关闭",
@@ -7051,7 +7155,9 @@
       "switch_to_unified_view": "切换到统一视图",
       "this_document_is_tracked_as_a_session_artifact_n": "此文档被记录为会话产物，而非源文件更改",
       "toggle_diff": "显示或隐藏 {{path}} 的差异",
-      "show_more_count_other": "展开另外 {{count}} 项"
+      "show_more_count_other": "展开另外 {{count}} 项",
+      "more": "更多",
+      "show": "展开"
     },
     "openFileChips": {
       "open_file": "打开文件"
@@ -7077,7 +7183,8 @@
       "search_denied_path": "无权访问此路径",
       "check_path_inside_project": "请选择其他路径",
       "enter_sends": "按 Enter 直接发送消息",
-      "ctrl_enter_sends": "按 Ctrl+Enter 直接发送消息"
+      "ctrl_enter_sends": "按 Ctrl+Enter 直接发送消息",
+      "search_failed": "无法搜索文件。请重试。"
     },
     "fileRenderers": {
       "binary_file_download_hint": "它不是文本，因此这里没有可显示的内容。请下载一份副本，用其他应用打开。",
@@ -7134,7 +7241,12 @@
       "showing_first_rows_other": "显示 {{shown}} 行，共 {{count}} 行",
       "items_count_other": "{{count}} 项",
       "lines_count_other": "{{count}} 行",
-      "more_count_other": "还有 {{count}} 项"
+      "more_count_other": "还有 {{count}} 项",
+      "items": "项",
+      "lines": "行",
+      "more": "更多",
+      "rows": "行",
+      "showing_500_of": "显示 500 项，共"
     },
     "folderColorNames": {
       "amber": "琥珀色",
@@ -7159,6 +7271,8 @@
       "create_folder": "创建文件夹",
       "default_agent": "默认智能体",
       "default_agent_hint": "在此处新建会话时预先选中。",
+      "default_prompt": "默认首条提示词",
+      "default_prompt_hint": "从此文件夹新建对话时，放入其消息输入框，不会自动发出。子文件夹不会继承。",
       "enter_to_submit": "按回车提交",
       "folder_settings": "文件夹设置",
       "icon": "图标",
@@ -7276,6 +7390,7 @@
       "import_from_file": "从文件导入会话",
       "refusal_damaged_file": "无法读取此文件。它可能已损坏，或者不是导出的会话。",
       "refusal_not_a_session": "此文件不是导出的会话。",
+      "refusal_zip_archive": "此文件是 zip 压缩包，例如 Kiro IDE 导出的文件。只能导入从 {{productName}} 导出的会话。",
       "refusal_too_large": "此文件太大，无法导入。",
       "refusal_upload_failed": "无法上传此文件。连接可能已中断。",
       "refusal_busy": "当前正在进行的导入过多。请稍后重试。",
@@ -7533,7 +7648,8 @@
       "cancel_unsettled": "无法取消登录。登录仍在进行中，请再次点击同一选项重试。",
       "card_intro": "仅供 Kiro Agent 后端使用：其 Agent 将以这个 Kiro 账号运行。Kiro CLI 仍沿用自己的 kiro-cli 登录，在此登录不会改变它。",
       "previous_sign_in_not_removed": "已登录，但无法移除之前的登录",
-      "previous_sign_in_not_removed_body": "新账号已保存，但你切换前的那个账号仍然存在且优先生效。请先将其登出，再确认此处显示的登录。"
+      "previous_sign_in_not_removed_body": "新账号已保存，但你切换前的那个账号仍然存在且优先生效。请先将其登出，再确认此处显示的登录。",
+      "click_to_copy": "点击复制"
     },
     "kiroPrerequisiteGate": {
       "setup_completion_not_recorded": "未记录设置完成",
@@ -7723,6 +7839,7 @@
       "tooltip": "此代理在这里无法启动。它用 Markdown 定义，而 {{current}} 只运行 JSON 代理。改用 {{backends}}，或为它添加一个 JSON 文件。"
     },
     "markdownPanel": {
+      "partial_copy_cannot_save": "此文件只加载了一部分（内容被截断或凭据已隐去），因此无法保存覆盖磁盘上的文件。",
       "add_to_artifact_library": "添加到产物库",
       "add_to_artifacts": "添加到产物",
       "add_to_knowledge": "添加到知识库",
@@ -8123,7 +8240,8 @@
         "decision_recorded": "你的决定已记录。",
         "show_less": "收起",
         "show_muted_count": "显示已静音（{{count}}）",
-        "try_a_different_search": "换个搜索词试试"
+        "try_a_different_search": "换个搜索词试试",
+        "activity_will_appear_here": "动态会显示在这里"
       },
       "notificationPermissionHint": {
         "get_alerted_when_you_re_away": "离开时也能收到提醒",
@@ -8694,7 +8812,8 @@
       "sent_transcript_only": "已发送（仅对话记录）",
       "transcript_only_hint": "该 Crew 无法恢复完整的对话上下文，因此此副本仅从对话记录继续。",
       "unknown_error": "未知错误",
-      "default_badge": "默认"
+      "default_badge": "默认",
+      "failed": "失败"
     },
     "sessionActionsMenu": {
       "bring_back_to_main": "移回主窗口",
@@ -8859,7 +8978,8 @@
       "select_a_skill_to_preview": "选择技能以预览",
       "skill_search_results": "技能搜索结果",
       "source": "来源",
-      "installed_files_other": "已安装 {{count}} 个文件"
+      "installed_files_other": "已安装 {{count}} 个文件",
+      "by": "作者"
     },
     "skillDirectoryBrowser": {
       "description": "描述",
@@ -9031,6 +9151,7 @@
       "make_a_status_tag": "将 {{name}} 设为状态标签",
       "make_status_tag": "设为状态标签",
       "new_tag": "新标签… ↵",
+      "new_tag_label": "新标签名称",
       "remove_status_flag_from": "移除 {{name}} 的状态标记",
       "rename_tag": "重命名标签 {{name}}",
       "set_color_to_name": "将颜色设为{{name}}",
@@ -9158,7 +9279,8 @@
       "dismiss_tip": "忽略提示",
       "feature_tip": "功能提示",
       "learn_more": "了解更多",
-      "turn_off_tips": "关闭提示"
+      "turn_off_tips": "关闭提示",
+      "tip_settings": "提示设置"
     },
     "toolInputPreview": {
       "collapse": "折叠",
@@ -9254,6 +9376,7 @@
       "open_settings": "打开设置",
       "pick_an_installed_provider_under_settings_voice": "请在“设置 → 语音”中选择已安装的引擎，或安装当前引擎。",
       "provider_is_not_installed_on_this_machine": "语音转文字已开启，但本机未安装“{{provider}}”引擎，因此无法转写录音。",
+      "provider_off_open_settings": "语音识别已关闭：未选择语音提供方。打开设置并选择一个，即可使用麦克风。",
       "run_the_command_below_in_a_terminal_to_install_v": "在终端中运行下面的命令以安装语音支持，然后重新加载页面。",
       "settings_voice": "设置 → 语音",
       "speech_to_text_is_not_enabled_yet_so_the_microph": "语音转文字尚未启用，因此麦克风无法把你的语音转成文字。",
@@ -9381,6 +9504,8 @@
       "ask_kiro": "问 Kiro",
       "ask_kiro_prompt": "在浏览器里打开 {{url}}，把页面给我看。",
       "no_origins_yet": "还没有允许任何开发服务器。到“设置 → 浏览器 → 本地预览”里添加你的。",
+      "loopback_not_allowed_body": "这是一个 localhost 名称，但预览标签只打开你允许过的本地地址——带端口的 localhost 或 127.0.0.1。到“设置 → 浏览器 → 本地预览”里添加一个。",
+      "loopback_not_allowed_title": "这个 localhost 名称无法在这里预览",
       "open_in_your_chrome": "在你的 Chrome 里打开",
       "origin_not_allowed_body": "预览标签只打开你允许过的本地地址。允许这个地址后就能在这里显示。",
       "origin_not_allowed_title": "这个地址不在你的本地预览列表里",
@@ -9403,7 +9528,33 @@
       "annotate_click_to_edit": "点击编辑这条批注",
       "annotate_note_for_n": "标记 {{n}} 的批注",
       "annotate_added_ack": "已加入消息输入框 — 在你发送消息之前不会发出",
-      "try_again": "重试"
+      "try_again": "重试",
+      "browser_view": "浏览器视图",
+      "browser_view_can_t_be_reached_from_this_browser": "无法从此浏览器访问浏览器视图",
+      "browser_view_is_not_running": "浏览器视图未运行",
+      "browser_view_unavailable": "浏览器视图不可用",
+      "can_t_embed_an_http_page_here": "无法在此嵌入 http:// 页面",
+      "couldn_t_open_this_page_in_the_browser": "无法在浏览器中打开此页面",
+      "couldn_t_start_the_browser_view": "无法启动浏览器视图。",
+      "dashboard_policy_blocks_embedding_http_page": "浏览器本可以允许此页面，但此仪表板只嵌入来自 127.0.0.1 或 localhost 的 http:// 页面。这是网关策略，而不是浏览器的拦截。",
+      "http": "http://",
+      "live_browser_session": "实时浏览器会话",
+      "loading_the_browser_view": "正在加载浏览器视图…",
+      "more_actions": "更多操作",
+      "opening_in_the_browser": "正在浏览器中打开…",
+      "page_mixed_content": "页面（混合内容）。",
+      "start_browser_view": "启动浏览器视图",
+      "start_it_to_watch_and_drive_the_agent_s_browser": "启动后即可在此面板中查看并操作代理的浏览器会话。",
+      "the_browser_view_isn_t_available_on_this_gateway": "此网关上没有可用的浏览器视图。",
+      "the_gateway_could_not_open_a_browser_for_this_page": "网关无法为此页面打开浏览器。",
+      "the_view_runs_on_the_gateway_host_pin_and_forward": "浏览器视图由网关主机的回环地址提供，此浏览器无法连接到它。如果你通过 SSH 隧道访问仪表板，请用下方设置固定视图端口，并同时转发该端口。",
+      "browser_view_can_t_load_its_files_here": "浏览器视图可能无法在此加载其文件",
+      "a_sign_in_proxy_refuses_the_view_s_files": "视图的文件在不带 Cookie 时被拒绝，带 Cookie 时则有响应。可能的原因是仪表板前面的某个组件（例如登录代理或隧道）会在每个请求上检查 Cookie。视图运行在一个隔离的框架中，无法发送该 Cookie。如果是这种情况，请改为通过直接的 SSH 端口转发访问仪表板。",
+      "opened_from_this_chat": "从本聊天打开",
+      "this_dashboard_is_served_over_https_so_the_brows": "此仪表板通过 HTTPS 提供服务，因此浏览器会阻止嵌入",
+      "to_open_another_site_unlock_the_view_s_address_bar": "点击页面上方的锁图标即可在那里输入其他地址；右上角的显示器按钮可切回预览地址栏。",
+      "your_page_is_in_pick_it_in_the_sidebar": "你的页面在 {{session}} 中，请在框架的侧边栏中选择它。",
+      "links_with_a_query_or_hash_part_go_in_the_frame_s_own_address_bar": "带 ? 或 # 部分的链接无法通过此地址栏打开——请先打开网站普通地址，再点击页面上方的锁图标，在框架自带地址栏中输入完整链接。"
     },
     "welcomeView": {
       "incognito": "隐身",
@@ -9577,7 +9728,7 @@
       "row_unreadable_marker_dismissed": "无法读取 — 通知已忽略",
       "root_unreadable": "没有读取工作区文件夹的权限",
       "root_hidden_only": "此工作区仅包含隐藏项（跳过的工具和缓存文件夹、受保护的条目）",
-      "root_truncated": "工作区过大，无法列出：已达到 10,000 个项目的数量上限",
+      "root_truncated": "一切正常。此项目的文件和文件夹太多，无法在此全部列出（上限为 10,000 个）。",
       "root_truncated_search_hint": "在上方的输入框中输入文件名即可找到它。",
       "unreadable_folders": "无法读取的文件夹：{{paths}}",
       "dismiss_unreadable": "忽略：在不可读的文件夹发生变化之前隐藏此通知",
@@ -9808,7 +9959,8 @@
       "capture_n_of_m": "第 {{n}} 张，共 {{m}} 张",
       "turn_on": "开启此预览",
       "screenshot_badge": "截图",
-      "is_on": "此预览已开启。关闭只会把它隐藏起来，你创建的内容不会丢失"
+      "is_on": "此预览已开启。关闭只会把它隐藏起来，你创建的内容不会丢失",
+      "where_to_find": "你会在哪看到它"
     },
     "sessionAutomationPopover": {
       "snapshot_failed": "无法加载此会话的监控状态。请重试加载后再启动监控。",
@@ -10177,7 +10329,25 @@
       "ultra_done_line_files_other": "当全部 {{count}} 项文件检查通过后完成。",
       "ultra_done_line_files_rest_other": "当全部 {{count}} 项文件检查通过且你批准其余部分后完成。",
       "breadcrumb_nav_label": "面包屑导航",
-      "breadcrumb_back_to": "返回 {{t}}"
+      "breadcrumb_back_to": "返回 {{t}}",
+      "ultra_pause_all": "全部暂停",
+      "ultra_resume_all": "全部继续",
+      "ultra_paused_continue": "继续",
+      "ultra_pause_confirm_title": "暂停所有成员？",
+      "ultra_pause_failed": "无法暂停团队。",
+      "ultra_resume_failed": "无法继续团队。",
+      "ultra_continue_failed": "无法让这个成员继续。",
+      "ultra_paused_detail_other": "已停止 {{count}} 个成员 · 排队的消息会保留",
+      "ultra_pause_confirm_body_other": "停止 {{count}} 个正在运行的成员，包括子团队。进行中的步骤现在停止，继续时会重新运行。暂停期间不会启动新成员。",
+      "ultra_paused_notice_other": "你暂停了团队。已停止 {{count}} 个成员。可在 Board 上继续。",
+      "ultra_row_lead_working": "负责人工作中",
+      "ultra_pause_confirm_lead": "停止负责人当前的步骤。暂停期间不会启动新成员。",
+      "breadcrumb_label": "团队成员",
+      "ultra_needs_you_none_blocked": "没有等你批准的事项。受阻的工作在“里程碑”下。",
+      "ultra_stalled": "停滞",
+      "ultra_ms_blocked": "受阻",
+      "ultra_recap_blocked_one": "{{names}}受阻",
+      "ultra_recap_blocked_many": "{{names}}受阻"
     },
     "guideLayer": {
       "region_label": "引导",
@@ -10237,6 +10407,7 @@
       "predicate_crewmate_danger_zone_open": "在编辑器左侧的分区列表里选“危险操作区”",
       "predicate_crewmate_place_pane_open": "在编辑器左侧的分区列表里选“记忆”",
       "predicate_crewmate_model_pane_open": "在编辑器左侧的分区列表里选“常规”",
+      "predicate_crewmate_panel_not_docked": "这个 Bot 的侧边面板已经在聊天旁打开，所以没有要打开的。",
       "predicate_no_response_running": "等当前这条回复结束，或先停止它（回复进行中时不能切换模型）",
       "predicate_phone_connect_available": "这台机器上不能配对手机",
       "predicate_mouse_input": "请用鼠标或触控板操作（在触屏上，回形针会直接打开文件选择器）",
@@ -10576,6 +10747,22 @@
       "session_queued_hint": "同时运行的代理减少期间，此会话启动的代理正在等待空位。",
       "load_failed": "无法检查已排队的代理"
     },
+    "codeChannelBadge": {
+      "label": "Slack 代码频道",
+      "label_short": "代码频道",
+      "archived": "频道已归档",
+      "wrapped_up": "任务已完成",
+      "open_named": "在 Slack 中打开 {{channel}}",
+      "open_unnamed": "在 Slack 中打开此代码频道",
+      "opens_in_slack": "（在 Slack 中打开）",
+      "about": "此会话运行在一个 Slack 代码频道中。那里和这里的消息属于同一段对话。",
+      "archived_hint": "已在 Slack 中归档。该频道为只读。",
+      "wrapped_up_hint": "已收尾。任务已完成，频道仍保持开放，可继续跟进。",
+      "thread_label": "Slack 话题",
+      "thread_open": "打开此 Slack 话题",
+      "thread_paused": "回复已暂停",
+      "thread_paused_hint": "此会话在话题中的回复已暂停。在话题中发送的消息仍会送达。"
+    },
     "crew": {
       "crewEditorNextDialog": {
         "model_frame": "此 Bot 使用的模型。保持继承以沿用代理模板，或为此 Bot 固定某个具体模型。"
@@ -10662,8 +10849,26 @@
       "copy_failed": "无法复制。请在应用中选中文字后自行复制。",
       "more_actions": "更多操作"
     },
-    "meetYourMatesIntro": {},
-    "startupVideoModal": {},
+    "meetYourMatesIntro": {
+      "sample_line_1": "我昨晚发现了一个不稳定的测试，并修好了。",
+      "sample_line_2": "PR 已经准备好了。要我合并吗？",
+      "sample_merge": "合并",
+      "sample_show_first": "先给我看看"
+    },
+    "startupVideoModal": {
+      "close": "关闭",
+      "crewmates_description": "它们会自己找到要做的事、动手完成，只在需要你时才来问你。",
+      "crewmates_title": "认识你的队友。",
+      "got_it": "知道了",
+      "media_failed": "无法加载功能视频",
+      "new_tag": "新",
+      "not_now": "暂不",
+      "share": "共享",
+      "share_description": "把这个功能视频变成可以发布到任何地方的分享卡片。",
+      "share_include_title": "包含视频标题",
+      "streaming": "在线播放",
+      "try_now": "立即试试"
+    },
     "selectionActions": {
       "apps": "应用",
       "apps_hint": "把选中的文字发给一个应用",
@@ -10730,6 +10935,11 @@
       "job_title": "{{name}} — {{time}} {{tz}}",
       "job_title_paused": "{{name}}（已暂停）— {{time}} {{tz}}",
       "job_name_paused": "{{name}}（已暂停）"
+    },
+    "unscannedDownload": {
+      "body": "{{name}} 大小为 {{size}}。超过 {{limit}} 的文件在下载前不会检查其中是否含有密钥等机密信息。",
+      "download_anyway": "仍要下载",
+      "title": "文件太大，无法扫描"
     }
   },
   "hooks": {
@@ -10796,7 +11006,8 @@
       "toggle_left_sidebar": "切换左侧边栏",
       "toggle_session_panel": "切换会话面板",
       "toggle_side_panel": "切换侧边面板",
-      "toggle_terminal": "切换终端"
+      "toggle_terminal": "切换终端",
+      "toggle_side_terminal": "切换侧边面板终端"
     },
     "useNativeNotification": {
       "new_notifications_other": "{{count}} 条新通知"
@@ -11148,7 +11359,14 @@
         "installed_needs_newer_host": "已安装的 {{name}} 需要更新的 {{productName}}。请更新 {{productName}}；你的数据不受影响。"
       },
       "grants_reconsent_composer_actions": "输入框按钮：允许应用在输入框的 + 菜单中添加这些按钮。点击后会把应用的文字插入你的草稿；应用看不到草稿，也不能发送。",
-      "grants_reconsent_selection_actions": "选中文字操作：允许应用的条目拿到你在聊天回复中选中的文字，并提供结果供复制或打开。"
+      "grants_reconsent_selection_actions": "选中文字操作：允许应用的条目拿到你在聊天回复中选中的文字，并提供结果供复制或打开。",
+      "installed": "已安装：",
+      "lifecycle": "| 生命周期：",
+      "memory": "内存：",
+      "min_kirocrew_v": "最低 {{productName}}：v",
+      "origin": "安装来源：",
+      "platform": "平台：",
+      "resources_2": "| 资源："
     },
     "appPage": {
       "loading_app": "加载应用…",
@@ -11169,7 +11387,6 @@
       "agent_other": "{{count}} 个代理",
       "all_apps": "全部应用",
       "app_other": "{{count}} 个应用",
-      "available": "可用",
       "backend_refused_notice": "{{name}} 的后端未启动：{{reason}}",
       "built_in_kirocrew": "内置 · kirocrew",
       "cancel": "取消",
@@ -11207,7 +11424,6 @@
       "skill_other": "{{count}} 个技能",
       "sort": "排序：",
       "sort_apps": "应用排序",
-      "the_app_itself_is_managed_externally": "应用本身由外部管理。",
       "this_app_could_not_be_displayed": "无法显示此应用。",
       "this_section_could_not_be_displayed": "无法显示此板块。",
       "this_app_has_an_uninstall_script_that_will_run_b": "此应用有一个卸载脚本，会在移除前运行。它可能会删除应用二进制文件、代理配置、技能以及安装期间创建的其他资源。",
@@ -11219,8 +11435,8 @@
       "uninstall": "卸载",
       "uninstall_removes_metadata_and_source": "通过“应用”安装 — 会移除 {{productName}} 元数据和已下载的源代码。",
       "uninstall_removes_metadata_secret_and_source": "通过“应用”安装 — 会移除 {{productName}} 元数据、应用密钥和已下载的源代码。",
+      "uninstall_removes_metadata_secret_and_source_managed_externally": "通过“应用”安装 — 会移除 {{productName}} 元数据、应用密钥和已下载的源代码。应用本身由外部管理。",
       "update_all": "全部更新",
-      "update_other": "{{count}} 项更新",
       "updates_hint_link": "查看更新",
       "updates_hint_other": "有 {{count}} 项更新可用",
       "updating_progress": "正在更新 {{done}}/{{total}}…",
@@ -11231,7 +11447,14 @@
       "updated_from_the_registry": "已从注册表更新 {{name}}。",
       "updated_needs_session_approval_consent": "{{name}} 已被禁用，因为它新增了控制你对话的请求。请在应用详情中查看该权限，然后启用它。",
       "refresh_store": "刷新商店",
-      "refreshing_store": "正在刷新商店…"
+      "refreshing_store": "正在刷新商店…",
+      "action_failed": "{{action}} {{name}} 失败",
+      "available": "可用",
+      "kept": "已保留 —",
+      "show_disabled_other": "显示 {{count}} 个已禁用应用",
+      "show_enabled_only": "仅显示已启用",
+      "the_app_itself_is_managed_externally": "应用本身由外部管理。",
+      "update_other": "{{count}} 项更新"
     },
     "artifactDeployPage": {
       "0_00_mo": "~$0.00/月",
@@ -11405,7 +11628,9 @@
       "col_type": "类型",
       "col_url": "链接",
       "col_cost": "费用",
-      "more_count_other": "另外 {{n}} 个"
+      "more_count_other": "另外 {{n}} 个",
+      "access_reachable": "：访问可达",
+      "more": "更多"
     },
     "artifactDetailPage": {
       "published_to_provider": "已发布到 {{provider}}",
@@ -11544,7 +11769,12 @@
       "content_copied_from_version": "内容复制自 v{{version}}",
       "version_label": "v{{version}}",
       "to_version": "→ v{{version}}",
-      "version_change": "v{{from}} → v{{to}}"
+      "version_change": "v{{from}} → v{{to}}",
+      "by": "由",
+      "content_copied_from_v": "内容复制自 v",
+      "updated": "· 更新于",
+      "v": "v",
+      "v_2": "→ v"
     },
     "artifactPopoutFrame": {
       "artifact": "产物",
@@ -11673,7 +11903,9 @@
       "saved_to_library_notice": "已将“{{name}}”保存到你的产物中。",
       "open_doc_in_editor": "在编辑器中打开 {{path}}",
       "open_doc_in_editor_failed": "无法在编辑器中打开此文件：{{reason}}。点击文件名即可预览。",
-      "folder_renamed_to": "文件夹已重命名为 {{name}}"
+      "folder_renamed_to": "文件夹已重命名为 {{name}}",
+      "by": "由",
+      "on": "开"
     },
     "capabilitiesPage": {
       "agent_capabilities": "自定义",
@@ -11995,7 +12227,8 @@
         "trust": "信任",
         "trusted": "已信任",
         "view_full_activity": "查看完整动态 →",
-        "approvals_pending_count_other": "{{count}} 项待审批"
+        "approvals_pending_count_other": "{{count}} 项待审批",
+        "approvals_pending": "项待审批"
       },
       "cronAckBar": {
         "acknowledge": "确认",
@@ -12099,7 +12332,9 @@
         "search_failed_for_query": "知识搜索失败：“{{query}}”",
         "searching_knowledge_for_query": "正在搜索知识：“{{query}}”…",
         "selected_count_other": "已选 {{count}} 项",
-        "tokens_count_other": "{{count}} 个令牌"
+        "tokens_count_other": "{{count}} 个令牌",
+        "selected": "已选 ·",
+        "tokens": "个令牌"
       },
       "mcpInfoButton": {
         "agent_loads_only_its_own_mcp_servers": "代理“{{name}}”仅加载自己的 MCP 服务器。",
@@ -12361,7 +12596,8 @@
         "chip_failed_other": "{{count}} 个代理失败",
         "chip_stopped_other": "{{count}} 个代理已停止",
         "chip_stalled_other": "{{count}} 个代理可能已停滞",
-        "more_running_normally_count_other": "另有 {{count}} 个正常运行中…"
+        "more_running_normally_count_other": "另有 {{count}} 个正常运行中…",
+        "more_running_normally": "个仍在正常运行…"
       },
       "subagentQueued": {
         "low_memory": "等待开始 — 需要 {{required}} 可用内存，当前可用 {{available}}；请释放内存以继续",
@@ -12421,7 +12657,8 @@
         "set_by_you_open": "你标成了未完成，agent 还没确认。",
         "sending": "发送中",
         "done_of_total": "{{done}} / {{total}}",
-        "more_count_other": "另外 {{n}} 个…"
+        "more_count_other": "另外 {{n}} 个…",
+        "more": "更多…"
       },
       "thinkingBlock": {
         "collapse_model_reasoning": "收起模型推理",
@@ -12558,8 +12795,14 @@
         "agent_switch_blocked_channel": "切换到 {{agent}} 已被阻止 — 此聊天已关联到由 {{channel_agent}} 服务的 Slack 频道。下一轮将在该智能体上重新开始。",
         "channel_message_not_run": "Slack 频道发来的消息未运行：此会话的智能体与该频道所用智能体不同。",
         "crew_name_undispatchable": "无法使用此话题的团队名称。请重命名或重新创建该 Bot。",
+        "code_channel_worktree_not_ready": "此代码频道的 worktree 尚未就绪，因此未运行该消息。请稍后重新发送。",
         "remote_crew_read_only": "此聊天在远程团队上运行，现在为只读。要继续，请打开该团队自己的会话。",
-        "archive_failed_turn_cancelled": "取消正在运行的一轮后，归档此标签页失败。标签页已保留，但该轮没有完成 — 请重新发送消息以继续。"
+        "archive_failed_turn_cancelled": "取消正在运行的一轮后，归档此标签页失败。标签页已保留，但该轮没有完成 — 请重新发送消息以继续。",
+        "kas_signed_out": "尚未登录 Kiro。请在“设置 → 代理运行框架 → Kiro 登录”中登录，然后开始新的聊天。",
+        "kas_signed_out_sign_in_below": "尚未登录 Kiro。请在下方登录，然后开始新的聊天。",
+        "kas_route_relay": "你的代理通过 kiro-cli 运行。",
+        "kas_route_bundle": "你的代理在 {{productName}} 自带的引擎上运行。",
+        "kas_route_lead": "{{route}}{{message}}"
       },
       "turnBlock": {
         "earlier_step_other": "之前的 {{count}} 个步骤",
@@ -12585,15 +12828,17 @@
         "steer_unsend": "撤回",
         "steer_edit": "在消息框中编辑",
         "steer_queue_instead": "改为排队",
+        "steer_queue_instead_hint": "代理完成后发送",
         "show_full_message": "显示完整消息",
         "hide_full_message": "隐藏完整消息",
+        "sent_by_script": "由脚本发送",
         "steer_take_back_more": "编辑或撤回",
         "steer_unsend_in_flight": "正在撤回…",
         "steer_edit_in_flight": "正在移回消息框…",
-        "steer_queue_in_flight": "正在移到队列中…",
+        "steer_queue_in_flight": "正在移到队列中，代理完成后发送…",
         "steer_retracted_unsend": "你撤回了这条消息",
         "steer_retracted_edit": "你把这条消息移回了消息框",
-        "steer_retracted_queue": "你把这条消息移到了队列中",
+        "steer_retracted_queue": "你把这条消息移到了队列中。代理完成后会发送。",
         "steer_take_back_busy": "另一条消息仍在发送中，稍后重试。",
         "steer_unsend_unsupported": "此代理无法撤回这条消息。",
         "steer_edit_unsupported": "此代理无法把这条消息移回消息框。",
@@ -12635,7 +12880,8 @@
       },
       "workflowSidebarRow": {
         "could_not_load_snapshot": "无法加载快照：",
-        "events_count_other": "{{n}} 个事件"
+        "events_count_other": "{{n}} 个事件",
+        "events": "个事件"
       },
       "pins": {
         "pinned_messages": "已置顶消息",
@@ -13455,9 +13701,48 @@
       "comments_sent_other": "{{count}} 条评论已发送",
       "your_crewmate": "你的 Bot",
       "jump_to_new_other": "{{count}} 条新 · 跳到最新",
-      "could_not_repair_images": "无法修复图片"
+      "could_not_repair_images": "无法修复图片",
+      "mcp_session_source_note": "列表是该 agent 的配置；每个名称旁的状态来自本会话的上报。"
     },
     "chatSidebar": {
+      "needsMeCard": {
+        "card_label": "{{title}}：需要你处理",
+        "recap": "概要",
+        "recap_none": "还没有概要。",
+        "needs_you": "需要你",
+        "kind_approval": "审批",
+        "kind_question": "问题",
+        "kind_form": "表单",
+        "kind_reply": "回复",
+        "no_arguments": "（无参数）",
+        "approved": "已批准",
+        "denied": "已拒绝",
+        "expired": "已过期，助手已经继续往下了。",
+        "decision_failed": "无法提交这个决定。",
+        "deny": "拒绝",
+        "deny_aria": "拒绝 {{tool}}",
+        "approve": "批准",
+        "approve_aria": "批准 {{tool}}",
+        "answer_in_session": "在列表里打开这个会话来回答。",
+        "required": "必填",
+        "reply_placeholder": "回复这个会话…",
+        "reply_aria": "快速回复 {{title}}",
+        "send": "发送回复",
+        "sent": "已发送。",
+        "queued": "已排队，会在助手完成当前这一步后发送。",
+        "reply_not_approval": "回复会发到聊天里。审批请用上面的批准或拒绝。",
+        "reply_keys": "Enter 发送 · Shift+Enter 换行 · Esc 关闭",
+        "send_failed": "无法发送回复。",
+        "decide_on_conductor": "请在指挥者的审批卡片上处理。",
+        "recap_failed": "无法加载概要。",
+        "asks_failed": "无法加载审批。点击会话查看。",
+        "unconfirmed": "还没确认送达。再次发送前请先查看会话。",
+        "decision_hint": "批准：让助手做这一次。拒绝：跳过这一步。",
+        "send_race": "有人先回复了，这条回复没有发送。",
+        "approved_elsewhere": "已在别处批准",
+        "denied_elsewhere": "已在别处拒绝",
+        "unknown_tool": "未知工具"
+      },
       "1_skipped_currently_selected": "（跳过 1 个 — 当前已选中）",
       "no_sessions_match_folders": "没有匹配的会话 — 只有文件夹名称匹配",
       "history_search_failed": "搜索失败。仅显示标题匹配的结果。",
@@ -13784,6 +14069,14 @@
       "crew_attention_go_question": "打开需要你回答的聊天",
       "crew_attention_go_working": "打开进行中的聊天",
       "crew_attention_name": "{{target}}。{{counts}}",
+      "code_channel_crew_waiting": "等你处理",
+      "code_channel_crew_waiting_title_other": "此频道有 {{count}} 个会话在等你处理",
+      "code_channel_crew_interrupted_other": "{{count}} 个已中断",
+      "code_channel_crew_show_other": "显示 {{count}} 个工作会话",
+      "code_channel_crew_hide_other": "隐藏 {{count}} 个工作会话",
+      "code_channel_crew_stuck_other": "{{count}} 个卡住",
+      "code_channel_crew_done_other": "已完成 {{count}}/{{total}}",
+      "code_channel_crew_done_plain": "已完成",
       "not_open_here_yet": "在 {{name}} 上 —— 点击可在此处打开",
       "on_instance": "在 {{name}} 上",
       "only_show_sessions_that_have_no_tags": "仅显示没有标签的会话",
@@ -13895,7 +14188,11 @@
       "skip_running_sessions_other": "跳过 {{n}} 个运行中的会话",
       "cleanup_move_count_other": "{{n}} 个会话将被移至较早的会话。",
       "show_sessions_count_other": "显示 {{n}} 个会话",
-      "hide_sessions_count_other": "隐藏 {{n}} 个会话"
+      "hide_sessions_count_other": "隐藏 {{n}} 个会话",
+      "hide": "隐藏",
+      "skip": "跳过",
+      "will_be_moved_to_older_sessions": "将被移至较早的会话。",
+      "broadcast_crewmates_hint": "由 AI 队友（crew 里的 agent）运行的会话"
     },
     "connectionsPage": {
       "action_failed": "操作失败：{{error}}",
@@ -13985,6 +14282,7 @@
       "backend_oauth_caveat": "Connect 仍会完成，{{provider}} 登录会为支持它的聊天保存。部分聊天暂时无法使用这类登录，因此其工具在那里可能无法工作。",
       "chat_use_label": "在聊天中",
       "chat_use_lacks_oauth": "已为支持它的聊天保存。部分聊天暂时无法使用这类登录。",
+      "chat_use_kas_sign_in": "聊天需要单独登录：在聊天中输入一次 {{word}}。",
       "configure_oauth_app": "配置 OAuth 应用",
       "prerequisite_github": "GitHub 不支持动态客户端注册，因此“连接”会使用在设置 → OAuth 应用中注册的 GitHub OAuth 应用。GitHub 授权页面显示的是此应用；同意后即可继续。",
       "prerequisite_asana": "Asana 不支持动态客户端注册，因此“连接”会使用在设置 → OAuth 应用中注册的 Asana MCP 应用。Asana 授权页面显示的是此应用；同意后即可继续。",
@@ -14082,6 +14380,8 @@
       "turn_picker": "选择一轮",
       "unit_chars": "字符",
       "unit_tokens": "token",
+      "n_chars_other": "{{n}} 个字符",
+      "n_tokens_other": "{{n}} 个 token",
       "window_usage": "{{size}} token 窗口的 {{percent}}",
       "block_your_message": "你的消息",
       "block_memory": "关于你的记忆",
@@ -14106,7 +14406,21 @@
       "start_row_show": "显示",
       "start_row_shown": "已在上方显示",
       "picked_gone": "第 {{n}} 轮已移出图表，所以显示最近一轮。",
-      "turn_start_latest": "第 {{n}} 轮 · 会话开始 · 最近一次"
+      "turn_start_latest": "第 {{n}} 轮 · 会话开始 · 最近一次",
+      "delta_down": "比上一轮 −{{n}}",
+      "delta_same": "与上一轮相同",
+      "delta_up": "比上一轮 +{{n}}",
+      "engine_calls": "本轮次模型请求次数：{{n}}。",
+      "engine_heading": "由智能体循环测量",
+      "engine_hist_all": "对话历史",
+      "engine_hist_crew": "{{productName}} 的提示（仍在上下文中的每个轮次）",
+      "engine_not_measured": "智能体循环没有测量这个轮次。",
+      "engine_note": "按智能体循环在本轮次最后一次模型请求中统计的字符数。{{productName}} 的提示使用 {{productName}} 自己的统计。",
+      "engine_total": "本轮次最后一次模型请求共 {{chars}} 个字符。下方“{{productName}} 的提示”为 {{productName}} 写入部分，覆盖仍在上下文中每个轮次。",
+      "engine_ttft_detail": "{{total}} 后出现首个输出（模型首个 token 在 {{model}} 后）。",
+      "footer": "只统计 {{productName}} 本轮发送的内容，含你的消息。不是累计发送量，也不是 AI 的全部上下文。",
+      "rebuild_row": "第 {{n}} 轮 · 上下文重建",
+      "start_note": "会话开始和重建的轮次单独列在图表上方，这样后面的轮次才看得清。"
     },
     "crewBoard": {
       "title": "工作项",
@@ -14198,7 +14512,7 @@
       "filter_worktrees": "筛选工作树…",
       "filter_worktrees_2": "筛选工作树",
       "finished": "已完成",
-      "force_remove_confirm_desc": "{{count}} 个工作树存在未合并或未提交的改动。移除后将永久删除所有本地更改，无法撤销。",
+      "force_remove_confirm_desc_other": "{{count}} 个工作树存在未合并或未提交的改动。移除后将永久删除所有本地更改，无法撤销。",
       "force_remove_confirm_title": "强制移除工作树？",
       "force_remove_warning": "所选工作树存在未合并的改动 — 移除是永久性的，无法撤销。",
       "force_remove": "强制移除 {{name}}",
@@ -14390,7 +14704,9 @@
       "orphan_pods_label": "孤立 Pod 主目录：{{value}}",
       "total_disk_used_by_running_pod_homes": "运行中 Pod 主目录占用的磁盘总量",
       "pod_homes_left_on_disk_with_no_live_pod": "磁盘上没有对应运行 Pod 的遗留主目录",
-      "disk_usage_unavailable": "磁盘用量不可用"
+      "disk_usage_unavailable": "磁盘用量不可用",
+      "force_remove_confirm_desc": "{{count}} 个工作树存在未合并或未提交的改动。移除后将永久删除所有本地更改，无法撤销。",
+      "just_now": "刚刚"
     },
     "developer": {
       "agentBackendTab": {
@@ -14550,6 +14866,30 @@
         "decisions_provider_jev_detail": "基准模型，也是最快的，每次决策约 0.7 秒。需要 TypeSafe API 密钥，决策点收集的内容会发送给 TypeSafe。",
         "decisions_provider_none": "不使用模型",
         "decisions_provider_none_detail": "不发送任何内容，也不运行模型。所有决策都使用内置规则。",
+        "decisions_provider_sagemaker": "你的 SageMaker 端点",
+        "decisions_provider_sagemaker_detail": "你托管在 Amazon SageMaker 端点上的 System One 模型。它用这台机器的 AWS 凭证调用，决策点收集的内容会发送到那里。",
+        "decisions_provider_sagemaker_name": "端点名称",
+        "decisions_provider_sagemaker_region": "AWS 区域",
+        "decisions_provider_sagemaker_profile": "AWS 配置文件（可选）",
+        "decisions_provider_sagemaker_profile_hint": "AWS 配置文件中的一个 profile 名称。留空则使用默认 AWS 凭证。",
+        "decisions_provider_sagemaker_not_sending": "还没有向这个端点发送决策。要开始，请打开本卡片顶部的“{{switch}}”开关；如果它已经打开，就先关掉再打开。在你打开 {{point}} 下的“{{screenshots}}”之前，智能体浏览器标签页的截图不会发往这个端点。",
+        "decisions_provider_sagemaker_boto3_missing": "未安装 boto3。安装后才能使用 SageMaker 端点：{{command}}",
+        "decisions_provider_sagemaker_test": "测试连接",
+        "decisions_provider_sagemaker_testing": "正在测试…",
+        "decisions_provider_sagemaker_test_ok": "已连接。端点在 {{latency}} 内应答。",
+        "decisions_provider_sagemaker_test_credentials": "AWS 凭证缺失或被拒绝。请刷新这台机器的 AWS 凭证，然后再测试一次。",
+        "decisions_provider_sagemaker_test_not_found": "该区域没有这个名称的端点。",
+        "decisions_provider_sagemaker_test_timeout": "端点没有及时应答。",
+        "decisions_provider_sagemaker_test_throttled": "端点正在限制请求。",
+        "decisions_provider_sagemaker_test_unavailable": "端点尚未就绪，或无法连接到 SageMaker。",
+        "decisions_provider_sagemaker_test_model_error": "模型容器返回了错误。",
+        "decisions_provider_sagemaker_test_protocol": "端点有应答，但不是 System One 的应答。",
+        "decisions_provider_sagemaker_test_failed": "测试请求失败。",
+        "decisions_provider_sagemaker_test_request_failed": "无法运行测试。",
+        "decisions_provider_sagemaker_invalid_name": "只能使用字母、数字和连字符，最多 63 个字符，并以字母或数字开头和结尾。",
+        "decisions_provider_sagemaker_invalid_region": "请输入 AWS 区域代码，例如 us-west-2。",
+        "decisions_provider_sagemaker_invalid_profile": "配置文件名称可以包含字母、数字、下划线、点、加号和连字符。",
+        "decisions_provider_sagemaker_unknown_profile": "你的 AWS 配置文件中没有这个名称的 AWS 配置文件。",
         "decisions_no_model_note": "还没有选择决策模型。在下方选一个模型即可开启。",
         "decisions_provider_quality": "准确率约为 Jev 的 {{percent}}，复杂决策上为 {{hard}}",
         "decisions_provider_memory": "约占用 {{peak}} 内存；建议机器内存不低于 {{total}}",
@@ -14610,9 +14950,9 @@
         "folder_conductor": "文件夹调度者",
         "folder_conductor_desc": "把开启本文件夹其他对话的那个对话提到该文件夹最上面：左边一道强调色竖线，智能体名字旁边一个小小的 conductor 标签。这会改变会话列表的排序，所以开启之前列表保持原样。文件夹菜单里的对话入口一直都在。",
         "folder_conductor_desc_summary": "把开启文件夹内对话的那个对话移到最上面。",
-        "crewmate_harness": "按 Bot 设置代理运行框架",
-        "crewmate_harness_desc": "在每个 Bot 的资料中添加“代理运行框架”设置，让某个 Bot 使用另一种 AI 编程工具（例如 Claude Code）及其模型，其他 Bot 保持默认。",
-        "crewmate_harness_desc_summary": "让某个 Bot 改用另一种 AI 编程工具。",
+        "mate_sessions": "Bot 会话放在 Bot 资料页",
+        "mate_sessions_desc": "把 Bot 打开的聊天移出会话列表、最近和网格，改放到该 Bot 资料页的会话标签。Bot 自己的聊天不变，历史记录和搜索仍能找到所有聊天。",
+        "mate_sessions_desc_summary": "把 Bot 的聊天移到它的会话标签。",
         "crew_mode": "Ultra Mode",
         "crew_mode_desc": "让一个对话把任务交给一个团队，并在看板里跟踪它们。",
         "crew_mode_desc_summary": "把对话的任务交给团队。",
@@ -14624,7 +14964,9 @@
         "remote_dispatch_desc_summary": "在已连接的机器上运行 Ultra Mode 任务。",
         "remote_dispatch_save_failed": "无法保存远程派发设置。请重试。",
         "remote_dispatch_load_failed": "无法读取远程派发设置。",
-        "remote_dispatch_connect": "在 <0>Settings › Remote Crew</0> 中连接机器。"
+        "remote_dispatch_connect": "在 <0>Settings › Remote Crew</0> 中连接机器。",
+        "crewmate_harness": "按队友设置代理运行框架",
+        "crewmate_harness_desc": "在每个队友的资料中添加“代理运行框架”设置，让某个队友使用另一种 AI 编程工具（例如 Claude Code）及其模型，其他队友保持默认。"
       },
       "kasBundleCard": {
         "toggle_label": "用 {{productName}} 自带的引擎运行 KAS",
@@ -14732,6 +15074,9 @@
         },
         "telemetry": {
           "label": "遥测"
+        },
+        "mcpPool": {
+          "label": "MCP 管理"
         }
       }
     },
@@ -14946,7 +15291,10 @@
       "open_crew_manager": "打开团队管理页",
       "built_from": "基于",
       "change_default_crewmate": "更换默认 Bot",
-      "change_default_hint": "打开“开发者 → 配置”里的“默认 Bot”设置。"
+      "change_default_hint": "打开“开发者 → 配置”里的“默认 Bot”设置。",
+      "inherited_from_the_agent_template": "来自它所基于的自定义代理。",
+      "no_pin_anywhere_the_backend_chooses": "这里和自定义代理里都没有选定，所以由 {{productName}} 替你挑一个。",
+      "resolves_to": "使用 {{model}}"
     },
     "knowledge": {
       "detailView": {
@@ -14979,7 +15327,8 @@
         "unarchive": "取消归档",
         "shared_count_other": "{{n}} 个共有",
         "status_active": "使用中",
-        "status_archived": "已归档"
+        "status_archived": "已归档",
+        "shared": "共享"
       },
       "embeddingStatus": {
         "embedded_pct": "{{embedded}}/{{total}} 已嵌入 ({{pct}}%)",
@@ -15073,7 +15422,8 @@
         "type_policy": "策略",
         "type_personal_notes": "个人笔记",
         "type_external_reference": "外部参考",
-        "type_document": "文档"
+        "type_document": "文档",
+        "selected": "已选择"
       },
       "itemCard": {
         "copied": "已复制！",
@@ -15097,7 +15447,9 @@
         "retry": "重试",
         "nodes_count_other": "{{count}} 个节点",
         "edges_count_other": "{{count}} 条边",
-        "graph_counts": "{{nodes}}，{{edges}}"
+        "graph_counts": "{{nodes}}，{{edges}}",
+        "edges": "条边",
+        "nodes": "个节点，"
       },
       "sourceGroup": {
         "items_added_directly": "直接添加的条目",
@@ -15230,7 +15582,8 @@
         "region_example_placeholder": "例如 us-east-1",
         "word_count_other": "{{n}} 个词",
         "word_count_approx_other": "约 {{n}} 个词",
-        "items_count_other": "{{n}} 个条目"
+        "items_count_other": "{{n}} 个条目",
+        "items": "个条目"
       },
       "settings": {
         "title": "Ingestion Settings",
@@ -15291,7 +15644,8 @@
       "section_disabled": "已禁用",
       "unpin": "取消置顶",
       "unpin_from_sidebar": "取消 {{name}} 在侧边栏的置顶",
-      "installed_apps": "已安装的应用"
+      "installed_apps": "已安装的应用",
+      "tile_disabled": "已禁用"
     },
     "logsPage": {
       "filter_logs": "筛选日志",
@@ -15307,7 +15661,8 @@
       "wrap_off": "换行：关",
       "wrap_on": "换行：开",
       "level_change_failed": "更改日志级别失败",
-      "matches_count_other": "{{count}} 条匹配"
+      "matches_count_other": "{{count}} 条匹配",
+      "matches": "条匹配"
     },
     "mcpGatewayCard": {
       "backends": "后端",
@@ -15324,7 +15679,8 @@
       "status_stopped": "已停止",
       "status_unhealthy": "异常",
       "with_shared_gateway_pooled": "使用共享网关（池化）",
-      "without_gateway_per_session_copies": "不使用网关（每会话独立副本）"
+      "without_gateway_per_session_copies": "不使用网关（每会话独立副本）",
+      "s": "s"
     },
     "mcpManagement": {
       "assessment": {
@@ -15373,10 +15729,10 @@
       "resolve_label": "预装 npm 服务器",
       "resolve_no_targets": "暂时没有可预装的。",
       "resolve_none_ready": "已是最新。",
-      "resolve_all_failed": "有 {{failed}} 个服务器无法预装。",
+      "resolve_all_failed_other": "有 {{count}} 个服务器无法预装。",
       "resolve_partly_ready": "已预装 {{ready}} 个，失败 {{failed}} 个。",
       "resolve_already_running": "正在更新中。",
-      "resolve_ready": "已预装 {{ready}} 个服务器。",
+      "resolve_ready_other": "已预装 {{count}} 个服务器。",
       "resolve_update_now": "立即更新",
       "resolve_updating": "更新中…",
       "servers_failed": "无法加载服务器列表。这和“没有配置任何服务器”不是一回事。",
@@ -15484,7 +15840,9 @@
       "footprint_owner_only": "只有 crew 所有者可以查看内存数据。",
       "review_what_approve_does": "批准：为所有聊天只运行一份，在每个聊天的沙盒之外运行。跳过：它继续在每个聊天里各自运行。",
       "share_risk": "在沙盒之外，共享服务器可以像你自己启动的程序一样读取和修改你的文件。",
-      "review_when_safe": "如果服务器是你自己添加的，且显示的命令符合预期，再批准它。"
+      "review_when_safe": "如果服务器是你自己添加的，且显示的命令符合预期，再批准它。",
+      "resolve_all_failed": "有 {{failed}} 个服务器无法预装。",
+      "resolve_ready": "已预装 {{ready}} 个服务器。"
     },
     "migrationPage": {
       "app_migration": "应用迁移",
@@ -15495,7 +15853,7 @@
       "cleanup_failed": "清理失败",
       "coming_soon_this_app_is_not_yet_available_in_app": "即将推出 — 此应用尚未在“应用”中提供。请在下次更新后再查看。",
       "failed_to_load_app_info": "加载应用信息失败",
-      "has_moved_to_a_standalone_app": "已迁移为独立应用",
+      "name_has_moved_to_a_standalone_app": "{{name}} 已迁移为独立应用",
       "install_from_apps": "从“应用”安装",
       "install_the_standalone_version_to_continue_using": "安装独立版本以继续使用此功能。",
       "migration_complete": "迁移完成",
@@ -15506,7 +15864,8 @@
       "the_standalone_version_is_installed_and_ready_to": "独立版本已安装，可以使用。",
       "this_feature_was_previously_built_into_kirocrew": "此功能以前内置于 {{productName}}，现已拆分为独立应用包。\n                此 {{productName}} 版本已移除内置版本。",
       "you_can_clean_up_the_old_builtin_entry_to_remove": "你可以清理旧的内置入口，将其从侧边栏移除。",
-      "your_data_has_been_preserved_and_will_be_availab": "你的数据已保留，将在独立版本中可用。"
+      "your_data_has_been_preserved_and_will_be_availab": "你的数据已保留，将在独立版本中可用。",
+      "has_moved_to_a_standalone_app": "已迁移为独立应用"
     },
     "notificationsPage": {
       "activity_feed": "活动动态",
@@ -15794,7 +16153,8 @@
         "temp_refusal_unclassifiable": "已忽略声明的 {{key}}={{path}}，原因：无法确认它的实际位置。探测改用了托管的临时文件夹。",
         "temp_refusal_check_failed": "已忽略声明的 {{key}}={{path}}，原因：位置检查失败。探测改用了托管的临时文件夹。",
         "mcp_deny_spared": "这是 {{productName}} 自己的服务器，因此在 {{name}} 上关闭这里的一个工具只会停止该工具。",
-        "tools_count_other": "{{n}} 个工具"
+        "tools_count_other": "{{n}} 个工具",
+        "tools_2": "个工具"
       },
       "memoryGraphTab": {
         "all_count": "全部（{{count}}）",
@@ -15975,7 +16335,8 @@
         "agent_template_skip_unwritable": "无法写入",
         "agent_template_skip_over_limit": "超出归档上限",
         "archive_agent_templates_more": "超出归档上限、未提供的模板：{{templates}}",
-        "include_agent_templates_memory_hint": "记忆导出从不包含智能体模板。"
+        "include_agent_templates_memory_hint": "记忆导出从不包含智能体模板。",
+        "kb": "KB"
       },
       "promptsTab": {
         "agent_sop_name": "@agent-sop:name",
@@ -16619,7 +16980,11 @@
       "today_line": "今天：{{summary}}",
       "today_sessions_other": "{{amount}} 个会话",
       "today_messages_other": "{{amount}} 条消息",
-      "today_tokens_other": "{{amount}} 个令牌"
+      "today_tokens_other": "{{amount}} 个令牌",
+      "messages": "条消息",
+      "sessions": "个会话 ·",
+      "today": "今天：",
+      "tokens": "令牌"
     },
     "performanceTab": {
       "builder_mcp_procs": "Builder MCP",
@@ -16658,7 +17023,8 @@
       "working_directory": "工作目录",
       "graph_scale_network": "满量程 {{max}} · 最近 {{seconds}}",
       "graph_scale_percent": "满量程 100% · 最近 {{seconds}}",
-      "session_storage_detail_other": "{{sessions}} 个会话 · 可回收 {{reclaimable}}"
+      "session_storage_detail_other": "{{sessions}} 个会话 · 可回收 {{reclaimable}}",
+      "session_storage_detail": "{{sessions}} 个会话 · 可回收 {{reclaimable}}"
     },
     "popoutFrame": {
       "session": "会话",
@@ -17051,7 +17417,8 @@
       "title": "会话拆解",
       "tool_count_other": "{{n}} 个工具",
       "unknown_agent": "子代理",
-      "unknown_model": "未知"
+      "unknown_model": "未知",
+      "tool_count": "{{count}} 个工具"
     },
     "sessionStorage": {
       "age_option_other": "超过 {{days}} 天 — {{count}} 个会话 · {{size}}",
@@ -17118,7 +17485,8 @@
       "unknown_session": "未列出的会话",
       "busy_emptying": "正在清空回收站，部分操作会暂停到完成为止。",
       "empty_failed_next_step": "请再次尝试“永久删除”。详细信息见网关日志。",
-      "kept_identity_changed": "有一批在你选择之后于磁盘上发生了变化，因此被保留。"
+      "kept_identity_changed": "有一批在你选择之后于磁盘上发生了变化，因此被保留。",
+      "refused_heading": "{{count}} 个会话无法移动"
     },
     "sessionsPage": {
       "page_title": "全部会话",
@@ -17130,7 +17498,8 @@
       "group_yesterday": "昨天",
       "group_earlier": "更早",
       "empty_title": "暂无会话",
-      "filter_label": "会话筛选"
+      "filter_label": "会话筛选",
+      "empty_subtitle": "新建一个开始吧。"
     },
     "sessionsTab": {
       "agent": "代理",
@@ -17222,6 +17591,7 @@
         "commits_behind_other": "落后 {{count}} 个提交",
         "updates_managed_by_policy": "此安装的更新由管理员定义的更新策略管理。新版本将通过该机制到达。",
         "updates_managed_by_policy_desktop": "此计算机上的策略管理此应用的更新。新版本通过该策略到达，因此 {{productName}} 不会自行检查。请联系设置者进行更改，或编辑 security_policy.json。",
+        "updates_policy_file": "策略文件：{{path}}",
         "updates_managed_externally": "此安装的更新由外部包管理器管理。请使用该包管理器获取新版本。",
         "updates_managed_externally_by": "此安装的更新由 {{managedBy}} 管理。请使用它获取新版本。",
         "updates_managed_lane": "此安装的更新由外部包管理器管理。如需手动更新，请在终端中运行以下命令。",
@@ -17424,7 +17794,12 @@
         "backfill_folder_gone_nothing_filed": "{{folder}} 文件夹在运行期间被删除，因此没有放入任何内容。请先保存此设置以重新创建。",
         "loading_channel_config": "正在加载 {{channel}} 配置…",
         "cannot_load_channel_config": "无法加载 {{channel}} 配置。网关是否正在运行？",
-        "channel_settings_read_only": "{{channel}} 设置在运行 {{productName}} 的机器上管理，远程会话中为只读。"
+        "channel_settings_read_only": "{{channel}} 设置在运行 {{productName}} 的机器上管理，远程会话中为只读。",
+        "cannot_load": "无法加载",
+        "config": "配置…",
+        "config_is_the_gateway_running": "配置。网关是否正在运行？",
+        "loading": "正在加载",
+        "settings_are_managed_on_the_machine_running_kiro": "设置在运行 {{productName}} 的机器上管理，远程会话中为只读。"
       },
       "browserPanel": {
         "add_origin": "添加地址",
@@ -17513,14 +17888,101 @@
         "cred_domains_full": "最多 {{count}} 个网站。删掉一个才能再添加。",
         "add_cred_domain": "添加网站",
         "remove_cred_domain": "删除 {{domain}}",
-        "credentials_applied_other": "已应用 {{count}} 个 Cookie"
+        "credentials_applied_other": "已应用 {{count}} 个 Cookie",
+        "use_builtin_label": "使用内置浏览器",
+        "use_builtin_desc": "在 {{productName}} 的内置面板中打开页面。关闭后改用 playwright-cli 浏览。",
+        "browsing": "网页浏览",
+        "presence_is_consent": "因为已安装 Playwright CLI，所以可以浏览网页。卸载它就会收回这项能力。",
+        "not_installed": "助手还不能浏览网页。",
+        "install_explains": "安装 Playwright CLI 后，助手可以打开页面、读取内容并填写表单。你可以在 Browser 面板里查看，也可以随时接手操作。",
+        "install": "安装 Playwright CLI",
+        "install_takes_a_while": "这会下载一个浏览器，可能需要几分钟。你可以离开此页面。",
+        "needs_node": "安装需要 Node.js 20 或更高版本（检测到 {{version}}）。",
+        "get_the_extension": "获取扩展",
+        "token_label": "扩展令牌（可选）",
+        "token_placeholder": "从扩展里粘贴",
+        "token_set": "已保存",
+        "token_save": "保存",
+        "token_clear": "清除",
+        "token_explains": "没有令牌时，浏览器每次连接都会请你批准；有令牌则静默连接。从浏览器里的 Playwright 扩展复制它。",
+        "attach_title": "使用你自己已登录的浏览器",
+        "token_stored": "已保存",
+        "install_steps_intro": "安装会执行三步。",
+        "step_npm": "用 npm 全局安装 @playwright/cli。",
+        "step_browser": "下载它驱动的浏览器。",
+        "step_skills": "注册它的技能，让智能体知道有哪些命令。",
+        "engine_chromium": "Chromium",
+        "engine_firefox": "Firefox",
+        "engine_webkit": "WebKit",
+        "engine_downloaded": "已下载",
+        "engine_download": "下载",
+        "node_missing": "需要 Node.js 20 或更新版本，而本机没有找到 Node。",
+        "node_how": "安装后重新打开本页面。<dl>下载 Node.js</dl>",
+        "node_no_admin": "在无法安装 Node 的机器上（没有管理员权限，或者注册表需要登录），请在运行 {{productName}} 的那台机器上执行以下命令。脚本会把 Node 和 CLI 安装到你的主目录，并在网络阻止下载时告诉你如何解决。",
+        "copy_command": "复制命令",
+        "copied": "已复制",
+        "builtin_save_failed": "无法保存内置浏览器设置。",
+        "builtin_status_unavailable": "无法加载内置浏览器设置。",
+        "host_unavailable": "无法加载主机名。",
+        "copy_failed": "复制失败。请选中命令并手动复制。",
+        "engine_download_failed": "无法开始下载浏览器。",
+        "token_save_failed": "无法保存扩展令牌。",
+        "managed_title": "{{productName}} 主机上的托管浏览器",
+        "host_label": "主机：{{host}}",
+        "managed_explains": "Playwright 会把独立的浏览器版本下载到运行 {{productName}} 的机器上。它们使用自己的浏览配置文件，不共享你个人浏览器的登录状态。",
+        "managed_host_note": "这些下载位于 {{productName}} 主机上，而不是显示此页面的设备上。用 Mac 访问 Linux 主机时，会在该主机上得到 Linux 版本；在 Mac 的 Chrome 里安装扩展，本身并不能让主机上的 CLI 连接到那个浏览器。",
+        "cli_installed": "已安装 Playwright CLI",
+        "engines_heading": "浏览器引擎",
+        "engines_help": "Chromium 是自动化的默认引擎。Google Chrome 是另一个浏览器，这里不会安装；WebKit 是 Playwright 构建的 Safari 引擎，不是你的 Safari 应用。托管浏览器是完整的浏览器，可以打开可见窗口。已下载表示文件已在磁盘上，并不代表测试过启动。",
+        "engine_default_badge": "自动化默认引擎",
+        "engine_downloading": "正在下载…",
+        "engine_retry": "重试",
+        "engine_unknown": "未知",
+        "engine_unknown_reason": "{{productName}} 无法从浏览器缓存中确认此版本。重新下载是安全的。",
+        "status_region_label": "浏览器设置进度",
+        "status_unavailable": "无法读取浏览器设置状态，显示的内容可能已过时。",
+        "op_cli_setup": "正在设置 Playwright CLI",
+        "op_engine_download": "正在下载 {{engine}}",
+        "stage_line": "步骤：{{stage}}",
+        "stage_preparing": "准备中",
+        "stage_installing_cli": "正在安装 Playwright CLI",
+        "stage_downloading_browser": "正在下载浏览器",
+        "stage_installing_skills": "正在注册助手的浏览器技能",
+        "stage_finishing": "正在收尾",
+        "elapsed_running": "已运行 {{duration}}",
+        "elapsed_done": "用时 {{duration}}",
+        "done_cli": "Playwright CLI 设置完成",
+        "failed_cli": "Playwright CLI 设置失败",
+        "interrupted_cli": "Playwright CLI 设置被中断",
+        "done_engine": "{{engine}} 下载完成",
+        "failed_engine": "{{engine}} 下载失败",
+        "interrupted_engine": "{{engine}} 下载被中断",
+        "outcome_succeeded": "浏览器设置完成",
+        "outcome_failed": "浏览器设置失败",
+        "outcome_interrupted": "浏览器设置被中断",
+        "failure_no_detail": "主机没有报告更多详情。",
+        "reason_status_unavailable": "在设置状态重新加载之前，下载已暂停。",
+        "reason_checking": "正在确认上一个请求是否启动了下载。主机回应后即可下载。",
+        "reason_engine_busy": "正在下载 {{engine}}。完成后才能进行其他下载。",
+        "reason_cli_busy": "正在设置 Playwright CLI。完成后才能下载。",
+        "reason_busy_generic": "另一个浏览器设置操作正在进行。",
+        "op_busy_generic": "{{productName}} 主机上正在进行浏览器设置。",
+        "reason_cli_first": "请先安装 Playwright CLI。",
+        "connect_title": "连接你现有的浏览器",
+        "connect_explains": "使用你正在运行的浏览器里的标签页和登录状态。这需要一个基于 Chromium 的浏览器（例如 Chrome），并安装 Playwright 扩展。",
+        "connect_host_note": "浏览器及其扩展必须运行在 {{productName}} 主机上，CLI 才能访问到它们。其他设备上浏览器里的扩展不会自行连接到这台主机。",
+        "connect_consent": "已安装扩展或已保存令牌并不表示浏览器已连接。",
+        "desktop_title": "桌面应用中的内置浏览器",
+        "desktop_web_explains": "可在 {{productName}} 桌面应用中使用。在网页控制台中，助手改用 Playwright。"
       },
       "channelDisabledPanel": {
         "checking_your_organization_s_channel_policy": "正在检查你所在组织的渠道策略…",
         "channel_policy_status_unavailable": "{{channel}} 策略状态不可用",
         "channel_turned_off": "{{channel}} 已被管理员关闭",
         "kirocrew_couldn_t_confirm_whether_your_organizat": "{{productName}} 无法确认你所在组织的安全策略\n          是否允许此渠道。在状态解析完成前，其设置处于隐藏状态 —\n          强制执行不受影响。请尝试重新加载。",
-        "your_organization_s_security_policy_disables_thi": "你所在组织的安全策略已禁用此渠道。其设置\n        不可用，此处的任何配置都不会生效。"
+        "your_organization_s_security_policy_disables_thi": "你所在组织的安全策略已禁用此渠道。其设置\n        不可用，此处的任何配置都不会生效。",
+        "is_turned_off_by_your_administrator": "已被管理员关闭",
+        "policy_status_unavailable": "策略状态不可用"
       },
       "channels": {
         "get_your_bot_credentials": "获取你的机器人凭证",
@@ -17768,6 +18230,8 @@
         "spellcheck_input_desc": "在消息输入框中用红色波浪线标出拼写有误的词。想在输入时去掉红色下划线就把它关掉。",
         "inline_markdown_input": "输入时显示 Markdown 样式",
         "inline_markdown_input_desc": "在消息输入框中边输入边显示粗体、斜体、删除线和行内代码。开启后，消息输入框还会切换到仍处于测试阶段的富文本编辑器。关闭即可恢复为普通输入框。Markdown 标记仍然可见，发送的消息不会改变。",
+        "optimize_before_sending": "发送前优化提示词",
+        "optimize_before_sending_desc": "按发送时先运行“优化提示词”，并把改写结果留在消息输入框中。检查或修改后，再按一次发送即可发出；按 {{chord}} 可恢复你输入的原文。斜杠命令、语音发送的消息和代理工作时发送的消息会按原样发出。每条消息会多调用一次优化器。",
         "show_pasted_text_in_full": "完整显示粘贴内容",
         "show_pasted_text_in_full_desc": "在消息输入框中把长内容保持为可编辑的文本，而不是折叠成一个粘贴块。关闭时 {{chord}} 仍可对单次粘贴这样做。粘贴内容非常大时输入可能变慢。",
         "show_pasted_text_in_full_desc_summary": "粘贴的内容很大时，输入框可能变慢。",
@@ -17863,7 +18327,14 @@
         "default_session_folder_none": "无（不归档）",
         "default_session_folder_deleted": "已删除的文件夹",
         "default_session_folder_save_failed": "无法保存默认文件夹。请重试。",
-        "default_session_folder_load_failed": "无法加载侧边栏文件夹，因此这里没有列出它们。"
+        "default_session_folder_load_failed": "无法加载侧边栏文件夹，因此这里没有列出它们。",
+        "default_defers_to_your_agent_config_and_then_to": "配置了自己模型的代理会忽略此设置。“默认”使用代理配置中的模型；若未配置，则使用系统默认模型。更改此设置不会影响已打开的会话。",
+        "which_model_new_sessions_start_with_pick_a_model": "代理未指定模型时，新会话默认使用的模型。可在“自定义 → 队友”中为每个代理单独设置模型，或在会话内选择模型以就地覆盖。",
+        "follow_default_description": "旧聊天可能保留最初使用的模型，不随新默认模型变化。由队友、应用、计划或频道发起的聊天会保留各自模型。在任何更改之前，你会看到将更改的聊天数量并进行确认。",
+        "follow_default_hint": "只统计你自己发起的聊天。",
+        "default_session_folder_desc": "未选择文件夹就开始的新聊天会归入这个侧边栏文件夹。它只用于在侧边栏中分组聊天，不是磁盘上的文件夹。",
+        "default_session_folder_hint": "聊天会使用该文件夹关联的项目和代理，与“在文件夹中新建聊天”相同。",
+        "model_for_spawned_sub_agents": "用于派生子代理的模型。"
       },
       "computerUsePanel": {
         "accessibility": "辅助功能",
@@ -17980,6 +18451,8 @@
         "installed_theme_could_not_be_loaded": "无法加载已安装的主题。重新安装，或选择其他主题。",
         "custom_theme_could_not_be_loaded": "无法加载此主题。选择其他主题，或编辑此主题。",
         "local_folder": "本地文件夹",
+        "browse_theme_folder": "浏览…",
+        "browse_theme_folder_failed": "无法打开文件夹选择器。请直接输入路径。",
         "zip_file": "Zip 文件",
         "mode": "模式",
         "native_window_zoom_tip": "原生窗口缩放，与 {{mod}}+ / {{mod}}− 是同一项设置（50%–300%）。重新启动后仍保留。",
@@ -18227,7 +18700,11 @@
         "not_active_until_restart": "— 重启后才会生效",
         "remote_port_ttl": "· 远程端口 {{port}} · ttl {{ttl}}",
         "warm_cap_count_other": "最多 {{count}} 个远程 Crew 可同时保持预热（活动隧道）；其余按需重连。可通过以下命令调整",
-        "remote_port_value": "· 远程端口 {{port}}"
+        "remote_port_value": "· 远程端口 {{port}}",
+        "instances_stay_warm_live_tunnel_at_once_the_rest": "个远程 Crew 可同时保持预热（活动隧道）；其余按需重连。可通过\n                以下命令调整",
+        "port_2": "· 远程端口",
+        "ttl": "· ttl",
+        "up_to": "最多"
       },
       "notificationsPanel": {
         "desktop_alerts": "桌面通知",
@@ -18400,7 +18877,9 @@
         "label_credential_families": "凭据模式",
         "label_exfil_heuristics": "URL 数据外泄检测",
         "label_audit_surfaces": "SEL 审计日志",
-        "label_token_auth": "仪表板令牌认证"
+        "label_token_auth": "仪表板令牌认证",
+        "more": "更多",
+        "show": "展开"
       },
       "releases": {
         "badge_unreleased": "未发布",
@@ -18432,6 +18911,7 @@
         "and_cannot_be_changed_here": "，无法在此更改。",
         "and_per_surface": "以及按接入面的",
         "block_list_rules": "拒绝列表 · {{rules}}",
+        "rule_count_other": "{{count}} 条规则",
         "built_in_rules_enforced_note": "在你的退出选项和任何策略固定之后，当前有 {{total}} 条内置规则中的 {{enabled}} 条正在生效。",
         "cancel": "取消",
         "click_any_control_to_see_exactly_what_it_covers": "点击任一控制项可查看它具体涵盖的范围。",
@@ -18443,6 +18923,12 @@
         "custom_patterns_hidden_by_filter": "当前筛选条件隐藏了你的自定义模式。",
         "defense_in_depth_architecture": "纵深防御架构",
         "delete_pattern": "删除规则 {{name}}",
+        "delete": "删除",
+        "edit_custom_deny": "编辑自定义拒绝规则",
+        "edit": "编辑",
+        "pattern_actions": "规则 {{name}} 的操作",
+        "save": "保存",
+        "sort_patterns_a_z": "按字母顺序排序",
         "denied_commands": "已拒绝命令",
         "disable": "禁用",
         "disable_all_built_in_denies": "禁用所有内置拒绝规则",
@@ -18710,7 +19196,32 @@
         "redaction_revoke": "撤销",
         "rules_matched_other": "{{matched}} / {{n}} 条规则",
         "categories_count_other": "{{n}} 个类别 ·",
-        "rules_count_other": "{{n}} 条规则"
+        "rules_count_other": "{{n}} 条规则",
+        "categories": "个类别 ·",
+        "rules": "条规则",
+        "file_delivery_arm_status_failed": "无法确认是否有审批正在进行。",
+        "file_delivery_armed_expired": "该请求在获批前已过期。请再次允许传送以重新开始。",
+        "file_delivery_armed_expires": "此请求将在约 {{duration}} 后过期。",
+        "file_delivery_armed_help": "在这台机器上还差一步：在运行 {{productName}} 的计算机的终端中运行此命令，以完成允许投递。这可确认有人在机器旁——仅凭浏览器会话无法允许。",
+        "file_delivery_confirm": "确认",
+        "file_delivery_confirm_help": "此操作会发起一个请求，需要你在本机的终端中完成；在那之前不会交付任何内容，你也可以随时撤销。",
+        "file_delivery_copied": "已复制",
+        "file_delivery_copy": "复制",
+        "file_delivery_copy_command": "复制批准命令",
+        "file_delivery_copy_failed": "无法复制命令。请手动选中并复制。",
+        "file_delivery_desc": "当凭据扫描器标记出文件内容时，{{productName}} 会拒绝投递该文件。在此确认后，它可以将这类文件投递到本机的发件箱和你自己的仪表板。任何检测器都不会被放宽，并且在确认之下完成的每一次投递都会记录到安全事件日志中。当你自己的文件（例如 {{productName}} 为你生成的 VPN 密钥）在送达你时被拦截，可使用此功能。",
+        "file_delivery_destination_help": "也就是说，文件会保存到本机发件箱文件夹，并显示在你仪表板的文件视图中——不会到达任何第三方可见的位置。它绝不会发送到 Slack 或聊天频道。",
+        "file_delivery_load_failed": "无法读取哪些目标已确认。",
+        "file_delivery_never_grantable": "向 Slack 或聊天频道的上传在此永远无法被允许，也不会提供：允许永远不能覆盖第三方可见的目标。",
+        "file_delivery_save_failed": "无法保存该更改。",
+        "file_delivery_since": "自 {{time}} 起",
+        "file_delivery_state_armed": "等待批准",
+        "file_delivery_state_confirmed": "已确认",
+        "file_delivery_state_not_confirmed": "未确认",
+        "file_delivery_title": "被标记文件可以投递到哪里",
+        "file_delivery_waiting": "正在此设备上等待",
+        "file_delivery_withdraw": "撤回",
+        "file_delivery_section": "被标记文件的投递"
       },
       "shortcutsPanel": {
         "bind_chat_tab_switching_to_ctrl_digit_instead_of": "将聊天标签切换绑定到 Ctrl+数字，而不是 Option+数字。文本框获得焦点时，Option+数字不会切换聊天。",
@@ -18813,7 +19324,7 @@
           "agent_sessions_note": "开启后，Slack 中暂时不会有任何变化。它只会加入应用清单，也就是你在下方步骤中复制到 Slack 的设置文本。",
           "update_keeps_working": "在你更新之前，Slack 会照常工作。",
           "code_channels": "代码频道",
-          "code_channels_desc": "开启：代理可以为每个编码任务开启一个 Slack 频道，邀请你加入，并以自己的名义在其中发帖和记录笔记。为此你的 Slack 应用会获得 5 项权限。关闭：不会有任何变化，之后可以在 Slack 中移除这些权限。Slack 正在逐步推出代码频道，因此你的工作区可能尚未提供。",
+          "code_channels_desc": "开启：代理可以为每个编码任务开启一个带上下文栏和差异标签页的 Slack 频道，邀请你加入，并以自己的名义在其中发帖和记录笔记。为此你的 Slack 应用会获得 5 项权限。关闭：不会有任何变化，之后可以在 Slack 中移除这些权限。Slack 正在逐步推出代码频道，因此你的工作区可能尚未提供。",
           "stage_tag": "预览",
           "defaults_title": "新代码频道的初始设置",
           "defaults_desc": "选择文件夹、代理或两者。留空的项会使用文件夹或 Slack 的设置，因此代码频道始终可用。",
@@ -18928,6 +19439,8 @@
         "endpointing_desc": "用一个快速模型判断你是否已说完一个完整请求，然后自动发送。仅流式 provider 可用。",
         "submit_on_release": "停止录音后发送",
         "submit_on_release_desc": "停止即发送消息。按住 Shift 点击麦克风，或在手机上侧滑，即可保留为草稿。",
+        "slide_to_send": "右上滑发送",
+        "slide_to_send_desc": "在手机的按住说话栏上，松手前向右上滑动即可发送，或在代理工作时引导它。直接上滑仍会取消。仅在“停止录音后发送”关闭时生效。",
         "failed_to_save_stt_config": "保存 STT 配置失败",
         "input_device_used_to_capture_your_voice": "用于采集语音的输入设备",
         "language": "语言",
@@ -19064,7 +19577,8 @@
         "decode_threads_desc": "本地模型识别语音时在 CPU 上使用的解码并发数。自动会使用本机一半的核心，最多 16 个。在有空闲核心的大型机器上，提高并发数能让每次听写更快完成。更改会在下一次听写时生效，届时会重新加载一次模型。",
         "decode_threads_auto": "自动",
         "decode_threads_auto_count": "自动（{{n}}）",
-        "decode_threads_env_override": "此网关使用的解码并发数为 {{value}}，由 KIROCREW_STT_THREADS 设定。删除该变量后才会使用此选择。"
+        "decode_threads_env_override": "此网关使用的解码并发数为 {{value}}，由 KIROCREW_STT_THREADS 设定。删除该变量后才会使用此选择。",
+        "aws_region_for_transcribe": "Transcribe 使用的 AWS 区域"
       },
       "teamsPanel": {
         "above_unlike_slack_the_bot_framework_has_no_outb": "。与 Slack 不同，Bot Framework 没有\n              仅出站模式。",
@@ -19413,6 +19927,7 @@
         "changed_outside_this_form": "此 Crew 已在此表单之外发生更改（{{fields}}）。请检查上方那一行 — 如果它不是你开始编辑的那个 Crew，请取消。",
         "checking": "Checking…",
         "checking_against": "Checked against profile {{profile}} in {{region}}.",
+        "checking_against_no_region": "已按配置文件 {{profile}} 检查，未设置区域。",
         "cloud_crew_name": "{{productName}} Cloud ({{tag}})",
         "code_ready": "你的登录验证码已就绪",
         "code_ready_for": "{{name}} 的登录验证码已就绪",
@@ -19470,11 +19985,14 @@
         "keep_setting_up": "继续创建",
         "keeps_running": "Keeps running if you leave this page.",
         "launch": "Launch",
+        "launch_another": "再启动一个 Crew",
         "launch_done": "完成 — 你的新 Crew 已就绪，现在会出现在“你的 Crew”中。",
         "launch_done_unsigned": "Crew 已就绪并出现在“你的 Crew”中，但还没有登录 Kiro。请在上方完成登录。",
         "launch_failed_title": "Launch failed",
         "launch_status_unavailable": "无法刷新设置进度。下方卡片显示的是最后一次收到的状态。",
+        "launch_wait_for_setup": "下方有一个 Crew 正在设置。设置完成后才能再启动一个 Crew。",
         "launched_by_kiro_crew": "由 {{productName}} 启动",
+        "launched_same_settings": "已启动，进度显示在下方。要用相同设置再启动一个 Crew，请选择“再启动一个 Crew”。",
         "launching": "Launching…",
         "more_actions": "{{name}} 的更多操作",
         "more_sizes": "Smaller and x86_64 sizes",
@@ -19520,6 +20038,8 @@
         "recheck_not_yet": "尚未登录 — 请在浏览器中确认验证码，然后再检查一次。",
         "recheck_sign_in": "我已确认 — 立即检查",
         "region": "Region",
+        "region_placeholder": "例如 us-east-1",
+        "region_required": "请输入 AWS 区域，例如 us-east-1。",
         "remove": "移除…",
         "remove_warning": "移除只会将其从此列表中删除。如果这是一个云 Crew，其 EC2 实例会继续运行并计费 — 请在 AWS 控制台中删除它。",
         "runs_on_gateway": "它在网关上运行，而不是在这个标签页里 — 离开页面或切换 Crew 它也会继续。请让 {{productName}} 保持运行直到完成。",
@@ -19779,7 +20299,12 @@
       "no_telemetry_in_window": "此时间范围内（{{period}}）没有记录遥测数据。",
       "otel_retention_cap": "轮次、延迟和启动数据仅涵盖最近 {{days}} 天；更早的指标会被删除（<settingRef/>）。",
       "window_footer_shards_other": "OTEL 部分 · 时间范围：{{period}} · {{n}} 个分片 · 来源：<dir/> · 仅本地，无外发",
-      "daily_trend_point_other": "{{date}} · 冷启动 {{cold}} · 热启动 {{warm}} · {{n}} 次启动"
+      "daily_trend_point_other": "{{date}} · 冷启动 {{cold}} · 热启动 {{warm}} · {{n}} 次启动",
+      "daily_trend_point": "{{date}} · 冷启动 {{cold}} · 热启动 {{warm}} · {{count}} 次启动",
+      "local_only_no_egress": "· 仅本地，无外发",
+      "shard_s_source": "个分片 · 来源",
+      "window_footer": "OTEL 部分 · 时间范围：{{period}} ·",
+      "top_spenders_link_to_chat": "有标题的仪表板会话可点击跳转"
     },
     "terminalPopoutFrame": {
       "return": "返回停靠面板",
@@ -19948,7 +20473,12 @@
       "slots_open_other": "{{n}} 个空闲槽位",
       "summary": "{{present}}，{{active}}，{{open}}",
       "scene_label": "场景",
-      "scene_button": "{{label}} 场景：{{desc}}"
+      "scene_button": "{{label}} 场景：{{desc}}",
+      "active": "个活动，",
+      "agent_other": "{{count}} 个代理",
+      "open": "打开",
+      "present": "个在场，",
+      "slot_other": "{{count}} 个槽位"
     },
     "worldsPopout": {
       "hide_controls": "隐藏控制项",
@@ -20430,14 +20960,20 @@
       "export_reason_first_goal_only": "这个文件只放得下第一个目标",
       "built_from_mate_label": "Bot",
       "profile_harness": "代理运行框架",
-      "profile_harness_hint": "运行 {{name}} 的聊天及其工作会话的 AI 编程工具（例如 Kiro Agent 或 Claude Code），它也决定 {{name}} 能用哪些模型。更改从发给 {{name}} 的下一条消息起生效，并把“模型”和“工作会话模型”都恢复为“继承”。",
       "profile_harness_sub": "{{name}} 运行所用的 AI 编程工具",
       "profile_harness_inherited_value": "继承（{{harness}}）",
       "profile_harness_inherited_hint": "跟随团队默认设置（当前为 {{harness}}）。",
       "profile_harness_no_workers": "{{name}} 可以在此运行框架上聊天，但其工作会话无法在此启动。",
+      "profile_harness_models_failed": "无法读取 {{harnesses}} 的模型列表，因此不显示在那里选择会对模型产生什么影响。",
+      "profile_harness_keeps_model": "保留 {{model}}。",
+      "profile_harness_model_resets": "模型恢复为“继承”。",
+      "profile_harness_keeps_worker": "保留工作会话模型 {{model}}。",
+      "profile_harness_worker_resets": "工作会话模型恢复为“与 {{name}} 相同”。",
       "profile_harness_cannot_start": "无法在此启动。",
+      "profile_harness_unavailable_value": "{{harness}}（不可用）",
       "profile_harness_saved": "已保存。从下一条消息起，{{name}} 在此运行框架上运行。",
       "profile_harness_unavailable": "{{name}} 设置为使用 {{harness}}，但它在这里无法启动，因此其聊天和工作会话也不会启动。请选择其他代理运行框架，或选择“继承”。",
+      "profile_harness_not_supported": "{{name}} 设置为 {{harness}}，但 Bot 无法在此运行于它。请选择其他代理运行框架，或选择“继承”。",
       "profile_harness_choose": "选择代理运行框架",
       "member_count_filtered_other": "显示 {{shown}} / {{n}} 个 Bot",
       "sessions_group_waiting_on_mate": "等待 {{name}}",
@@ -20463,7 +20999,35 @@
       "recap_reason_needs_human": "需要有人处理",
       "recap_state_accepted": "已接受",
       "recap_state_rejected": "已拒绝",
-      "recap_state_abandoned": "已放弃"
+      "recap_state_abandoned": "已放弃",
+      "driving_idle": "空闲",
+      "member_count_filtered": "显示 {{shown}} / {{count}} 位队友",
+      "profile_harness_hint": "运行 {{name}} 的聊天及其工作会话的 AI 编程工具（例如 Kiro Agent 或 Claude Code），它也决定 {{name}} 能用哪些模型。更改从发给 {{name}} 的下一条消息起生效，并把“模型”和“工作会话模型”都恢复为“继承”。",
+      "switcher_unread": "未读",
+      "profile_monitor": "监视器",
+      "profile_monitor_active": "运行中",
+      "profile_monitor_cycle": "检查次数",
+      "profile_monitor_cycle_value": "{{current}} / {{max}}",
+      "profile_monitor_frequency": "间隔",
+      "profile_monitor_inactive": "已停止",
+      "profile_monitor_loading": "正在检查监视器状态…",
+      "profile_monitor_next": "下次检查",
+      "profile_monitor_no_limit": "无限制",
+      "profile_monitor_none": "未监视任何内容",
+      "profile_monitor_reason_unknown": "已停止",
+      "profile_monitor_runtime": "已用时间",
+      "profile_monitor_runtime_value": "{{used}} / {{max}}",
+      "profile_monitor_started": "运行计时开始",
+      "profile_monitor_state": "状态",
+      "profile_monitor_stopped": "停止原因",
+      "profile_monitor_subject": "监视对象",
+      "profile_monitor_subject_goal": "目标循环",
+      "profile_monitor_subject_ledger": "任务列表",
+      "profile_monitor_subject_pull_request": "拉取请求",
+      "profile_monitor_type": "类型",
+      "profile_monitor_type_bounded": "监视器",
+      "profile_monitor_unavailable": "无法获取监视器状态",
+      "profile_monitor_unknown": "未知"
     },
     "tasksCapacityCard": {
       "title": "任务与容量",
@@ -20525,7 +21089,8 @@
       "state_stalled": "停滞",
       "next_retry_in": "{{age}} 后重试",
       "age_for": "已 {{age}}",
-      "open_chat": "打开聊天"
+      "open_chat": "打开聊天",
+      "age_tip": "处于徽标所示状态的时长。"
     },
     "layoutEditorHarness": {
       "title": "布局编辑器测试台",
@@ -20734,6 +21299,7 @@
   "store": {
     "chatSlice": {
       "session_gone_open_failed": "你点击的会话已被删除，无法打开。",
+      "session_closed_find_in_older_sessions": "该会话已关闭。可在“较早的会话”中找到它的记录。",
       "session_open_error_named": "无法打开“{{name}}”。",
       "session_open_error": "无法打开该会话。",
       "session_gone_open_failed_named": "“{{name}}”已被删除，无法打开。",
@@ -21738,7 +22304,29 @@
     "preview_save_failed": "无法保存共享 Crew 设置。",
     "preview_restart_failed": "无法重启网关。",
     "raised_by": "由 {{name}} 发起",
-    "take_over_keeps_draft": "接手后即可输入。{{name}} 的草稿会保留。"
+    "take_over_keeps_draft": "接手后即可输入。{{name}} 的草稿会保留。",
+    "several_typing": "有几个人正在输入",
+    "person_viewing": "{{name}} 在这里",
+    "composer_locked_hint": "对方发送或停下后，你就可以再次输入了。",
+    "sent_by": "由 {{name}} 发送",
+    "approval_waiting": "{{name}} 的操作待批准",
+    "invite_status_pending": "等待中",
+    "invite_single_use": "一次性链接",
+    "question_waiting": "Kiro 在等 {{name}} 回答",
+    "invite_title": "通过 Tailscale 邀请",
+    "person_typing": "{{name}} 正在输入",
+    "collab_region": "会话动态",
+    "decisions_list": "审批与问题",
+    "invite_empty": "还没有邀请。",
+    "invite_list_title": "邀请",
+    "people_tip": "要移除某人，请在 Tailscale 中移除。",
+    "composer_taken_over_hint": "你的草稿已保留。对方发送或停下后，你就可以再次输入了。",
+    "take_over_typing_label": "从 {{name}} 那里接手输入。对方的草稿会保留在对方那里。",
+    "step_share": "在 Tailscale 共享这台机器",
+    "step_send": "把 Crew 链接发给对方",
+    "not_joined": "未加入",
+    "approval_waiting_you": "你的操作待批准",
+    "question_waiting_you": "Kiro 在等你回答"
   },
   "milestones": {
     "getting_started_result": "第一个完成的成果",
@@ -21771,7 +22359,8 @@
     "try_today_hint": "点“试试”到达那里就算完成，今天也会计入连续天数。",
     "arrival_failed": "无法保存你已到达那里。",
     "retry": "重试",
-    "video_failed": "无法加载功能视频"
+    "video_failed": "无法加载功能视频",
+    "intro_video_title": "15 秒了解 {{productName}}"
   },
   "milestone": {
     "streak_best": {

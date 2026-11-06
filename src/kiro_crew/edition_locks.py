@@ -36,7 +36,7 @@ LOCKED_BY_POLICY = "locked by policy"
 #: Control id -> the local source that is ignored and what the feature does instead.
 #: Ids follow the RFC appendix "Crew key" column.
 UNKEYED_LOCKS: Dict[str, str] = {
-    "tunnel": "tunnel.enabled is ignored; no tunnel is started",
+    "tunnel": "tunnel.enabled and tunnel.relay_enabled are ignored; no tunnel or relay is started",
     "telemetry.otlp_hosts": (
         "telemetry.otlp_endpoint and telemetry.otlp_endpoints are ignored; "
         "only endpoints this build ships may receive metrics"
@@ -49,6 +49,7 @@ UNKEYED_LOCKS: Dict[str, str] = {
 #: config.json path -> the control whose lock makes that local value inert.
 CONFIG_PATH_LOCKS: Dict[str, str] = {
     "tunnel.enabled": "tunnel",
+    "tunnel.relay_enabled": "tunnel",
     "slack.use_tunnel_url": "tunnel",
     "telemetry.otlp_endpoint": "telemetry.otlp_hosts",
     "telemetry.otlp_endpoints": "telemetry.otlp_hosts",
@@ -228,7 +229,7 @@ def sandbox_mode_floor(mode: Any, default: Any) -> Any:
     """``agent.sandbox`` as read, except an enterprise build cannot read ``off``.
 
     There ``off`` reads as the shipped *default*, so local config cannot go below
-    Crew's own sandbox; ``strict`` still narrows (Red "Minimum sandbox level"). An
+    Crew's own sandbox; ``strict`` still narrows ("Minimum sandbox level", RFC D7). An
     ``oss`` build returns *mode* unchanged. Read by
     ``sandbox_tiers._clamp_sandbox_mode_to_floor``, the clamp every spawn path shares.
     """

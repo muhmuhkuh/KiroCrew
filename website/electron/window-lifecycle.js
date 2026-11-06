@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
+const { createTokenRetryHandler, dashboardRetryPath, loadDashboardWithToken } = require("./token-retry");
 const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
 const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
 const { createHangRecovery } = require("./hang-recovery");
@@ -801,8 +801,8 @@ function createWindowLifecycle(options) {
         ({ token: tokenValue } = await fetchRemoteToken(port));
       }
       if (tokenValue && !mainWindow.isDestroyed()) {
-        const target = `${backendUrl}?token=${tokenValue}`;
-        mainWindow.webContents.loadURL(retrySafe ? withSafeReload(target) : target);
+        const target = retrySafe ? withSafeReload(backendUrl) : backendUrl;
+        await loadDashboardWithToken(mainWindow.webContents, target, tokenValue);
       }
     });
     mainWindow.webContents.on("did-navigate", (_event, url, httpCode) => {
@@ -839,9 +839,7 @@ function createWindowLifecycle(options) {
         }
         if (mainWindow.isDestroyed()) return;
         // `safe=1`: do not reopen the chat that may have caused the crash.
-        mainWindow.webContents.loadURL(withSafeReload(
-          tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
-        ));
+        await loadDashboardWithToken(mainWindow.webContents, withSafeReload(backendUrl), tokenValue);
       })().catch((error) => {
         glog(`renderer recovery reload failed: ${error && error.message}`);
       });
@@ -988,13 +986,31 @@ function createWindowLifecycle(options) {
     }
   }
 
+  // A focused show answers an explicit user gesture (a relaunch, the tray's
+  // Show item, a notification click) that usually reaches the app while another
+  // app is frontmost. On macOS 14+ `win.focus()` alone orders the window in
+  // without activating the app, so the other app keeps the keyboard and stays
+  // in front; steal activation the way the summon hotkey and the gateway-error
+  // reveal do. A show without `focus` never activates the app.
+  function activateApp() {
+    if (!IS_MAC || typeof app.focus !== "function") return;
+    try {
+      app.focus({ steal: true });
+    } catch {
+      /* best effort — the window is already shown and focused */
+    }
+  }
+
   function showMainWindow({ focus = false } = {}) {
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     cancelPendingTrayHide(mainWindow);
     unhideApp();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
-    if (focus) mainWindow.focus();
+    if (focus) {
+      mainWindow.focus();
+      activateApp();
+    }
     return true;
   }
 
@@ -1234,7 +1250,7 @@ function createWindowLifecycle(options) {
     }
     if (win.isDestroyed()) return;
     if (tokenValue) {
-      win.webContents.loadURL(`${targetUrl}?token=${tokenValue}`);
+      await loadDashboardWithToken(win.webContents, targetUrl, tokenValue);
       return;
     }
     // Resolver, not the port alone: a crew an older version left under the empty
@@ -1309,8 +1325,7 @@ function createWindowLifecycle(options) {
       }
       if (tokenValue && !connWin.isDestroyed()) {
         const target = new URL(retryTarget || "", connectionBackendUrl);
-        target.searchParams.set("token", tokenValue);
-        connWin.webContents.loadURL(target.toString());
+        await loadDashboardWithToken(connWin.webContents, target.toString(), tokenValue);
       }
     });
     connWin.webContents.on("did-navigate", (_event, url, httpCode) => {

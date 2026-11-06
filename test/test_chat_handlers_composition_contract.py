@@ -55,7 +55,7 @@ _BASE_NAMES = frozenset("""
         STEER_REQUEUED STEER_STEERED SUGGEST_FOLLOWUP_SCHEMA SYNTHETIC_RECOVERY_KIND
         SelectionChange SessionFolderError SlotAgentSwitchCaller SlotCloseError
         SlotContinueRefusal SplitlinesBoundaryRecord TURN_ACTOR_META_KEY TURN_END_WIRE_CLS
-        TYPE_CHECKING TranscriptRevisionChanged UnknownMemoryStore ValidationError
+        TURN_OPENING_INJECT_KINDS TYPE_CHECKING TranscriptRevisionChanged UnknownMemoryStore ValidationError
         _CREATABLE_MODES _ChatSlot _CommitToken _DEFERRED_PLAIN_CREATE_KNOWN_KEYS
         _DurablePrefixMismatch _FLUSH_SNAPSHOT_RETRIES _FOLLOWUP_TEXT_FIELDS
         _GUARDED_WRITE_WAIT_SECS _HandoverDrainResult _MANUAL_CONTINUE_MSG
@@ -536,6 +536,7 @@ _OWNER_MODULES = frozenset(
         "project_lists",
         "prompt_queue",
         "resume",
+        "resume_window",
         "session_relaunch",
         "slot_approval",
         "slot_create",
@@ -635,11 +636,6 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
     ),
     "resume": (
         (
-            "_reconcile_slot_window",
-            "async function",
-            "(state: 'DashboardState', slot: \"'_ChatSlot'\") -> 'None'",
-        ),
-        (
             "_resume_session_identity",
             "function",
             "(state: 'DashboardState', history_key: 'str') -> 'str'",
@@ -672,6 +668,13 @@ _BASE_SURFACE: dict[str, tuple[tuple[str, str, str], ...]] = {
             "resume_slot_from_history",
             "async function",
             "(state: \"'DashboardState'\", *, name: 'str', history_key: 'str | None' = None, request_app: 'str' = '', caller_label: 'str' = '', request_title: 'str' = '', containment: \"'Callable[[_ChatSlot], Awaitable[ResumeRefusal | None]] | None'\" = None, final_check: \"'Callable[[_ChatSlot], ResumeRefusal | None] | None'\" = None, rebind_manager: 'bool' = True) -> 'ResumeOutcome'",
+        ),
+    ),
+    "resume_window": (
+        (
+            "_reconcile_slot_window",
+            "async function",
+            "(state: 'DashboardState', slot: \"'_ChatSlot'\") -> 'None'",
         ),
     ),
     "slot_repair": (

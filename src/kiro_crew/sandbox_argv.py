@@ -51,6 +51,7 @@ from kiro_crew.sandbox_seals import (
     _refuse_linked_models_leaf,
 )
 from kiro_crew.sandbox_staging import (
+    _materialize_env_mask_target,
     _materialize_live_target_mask_target,
     _materialize_maskable_dirs,
     _materialize_md_notebook_mask_targets,
@@ -81,6 +82,8 @@ from kiro_crew.sandbox_tiers import (
 )
 from kiro_crew.sandbox_workspace import (
     _literal_ancestor_guards,
+    _renameable_ancestor_guards,
+    _resolution_entries,
     _voice_runtime_ancestor_guards,
     _voice_runtime_parent_paths,
     _voice_runtime_sandbox_paths,
@@ -342,12 +345,26 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
     relocated_crew_readonly = tuple(_relocated_crew_targets(_CREW_READONLY_LEAVES))
     kiro_agents_targets = tuple(_resolved_kiro_agents_targets())
     install_root_targets = tuple(_resolved_install_root_targets())
-    # The namespace launcher binds the package directory itself, so a renamed parent
-    # carries the read-only mount with it; Seatbelt matches paths and needs the guards.
-    install_root_ancestor_guards = (
-        ()
+    # A renamed parent carries a seal away on both backends, so every entry resolving a
+    # seal steps on is guarded, and so are the parents of its own spelling, which keep a
+    # name below one not created yet guarded on Seatbelt (the namespace launcher skips an
+    # absent name): Seatbelt denies writing each one, and the namespace launcher pins the
+    # ones this uid could rename.
+    seal_parents = tuple(
+        entry
+        for target in (
+            *voice_runtime_parents,
+            *kiro_agents_targets,
+            *(os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS),
+            *relocated_crew_readonly,
+            *install_root_targets,
+        )
+        for entry in (os.path.dirname(os.path.normpath(target)), *_resolution_entries(target))
+    )
+    readonly_ancestor_guards = (
+        _renameable_ancestor_guards(seal_parents, uid)
         if namespace
-        else _literal_ancestor_guards(tuple(os.path.dirname(t) for t in install_root_targets))
+        else _literal_ancestor_guards(seal_parents)
     )
     carveout_probes = tuple(_carveout_probes(sandbox_plan.carveout_candidates(request)).values())
     host_paths = [
@@ -362,7 +379,7 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         *voice_runtime_ancestor_guards,
         *kiro_agents_targets,
         *install_root_targets,
-        *install_root_ancestor_guards,
+        *readonly_ancestor_guards,
     ]
     return sandbox_plan.PlanHost(
         home=home,
@@ -388,11 +405,26 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         voice_runtime_ancestor_guards=voice_runtime_ancestor_guards,
         kiro_agents_targets=kiro_agents_targets,
         install_root_targets=install_root_targets,
-        install_root_ancestor_guards=install_root_ancestor_guards,
+        readonly_ancestor_guards=readonly_ancestor_guards,
         carveout_probes=carveout_probes,
         uid=uid,
         gid=gid,
         ssh_accept_new=_ssh_supports_accept_new() if namespace else False,
+        # ``forward_ssh_auth_sock`` is the forward verdict ``wrap_argv`` re-judged against
+        # the tier it applies: when the spawn keeps the ssh agent, its socket stays
+        # reachable too (``~/.ssh/config`` names it as ``IdentityAgent``).
+        denied_socket_patterns=(
+            ()
+            if namespace
+            else sandbox_plan.denied_socket_patterns(
+                voice_runtime_parents, keep_ssh_agent=request.forward_ssh_auth_sock
+            )
+        ),
+        sealed_socket_patterns=(
+            ()
+            if namespace
+            else sandbox_plan.credential_agent_socket_patterns(request.forward_ssh_auth_sock)
+        ),
     )
 
 
@@ -505,6 +537,7 @@ def _build_launcher_script(
 def _build_seatbelt_profile(
     sandbox_level: str = "strict",
     *,
+    forward_ssh_auth_sock: bool = False,
     extra_hidden_dirs: tuple[str, ...] = (),
     extra_visible_dirs: tuple[str, ...] = (),
     extra_private_dirs: tuple[str, ...] = (),
@@ -520,6 +553,7 @@ def _build_seatbelt_profile(
         _spawn_plan(
             sandbox_plan.BACKEND_SEATBELT,
             sandbox_level,
+            forward_ssh_auth_sock=forward_ssh_auth_sock,
             extra_hidden_dirs=extra_hidden_dirs,
             extra_visible_dirs=extra_visible_dirs,
             extra_private_dirs=extra_private_dirs,
@@ -587,6 +621,8 @@ def namespace_argv(
     # creatable from any sandbox simply because the data-home ROOT is writable there and
     # an absent name has no mask. Publishing the stub first makes the mask non-vacuous.
     _materialize_live_target_mask_target(_required_targets)
+    # The channel-credential file has the same gap: an absent ``.env`` gets no mask.
+    _materialize_env_mask_target(_required_targets)
     # CLEANUP BEFORE THE REFUSAL, and this order is a contract rather than a preference.
     # Both sweeps and the reconciliation remove names that are themselves hard links to a
     # masked credential leaf -- a pre-upgrade orphan is a link to the signing key by
@@ -884,6 +920,8 @@ def sandbox_exec_argv(
             )
     profile = _build_seatbelt_profile(
         sandbox_level,
+        # The ssh agent's socket stays reachable exactly when its env var is forwarded.
+        forward_ssh_auth_sock=forward_ssh_auth_sock,
         # These entries become path RULES, not binds over an inode. That is weaker than it
         # first appears: the rule keeps naming a path, and nothing here denies a write to the
         # alias's parent or its ancestors while the data home root stays writable in-sandbox,
