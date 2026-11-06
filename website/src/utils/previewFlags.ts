@@ -179,6 +179,21 @@ export const PREVIEW_CREW_MODE = `${PREVIEW_FLAG_PREFIX}crew-mode`
 export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
 
 /**
+ * A crewmate's sessions leave the person's own lists: every session a mate
+ * thread dispatched (its `mate_root` stamp), at any depth, is left out of the
+ * sidebar, Recents, the grid and unread counts, and shows on the mate's
+ * Sessions tab instead. The mate's own chat stays; History and search still find
+ * every session (step 6 of
+ * docs/request-for-change/rfc-crewmate-workers-under-the-crewmate.md).
+ *
+ * Read it through `mateSessionsHidden()` in `lib/crewMode.ts`. Unlike the other
+ * flags here it also has a server half: a person's `GET /api/chat/slots` leaves
+ * the same rows out (`crew_mode.list_view`). Default OFF, and OFF is every list
+ * as before, a mate's sessions included.
+ */
+export const PREVIEW_MATE_SESSIONS = `${PREVIEW_FLAG_PREFIX}mate-sessions`
+
+/**
  * Explore: the top-bar "Explore N/7" pill and its phone twins (the bar ring and
  * the overflow-menu row), the Explore sheet, the milestone notice, the Try today
  * card on a new chat, and the Display > Explore switch.
@@ -210,7 +225,9 @@ export const PREVIEW_FLAGS: readonly string[] = [
   PREVIEW_FOLDER_CONDUCTOR,
   PREVIEW_SESSION_ENVIRONMENTS,
   PREVIEW_CREWMATE_HARNESS,
+  PREVIEW_CREW,
   PREVIEW_CREW_MODE,
+  PREVIEW_MATE_SESSIONS,
   PREVIEW_EXPLORE,
 ]
 

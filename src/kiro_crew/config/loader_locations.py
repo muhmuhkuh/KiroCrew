@@ -374,6 +374,28 @@ def decisions_consent_path() -> Path:
     return config_dir() / "decisions_consent.json"
 
 
+def file_delivery_consent_path() -> Path:
+    """Return path to file_delivery_consent.json -- flagged-file delivery consent.
+
+    Same KEYSTONE reasoning as :func:`aws_consent_path`, and the leaf is on
+    ``security._CREW_SECRET_LEAVES`` for the same reason: a recorded consent to
+    deliver a file the credential scanner flagged is an authorization, not a
+    preference. Storing it in ``config.json`` would leave it writable by any
+    auto-approved agent shell, so a prompt-injected agent could mint the grant and
+    consent, on the owner's behalf, to shipping the owner's secrets -- the exact
+    shape ``CredentialPolicy.exempt_exact_hosts`` refuses when it says such a set
+    is "NEVER sourced from ``config.json``". ``is_sensitive_path`` blocks the tool
+    path and the OS sandbox mounts the keystone read-only for the shell.
+
+    Holds ``{"<destination_class>": {destination_class, granted_at}}``; every read
+    fails soft to NO CONSENT (see ``file_delivery_consent.read_grant``). The only
+    writer is the authenticated, OWNER-gated dashboard
+    ``/api/file-delivery/consent`` handler, which opens the path directly rather
+    than through this gate. Respects ``KIROCREW_HOME``.
+    """
+    return config_dir() / "file_delivery_consent.json"
+
+
 def credential_redaction_path() -> Path:
     """Return path to credential_redaction.json -- the credential-redaction switch.
 
