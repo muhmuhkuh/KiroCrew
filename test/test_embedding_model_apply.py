@@ -131,9 +131,12 @@ class TestGatedCandidateLifecycle:
         cand = emb.LlamaCppEmbedder(
             model_path=_write_model(tmp_path / "m.gguf"), dim=0, serving=False
         )
-        cand._load_model()
-        assert cand.dim == 768
-        assert cand.is_ready() is True
+        try:
+            cand._load_model()
+            assert cand.dim == 768
+            assert cand.is_ready() is True
+        finally:
+            cand.close()  # the published model's idle evictor ends with the test
 
     def test_boot_mismatch_refusal_is_unchanged_by_adopt_mode(
         self, tmp_path, monkeypatch
@@ -1374,6 +1377,24 @@ class TestConfigWrite:
         with pytest.raises(ValueError):
             await _write_embed_model_config(str(model), 0)
         assert cfg.read_text(encoding="utf-8") == "{ this is not json"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("section", [[], ["embedding_dim"], "embedding_dim=8", 5])
+    async def test_a_memory_section_that_is_not_an_object_is_refused_and_kept(
+        self, tmp_path: Path, monkeypatch, section: object
+    ) -> None:
+        from kiro_crew.dashboard.handlers.memory import _write_embed_model_config
+
+        cfg = tmp_path / "config.json"
+        original = json.dumps({"memory": section, "agent": {"default_agent": "kirocrew"}})
+        cfg.write_text(original, encoding="utf-8")
+        monkeypatch.setattr("kiro_crew.dashboard.handlers.memory.config_path", lambda: cfg)
+
+        model = _write_model(tmp_path / "m.gguf")
+        # A clear refusal, not a TypeError/AttributeError the model card would show.
+        with pytest.raises(ValueError, match="'memory' is not an object"):
+            await _write_embed_model_config(str(model), 0)
+        assert cfg.read_text(encoding="utf-8") == original
 
 
 class TestStatusEndpointCarriesProgress:

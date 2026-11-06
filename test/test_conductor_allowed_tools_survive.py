@@ -1473,19 +1473,61 @@ class TestASpecLeftInPlaceHoldsTheCeilingMemo:
             )
             assert retry() is True
 
+    @pytest.mark.parametrize(
+        "main_unreadable", [True, False], ids=["unreadable-main", "held-conductor"]
+    )
+    def test_the_retry_warning_names_the_remedy_for_its_cause(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        main_unreadable: bool,
+    ) -> None:
+        """An unreadable main spec is told to restore read access and is never told
+        to run ``--clean``, which would write defaults over the very file the skip
+        keeps. A held conductor spec keeps the ``--clean`` advice. Mutation pin:
+        dropping the unreadable branch puts ``--clean`` in the first case."""
+        monkeypatch.setattr(agent, "_conductor_spec_held", True, raising=False)
+        monkeypatch.setattr(agent, "_main_spec_unreadable", main_unreadable, raising=False)
+        monkeypatch.setattr(agent, "kiro_agents_dir_path", lambda: tmp_path)
+
+        def _held_rebuild(*, _held_out: list[bool]) -> tuple[Path, bool]:
+            _held_out.append(True)
+            return tmp_path / agent.AGENT_FILENAME, not main_unreadable
+
+        monkeypatch.setattr(agent, "rebuild_agent_config_reporting", _held_rebuild)
+        with caplog.at_level(logging.WARNING, logger=agent.logger.name):
+            assert agent.retry_held_conductor_specs() is False
+        [message] = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        if main_unreadable:
+            assert "restore read access" in message
+            assert "--clean" not in message
+            assert str(tmp_path / agent.AGENT_FILENAME) in message
+        else:
+            assert "still unwritten" in message
+            assert "kirocrew setup --agent-only --clean" in message
+
     def test_the_hourly_maintenance_wake_retries_held_specs_before_its_sweeps(self) -> None:
         """The retry rides the gateway's existing hourly maintenance wake -- the one
         loop that already hosts the scratch, work-root and session-dir sweeps rather
         than a scheduler of its own -- first in the wake, off the event loop, and
         from nowhere else: no second timer, no thread."""
-        from kiro_crew.slack import gateway
+        from kiro_crew.slack.gateway_runtime import process_entry
 
-        source = Path(gateway.__file__).read_text(encoding="utf-8")
+        source = Path(process_entry.__file__).read_text(encoding="utf-8")
         wake = source.index("async def _run_agent_scratch_sweep()")
         slept = source.index("await asyncio.sleep(3600)", wake)
         retried = source.index("await asyncio.to_thread(retry_held_conductor_specs)", slept)
         swept = source.index("await asyncio.to_thread(agent_scratch.sweep_dead_scratch)", slept)
         assert slept < retried < swept, "the retry runs first in the hourly wake"
+        slack_dir = Path(process_entry.__file__).resolve().parents[1]
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in [
+                slack_dir / "gateway.py",
+                *sorted((slack_dir / "gateway_runtime").glob("*.py")),
+            ]
+        )
         assert (
             source.count("await asyncio.to_thread(retry_held_conductor_specs)") == 1
             and source.count("import retry_held_conductor_specs") == 1

@@ -301,7 +301,7 @@ def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     if contested is not None:
         return contested
     if getattr(exc, "auth_required", False):
-        return {"kind": AUTH_REQUIRED_KIND}
+        return {"kind": AUTH_REQUIRED_KIND, **_kas_signed_out_notice(str(exc))}
     if getattr(exc, "usage_limit", False):
         return {"kind": USAGE_LIMIT_KIND}
     if getattr(exc, "image_dimension_wedge", False) is True:
@@ -315,6 +315,24 @@ def _terminal_error_meta(exc: BaseException) -> dict[str, object] | None:
     if getattr(exc, "kiro_cli_missing", False) is True:
         return {"kind": KIRO_CLI_MISSING_KIND}
     return None
+
+
+def _kas_signed_out_notice(text: str) -> dict[str, object]:
+    """The notice token for a KAS signed-out sentence, so the dashboard translates it.
+
+    Empty for any other sentence: that row keeps its English.
+    """
+    from kiro_crew.agent_sdk.host_auth import kas_signed_out_route
+    from kiro_crew.dashboard import gateway_notice as gn
+
+    route = kas_signed_out_route(text)
+    if route is None:
+        return {}
+    # The route rides along so the translated copy names it: every KAS prompt
+    # names the real route (the recorded decision on choosing KAS's engine).
+    if not route:
+        return gn.gateway_notice_meta(gn.GATEWAY_NOTICE_KAS_SIGNED_OUT)
+    return gn.gateway_notice_meta(gn.GATEWAY_NOTICE_KAS_SIGNED_OUT, route=route)
 
 
 async def _recovery_delay(secs: float) -> None:
@@ -1040,10 +1058,6 @@ _COMPACTION_FAILED_RETRIES = 2
 # conversation away instead of explaining it.
 _COMPACT_FAIL_REASON_MAX_CHARS = 300
 
-COMPACT_FRESH_SESSION_NOTICE = (
-    "Nothing to compact yet: the agent's session starts with your next message."
-)
-
 
 # The answer to a /compact that reached a fresh provider session still owing the
 # Kiro Crew conversation replay. The replay rides the next context-bearing
@@ -1051,4 +1065,13 @@ COMPACT_FRESH_SESSION_NOTICE = (
 # compaction status to wait for.
 COMPACT_REPLAY_PENDING_NOTICE = (
     "Nothing to compact yet: the restored history is delivered with your next message."
+)
+
+# The answer to a /compact that reached a fresh provider session no ordinary
+# prompt has reached yet (a brand-new chat, or a session restarted under an
+# existing one): the session holds no conversation, so the backend reports no
+# compaction status to wait for. The chat's own history, if any, rides the next
+# prompt, so the notice speaks of the agent's session, not the chat.
+COMPACT_FRESH_SESSION_NOTICE = (
+    "Nothing to compact yet: the agent's session starts with your next message."
 )

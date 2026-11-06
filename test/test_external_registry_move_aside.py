@@ -884,7 +884,6 @@ class TestStaleCheckoutSweep:
 
         sources = tmp_path / "app-sources"
         sources.mkdir()
-        # Create a target outside sources
         outside = tmp_path / "outside-precious"
         outside.mkdir()
         (outside / "secret.txt").write_text("do not delete", encoding="utf-8")
@@ -1011,7 +1010,6 @@ class TestStaleCheckoutSweep:
         very_old = time.time() - ((_STALE_CHECKOUT_RETENTION_DAYS + 1) * 86400)
         os.utime(genuinely_old, (very_old, very_old))
 
-        # Run sweep.
         removed = _sweep_stale_checkouts_sync(sources, time.time())
 
         # The refreshed dir must survive — its mtime is now < retention.

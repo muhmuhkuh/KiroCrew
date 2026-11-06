@@ -39,6 +39,18 @@ from kiro_crew.publish_provider import DEFAULT_PROVIDER, Capability, CommentAnch
 
 
 # ── Comments ──────────────────────────────────────────────────────────────────
+def _redact_anchor_context(value: Any) -> str | None:
+    """Redact an anchor prefix/suffix for the response; a non-string is sent as ``None``.
+
+    These fields are decoded verbatim from ``comments.json``, so a hand edit can
+    leave a number, list or object. ``_redact_text`` raises on one, and nested
+    text inside it would reach the dashboard unredacted, so it is never sent.
+    """
+    if not isinstance(value, str):
+        return None
+    return _redact_text(value) if value else value
+
+
 def _comment_identity(request: web.Request, body: dict[str, Any], route: str) -> tuple[str, bool]:
     """Return ``(author, is_agent)`` for a new comment or reply, read from the request.
 
@@ -187,7 +199,10 @@ async def api_artifact_comments(request: web.Request) -> web.Response:
             "created_at": c.created_at,
             "updated_at": c.updated_at,
         }
-        if c.anchor_quote:
+        # comments.json is decoded verbatim, so a hand edit can leave anchor text
+        # that is not a string; it is sent as no anchor (quote) or None (context)
+        # rather than raising for the whole list.
+        if isinstance(c.anchor_quote, str) and c.anchor_quote:
             # Anchor text can carry provider/agent-influenced content and is
             # echoed to the dashboard, so redact credentials/exfil-URLs like the
             # body (backend-security-controls). Remote comments merged from a
@@ -195,8 +210,8 @@ async def api_artifact_comments(request: web.Request) -> web.Response:
             # boundary too — not only on the local POST path.
             entry["anchor"] = {
                 "quote": _redact_text(c.anchor_quote),
-                "prefix": _redact_text(c.anchor_prefix) if c.anchor_prefix else c.anchor_prefix,
-                "suffix": _redact_text(c.anchor_suffix) if c.anchor_suffix else c.anchor_suffix,
+                "prefix": _redact_anchor_context(c.anchor_prefix),
+                "suffix": _redact_anchor_context(c.anchor_suffix),
                 "start_offset": c.anchor_start_offset,
                 "end_offset": c.anchor_end_offset,
                 "version_number": c.anchor_version,
@@ -246,7 +261,6 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
     except ArtifactNotFoundError as exc:
         return _err(str(exc), status=404)
 
-    # Build anchor if provided
     anchor_data = body.get("anchor")
     anchor_quote = None
     anchor_prefix = None
@@ -313,7 +327,13 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
     # must be denied too. Denial keeps the comment LOCAL (local_only) rather than
     # 403-ing — the local comment store is unaffected.
     gov_denied = (
-        _publish_governance_denied(request, comment.target_provider or DEFAULT_PROVIDER)
+        (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, comment.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
         if scope == "shared" and comment.target_external_id
         else "not shared"
     )
@@ -440,7 +460,14 @@ async def api_artifact_reply_comment(request: web.Request) -> web.Response:
         parent.origin
         and parent.origin != "local"
         and reply.target_external_id
-        and _publish_governance_denied(request, reply.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, reply.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -511,7 +538,14 @@ async def api_artifact_mark_review(request: web.Request) -> web.Response:
         target.origin
         and target.origin != "local"
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -735,7 +769,14 @@ async def api_artifact_delete_comment(request: web.Request) -> web.Response:
         target
         and is_provider_origin
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
 
@@ -852,7 +893,14 @@ async def api_artifact_edit_comment(request: web.Request) -> web.Response:
         target.origin
         and target.origin != "local"
         and target.target_external_id
-        and _publish_governance_denied(request, target.target_provider or DEFAULT_PROVIDER) is None
+        and (
+            await _run_off_loop(
+                lambda: _publish_governance_denied(
+                    request, target.target_provider or DEFAULT_PROVIDER
+                )
+            )
+        )
+        is None
     ):
         try:
             provider = get_provider(target.target_provider or DEFAULT_PROVIDER)

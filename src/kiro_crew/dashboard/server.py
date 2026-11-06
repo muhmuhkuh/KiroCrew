@@ -57,9 +57,15 @@ from kiro_crew.dashboard import (  # noqa: F401
     chat,
     crewmate_feed,
     handlers,
+    members_roster_goals,
     slot_retention,
     tailnet,
     tailnet_serve,
+)
+from kiro_crew.dashboard.agent_ipc import (  # noqa: F401
+    AGENT_SOCKET_HOLDER_KEY,
+    register_agent_site_cleanup,
+    start_agent_site,
 )
 from kiro_crew.dashboard.approval_posture import trust_reaches_subagents  # noqa: F401
 from kiro_crew.dashboard.chat_utils import (  # noqa: F401
@@ -226,6 +232,7 @@ from kiro_crew.dashboard.server_runtime.app_platform import (  # noqa: F401
     _apply_builtin_adoptions,
     _kick_builtin_adoption_staging,
     _kick_default_app_installs,
+    _kick_interrupted_update_sweep,
     _reconcile_app_resources,
     _start_app_backends,
     _warm_builtin_app_names,
@@ -280,6 +287,7 @@ from kiro_crew.dashboard.server_runtime.listener import (  # noqa: F401
     _reserve_dashboard_port,
     _resolved_bound_host,
     _resolved_bound_port,
+    _start_dashboard_unix_site,
     _start_secondary_loopback_site,
     _start_site,
     _start_unix_site,
@@ -767,7 +775,6 @@ async def start_dashboard(
     # --- Pending-skill approval notifications ---
     _register_pending_skill_hooks(state)
 
-    # Initialize script hook store
     state._hook_store = ScriptHookStore()
     set_global_hook_store(state._hook_store)
 
@@ -812,6 +819,8 @@ async def start_dashboard(
     # whichever thread happens to arrive first.
     state.bind_serving_loop(asyncio.get_running_loop())
     crewmate_feed.start(state)  # the goal and waiting folds a crewmate's page reads
+    # The roster's has_goal / heartbeat_on re-read after every goal write.
+    members_roster_goals.start_roster_refresh(state)
     # Voice settings live in slack/handler's module state and are otherwise
     # loaded only on the Slack startup path (set_orch_cfg) — without this a
     # dashboard-only gateway (no Slack tokens) resets TTS to defaults on
@@ -1092,11 +1101,16 @@ async def start_dashboard(
         # with, for handlers the middleware bypasses (POST /api/auth/refresh must
         # re-bind a rotated access token to the same verified peer identity).
         app["tailnet_trust"] = _tailnet_trust
-        # The relay client's door into this app (dashboard/kiro_relay). Built off:
-        # the relay client, and the setting that turns this on, arrive together in a
-        # later change. Off, the ingress middleware hands every request on to the
-        # client-sent relay-header strip.
-        app[RELAY_INGRESS_APP_KEY] = RelayIngress(enabled=False)
+        # The relay client's door into this app (dashboard/kiro_relay). Built off
+        # unless tunnel.relay_enabled is set, and always off in an enterprise build,
+        # which ignores that local switch with the rest of the tunnel control. Either
+        # way the ingress middleware hands every request that is not a verified
+        # handover on to the client-sent relay-header strip.
+        from kiro_crew.edition_locks import local_enable_locked
+
+        app[RELAY_INGRESS_APP_KEY] = RelayIngress(
+            enabled=_cfg.tunnel.relay_enabled is True and not local_enable_locked("tunnel")
+        )
         app["allowed_origins"] = build_allowed_origins(
             port, local_only, configured_host, tailnet_host=_tailnet_host
         )
@@ -1245,6 +1259,12 @@ async def start_dashboard(
             await _stop_spawned_backends()
         _dashboard_sock.close()
         raise
+    # After the bind, never on the boot path (no-new-work-on-gateway-boot-path):
+    # from here an app cron naming a missing folder creates it through the
+    # dashboard's own folder service. Boot-time registration stays read-only.
+    from kiro_crew.dashboard.handlers.cron_board import wire_app_cron_folder_creator
+
+    wire_app_cron_folder_creator(state)
     # The listener is up -- keep it up. One failed accept() on Windows would
     # otherwise close it for the life of the process (see listener_guard).
     _arm_listener_guard(state, runner, site)
@@ -1263,18 +1283,20 @@ async def start_dashboard(
     # via _start_site with no reservation step, still exports post-listen.)
     _kick_default_app_installs(state)
     _kick_builtin_adoption_staging(state)
+    _kick_interrupted_update_sweep(state)
+    # Resolved ONCE, and used for the unix socket's name, the second bind and the
+    # publication below. Under `--port auto` the requested port is 0 and stays 0:
+    # a socket named for it is one no client dials (they name the real port), and
+    # binding the second family on it lands on an unrelated ephemeral port while
+    # the sidecar is filed under the real one -- which would publish coverage for
+    # an address nothing listens on and leave the real one free for anyone to take.
+    _bound_port = _resolved_bound_port(runner, port)
     # Additional kernel-verifiable transport for the internal API (POSIX only;
     # degrades to TCP-only on any failure — see _start_unix_site).
-    _unix_socket_holder["path"] = await _start_unix_site(runner, port)
+    _unix_socket_holder["path"] = await _start_unix_site(runner, _bound_port)
     # Hold the OTHER loopback family too, so a client dialling a NAME cannot be
     # answered by anyone else -- see _start_secondary_loopback_site. None when
     # there is no second listener, and the client then signs in explicitly.
-    # Resolved ONCE, and used for both the second bind and the publication below.
-    # Under `--port auto` the requested port is 0 and stays 0, so binding the
-    # second family on it lands on an unrelated ephemeral port while the sidecar
-    # is filed under the real one -- which would publish coverage for an address
-    # nothing listens on and leave the real one free for anyone to take.
-    _bound_port = _resolved_bound_port(runner, port)
     _second_loopback = await _start_secondary_loopback_site(runner, _bound_port, _bind_ip)
     # The direct tailnet sites, on the same port; nothing when the gate is off.
     if _direct is not None:
@@ -1378,8 +1400,9 @@ async def start_dashboard(
     # Keep the host awake while a turn is in flight (opt-in via
     # dashboard.prevent_sleep), or while the dashboard is published on the
     # tailnet (opt-out via dashboard.tailscale.keep_awake). Shared with the
-    # headless --slack-only entrypoint.
-    _arm_prevent_sleep_poll(state, port)
+    # headless --slack-only entrypoint. The bound port: the poll asks whether
+    # `tailscale serve` fronts THIS listener, which `--port auto`'s 0 never names.
+    _arm_prevent_sleep_poll(state, _bound_port)
 
     # Arm the stall watchdog only when faulthandler is enabled — i.e. under the
     # real gateway entrypoint (see cli `gateway` dispatch). Tests that spin up
@@ -1465,8 +1488,8 @@ async def start_dashboard(
     # NOTE: Even with restore_sessions=false, foldered and pinned sessions are restored
     # so the Explorer tree stays populated.  Users can unpin or remove from folder to dismiss.
     cfg = KiroCrewConfig.load()
-    # Offloaded: this PR gave arming a fail-closed ``approval_modes`` gate, so
-    # ``grant_declared_yolo`` now resolves governance -- an ``iterdir`` + per-file
+    # Offloaded: arming has a fail-closed ``approval_modes`` gate, so
+    # ``grant_declared_yolo`` resolves governance -- an ``iterdir`` + per-file
     # ``stat`` walk of the profiles dir. We are inside ``async def start_dashboard``,
     # so running it inline stalls the gateway's loop, and on slow storage it stalls
     # the heartbeat with it.

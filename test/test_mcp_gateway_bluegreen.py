@@ -185,7 +185,6 @@ async def test_idle_backends_still_evicted_as_before() -> None:
     pool = BackendPool(max_backends=10)
     key = _make_pool_key()
     backend = _make_mock_backend(key, refcount=0)
-    # Make it look old
     backend.last_used_at = time.monotonic() - 1000
     await pool.add(key, backend)
 
@@ -673,9 +672,11 @@ async def test_credwatch_fires_on_content_change(tmp_path: Path) -> None:
     cred.write_bytes(b"secret-v1")
     stop = asyncio.Event()
     fired = asyncio.Event()
+    fires: list[bytes] = []
     barrier = _ProbeBarrier()
 
     async def _on_change() -> None:
+        fires.append(cred.read_bytes())
         fired.set()
 
     task = asyncio.create_task(
@@ -695,8 +696,12 @@ async def test_credwatch_fires_on_content_change(tmp_path: Path) -> None:
     st = cred.stat()
     os.utime(cred, (st.st_atime, st.st_mtime + 10.0))  # defeat coarse mtime gate
     await await_until(fired, what="the rotation firing")
+    # One rotation is one fire: the fired content becomes the new baseline.
+    await barrier.wait_for(barrier.count + 2)
     stop.set()
     await task
+
+    assert fires == [b"secret-v2"]
 
 
 @pytest.mark.asyncio
@@ -713,9 +718,11 @@ async def test_credwatch_fires_on_content_change_with_unchanged_mtime(tmp_path: 
     baseline_mtime = cred.stat().st_mtime
     stop = asyncio.Event()
     fired = asyncio.Event()
+    fires: list[bytes] = []
     barrier = _ProbeBarrier()
 
     async def _on_change() -> None:
+        fires.append(cred.read_bytes())
         fired.set()
 
     task = asyncio.create_task(
@@ -736,8 +743,11 @@ async def test_credwatch_fires_on_content_change_with_unchanged_mtime(tmp_path: 
     os.utime(cred, (baseline_mtime, baseline_mtime))
 
     await await_until(fired, what="the rotation firing")
+    await barrier.wait_for(barrier.count + 2)
     stop.set()
     await task
+
+    assert fires == [b"secret-v2"]
 
 
 @pytest.mark.asyncio

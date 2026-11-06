@@ -166,8 +166,7 @@ async def _on_text_chunk(turn: _ChatTurn, event) -> None:
         # Record it instead, so the post-compaction gate can tell
         # the turn's own ANSWER from a control frame: a notice
         # counted as an answer would shadow the continuation branch
-        # and leave the request unanswered — the exact hang this PR
-        # exists to fix.
+        # and leave the request unanswered.
         _compaction_notice_chunks.append(safe_chunk)
         # A Regenerate tells its reply from a control frame the same way: a
         # notice-only row must not replace the previous reply.

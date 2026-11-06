@@ -580,6 +580,14 @@ def _build_tunnel_config(tunnel_data: dict) -> TunnelConfig:
         enabled=bool(section.get("enabled")),
         name_mode=str(section.get("name_mode")),
         name_override=str(section.get("name_override")),
+        # Only the JSON boolean ``true`` opens the relay path: a string or a number
+        # left by a hand edit keeps it off rather than reading as truthy.
+        relay_enabled=section.get("relay_enabled") is True,
+        relay_host_url=str(section.get("relay_host_url") or ""),
+        relay_crew_domain=str(section.get("relay_crew_domain") or ""),
+        relay_move_grace_seconds=section.read("relay_move_grace_seconds", _safe_float, 0.0, 30.0),
+        relay_lease_url=str(section.get("relay_lease_url") or ""),
+        relay_lease_credential=str(section.get("relay_lease_credential") or ""),
     )
 
 
@@ -772,6 +780,8 @@ def _build_whatsapp_config(whatsapp_data: dict) -> WhatsAppConfig:
         db_path=str(section.get("db_path")),
         soft_threshold_pct=section.read("soft_threshold_pct", _threshold_pct),
         hard_threshold_pct=section.read("hard_threshold_pct", _threshold_pct),
+        # _safe_bool, not bool(): a hand-edited "false" must not turn on a billed service.
+        auto_reply_to_voice=section.read("auto_reply_to_voice", _safe_bool),
     )
 
 
@@ -948,6 +958,7 @@ def _build_stt_config(stt_data: dict) -> SttConfig:
         threads=_sections._validated_stt_threads(section.get("threads")),
         endpointing=section.read("endpointing", _safe_bool),
         submit_on_release=section.read("submit_on_release", _safe_bool),
+        slide_to_send=section.read("slide_to_send", _safe_bool),
         dictation_panel=section.read("dictation_panel", _safe_bool),
         timeout_secs=section.read(
             "timeout_secs", _safe_int, lo=_STT_MIN_TIMEOUT_SECS, hi=_STT_MAX_TIMEOUT_SECS

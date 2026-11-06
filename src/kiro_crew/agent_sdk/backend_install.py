@@ -168,6 +168,11 @@ class BackendInstallState:
     fix: the harness is installed on disk NOW, but the running gateway already
     resolved its absence and cached that, so a session started right now would
     still fail. See :func:`_probe_claude`.
+
+    ``found_version`` is non-empty only on a ``MISSING`` verdict whose binary DOES
+    resolve but runs a release other than the one Crew verified (Copilot CLI's
+    pin): what is missing is that release, so the row names the release it found,
+    and ``install_command`` installs the verified one.
     """
 
     backend: str
@@ -200,17 +205,17 @@ def _kas_bundle_route() -> bool:
     """Whether KAS runs Crew's own engine, not kiro-cli: ``agent.kas_bundle`` is on,
     or kiro-cli's relay cannot run on this host (``acp/kas_route.py``).
 
-    Read on every probe, never remembered here: the panel reads this verdict
-    live, and the probe cache's TTL is the one staleness this module already
-    accepts.
+    The shared route half, with no backend half on purpose: the KAS row describes
+    KAS whatever the default backend is, and the spec ``permissions`` gate guards
+    every backend's specs. Read on every probe, never remembered here: the panel
+    reads this verdict live, and the probe cache's TTL is the one staleness this
+    module already accepts.
     """
     from kiro_crew.agent_sdk import kas_bundle
     from kiro_crew.config import KiroCrewConfig
 
     try:
-        if KiroCrewConfig.load().agent.kas_bundle:
-            return True
-        return bool(kas_bundle.kas_route().bundle)
+        return kas_bundle.kas_spawn_takes_bundle(KiroCrewConfig.load().agent)
     except Exception:
         return False
 
@@ -371,6 +376,10 @@ def _probe_self_served(backend: str) -> BackendInstallState:
     launch = launch_for(backend)
     policy_id = _policy_id(backend)
     if acp_driver.self_served_resolves(backend):
+        # A release the handshake refuses is not installed in any sense that helps:
+        # every session would end at ``initialize``. So the row says MISSING, names
+        # the verified release as the absent component and carries the command that
+        # installs it -- the same remedy a missing binary gets.
         found = acp_driver.self_served_wrong_version(backend)
         if found:
             return BackendInstallState(

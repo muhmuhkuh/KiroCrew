@@ -58,13 +58,17 @@ permissions or setting `minKiroCrewVersion`.
 The signature covers `name`, `version`, `signer` and `permissions`, plus each of
 these groups when it is non-empty: `notifications`, `crons`, `contributes`,
 `setup`, `mcpServers`, `backend`, `ui`, `agents`, `skills`, `sops`,
-`dependencies`, `platform` and `config_keys`. An empty group is left out of the signed
-bytes.
+`dependencies`, `platform`, `publishProvider` and `config_keys`. An empty group is left
+out of the signed bytes. `displayName`, `description` and `author` are display text
+and are not signed.
 
 A gateway computes the signed bytes from the groups it knows. A signed manifest
 that declares a group an older gateway does not sign fails verification there.
 It fails closed: the install is refused, not downgraded. Set
 `minKiroCrewVersion` on a signed app so that refusal names the version floor.
+The reverse holds too: a signature issued before a gateway started signing a group
+your manifest declares fails on that gateway. The app is refused at install, at
+enable and at gateway start until you re-sign it and the operator re-installs it.
 
 ## Resources
 
@@ -126,6 +130,33 @@ spawns them: the server receives the literal reference text. Registration logs
 a warning naming the app, server and env key when it sees one. How an app may
 receive a vault secret is undecided
 ([#10641](https://github.com/kirodotdev/KiroCrew/issues/10641)).
+
+### Host paths in an agent file
+
+An agent file ships inside your app, so it cannot name a path that exists only
+on the host. Write one of these placeholders inside a JSON string instead, and
+the gateway fills it in when it registers the agent (on enable and at gateway
+start):
+
+| Placeholder | Value |
+|---|---|
+| `{APP_ROOT}` | your app's install directory |
+| `{APP_DATA}` | your app's data directory, the one hooks receive as `ctx.data_dir` |
+| `{UV_BIN}` | the absolute path of the `uv` the gateway resolves |
+| `{HOST_PATH}` | the gateway's `PATH`, plus LibreOffice's install directory on Windows when `soffice` is not on `PATH` |
+| `{PATH_SEP}` | the host's `PATH` separator (`:` or `;`) |
+
+The set is fixed and the same for every app. LibreOffice is the one host tool
+`{HOST_PATH}` adds, because Kiro Crew locates it for its own slide previews; find
+any other tool yourself.
+
+Join a subpath with `/`, for example `"{APP_DATA}/vendor/bin"`, and extend
+the `PATH` of a server with `"{HOST_PATH}{PATH_SEP}{APP_DATA}/bin"`. The
+gateway computes every value itself and never reads one from a file. It writes
+the rendered copy under the data home, so your agent cannot rewrite it. An
+agent that names any other `{UPPER_CASE}` placeholder, or one the host cannot
+compute (no `uv`, an empty `PATH`), is not registered. A templated agent cannot
+be a command's `agent`.
 
 ### Session label for a stdio server (`x-kirocrew-session-label`)
 
@@ -208,7 +239,7 @@ with without the label.
 | `env` | object | String environment variables passed to the job |
 | `persistent_session` | boolean | Default `true`; retain one agent session across runs |
 | `silent` | boolean | Default `false`; suppress automatic result delivery |
-| `folder` | string | Existing Schedule-folder name; an unknown name leaves the job ungrouped until a later enable finds it |
+| `folder` | string | Schedule-folder name. Installing, enabling or updating the app in a running gateway creates a missing folder; a name several folders share, registration during gateway startup, or a CLI enable leaves the job ungrouped |
 | `timezone` | string | IANA zone name the schedule and `skip_dates` are evaluated in, e.g. `America/New_York`. Optional, but an empty value falls back to the gateway config's timezone and then to **UTC** — so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC, the wrong calendar day for most users. An unknown zone is rejected at manifest validation. A per-**user** zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
 | `skip_dates` | string[] | Calendar dates the job must not fire on, evaluated in `timezone`. Must be zero-padded `YYYY-MM-DD` — `2026-1-1` parses but never matches the padded fire-time rendering, so it is rejected at manifest validation rather than silently skipping nothing |
 | `timeout` | number | Seconds a `command` or `script` subprocess may run. `0` or omitted uses the scheduler default: 30s for a script, 300s for a command |
@@ -236,8 +267,9 @@ manifest** always: a paused job gets the new values and stays paused. Settings t
 visibility, a secret grant -- are never touched. A change to `command`, `script`,
 `agent_sequence` or `env` is the exception: the scheduler accepts those fields at
 creation only, so the change is logged (and audited as
-`app_cron_resync_pending_reenable`) on every registration until the app is
-disabled and enabled again, which is when it reaches the job; the entry's other
+`app_cron_resync_pending_reenable`) on every registration until the job is
+recreated, which is when it reaches the job: the app is disabled and enabled
+again, or a Sync of an app with backend hooks reloads its code; the entry's other
 changed fields still land at once. A `message` cleared to empty is reported the
 same way, because the scheduler keeps the stored prompt on an empty value. A job registered
 by a build that did not yet record its entry is brought up to the manifest once,
@@ -286,20 +318,50 @@ each replaced field with its old and new value (a WARNING line ending in
 | `ui.entry` | string | | Path to ESM bundle (relative to ui/) |
 | `ui.pages[].route` | string | | URL path for the page |
 | `ui.pages[].label` | string | | Sidebar label |
-| `ui.pages[].icon` | string | | Lucide icon name (e.g. `"Shield"`, `"Package"`) |
+| `ui.pages[].icon` | string | | Lucide icon name (e.g. `"Shield"`, `"Package"`). Built-in apps only: an installed app's sidebar row shows the generic icon for it, so ship an image instead (`iconPath`, or `ui.pages[].iconUrl`) |
 | `ui.pages[].iconUrl` | string | | Custom active icon image path (relative to ui/) |
-| `ui.pages[].iconInactiveUrl` | string | | Optional inactive-state icon image path (relative to ui/) |
+| `ui.pages[].iconInactiveUrl` | string | | Optional sidebar icon for when the app is not selected (relative to ui/). Read from the first page. The sidebar row shows this file while another page is open, and the app's normal icon when its own page is open or the row is hovered. Use it for a greyed-out variant, the way built-in icons go grey. If the file fails to load, the row keeps the normal icon |
 | `ui.pages[].entryPoint` | string | | Per-page ESM bundle path, relative to ui/ (overrides `ui.entry`) |
 | `ui.pages[].mountFunction` | string | `"mount"` | Exported function name in the ESM bundle |
 | `ui.sidebar.section` | string | `"Apps"` | Sidebar section name |
 | `ui.sidebar.order` | number | `10` | Sort order within section |
 | `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
 | `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
+| `ui.loading.layout` | string | `"page"` | Placeholder shape shown while the bundle loads: `"page"`, `"rail"`, `"centered"` or `"split"` (see below) |
 | `contributes.sessionControls[].id` | string | | Control id, kebab-case; addressed as `<appName>:<id>` |
 | `contributes.sessionControls[].entryPoint` | string | | ESM bundle path for the control (relative to ui/) |
 | `contributes.sessionControls[].label` | string | | Accessible name, and the chip's tooltip |
 | `contributes.sessionControls[].icon` | string | | Icon name. Only `Shield`, `Bot`, `Search`, `Tag`, `Users`, `Zap`, `Star`, `Package`, `Cat`, `AudioLines` and `Mic` are rendered; any other name falls back to `Package`. Use `AudioLines` for a control that starts a voice conversation and `Mic` only for voice input: the composer's own dictation button already draws `Mic`, so a conversation chip with that glyph reads as a second dictation button |
 | `contributes.sessionControls[].statusPath` | string | | Optional backend route reporting per-session chip state (see below) |
+
+### `ui.loading` — Loading Placeholder Shape
+
+While your bundle downloads, the dashboard shows a placeholder. Nothing appears
+for the first 300 ms, so a fast load (the usual case on a local gateway) shows no
+placeholder at all. After that, the placeholder takes the shape you declare, so
+your page doesn't jump when it mounts:
+
+```json
+{
+  "ui": {
+    "entry": "dist/index.mjs",
+    "loading": { "layout": "rail" }
+  }
+}
+```
+
+| `layout` | Shape |
+|----------|-------|
+| `"page"` | Title bar, subtitle bar and content rows. The default |
+| `"rail"` | A 232px left column of list rows beside the main content |
+| `"centered"` | One narrow card in the middle of the page, e.g. a composer or a sign-in |
+| `"split"` | Two panes side by side, e.g. a list and a detail view |
+
+The shapes are drawn by the dashboard from its own skeleton pieces. You pick a
+name; you can't supply markup or styles. The match is exact: a missing or `null`
+`loading`, a non-object, a non-string `layout`, or an unknown name (including a
+different case, like `"Rail"`) all fall back to `"page"`. An invalid value is
+not an install error; it is dropped.
 
 ### `ui.overlays` — Replacing a Host Overlay Surface
 
@@ -637,6 +699,13 @@ installed at runtime.
 At most **10** rows per app.
 
 On activation core POSTs `{ item_id, surface, path, kind?, root? }` to `endpoint`.
+A successful JSON response may include a nonempty string `message` and an optional
+`url`. Core shows the message as plain text in a local
+host toast with a clickable HTTP(S) link. Unsafe URLs, including script/data
+schemes and credential-bearing URLs, are not linked. An absent, empty, or
+non-string message produces no toast. The toast holds only the latest result: a
+second result that arrives before the first hides replaces it. HTTP failures keep the existing host error
+notice; a toast neither grants access nor changes the endpoint's approval flow.
 
 **The file's PATH is sent, never its CONTENT.** A contributed row needs no
 permission to exist, so shipping file bytes with every activation would hand any
@@ -808,11 +877,12 @@ At most **one** provider per app; a link goes to the first enabled app whose
 the dashboard creates an iframe for the provider that is `sandbox="allow-scripts"`
 with no `allow-same-origin`, and loads a frame document the gateway serves at
 `/app-frame/<app>/linkPreviews/<id>/…` with its own `Content-Security-Policy: sandbox
-allow-scripts`. The frame's origin is opaque: it cannot read the dashboard's DOM,
+allow-scripts` (behind an authenticating reverse proxy that refuses that load, the
+same document is set as the frame's `srcdoc` instead, with the policy as a `<meta>`). The frame's origin is opaque: it cannot read the dashboard's DOM,
 its cookies, its storage or its token. The iframe is `credentialless`, the frame's
-CSP starts from `default-src 'none'` (scripts and network on the gateway only,
-images from any `https:` host, no workers, frames, objects, forms or `<base>`),
-and it is sent with `Referrer-Policy: no-referrer`. A frame that navigates itself
+CSP starts from `default-src 'none'` (scripts and
+network on the gateway only, images from any `https:` host, no workers, frames,
+objects, forms or `<base>`), and it sends no referrer. A frame that navigates itself
 away is removed. The frame imports `entry` and calls
 `activate(ctx)` once. The dashboard sends it only the hovered URL or text, the
 anchor's rect, the theme and the modifier keys, over `postMessage`, and it
@@ -899,6 +969,29 @@ failed frame and loads a new one for the same link, and a close button; Escape
 closes it too. Without Retry, the next hover at least 30 seconds later tries
 again. When the app is disabled the host sends `hide('disabled')`
 and `dispose`, then removes the frame.
+
+**Behind an authenticating reverse proxy, register your entry.** A sandboxed frame
+sends no cookie, so a proxy in front of the dashboard that signs every request in by
+cookie refuses the frame's own requests: its module import gets the proxy's login
+page. The dashboard then sets the frame document itself (`srcdoc`) when the load
+fails, and makes the frame's refused requests on its behalf (the same path, method, headers and capability).
+When the import is refused it fetches your module the same way and runs it inline,
+where no export can be read. For that path, also hand over `activate`:
+
+```js
+export function activate(ctx) { /* ... */ }
+globalThis.kirocrew?.register(activate)
+```
+
+`register` takes your `activate` function, called with `ctx` as the export is; anything
+else is ignored. It is read only on the
+inline path, so `activate` runs once either way, and the `?.` keeps the module
+loading on a host without the call. Keep the entry one self-contained file: an inline
+module's relative imports do not resolve. A module that only exports `activate` keeps
+working where its import is served (localhost, a plain port forward, a proxy that
+does not authenticate each request) and still fails behind an authenticating proxy.
+The same holds for every frame-backed point below (`messageActions`, `linkOpen`,
+`composerActions`, `selectionActions`).
 
 **Plain text (`textPatterns`).** Each entry names text that is not a link but should
 open the app's card:
@@ -1388,6 +1481,15 @@ popover says the app did not respond.
 > reason; the app itself still enables, since its other parts do not need the
 > backend.
 
+A Node backend gets its npm dependencies from the gateway, because an install
+never copies `node_modules`. Before the backend starts, the gateway runs
+`npm install --production` in every directory from the app root down to the
+entry point's own that has a `package.json` and no `node_modules`. So an
+`entryPoint` of `backend/dist/server.js` with its `package.json` in `backend/`
+gets `backend/node_modules`. This is how a local-path install gets its npm
+dependencies, since `setup.onInstall` does not run for one. A failed
+`npm install` is logged as a warning and the backend starts anyway.
+
 App backends are accessible through the Gateway's reverse proxy at
 `/apps/{name}/api/{path}`, which avoids CORS issues for dashboard UI pages.
 
@@ -1625,7 +1727,7 @@ packages at all.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `permissions.api` | string[] | Allowed API path prefixes. `/api/member-records/*` is the one that lets the app put a value on a Dashboard page of ANY crewmate it names by slug; there is no per-crewmate form of the grant ([api-reference](api-reference.md#member-records)) |
+| `permissions.api` | string[] | Allowed API path prefixes. `/api/member-records/*` is the one that lets the app put a value on a Dashboard page of ANY Bot it names by slug; there is no per-crewmate form of the grant ([api-reference](api-reference.md#member-records)) |
 | `permissions.events` | string[] | Allowed WebSocket event types |
 | `permissions.mcpTools` | string[] | Allowed MCP tool names |
 | `permissions.storage` | boolean | Can use app-scoped storage |
@@ -1635,7 +1737,7 @@ packages at all.
 | `permissions.sessionApproval` | boolean | Controls existing local user sessions: send messages (including generated response-option choices, but not a change to the session's agent binding, persona settings, or a harness slash command), approve or deny pending tool requests, and change approval modes within the limits below |
 | `permissions.spawn` | boolean | May start a background agent through the host's subagent manager (`ctx.spawn`) |
 | `permissions.jobs` | boolean | May run durable background work through `ctx.job` and the app-owned `_jobs/*` routes |
-| `permissions.proposeCrewmate` | boolean | **Preview, switched off**: `ctx.crewmate` stays `None` until the owner view that lists the cards lands (#21718). May propose one crewmate from a `.crewmate` bundle through `ctx.crewmate`. Gates a real capability like `spawn`: `ctx.crewmate` is absent unless the value is literally `true`. Each proposal is an owner change card; only the owner's press creates the crewmate ([api-reference](api-reference.md#crewmate-proposals-ctxcrewmate)) |
+| `permissions.proposeCrewmate` | boolean | **Preview, switched off**: `ctx.crewmate` stays `None` until the owner view that lists the cards lands (#21718). May propose one Bot from a `.crewmate` bundle through `ctx.crewmate`. Gates a real capability like `spawn`: `ctx.crewmate` is absent unless the value is literally `true`. Each proposal is an owner change card; only the owner's press creates the Bot ([api-reference](api-reference.md#bot-proposals-ctxcrewmate)) |
 | `permissions.exposeToApps` | string[] | App names (or `"*"`) allowed to request cross-app visibility into this app's slots/subagents |
 
 #### `permissions.spawn` — Background Agents
@@ -1753,10 +1855,11 @@ installs do not run `onInstall`; build first, then install. The `onEnable`,
 **not run on native Windows** (which has no `/bin/bash`): the runner refuses the
 hook before any process is started and reports a failure whose message names the
 unsupported platform, rather than letting the spawn fail opaquely and look like
-your script breaking. `onInstall` also runs through `/bin/bash`, without that
-up-front refusal, so a registry install of an app that declares it fails on a
-native-Windows host. Write hooks for POSIX shells; do not rely on them running
-on a native-Windows host.
+your script breaking. `onInstall` also runs through `/bin/bash` and gets the
+same up-front refusal: a registry install or update of an app that declares it
+fails on a native-Windows host with an error naming the unsupported platform,
+before the script is started. Write hooks for POSIX shells; do not rely on them
+running on a native-Windows host.
 
 **Exception — `platform.installMode: "client"` apps.** For a client app the
 script is **advisory**: a failure is reported on the response as
@@ -1949,11 +2052,16 @@ For apps that run outside the dashboard (e.g. Electron apps), the top-level
 
 `POST /api/apps/{name}/open` runs this command in the background. On a
 cloud/remote environment with no display, the endpoint returns the command for
-the user to run locally instead of executing it on the server. On native
-Windows, which has no `/bin/sh`, the command is not run: the endpoint answers
-409 with `code: "app_open_unsupported_platform"` and an error naming the
-platform. The same refusal covers a registry entry's `detectInstalled` probe,
-which reads not-installed there and logs one warning.
+the user to run locally instead of executing it on the server. A Linux gateway
+whose own environment names no display, such as the installed service, first
+asks the user's systemd manager for the desktop login's session, the same
+lookup the dashboard's file manager uses, and launches when that session is
+live. That is a fact about the gateway host, not the caller: the window opens
+on that host's screen, as it does on macOS. On native Windows, which has no
+`/bin/sh`, the command is not run: the endpoint answers 409 with
+`code: "app_open_unsupported_platform"` and an error naming the platform. The
+same refusal covers a registry entry's `detectInstalled` probe, which reads
+not-installed there and logs one warning.
 
 #### `openCommand` — Environment
 
@@ -1979,9 +2087,13 @@ hints a desktop launch needs:
   scrub's other targets (`AWS_SECRET*` / `AWS_SESSION*`, `GNUPGHOME`,
   `GIT_ASKPASS`, the gateway's channel credentials) are not in the allowlist to
   begin with.
-- **Desktop hints copied on top**, each only when the gateway itself has it:
+- **Desktop hints copied on top**, each only when the gateway or its desktop
+  session has it:
   `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`,
-  `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`.
+  `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP`. When the gateway names no display
+  and the desktop session above answered, each display, X cookie or desktop
+  name that session names replaces the gateway's own, each value checked
+  first; the session never supplies a bus address.
 
 The two user-bus locators, `XDG_RUNTIME_DIR` (from the allowlist) and
 `DBUS_SESSION_BUS_ADDRESS` (from the desktop hints), **reach the child** on this

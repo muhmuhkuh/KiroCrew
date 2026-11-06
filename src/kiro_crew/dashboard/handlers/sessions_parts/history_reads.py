@@ -202,7 +202,7 @@ def _has_user_content(log: object, row: dict) -> bool:
     if row.get("title", key) != key:
         return True
     try:
-        return bool(log.has_messages(key))  # type: ignore[attr-defined]
+        return bool(log.listing_has_messages(key))  # type: ignore[attr-defined]
     except OSError:
         # Unreadable is not empty: never hide what could not be read.
         return True
@@ -289,12 +289,16 @@ async def api_sessions(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     if not state.conversation_log:
         return web.json_response({"sessions": [], "total": 0, "has_more": False})
+    # Both bounds are floored, not just capped: the page below is a Python list
+    # slice, where a negative bound counts from the END: ``offset=-3`` would read
+    # the far end of the list, and ``limit=-5`` would return every row but five,
+    # past the 200-row cap.
     try:
-        limit = min(int(request.query.get("limit", "50")), 200)
+        limit = max(1, min(int(request.query.get("limit", "50")), 200))
     except (TypeError, ValueError):
         limit = 50
     try:
-        offset = int(request.query.get("offset", "0"))
+        offset = max(0, int(request.query.get("offset", "0")))
     except (TypeError, ValueError):
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")

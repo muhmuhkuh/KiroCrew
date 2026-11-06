@@ -176,14 +176,13 @@ export default [
       // that ignores every theme token and blocks the whole renderer thread.
       // The dashboard owns these decisions in-app: destructive choices go
       // through useConfirm() / ConfirmDialog, errors and acknowledgements
-      // through the in-app notice and status surfaces. The window-qualified
-      // forms (`window.confirm`) reach the same globals, so no-restricted-
-      // properties pairs with no-restricted-globals to cover both spellings.
+      // through the in-app notice and status surfaces. Qualified calls bypass
+      // no-restricted-globals, so no-restricted-properties covers them.
       //
       // 'error', not 'warn': like the native-<select> gate above this is a gate
       // on a set that only shrinks, so it stays out of the --max-warnings budget
       // where a real regression would be indistinguishable from unrelated noise.
-      // The 32 modules that still call these globals are exempted by name in the
+      // The modules that still call these globals are exempted by name in the
       // allowlist block below (see issue #15662); every other renderer file is
       // refused a new call. Electron main-process dialogs live outside src/ and
       // are untouched. Tests drive these globals through the harness and are
@@ -195,8 +194,14 @@ export default [
       ],
       'no-restricted-properties': ['error',
         { object: 'window', property: 'confirm', message: 'No window.confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { object: 'globalThis', property: 'confirm', message: 'No globalThis.confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
+        { object: 'self', property: 'confirm', message: 'No self.confirm() — use useConfirm() / ConfirmDialog. See issue #15662.' },
         { object: 'window', property: 'alert', message: 'No window.alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { object: 'globalThis', property: 'alert', message: 'No globalThis.alert() — route through the in-app notice or status surface. See issue #15662.' },
+        { object: 'self', property: 'alert', message: 'No self.alert() — route through the in-app notice or status surface. See issue #15662.' },
         { object: 'window', property: 'prompt', message: 'No window.prompt() — use the native text-entry dialog. See issue #15662.' },
+        { object: 'globalThis', property: 'prompt', message: 'No globalThis.prompt() — use the native text-entry dialog. See issue #15662.' },
+        { object: 'self', property: 'prompt', message: 'No self.prompt() — use the native text-entry dialog. See issue #15662.' },
       ],
       // A native <select> renders an OS-drawn popup: it ignores every theme
       // token, cannot be styled per row, and looks nothing like the rest of the
@@ -220,18 +225,16 @@ export default [
     // Allowlist for no-restricted-globals / no-restricted-properties: the
     // renderer modules that still call a browser-native confirm/alert/prompt
     // today (issue #15662). The gate above is 'error' for every OTHER renderer
-    // file, so a NEW native dialog anywhere else is refused; these 32 are the
+    // file, so a NEW native dialog anywhere else is refused; these are the
     // standing inventory, migrated to useConfirm() / in-app surfaces in later
     // PRs. This list only SHRINKS: delete a path the moment its last native
     // dialog is gone, never add one. Keep it sorted.
     files: [
       'src/apps/auto-improvement/AutoImprovementPage.tsx',
       'src/apps/auto-research/ResearchLabPage.tsx',
-      'src/apps/crew-companion/GalleryPanel.tsx',
       'src/apps/design-tweak/DesignTweakPage.tsx',
       'src/apps/meetings/MeetingView.tsx',
       'src/apps/meetings/MeetingsPage.tsx',
-      'src/apps/mochi/src/renderer/GalleryPanel.tsx',
       'src/apps/papyrus/PapyrusPage.tsx',
       'src/apps/papyrus/ProjectList.tsx',
       'src/components/RestartButton.tsx',

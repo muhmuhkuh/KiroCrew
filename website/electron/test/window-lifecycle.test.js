@@ -75,22 +75,25 @@ describe("every token-bearing navigation stays on the configured origin", () => 
     .join("\n")
     .replace(/\r\n/g, "\n");
 
-  /** Lines composing a credential onto a base, with the 4 lines before each. */
+  /** A load that signs in with a token (the helper keeps it out of the address). */
+  const isTokenedLoad = (line) => /loadDashboardWithToken\(/.test(line) && !/require\(/.test(line);
+  /** A line that writes a token into a URL. */
+  const composesToken = (line) => /\?token=\$\{/.test(line) || /searchParams\.set\(\s*"token"/.test(line);
+  /** A line that re-derives an origin as a fallback. */
+  const rebasesOrigin = (line) => /\$\{\s*\w*[Oo]rigin\s*\|\|/.test(line) || /loopbackOrigin/.test(line);
+
+  /** The lines of *text* that *isSite* matches, each with its index. */
   function credentialSites(text, isSite) {
-    const lines = text.split("\n");
-    return lines
-      .map((line, index) => ({ line, index, before: lines.slice(Math.max(0, index - 4), index + 1) }))
+    return text.split("\n")
+      .map((line, index) => ({ line, index }))
       .filter(({ line }) => isSite(line));
   }
 
   it("never re-bases a token-bearing navigation onto a different origin", () => {
     // A structural guard rather than a behavioural one, because the failure mode
-    // is a NEW navigation site added later on a path no test drives.
-    const offenders = credentialSites(
-      SOURCE,
-      (line) => /\?token=\$\{/.test(line) || /searchParams\.set\(\s*"token"/.test(line),
-    )
-      .filter(({ line }) => /\$\{\s*\w*[Oo]rigin\s*\|\|/.test(line) || /loopbackOrigin/.test(line))
+    // is a NEW navigation site added later on a path no test drives. The URL a
+    // load signs in to is built lines above the call, so no line may re-derive one.
+    const offenders = credentialSites(SOURCE, rebasesOrigin)
       .map(({ line, index }) => `window-lifecycle.js:${index + 1}: ${line.trim()}`);
 
     assert.deepEqual(
@@ -101,13 +104,18 @@ describe("every token-bearing navigation stays on the configured origin", () => 
   });
 
   it("covers every navigation site rather than passing on an empty scan", () => {
-    // Control for the guard above: an empty offender list must mean the sites
-    // are right, not that the pattern matched nothing.
-    const sites = credentialSites(
-      SOURCE,
-      (line) => /\?token=\$\{/.test(line) || /searchParams\.set\(\s*"token"/.test(line),
-    );
+    // Control for the guard above: the token-bearing loads exist, and each goes
+    // through the one loader that signs the window in.
+    const sites = credentialSites(SOURCE, isTokenedLoad);
     assert.ok(sites.length >= 4, `expected at least 4 token-bearing sites, found ${sites.length}`);
+  });
+
+  it("never puts the token in a dashboard load's address", () => {
+    // Chromium logs a page's address beside every console line (#11189).
+    const inAddress = [["window-lifecycle.js", SOURCE], ["gateway-supervisor.js", SUPERVISOR]]
+      .flatMap(([name, text]) => credentialSites(text, composesToken)
+        .map(({ line, index }) => `${name}:${index + 1}: ${line.trim()}`));
+    assert.deepEqual(inAddress, [], "a dashboard load carries the token in its address");
   });
 
   it("never drops the origin on a fallback that still carries a credential", () => {
@@ -1782,5 +1790,82 @@ describe("gateway port prompt", () => {
       await settle();
       assert.deepEqual(ports, expected, `answer ${JSON.stringify(answer)}`);
     }
+  });
+});
+
+// ── Close button: background vs quit (#12204) ───────────────────────────────
+
+describe("main window close action", () => {
+  function closeHandlerBody() {
+    const start = SOURCE.indexOf('mainWindow.on("close", createCloseHandler({');
+    assert.notEqual(start, -1, "main window close handler must be built by createCloseHandler");
+    return SOURCE.slice(start, SOURCE.indexOf("\n    }));\n", start));
+  }
+
+  it("wires the close listener to the store, the tray hide, requestQuit and persist", () => {
+    // The sequence itself is exercised behaviourally in close-action.test.js;
+    // this pins that the main window feeds it the real effects.
+    const body = closeHandlerBody();
+    assert.match(body, /getAction: \(\) => getCloseAction\(store\)/);
+    assert.match(body, /cancelPendingTrayHide\(mainWindow\)/);
+    assert.match(body, /^\s*requestQuit,$/m);
+    assert.match(body, /hideToTray\(mainWindow, \{/);
+    assert.match(body, /persist\(\);/);
+  });
+
+  function facadeHarness(stored = {}) {
+    const data = { ...stored };
+    const writes = [];
+    const store = {
+      get: (key) => data[key],
+      set: (key, value) => { writes.push([key, value]); data[key] = value; },
+    };
+    const lifecycle = createWindowLifecycle(validOptions({ store }));
+    return { lifecycle, data, writes };
+  }
+
+  it("the facade reads and writes the stored choice, canonicalized", () => {
+    const h = facadeHarness();
+    assert.equal(h.lifecycle.closeAction.get(), "background", "an untouched install keeps running");
+    assert.equal(h.lifecycle.closeAction.set("quit"), "quit");
+    assert.equal(h.data.closeAction, "quit");
+    assert.equal(h.lifecycle.closeAction.get(), "quit");
+    assert.equal(h.lifecycle.closeAction.set("nonsense"), "background");
+    assert.equal(h.data.closeAction, "background");
+  });
+
+  it("the facade skips a write that changes nothing", () => {
+    const h = facadeHarness({ closeAction: "quit" });
+    h.lifecycle.closeAction.set("quit");
+    assert.deepEqual(h.writes, []);
+    h.lifecycle.closeAction.set("background");
+    assert.deepEqual(h.writes, [["closeAction", "background"]]);
+  });
+
+  it("the tray menu is unchanged: the setting lives only in Settings", () => {
+    const menus = [];
+    const lifecycle = createWindowLifecycle(validOptions({
+      electron: {
+        app: { name: "Kiro Crew", getVersion: () => "0.8.0", getPath: () => "/virtual/logs" },
+        Tray: class {
+          setToolTip() {}
+          setContextMenu() {}
+          on() {}
+        },
+        Menu: { buildFromTemplate: (template) => { menus.push(template); return { template }; } },
+        nativeImage: {
+          createFromPath: () => ({ resize: () => ({ fake: "icon" }), setTemplateImage() {} }),
+        },
+        shell: {},
+      },
+      store: { path: "/virtual/config.json", get: () => undefined, set() {} },
+      platform: "linux",
+      env: {},
+    }));
+    lifecycle.createTray();
+    assert.deepEqual(
+      menus[0].map((item) => item.label || item.type),
+      ["Show Kiro Crew", "separator", "New Connection Window…", "separator", "Open Config File", "separator", "Quit"],
+    );
   });
 });

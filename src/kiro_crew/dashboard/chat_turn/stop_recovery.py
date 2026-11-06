@@ -5,7 +5,6 @@ landed turn's reset of every retry budget, and consolidation."""
 
 from __future__ import annotations
 
-import asyncio
 import re
 from typing import TYPE_CHECKING, Literal
 
@@ -40,7 +39,7 @@ if TYPE_CHECKING:
         runtime_death,
         save_slot_off_loop,
     )
-    from kiro_crew.dashboard.chat_turn.file_changes import _flush_file_changes, _turn_after_reads
+    from kiro_crew.dashboard.chat_turn.file_changes import _flush_file_changes_off_loop
     from kiro_crew.dashboard.chat_turn.recovery import (
         _COMPACTION_FAILED_RETRIES,
         _should_suppress_requeue,
@@ -71,6 +70,10 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
 
     _is_synthetic = turn._is_synthetic
     _prompt_depth = turn._prompt_depth
+    # A turn the agent started has no prompt to continue or replay, so it takes
+    # the arms a nested turn takes below: it gives up with its notice, spends no
+    # retry budget and queues nothing.
+    _requeues = _prompt_depth == 0 and not turn._agent_started
     _stall_command = turn._stall_command
     _stall_evidence = turn._stall_evidence
     _stall_status = turn._stall_status
@@ -108,7 +111,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
         # above the recovery card.
         await _persist_partial_reply(turn, _stop_reason)
 
-        if _prompt_depth == 0 and slot._stale_recovery_retries < STOP_RECOVERY_MAX_RETRIES:
+        if _requeues and slot._stale_recovery_retries < STOP_RECOVERY_MAX_RETRIES:
             slot._stale_recovery_retries += 1
             _queue_recovery(
                 turn,
@@ -170,7 +173,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
         _stuck = (
             _stall_status is not None and _stall_status.wait_reason == WAIT_REASON_INPUT
         ) or "stuck_input" in (_stall_evidence or "")
-        if _prompt_depth == 0 and slot._tool_stall_retries < STOP_RECOVERY_MAX_RETRIES:
+        if _requeues and slot._tool_stall_retries < STOP_RECOVERY_MAX_RETRIES:
             slot._tool_stall_retries += 1
             _body = build_tool_stall_recovery_prompt(
                 _stall_tool_title,
@@ -247,7 +250,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
             # repeat a side effect, so an emitted turn keeps the old
             # give-up behaviour rather than inventing a continuation.
             and not _turn_emitted
-            and _prompt_depth == 0
+            and _requeues
             and slot._compaction_failed_retries < _COMPACTION_FAILED_RETRIES
             # The USER'S INTENT WINS over this recovery. A requeue lands at
             # queue index 0, so without these four checks a message the user
@@ -330,7 +333,7 @@ async def _turn_stop_recovery(turn: _ChatTurn) -> Literal[_Flow.END] | None:
         # after three own-fault deaths a shared one would read as 1 and hand
         # the slot fresh attempts it had used up.
         _death_attempts = max(slot._acp_pipe_death_retries, runtime_death.shared_deaths(slot.key))
-        if _prompt_depth == 0 and _death_attempts < SESSION_RECOVERY_MAX_ATTEMPTS:
+        if _requeues and _death_attempts < SESSION_RECOVERY_MAX_ATTEMPTS:
             if _own_fault:
                 slot._acp_pipe_death_retries += 1
             else:
@@ -438,31 +441,24 @@ async def _turn_persist_and_settle(turn: _ChatTurn) -> None:
         turn._turn_footer_attached = True
         if _prompt_depth == 0 and _stats_attached:
             slot._carried_ttft_clock = None
-        # Attach accumulated file changes to this turn's assistant row before persist.
-        # The turn-end disk reads and diffs (a whole file of up to two megabytes
-        # for a large edited file) run off the event loop; the flush then applies
-        # them to the slot here, on the loop. The teardown flush in
-        # _turn_release_handles (chat_turn/turn_entry.py) reads inline without them: it
-        # runs where an await could skip the session-permit release, so it keeps the
-        # ordinary capped read only.
-        _changes_now = getattr(slot, "_file_changes", None)
-        _after_reads = (
-            await asyncio.to_thread(_turn_after_reads, list(_changes_now), bool(_shell_tool_calls))
-            if isinstance(_changes_now, list) and _changes_now
-            else None
-        )
+        # Attach accumulated file changes to this turn's assistant row before
+        # persist. Awaited: the turn-end disk reads, diffs (a whole file of up
+        # to two megabytes for a large edited file), redaction and budget run
+        # on a worker thread, and the attach has happened when this returns,
+        # so the save below still carries the chips. A cancellation that
+        # lands during the read is re-raised after the attach, into this
+        # turn's own CancelledError arm.
         # Copied before the flush, which clears the reply ids on exit.
         _note_reply_mids = list(_reply_mids) if isinstance(_reply_mids, list) else []
         # The Slack mirror leg (_turn_stop_hook) runs AFTER this flush, so it reads
         # the snapshot rather than the cleared live list to publish the whole
         # answer (see _turn_full_reply_text).
         turn._reply_mids_snapshot = _note_reply_mids
-        _flush_file_changes(
+        await _flush_file_changes_off_loop(
             slot,
             turn_boundary=_turn_msg_boundary,
             turn_start_mid=_turn_start_mid,
             turn_had_shell=bool(_shell_tool_calls),
-            after_reads=_after_reads,
         )
         # The reply is in the window, so this save is the durable clear of
         # the in-flight marker: retire it first and the omission rides the

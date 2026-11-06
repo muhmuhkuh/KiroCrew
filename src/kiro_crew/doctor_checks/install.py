@@ -260,6 +260,61 @@ def _doctor_skill_currency(issues: list[str]) -> None:
         )
 
 
+#: Basename of Toolbox's shared dispatcher. Every Toolbox tool name on PATH is a
+#: link to it, and it picks the tool from the name it was invoked as.
+_TOOLBOX_DISPATCHER = "toolbox-exec"
+
+
+def _toolbox_launcher_runs_this_version(on_path: str) -> bool:
+    """Whether *on_path* is the Toolbox dispatcher and runs this install's version.
+
+    A path comparison cannot answer this for Toolbox: ``on_path`` resolves to the
+    one dispatcher every tool shares, never to this install's own binary. So when
+    THIS install is Toolbox-managed and ``on_path`` resolves to that dispatcher,
+    ask it: ``--version`` run through the PATH spelling (the dispatcher reads its
+    argv[0]) must print exactly this install's version line. Any other answer --
+    another version, a failed or timed-out run, unreadable output, a host that
+    cannot build the sandbox -- is False, so the caller keeps its warning.
+
+    The launcher is whatever ``which`` found first on PATH, so a file an agent
+    wrote into a PATH directory (an activated worktree venv, say) can reach this
+    point. It is run the way an agent-influenced command is: through the sandbox
+    chokepoint with a credential-scrubbed environment and the kernel resource
+    ceiling, never bare with this process's privileges.
+    """
+    import subprocess
+
+    from kiro_crew import env, version_line
+
+    if os.path.basename(os.path.realpath(on_path)) != _TOOLBOX_DISPATCHER:
+        return False
+    if not env.is_toolbox_install():
+        return False
+    sandbox = cli_doctor.sandbox
+    try:
+        wrapped, child_env, cleanup = sandbox.sandboxed_spawn_argv(
+            [on_path, "--version"], mode="strict", strip_python_env=True
+        )
+    except (RuntimeError, OSError):
+        return False
+    try:
+        result = sandbox.run_limited(
+            wrapped,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            env=child_env,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if cleanup:
+            Path(cleanup).unlink(missing_ok=True)
+    return result.returncode == 0 and result.stdout.strip() == version_line()
+
+
 def _doctor_path_launcher() -> None:
     """Report which install the ``kirocrew`` command on PATH actually belongs to.
 
@@ -286,6 +341,11 @@ def _doctor_path_launcher() -> None:
     if not os.path.isabs(running) or os.path.realpath(on_path) == os.path.realpath(running):
         # Canonical spelling, matching the Data Home row and the comparison above.
         print(f"  kirocrew CLI: ✅ {os.path.realpath(on_path)}")
+        return
+    if _toolbox_launcher_runs_this_version(on_path):
+        # The realpath is Toolbox's shared dispatcher, so the PATH spelling is the
+        # one that names the tool.
+        print(f"  kirocrew CLI: ✅ {on_path} (Toolbox launcher, same version)")
         return
     print("  ⚠ kirocrew CLI on PATH belongs to a different install than this one.")
     # Paths are printed UNWRAPPED, one per line: a wrapped path cannot be copied
@@ -722,3 +782,33 @@ def _doctor_tz_data(issues: list[str]) -> None:
     else:
         print("               Fix: update Kiro Crew, then restart the gateway.")
     issues.append("timezone data out of date")
+
+
+def _doctor_tls_trust(issues: list[str]) -> None:
+    """Report, on macOS, whether HTTPS clients trust the system trust store.
+
+    A CA installed in the Keychain (a corporate or MDM root) is trusted only
+    through the system trust store. When it could not be enabled, HTTPS falls back
+    to file-based CAs and a download behind such a root fails certificate
+    verification, so this is an issue. An operator's ``SSL_CERT_FILE`` is their
+    choice and only reported. No row off macOS.
+    """
+    from kiro_crew import _ssl_compat
+
+    state, detail = _ssl_compat.macos_trust_state()
+    if state == _ssl_compat.TRUST_NOT_MACOS:
+        return
+    if state == _ssl_compat.TRUST_SYSTEM:
+        print("  tls trust:   ✅ macOS system trust store")
+        return
+    if state == _ssl_compat.TRUST_OPERATOR_BUNDLE:
+        print(
+            f"  tls trust:   ✅ SSL_CERT_FILE={render._safe_display(detail)} (Keychain CAs not used)"
+        )
+        return
+    print("  tls trust:   ❌ macOS system trust store not in use")
+    print(f"               {render._safe_display(detail)}")
+    print("               CAs installed in the Keychain are not trusted, so an HTTPS")
+    print("               download behind a corporate root fails verification.")
+    print("               Fix: update or reinstall Kiro Crew, then restart the gateway.")
+    issues.append("tls trust")

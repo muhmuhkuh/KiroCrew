@@ -655,6 +655,16 @@ def _builtin_adoption_markers(raw: object) -> dict[str, dict[str, object]]:
     return {name: dict(marker) for name, marker in coerce_adoption_markers(raw).items()}
 
 
+def _builtin_adoption_nav(raw: object) -> dict[str, dict[str, str]]:
+    """``agent.apps_builtin_adoption_nav``: the legacy nav recorded at adoption, validated."""
+    from kiro_crew.apps.builtin_adoption_markers import coerce_adoption_nav
+
+    return {
+        name: {"route": nav["route"], "icon": nav["icon"]}
+        for name, nav in coerce_adoption_nav(raw).items()
+    }
+
+
 def _build_agent_config(agent_data: dict) -> AgentConfig:
     section = _sections.SectionReader(AgentConfig, agent_data)
     return AgentConfig(
@@ -678,6 +688,9 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         acp_failover=_sections.normalize_acp_failover(section.get("acp_failover")),
         kas_bundle=section.read("kas_bundle", _safe_bool),
         kas_persist_mcp_sign_in=section.read("kas_persist_mcp_sign_in", _safe_bool),
+        kas_refuse_plain_http_mcp_headers=section.read(
+            "kas_refuse_plain_http_mcp_headers", _safe_bool
+        ),
         kas_bundle_url=_sections.coerce_kas_bundle_url(section.get("kas_bundle_url")),
         native_skill_projection=section.read("native_skill_projection", _safe_bool),
         default_agent=section.get("default_agent"),
@@ -732,6 +745,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
             else section.default("apps_default_installs_applied")
         ),
         apps_builtin_adoption=_builtin_adoption_markers(section.get("apps_builtin_adoption")),
+        apps_builtin_adoption_nav=_builtin_adoption_nav(section.get("apps_builtin_adoption_nav")),
         apps_ui_stream_timeout_secs=section.read("apps_ui_stream_timeout_secs", _safe_int, 5, 600),
         jail=_normalize_jail(section.get("jail")),
         dangerously_skip_permissions=_read_skip_permissions(agent_data),
@@ -741,6 +755,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         tool_search_min_pct=section.read("tool_search_min_pct", _safe_int),
         tool_search_min_tokens=section.read("tool_search_min_tokens", _safe_int),
         session_sharing=bool(section.get("session_sharing")),
+        agent_started_turns=bool(section.get("agent_started_turns")),
         max_subagents=section.read("max_subagents", _safe_int, 0, SUBAGENT_AUTO_MAX_CEILING),
         max_stop_hook_nudges=section.read("max_stop_hook_nudges", _safe_int, 0),
         subagent_mem_buffer_pct=section.read("subagent_mem_buffer_pct", _safe_int),
@@ -895,6 +910,7 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # Same band workflows/service.py clamp_run_timeout enforces, so a
         # hand-edited file and the live-bound setter agree.
         workflow_run_timeout_secs=section.read("workflow_run_timeout_secs", _safe_int, 60, 21600),
+        kas_workflows=section.read("kas_workflows", _safe_bool),
         subagent_cwd_allowed_roots=(
             [r for r in _roots if isinstance(r, str)]
             if isinstance(_roots := agent_data.get("subagent_cwd_allowed_roots"), list)

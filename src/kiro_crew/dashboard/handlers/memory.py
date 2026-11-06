@@ -573,6 +573,10 @@ async def api_memory_history(request: web.Request) -> web.Response:
     return _memory_document_response(content)
 
 
+class _MemorySectionNotObject(Exception):
+    """config.json's ``memory`` entry is present but is not a JSON object."""
+
+
 async def api_memory_settings(request: web.Request) -> web.Response:
     """GET/PUT /api/memory/settings — memory consolidation config."""
     cfg = KiroCrewConfig.load()
@@ -640,11 +644,27 @@ async def api_memory_settings(request: web.Request) -> web.Response:
             # is no change to persist.
             if not updates:
                 return None
-            data.setdefault("memory", {}).update(updates)
+            section = data.setdefault("memory", {})
+            if not isinstance(section, dict):
+                # Refuse rather than replace it with {}: whatever the person put
+                # there is theirs to fix, and nothing is written.
+                raise _MemorySectionNotObject
+            section.update(updates)
             return data
 
         try:
             await run_config_write(update_config_locked, config_path(), mutate=_apply)
+        except _MemorySectionNotObject:
+            return web.json_response(
+                {
+                    "error": (
+                        "config.json has a 'memory' entry that is not an object; "
+                        "fix or remove it, then save again"
+                    ),
+                    "code": "config_section_not_object",
+                },
+                status=409,
+            )
         except ConfigReadError:
             # Fail closed: writing back a {} baseline would drop every other setting.
             logger.exception("Refusing to save memory settings: config unreadable")
@@ -959,8 +979,18 @@ async def _set_migrated(value: bool) -> None:
     ``on_corrupt="fail"``, which is exactly that contract.
     """
 
-    def _apply(data: dict) -> dict:
-        data.setdefault("memory", {})["migrated"] = value
+    skipped_not_object = False
+
+    def _apply(data: dict) -> dict | None:
+        nonlocal skipped_not_object
+        section = data.setdefault("memory", {})
+        if not isinstance(section, dict):
+            # Same fail-closed contract as an unparseable file: keep the
+            # person's entry as written and write nothing. `None` tells
+            # update_config_locked there is no change to persist.
+            skipped_not_object = True
+            return None
+        section["migrated"] = value
         return data
 
     try:
@@ -969,6 +999,12 @@ async def _set_migrated(value: bool) -> None:
         logger.warning(
             "config.json is unparseable; skipping memory.migrated write to "
             "avoid clobbering other settings — will retry next boot"
+        )
+        return
+    if skipped_not_object:
+        logger.warning(
+            "config.json has a 'memory' entry that is not an object; skipping "
+            "memory.migrated write to leave it as written — will retry next boot"
         )
 
 
@@ -1082,9 +1118,10 @@ async def api_memory_stats(request: web.Request) -> web.Response:
     stats["embedding_provider"] = cfg.memory.embedding_provider
     stats["migrated"] = cfg.memory.migrated
     # Legacy markdown presence (diagnostics; migration is automatic at boot).
+    # Offload: it reads two markdown files, globs history/ and stats lessons.jsonl.
     from kiro_crew.memory import legacy_memory_present  # noqa: F811
 
-    stats["has_legacy_memory"] = legacy_memory_present()
+    stats["has_legacy_memory"] = await asyncio.to_thread(legacy_memory_present)
     return web.json_response(stats)
 
 
@@ -1241,7 +1278,13 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
     if body_err is not None:
         return body_err
     assert body is not None  # read_bounded_json returns (dict, None) on success
-    key = body.get("key", "").strip()
+    key = body.get("key", "")
+    if not isinstance(key, str):
+        return web.json_response(
+            {"error": "session key must be a string", "code": "invalid_session_key"},
+            status=400,
+        )
+    key = key.strip()
     if not key:
         return web.json_response({"error": "session key required"}, status=400)
     from kiro_crew.context import store_of_session
@@ -1469,8 +1512,9 @@ async def api_memory_graph(request: web.Request) -> web.Response:
     mem = _get_memory(state)
 
     try:
+        partial: dict[str, bool] = {}
         nodes, edges = await asyncio.to_thread(
-            lambda: _build_memory_graph(mem, state.lessons.load_all())
+            lambda: _build_memory_graph(mem, state.lessons.load_all(), partial)
         )
 
         for n in nodes:
@@ -1480,7 +1524,8 @@ async def api_memory_graph(request: web.Request) -> web.Response:
         _sel().log_tool_invocation(
             session_key="dashboard", tool_name="memory_graph", outcome="success"
         )
-        return web.json_response({"nodes": nodes, "edges": edges})
+        # ``partial`` says which capped populations left rows out of the graph.
+        return web.json_response({"nodes": nodes, "edges": edges, "partial": partial})
     except Exception:
         logging.getLogger(__name__).exception("memory_graph failed")
         _sel().log_tool_invocation(
@@ -1507,6 +1552,10 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         api_memory_embedding_model,
         api_memory_embedding_status,
         api_memory_enable_embeddings,
+    )
+    from kiro_crew.dashboard.handlers.memory_graph import (  # noqa: F401
+        GRAPH_LESSON_LIMIT,
+        GRAPH_SEMANTIC_LIMIT,
     )
     from kiro_crew.dashboard.handlers.memory_services import (  # noqa: F401
         _get_vector_store,

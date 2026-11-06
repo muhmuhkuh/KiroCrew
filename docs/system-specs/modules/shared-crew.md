@@ -724,7 +724,7 @@ else has joined hides the control and the bylines (`useSharedCrewListView`,
 `SharedCrewBylineContext`; see People and setup modes). A creator-filtered row
 matches its catalog key against the full local live-slot roster by normalized
 session identity, including slots outside the chat-only sidebar projection.
-A live crewmate conversation opens its owning surface through `opensElsewhereOf`;
+A live Bot conversation opens its owning surface through `opensElsewhereOf`;
 a live chat switches with the actual slot key and passes that key to the host.
 Only a catalog row with no live match goes through `resumeFromHistory`.
 
@@ -1004,7 +1004,8 @@ automation, so a person cannot gain a second budget through automation.
 Native Slack's capacity entry uses its dispatcher's `_is_control_message`
 predicate, so bang commands such as `!yolo off` and modifier-only messages reach
 their existing sender and channel-policy checks without waiting for model
-capacity. Mention and privacy-token parsing are shared with dispatch; a privacy
+capacity. An OPTIONS answer (`interpret_commands=False`) is never a control there
+and waits for capacity. Mention and privacy-token parsing are shared with dispatch; a privacy
 modifier with a remaining prompt still faces admission. Model messages re-enter
 the full handler after admission, preserving its start-time checks. Telegram and
 `ChannelTurns` callers dispatch commands before entering their turn gates.

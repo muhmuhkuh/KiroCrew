@@ -33,6 +33,7 @@ from kiro_crew.acp.harness import KasHarness, KiroHarness
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
     ACP_BACKEND_CODEX,
+    ACP_BACKEND_COPILOT,
     ACP_BACKEND_DEEPSEEK,
     ACP_BACKEND_GOOSE,
     ACP_BACKEND_KAS,
@@ -48,6 +49,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
+    ACP_BACKENDS_STEER_RETRACT,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_CLIENT_CAPABILITIES,
@@ -55,6 +57,7 @@ from kiro_crew.acp.types import (
     PROVIDER_LABEL_BY_BACKEND,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_CODEX,
+    PROVIDER_LABEL_COPILOT,
     PROVIDER_LABEL_DEEPSEEK,
     PROVIDER_LABEL_DEFAULT,
     PROVIDER_LABEL_GOOSE,
@@ -294,7 +297,9 @@ def test_member_capabilities_are_opt_in() -> None:
     for provider in (providers_acp.AcpProvider, AcpSessionProvider):
         source = inspect.getsource(provider.member_tool_limits_supported.fget)
         assert "in ACP_BACKENDS_MEMBER_TOOL_LIMITS" in source
-    assert ACP_BACKENDS_MEMBER_TOOL_LIMITS == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+    assert ACP_BACKENDS_MEMBER_TOOL_LIMITS == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CLAUDE}
+    )
 
 
 def test_the_mate_worker_takes_the_member_rule() -> None:
@@ -639,6 +644,7 @@ def test_capability_sets_are_subsets_of_known_backends() -> None:
         ("ACP_BACKENDS_SESSION_SHARING", ACP_BACKENDS_SESSION_SHARING),
         ("ACP_BACKENDS_STEER", ACP_BACKENDS_STEER),
         ("ACP_BACKENDS_STEER_CONCURRENT_PROMPT", ACP_BACKENDS_STEER_CONCURRENT_PROMPT),
+        ("ACP_BACKENDS_STEER_RETRACT", ACP_BACKENDS_STEER_RETRACT),
         ("ACP_BACKENDS_INTERNAL_SANDBOX", ACP_BACKENDS_INTERNAL_SANDBOX),
         ("ACP_BACKENDS_ACP_RUNTIME", ACP_BACKENDS_ACP_RUNTIME),
         ("ACP_BACKENDS_COMPACT", ACP_BACKENDS_COMPACT),
@@ -740,6 +746,7 @@ def test_every_known_backend_has_a_label() -> None:
         (ACP_BACKEND_PI, PROVIDER_LABEL_PI),
         (ACP_BACKEND_GOOSE, PROVIDER_LABEL_GOOSE),
         (ACP_BACKEND_DEEPSEEK, PROVIDER_LABEL_DEEPSEEK),
+        (ACP_BACKEND_COPILOT, PROVIDER_LABEL_COPILOT),
     ):
         assert labels[backend] == label
 
@@ -1449,6 +1456,7 @@ def test_steer_advertisement_matches_the_steer_table(backend):
         backend in ACP_BACKENDS_STEER or backend in ACP_BACKENDS_STEERING_REQUEST
     )
     assert handle.supports_refusal_steer is (backend in ACP_BACKENDS_STEER)
+    assert handle.supports_steer_retract is (backend in ACP_BACKENDS_STEER_RETRACT)
 
 
 @pytest.mark.parametrize("backend", sorted(ACP_BACKENDS_KNOWN))

@@ -71,6 +71,7 @@ from kiro_crew.acp.types import (
     EVENT_MCP_SERVER_INITIALIZED,
     EVENT_STEER_CLEARED,
     EVENT_STEER_CONSUMED,
+    EVENT_STEER_DROPPED,
     EVENT_STEER_QUEUED,
     EVENT_STRUCTURED_STATUS,
     EVENT_SUBAGENT_ACTIVITY,
@@ -95,6 +96,12 @@ if TYPE_CHECKING:
 
 #: The session handle's logger: this code logged under that name before the split.
 logger = logging.getLogger("kiro_crew.acp.session_handle")
+
+#: Longest a single wait on an empty queue lasts before the verdict-driven
+#: watchdogs below get a look. Named so a test can tick the arm quickly under
+#: a turn budget it never reaches, instead of racing the arm against the turn's
+#: own deadline.
+QUEUE_POLL_SECS = 5.0
 
 
 async def _dispatch_events(
@@ -270,7 +277,9 @@ async def _dispatch_events(
             )
 
             try:
-                msg = await asyncio.wait_for(self._queue.get(), timeout=min(remaining, 5.0))
+                msg = await asyncio.wait_for(
+                    self._queue.get(), timeout=min(remaining, QUEUE_POLL_SECS)
+                )
             except asyncio.TimeoutError:
                 # ── Verdict-driven watchdogs ──
                 # Wellness (the liveness oracle) is the detector; timeouts
@@ -570,7 +579,13 @@ async def _dispatch_events(
                     if verdict == VERDICT_WORKING:
                         self._log_working_deferral(_stale_idle, evidence, timeout)
                         continue
-                    _flat_wait = evidence.startswith(EVIDENCE_ESTABLISHED_FLAT)
+                    # established_flat (a backend socket held, nothing
+                    # flowing) and platform_limited (macOS: a flat tree with
+                    # no socket evidence to tell a think from a wedge) both
+                    # get the model-silent window.
+                    _flat_wait = evidence.startswith(
+                        (EVIDENCE_ESTABLISHED_FLAT, EVIDENCE_PLATFORM_LIMITED)
+                    )
                     if verdict != VERDICT_DEAD:
                         # UNKNOWN: probe only past the window. An established-
                         # but-flat backend connection is probably a non-streamed
@@ -936,6 +951,11 @@ async def _dispatch_events(
                     yield AcpEvent(kind=EVENT_STEER_CONSUMED, text=_text, runtime_global=_ownerless)
                 elif _disc == "steering_cleared":
                     yield AcpEvent(kind=EVENT_STEER_CLEARED, runtime_global=_ownerless)
+                elif _disc == "AgentExecutionUserMessageCleared":
+                    # The steers a ``_session/steer/clear`` dropped unread. Only
+                    # the fact is carried: kiro-cli's message ids name nothing
+                    # Crew keeps, so the caller decides which steers it held.
+                    yield AcpEvent(kind=EVENT_STEER_DROPPED, runtime_global=_ownerless)
             elif action == "metadata":
                 self._track_metadata(msg)
             elif action == "compaction":

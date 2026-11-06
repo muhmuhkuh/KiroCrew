@@ -714,6 +714,12 @@ export default [
               // a shape UI copy takes — copy has spaces and capitals, which is what keeps
               // `['Save changes', 'Delete item']` reported.
               '^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$',
+              // The same snake_case identifier with a numeric version suffix: a
+              // versioned wire token such as the `fold_delta.1` socket capability the
+              // tab declares in `/api/ws?caps=` (hooks/websocket/foldWatch.ts). It is
+              // sent to the gateway, never rendered. Copy never ends in `.<digits>`
+              // after an underscore-joined lowercase word, so no prose matches.
+              '^[a-z][a-z0-9]*(?:_[a-z0-9]+)+\\.[0-9]+$',
               // A `KeyboardEvent.code` SIDE-SPECIFIC MODIFIER identifier, i.e.
               // `AltRight`, `ControlLeft`, `MetaRight`, `ShiftLeft`. These are DOM
               // protocol values: they are compared against `e.code` and never
@@ -741,6 +747,10 @@ export default [
               // that grows only when a new provider CLI is wired in on purpose.
               '^(?:gh|glab) auth login$',
               '^az login$',
+              // The install command the Decisions card's SageMaker option shows
+              // when the gateway has no boto3: typed into a terminal, so the
+              // same wire-string class, and enumerated for the same reason.
+              "^pip install 'boto3>=1\\.34,<2'$",
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -1250,6 +1260,12 @@ export default [
               // `config.json`, not copy. Already exempt as an object property below; a
               // JSX attribute of the same name carries the same machine value.
               'path',
+              // The same dotted config path on the Settings* primitives
+              // (`configKey="session_environments.coder_url"`): the settings
+              // extractor reads it to deep-link the control, so it is a machine
+              // key. A section with an underscore escapes the dotted-token word
+              // shape, which is why the attribute itself is named here.
+              'configKey',
               'data-\\w+', 'aria-(hidden|live|orientation|current|haspopup)',
               'autoComplete', 'inputMode', 'enterKeyHint', 'spellCheck',
               'viewBox', 'xmlns', 'fill', 'stroke', 'd', 'points', 'transform',

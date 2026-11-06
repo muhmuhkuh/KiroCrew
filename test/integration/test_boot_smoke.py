@@ -164,6 +164,27 @@ async def test_a_boot_leaves_the_process_as_it_found_it(gateway_boot) -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_boot_does_not_inherit_the_previous_homes_unreadable_spec(gateway_boot) -> None:
+    """The unreadable-spec episode describes ONE home's ``kirocrew.json``.
+    Left over from a home whose spec could not be read, it would hold the next
+    home's rebuild on the previous file's verdict, so the harness resets it
+    before every boot, as a fresh process starts with it clear."""
+    from kiro_crew import agent as agent_mod
+
+    agent_mod._main_spec_unreadable = True
+    agent_mod._main_spec_episode_revision = 5
+    agent_mod._main_spec_skip_generation = -1
+    agent_mod._main_spec_warned.add("retry")
+    async with gateway_boot() as gw:
+        await gw.get_json("/api/health", auth=False)
+        assert agent_mod._main_spec_unreadable is False
+        assert agent_mod._main_spec_episode_revision == 0
+        assert agent_mod._main_spec_skip_generation != -1
+        assert not agent_mod._main_spec_warned
+    assert _process_is_clean()
+
+
+@pytest.mark.asyncio
 async def test_a_second_home_gets_its_own_signing_key(tmp_path: Path, monkeypatch) -> None:
     """Two boots on two homes in one process: the token minted for the first
     must not validate against the second, which is only true when the cached
@@ -468,6 +489,7 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.apps.hooks_integration", "_route_registry"): "replaced per boot",
     ("kiro_crew.dashboard.cautious_boot", "_decision"): "replaced per boot",
     ("kiro_crew.dashboard.crash_dump_store", "_active_dump_file"): "replaced per boot",
+    ("kiro_crew.dashboard.members_roster_goals", "_state_ref"): "replaced per boot",
     ("kiro_crew.diag.recorder", "_recorder"): "replaced per boot",
     ("kiro_crew.hooks", "_BUILTIN_APP_AGENTS"): "replaced per boot",
     ("kiro_crew.hooks", "_global_script_hook_store"): "replaced per boot",
@@ -531,6 +553,7 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.executors", "_cron_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_discovery_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_embed_pool"): "lazy thread pool",
+    ("kiro_crew.executors", "_memory_background_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_recall_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_image_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_stt_pool"): "lazy thread pool",
@@ -541,6 +564,9 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.executors", "_path_probe_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_path_transfer_pool"): "lazy thread pool",
     ("kiro_crew.executors", "_crew_log_pool"): "lazy thread pool",
+    # Log-once dedup of the loop-thread lock warning: it holds source
+    # locations already warned about, not home state.
+    ("kiro_crew.vector_memory_lifecycle", "_loop_lock_sites"): "log-once warning dedup",
     # Task handles of loops the harness reaps at teardown (docstring, item 4);
     # only the dead handle remains.
     ("kiro_crew.apps.builtins.auto_research.handlers", "_watchdog_task"): "reaped task handle",

@@ -102,6 +102,7 @@ from kiro_crew.config.memory_sections import (  # noqa: F401
 )
 from kiro_crew.config.resolution import _OBSERVED_DEGRADED_SECTIONS, DEGRADED_TAILSCALE
 from kiro_crew.config.sections_agent import (  # noqa: F401
+    _CREW_MODE_AGENT_DEFAULT,
     _YOLO_DURATION_DEFAULT,
     AgentConfig,
     _read_skip_permissions,
@@ -156,6 +157,7 @@ from kiro_crew.config.sections_agent_fields import (  # noqa: F401
     JAIL_MODE_OFF,
     JAIL_MODE_ON,
     KAS_BUNDLE_DEFAULT_URL,
+    KAS_REFUSE_PLAIN_HTTP_MCP_HEADERS_HELP,
     MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE,
     MEMBER_APPROVAL_MODES,
     MODEL_CONTEXT_TOKENS_MAX,
@@ -297,6 +299,7 @@ from kiro_crew.config.sections_decisions import (  # noqa: F401
 )
 from kiro_crew.config.sections_defaults import (  # noqa: F401
     _ABSENT,
+    _REPORTED_CLAMPS,
     _T,
     CONTEXT_WARN_MARGIN_PCT,
     DEFAULT_AUTOCOMPACT_PCT,

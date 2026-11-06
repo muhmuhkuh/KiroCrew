@@ -109,8 +109,14 @@ GATEWAY_NOTICE_AGENT_SWITCH_BLOCKED_CREW_MODE = "agent_switch_blocked_crew_mode"
 GATEWAY_NOTICE_AGENT_SWITCH_BLOCKED_CHANNEL = "agent_switch_blocked_channel"
 GATEWAY_NOTICE_CHANNEL_MESSAGE_NOT_RUN = "channel_message_not_run"
 GATEWAY_NOTICE_CREW_NAME_UNDISPATCHABLE = "crew_name_undispatchable"
+GATEWAY_NOTICE_CODE_CHANNEL_WORKTREE_NOT_READY = "code_channel_worktree_not_ready"
 GATEWAY_NOTICE_REMOTE_CREW_READ_ONLY = "remote_crew_read_only"
 GATEWAY_NOTICE_ARCHIVE_FAILED_TURN_CANCELLED = "archive_failed_turn_cancelled"
+
+# The KAS signed-out ``error`` row (``kind = auth_required``). Its English is
+# ``host_auth.signed_out_message``; only the sentences ``host_auth.kas_signed_out_route``
+# recognises get it, with the route they name in ``notice_args["route"]``.
+GATEWAY_NOTICE_KAS_SIGNED_OUT = "kas_signed_out"
 
 #: English fallback ``content`` for the recovery rows above. Plain language: no
 #: "backend", no "hiccup" (the parity test lints every ``GATEWAY_*_TEXT``).

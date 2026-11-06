@@ -7,6 +7,7 @@ import ErrorNotice from './ErrorNotice'
 import { InAppUpdateFlow } from '../pages/settings/AboutPanel'
 import { updateInfoQuery } from '../api/updateInfoQuery'
 import { failedWithNoData } from '../api/queryState'
+import { useIsPolicyGoverned } from '../utils/updateSwitches'
 import { Download, X, Copy, Check } from 'lucide-react'
 
 import { api, ApiError } from '../api/client'
@@ -69,6 +70,9 @@ type Candidate = {
    *  snooze/skip records, and a fold there would make dismissing `0.4.0`
    *  swallow the next release's `0.4.0rcN` candidate too. */
   displayVersion: string
+  /** Gateway only: the candidate IS the running version (a git checkout
+   *  that is only behind its upstream), so the text names no version. */
+  sameAsRunning?: boolean
   notes?: string
   /** Gateway only: which action the primary slot offers. */
   affordance?: 'apply' | 'arm' | 'command'
@@ -94,11 +98,15 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
   // Backend-folded sibling for DISPLAY (clean base on the stable channel).
   // Raw fallback below covers a gateway that predates the field.
   const gwVersionDisplay = useAppSelector(s => s.dashboard.status?.update_latest_version_display) || ''
+  const runningVersion = useAppSelector(s => s.dashboard.status?.version) || ''
   const gwCanApply = useAppSelector(s => s.dashboard.status?.update_can_apply)
   const gwCanArm = useAppSelector(s => s.dashboard.status?.update_can_arm)
   const gwCommand = useAppSelector(s => s.dashboard.status?.update_command) || ''
   const gwRequired = useAppSelector(s => s.dashboard.status?.update_required === true)
   const gwMinVersion = useAppSelector(s => s.dashboard.status?.update_min_version) || ''
+  // True when the policy provider governs this bundled install.
+  // Read from the main-process-confirmed update-state (useIsPolicyGoverned).
+  const gwPolicyManaged = useIsPolicyGoverned()
 
   // When the user enabled background auto-download, the Electron main process
   // starts the download itself right after `found` — a consent popup whose
@@ -139,14 +147,15 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
     || (infoQ.data !== undefined && infoQ.errorUpdatedAt > infoQ.dataUpdatedAt)
 
   // Desktop first: when the dashboard runs inside the desktop app the gateway
-  // defers its own check (`managed_by_app`), so the two cannot both report —
-  // this ordering is belt-and-braces for the transition frame, not a policy.
+  // defers its own check (`managed_by_app`), so the two cannot both report.
+  // When a security policy provider governs the install, the Electron feed lane
+  // stands down (feed-lane.js), so the desktop candidate is skipped here too.
   // Candidacy waits for a read finished since this build was found (or for it
   // to fail), otherwise the popup opens for a frame on a stale preference and
   // then vanishes when the current one lands.
   const preferenceSettled = foundKey !== null && readForKey === foundKey && (bridgeInfo !== undefined || preferenceUnread)
   let candidate: Candidate | null = null
-  if (desktop && buildFound && !desktop.replayed && desktop.version && desktopCanDownload() && preferenceSettled && (preferenceUnread || bridgeInfo?.autoDownload !== true)) {
+  if (!gwPolicyManaged && desktop && buildFound && !desktop.replayed && desktop.version && desktopCanDownload() && preferenceSettled && (preferenceUnread || bridgeInfo?.autoDownload !== true)) {
     // Desktop-reported version never crosses the gateway, so the fold is
     // computed locally, keyed on the followed channel like the backend's.
     candidate = {
@@ -162,6 +171,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
       candidate = {
         source: 'gateway', version: gwVersion,
         displayVersion: gwVersionDisplay || gwVersion,
+        sameAsRunning: gwVersion === runningVersion,
         affordance: afford, command: gwCommand,
       }
     }
@@ -474,11 +484,15 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
                 ASCII joiner spaces cannot express. The bold wrapper is the
                 NUMBERED tag <0> because the catalog integrity gate forbids
                 letter-named closing tags in values. */}
-            <Trans
-              i18nKey="components.updateFoundModal.version_is_available"
-              values={{ version: candidate.displayVersion }}
-              components={[<span key="v" className="font-semibold" />]}
-            />
+            {candidate.sameAsRunning
+              ? i18nT('pages.settings.aboutPanel.a_newer_version_is_available')
+              : (
+                <Trans
+                  i18nKey="components.updateFoundModal.version_is_available"
+                  values={{ version: candidate.displayVersion }}
+                  components={[<span key="v" className="font-semibold" />]}
+                />
+              )}
           </p>
           {required && (
             // Why the modal cannot be dismissed. `update_min_version` is
@@ -502,11 +516,7 @@ export default function UpdateFoundModal({ held = false }: { held?: boolean } = 
             <ErrorNotice variant="inline" className="mt-2" message={i18nT('pages.settings.aboutPanel.auto_download_unreadable')}
               askAgent={!required} onHandoff={required ? undefined : () => setHandedOffVersion(candidate.version)}
               testId="update-found-preference-error" />
-          ) : (
-            <p className="mt-2 text-[12px] text-muted">
-              {i18nT('components.updateFoundModal.nothing_downloads_until_you_choose_to')}
-            </p>
-          ))}
+          ) : null)}
           {candidate.source === 'gateway' && candidate.affordance === 'arm' && (
             <div className="mt-2">
               <InAppUpdateFlow

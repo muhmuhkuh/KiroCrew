@@ -562,7 +562,23 @@ in an oss build). One fetch is the Kiro control plane's
   rule. A shape it does not know is off, not unnamed, because `capabilities.cron`
   is an open control: unnamed, it keeps Crew's default. For a capability with a
   resource, only a deny `exclude` grants anything; a lone deny `match` leaves the capability unnamed, so the
-  baseline keeps it off. `DISABLED` answers
+  baseline keeps it off. The reply's settings (`body.configuration`, each entry's
+  `value` the setting as JSON) are shape-checked and hashed when the reply declares a
+  hash, and then a badly shaped entry refuses the reply. With no hash they are read
+  leniently, as before, so an entry Crew does not read never refuses a reply, and a
+  bad `crew_sandbox_min_level` entry sets no floor. One is applied (RFC D7):
+  `crew_sandbox_min_level` becomes the `sandbox.min_level` floor, tighten-only
+  (`enterprise_policy_translate.sandbox_floor`). `cc` and `strict` set the floor; `off` and
+  `standard` set none, the same as no entry, because Crew's default already runs at
+  `standard` and the sandbox enforcer treats any floor as a governed host (the
+  first-party no-backend carve-out and the unsandboxed-exec allowance both close).
+  Any other value is not a level the organisation picked, so it sets no floor and
+  logs a warning (Crew adds no strictness of its own). The floor is part of the cached
+  document, so `UNCHANGED`, a refresh and a cache-only child keep it, and a local
+  level stricter than it still wins (the clamp only raises). The etag names the
+  translation that wrote the cache (`TRANSLATION_REVISION`), and the cached
+  `versionId` is sent only for this build's revision, so an upgraded build gets a
+  full reply instead of keeping an older build's document, which has no floor. `DISABLED` answers
   a document that names no scope, so the baseline holds every control. `UNCHANGED`
   keeps the cache. `NOT_ELIGIBLE`, an HTTP error, an unreachable service, a malformed
   answer, a hash mismatch and an untranslatable rule each raise. With no usable cache,
@@ -1204,11 +1220,11 @@ into a shared template by publish, or installed by a package) is filtered only w
 those writers writes it, and the rebuild does not rewrite it.
 
 A shared template is a spec Kiro Crew does not own, and the pass never writes one
-(the 2026-10-28 owner decision in docs/decisions, every crewmate on a user-level agent moves to the conductor):
+(the 2026-10-28 owner decision in docs/decisions, every Bot on a user-level agent moves to the conductor):
 it is the same file kiro-cli loads for that agent OUTSIDE Kiro Crew, so a rewrite stripped
 the user's own sessions too, and a package manager that reinstalls the spec fought it on
-every restart. The startup crewmate migration moves the rows that used to reach such a file
-onto their own crewmate file (crew-mode.md, "Existing crewmates move at startup"), and for a
+every restart. The startup Bot migration moves the rows that used to reach such a file
+onto their own Bot file (crew-mode.md, "Existing Bots move at startup"), and for a
 row still bound to one the ceiling holds two ways. KAS never takes grants from the file:
 Crew projects the spec at session start and filters both lists against the live ceiling
 there (`acp.kas_agents._ceiling_permitted`, `kas_permissions.merge_user_permissions`).
@@ -1216,7 +1232,7 @@ kiro-cli does read them, but on kiro-cli a session normally runs a Crew-owned co
 spec, not the file: the native skill projection (`acp.skill_projection`) writes each agent's
 skill view into the agents directory and hands kiro-cli the view's name on `--agent` and
 `session/set_mode`. For every name a crew binding records (either spelling, below) and every
-agent a crewmate ran on before the migration, the view loses every grant the two governance
+agent a Bot ran on before the migration, the view loses every grant the two governance
 passes remove (`agent_materialization.shared_template_view`, over the same
 `may_skip_gate_now` predicate the KAS projection filters with), so both hosts withhold the
 same grants and the file is never written. The removal is logged and recorded in the SEL as
@@ -1259,7 +1275,7 @@ agent-host-contract.md, "One name, several files"). A binding counts when it rec
 name or the file stem kiro-cli is dispatched under its declared name
 (`config.loader_snapshots.dispatch_kiro_agent`), and a config load that could not read a
 config file whole checks the agent's claimants as if it were bound, because the missing
-binding may be this one. So does an agent a crewmate ran on before the startup migration
+binding may be this one. So does an agent a Bot ran on before the startup migration
 moved it (`mate_config_migration.moved_from_agents`), because a conversation from before
 the move keeps the template its own record names; a ledger that cannot be read counts as
 naming it. The refusal names the file and the remedy and writes nothing. So the rebuild's pass over shared
@@ -1318,7 +1334,44 @@ wrote and the rebuild reports the hold through its private `_held_out` out-param
 the hook reads beside `wrote`. The hold is deliberately NOT folded into `wrote=False`:
 `kirocrew.json` was written, and the dashboard's default-model applier reads `wrote=False` as
 a change that did not land — a held conductor spec would otherwise announce every model
-change as failed and retry it forever. Either way,
+change as failed and retry it forever. An **unreadable** main spec is the third case:
+`kirocrew.json` is present but a read still fails after `read_bytes_with_retry` (a Windows
+sharing violation that outlasts the retry, `EACCES`/`EPERM`, `EIO`). Writing defaults over it
+would erase the user's spec, so the read raises `_AgentSpecUnreadable` and
+`_skip_unreadable_main_spec` ends the cycle. The rebuild checks the file before its self-heal
+migrations run, and takes the same exit if the load or the alias reconcile inside the write
+lock (`mcp_aliases._durable_tool_aliases`, which reports such a file as present, never as
+missing) fails later. `kirocrew.json` and the heartbeat and worker specs mirrored from it are
+left as they are. The steps that write other files (the service and conductor specs, the fork
+refresh, the hook repair) still run, so a moved ceiling still re-filters the forks and the
+conductor specs, and a fork refresh that cannot finish still records the failure the fork gate
+refuses on. Only a missing file (`FileNotFoundError`) or a read that returns invalid UTF-8 or
+JSON (`ValueError`) rebuilds from defaults, and a clean rebuild is the explicit reset that
+writes over an unreadable file. The skip returns `wrote=False`, reports a hold and sets
+`_conductor_spec_held`, so the memo stays pending, the boot baseline stays unseeded, the hourly
+maintenance wake retries, the default-model applier reports the change as not landed, and
+`kirocrew setup` says the config was left unchanged. It warns once per path and errno, since
+the config watcher retries a failed model change every tick, and logs one INFO when a rebuild
+writes the file again. For the same reason the sibling steps run on the first skip of an
+episode and again only when `governance_answer_generation` has moved since the last pass that
+completed without a held write and with its fork refresh run in-line; a boot rebuild defers that refresh to a thread, so its pass records no generation, and a crew-bound shared template the deferred pass then holds is retried by the next skip. A repeat skip under the same generation only keeps the flags set. Starts are not gated on the
+episode: while the file stays unreadable a start behaves as it would on a host where the
+rebuild never ran, and the only change is that the file is no longer overwritten. The open
+episode is itself a hold (`_spec_hold_open`): the retry, the profile watch, the ceiling hook and
+the boot baseline read the unreadable flag beside `_conductor_spec_held`, and the template-only
+skip (`_held_rebuild_would_repeat`) never skips an open episode. A rebuild that wrote the spec
+never clears the hold while an overlapping rebuild's skip has the episode open, both flags being
+written under one lock. A rebuild closes the episode only if no skip landed since it read the
+spec (an episode revision read before the read and compared when it closes), so an older write
+never closes a newer episode. The heartbeat and worker specs are derived from the main spec, so a
+skip cannot re-derive them; it re-filters their existing grants in place instead
+(`_refilter_kept_mirrors`): each spec is read, whatever the current ceiling no longer allows is
+dropped from its `allowedTools` and its servers' `autoApprove`, and it is written back. No server is
+copied in, and no grant is added. A spec that cannot be re-filtered holds the memo, so the next
+rebuild retries. The hourly retry's own warning names the kept file and never
+suggests `kirocrew setup --agent-only --clean`, which would write defaults over it. The episode
+ends only when an existing rebuild path (the maintenance wake, a config change the watcher
+applies, a restart) writes the spec. Either way,
 marking the generation synchronised would lose the retry the next poll gives and leave
 forbidden auto-approvals on disk for the process lifetime; holding the memo means every later
 poll retries and the projection lands the moment the failure or refusal clears. The verdict
@@ -1424,8 +1477,9 @@ every session after the tighten, which without it stayed open indefinitely.
 
 `register_post_install_hook` is the seam. Append-only, like `register_policy_fetcher`, and
 deliberately unaware of what it calls — this module must not learn about tailnet or anything
-above it, so the gateway registers `tailnet_serve.revoke_if_governance_now_pins_off` before
-it starts the poller. Hooks run on the refresher thread wherever a poll **confirms** what governs — an install *or*
+above it, so the gateway registers `tailnet_serve.revoke_if_governance_now_pins_off` and
+`origin.withdraw_refused_origins` (an origin in the server's set is asked only when added)
+before it starts the poller. Hooks run on the refresher thread wherever a poll **confirms** what governs — an install *or*
 an `unchanged` result — and best-effort: an exception is logged at ERROR **with a `degraded`
 governance incident** and the next hook still runs. The incident is what puts a control the
 installed ceiling calls for and the host is not applying onto `security_posture` and the
@@ -1869,7 +1923,7 @@ unfenced is `echo x > ~/.kiro/agents/kirocrew.json`:
 documented design choice — so the shell route rests on the OS sandbox, which seals
 the agents dir and not yet the registry leaf.
 
-**The crewmate folder `~/.kiro/mates/agents` and its state files beside it** (`owners.json`, `revoked-approvals.json`, `tool-access.json`, `migrated.json`) sit on the same write-only tier, also under `KIRO_HOME`. Only gateway handlers write them, directly rather than through the tool gate, so the agent's file-edit tools are refused and reads are unchanged.
+**The Bot folder `~/.kiro/mates/agents` and its state files beside it** (`owners.json`, `revoked-approvals.json`, `tool-access.json`, `migrated.json`) sit on the same write-only tier, also under `KIRO_HOME`. Only gateway handlers write them, directly rather than through the tool gate, so the agent's file-edit tools are refused and reads are unchanged.
 
 **Every other harness's own permission files sit on the same write-only tier**, listed per harness in `agent_sdk.native_allow_stores.NATIVE_ALLOW_STORES`: claude `~/.claude/settings*.json`, goose `permission.yaml` and `config.yaml`, opencode's global config, codex `config.toml`, pi `settings.json` and `extensions/`, copilot `mcp-config.json` and `installed-plugins/` (its `config.json`, which carries its permission settings, is already refused both ways as its credential leaf), each also at its harness's own home variable (`GOOSE_PATH_ROOT`, `XDG_CONFIG_HOME`, `CLAUDE_CONFIG_DIR` / `CLAUDE_HOME`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`, `COPILOT_HOME`) and through a symlinked config dir, plus a project's own harness config in any directory (`PROJECT_ALLOW_STORES`): `.claude/settings*.json`, opencode's `opencode.json` / `opencode.jsonc` and everything under `.opencode/`, and pi's `.pi/settings.json`, `.pi/mcp.json` and everything under `.pi/extensions/`. goose reads no project file of this kind, and copilot's are not listed: a Copilot session is refused outright where one exists (`acp/harness/copilot.py`). `agent.env` refuses each of those home variables, so a store cannot move for the harness child alone. Only the agent's file-edit tools are refused; a shell write to these files is not fenced yet. `test/test_native_allow_stores.py` fails when a harness has neither a row nor a stated reason.
 
@@ -1902,7 +1956,7 @@ canonical taxonomy parser — never re-implemented). Resolution is:
 `resolve_task_bound_profile(agent)` reads only the `task` bind for one agent,
 with no app or surface fallback (an unloaded store denies). A caller that already
 resolved the active profile uses it to narrow that by a second agent's own
-profile without re-applying the surface default; the one caller is a crewmate
+profile without re-applying the surface default; the one caller is a Bot
 stub's app callback (`mcp_gateway/app_call.py`).
 
 **`identity_proven` is true for ANY non-empty session key**, so an unattended
@@ -3434,7 +3488,7 @@ half-control this row exists to avoid.
 Two flat rulesets for the RFC appendix rows "Bind address and tunnel" (`identifier` matcher) and "Dashboard origins" (`origin` matcher: case-insensitive glob, `[` and `]` literal so an IPv6 origin matches its own entry). Both are asked through `edition_locks.policy_permits`: policy layer only (the questions are process-wide and carry no session, as for the tailnet probe), fail-closed, and in an enterprise build only a permit the policy layer gave counts. The baseline keeps both at this machine.
 
 - `bind_address`: `dashboard.urls.bind_address_for` asks the canonical IP text of any address other than `127.0.0.1` (`KIROCREW_BIND`, or `0.0.0.0` when `local_only` is false). A refused address binds `127.0.0.1` with a warning.
-- `dashboard_origins`: `dashboard.urls.build_allowed_origins` asks each origin outside the loopback origins on the bound port, by its `scheme://host[:port]` text, and drops a refused one. The `Host` barrier derives from the same set, so it narrows too. A connected tunnel's URL is asked the same way before it is trusted (`tunnel.setup._on_tunnel_connect`). The tailnet origin is not asked: it answers to `capabilities.tailnet_origin`.
+- `dashboard_origins`: `dashboard.urls.build_allowed_origins` asks each origin outside the loopback origins on the bound port, by its `scheme://host[:port]` text, and drops a refused one. The `Host` barrier derives from the same set, so it narrows too. A connected tunnel's URL is asked the same way before it is trusted (`tunnel.setup._on_tunnel_connect`). The tailnet origin is not asked: it answers to `capabilities.tailnet_origin`. A live refresh asks the running set again (`origin.withdraw_refused_origins`, a post-install hook, for either server entry point): each extra the new ceiling refuses is withdrawn, so the `Origin` check and the `Host` barrier narrow without a restart. The asks run on the refresher thread and only the removal on the event loop. The floor and the tailnet origins (MagicDNS and the direct listener's) are not asked. The first ask is a pure read; only a withdrawn origin is asked again with an audit row. An evaluation error withdraws, fail-closed, as it refuses at start.
 
 Every place an origin becomes trusted, and what decides it:
 
@@ -3443,6 +3497,7 @@ Every place an origin becomes trusted, and what decides it:
 | Loopback origins on the bound port (`127.0.0.1`, `localhost`, `[::1]`, `kirocrew.localhost`, also without `:80`) | floor, never asked | no |
 | Extra origins at startup (`dashboard.url`, configured host, env lists) | `dashboard_origins` | each one |
 | Tunnel URL on connect | `dashboard_origins` | yes |
+| Extra origins and the tunnel URL, again on each confirming policy poll | `dashboard_origins`; a refused one is withdrawn | only a withdrawal |
 | Tailnet origin (startup, recovery) | `capabilities.tailnet_origin` (enterprise: policy layer only) | yes |
 | Shared Crew Tailscale invites (invite and credential routes, accept poller) | `capabilities.tailnet_origin`, through `tailnet.is_governance_pinned_off` (`shared-crew.md` §1) | yes, except the status read |
 | `check_origin` loopback `Origin == Host` fallback | an allowlisted origin up to case and default port, else `dashboard_origins` | each request |
@@ -3450,7 +3505,7 @@ Every place an origin becomes trusted, and what decides it:
 
 In an enterprise build `dashboard_origins` is an exact-origin allow list. Deny mode is refused at load (`parsing.ALLOW_ONLY_IN_ENTERPRISE`). Each entry must be a literal lower-case ASCII `scheme://host[:port]`: an entry with a wildcard (`* ? [ ]`), non-ASCII (write the `xn--` form), a path or trailing `/`, userinfo, or a written-out default port is refused at load, naming the key and the entry (`parsing._refuse_inexact_origin_entries`). So is an entry a browser would serialize differently (`parsing._browser_serialized_origin`, the WHATWG host rules): an IPv6 literal not in its shortest hex form (`[2001:0db8::0:1]`, `[::ffff:192.0.2.1]`), an IPv4 host not in four decimal parts (`10.1`), or a port above 65535. The error names the spelling to write instead (`[2001:db8::1]`, `[::ffff:c000:201]`, `10.0.0.1`). Matching is exact set membership on the origin as a browser sends it (`matching._browser_origin`: lower-case, default port dropped), with no IDNA conversion, IP rewriting or glob. An approved origin, the tunnel URL included, is stored in `allowed_origins` in that same form (`urls.stored_origin`: `urls.origin_policy_item`, the item the policy was asked), so a configured `https://Crew.Example.com:443` is trusted as the `https://crew.example.com` a browser sends, and `check_origin` compares a non-loopback `Origin` by exact membership in that set. Six review rounds found spellings that slipped past a matcher; exact membership leaves nothing to normalise. An `oss` build keeps the glob matcher and both modes (`matching._origin_form`); there an item that is not `scheme://host[:port]` is refused while a policy governs the key.
 
-The tunnel half of "Bind address and tunnel" stays an edition lock (`edition_locks.UNKEYED_LOCKS["tunnel"]`). The bind address and the origin set are decided when the gateway starts; a policy refresh that narrows either takes effect at the next restart (#24363). `capabilities.tailnet_origin` is asked at each derivation, recovery attempt and publish, the tunnel URL at each connect, and `capabilities.computer_use` at each dispatch, so a refresh applies to those from the next ask. Each acting ask writes the answer it enforced to SEL (`governance_decision`, critical on an evaluation error); a pure read such as the status card does not. No profile is read: the questions are answered from the installed ceiling alone.
+The tunnel half of "Bind address and tunnel" stays an edition lock (`edition_locks.UNKEYED_LOCKS["tunnel"]`). The bind address is decided when the gateway starts; a policy refresh that narrows it takes effect at the next restart (#24363). A refresh that widens `dashboard_origins` adds no origin until the next start either; one that narrows it applies at once (above). `capabilities.tailnet_origin` is asked at each derivation, recovery attempt and publish, the tunnel URL at each connect, and `capabilities.computer_use` at each dispatch, so a refresh applies to those from the next ask. Each acting ask writes the answer it enforced to SEL (`governance_decision`, critical on an evaluation error); a pure read such as the status card does not. No profile is read: the questions are answered from the installed ceiling alone.
 
 ### Hosted feature-video media — `capabilities.feature_videos_download`
 

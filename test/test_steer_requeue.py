@@ -401,6 +401,7 @@ class TestSteerRegisteredBeforeAwait:
         state = _make_state(tmp_path)
         state.broadcast_ws = MagicMock()
         slot = _running_slot(state)
+        slot._steer_possibly_delivered.add("later")
         client_mock = MagicMock()
         client_mock.supports_steer = True
         client_mock.steer = AsyncMock(side_effect=RuntimeError("boom"))
@@ -415,6 +416,7 @@ class TestSteerRegisteredBeforeAwait:
 
         # unwound — queue fallback owns delivery, no double-delivery via requeue
         assert slot._pending_steers == []
+        assert "later" not in slot._steer_possibly_delivered
         assert [i["content"] for i in slot._queue] == ["later"]
 
     @pytest.mark.asyncio
@@ -462,7 +464,14 @@ class TestProductionWiring:
 
         import kiro_crew.dashboard.chat_runner as cr
 
-        return Path(cr.__file__).read_text(encoding="utf-8")
+        return "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [
+                *sorted(Path(cr.__file__).with_name("chat_turn").glob("*.py")),
+                Path(cr.__file__),
+            ]
+            if turn_file.name != "__init__.py"
+        )
 
     def test_finally_calls_requeue_before_queue_drain(self):
         import inspect

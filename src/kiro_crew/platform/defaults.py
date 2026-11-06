@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import shutil
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -152,7 +153,7 @@ class DefaultAgentRuntime:
         return dict(agent._MANAGED_MCP_SERVERS)
 
     def run_first_run_setup(self) -> None:
-        # WIRED: ``slack/gateway.py`` gateway boot calls this through the seam.
+        # WIRED: ``slack/gateway_runtime/service_boot.py`` gateway boot calls this through the seam.
         # Delegating to the real ``agent.run_first_run_setup`` makes the routing
         # behavior-preserving for the standalone edition — byte-for-byte the same
         # first-run wiring (PATH shim + admission-policy seed + one-time stale
@@ -172,7 +173,7 @@ class DefaultAgentExecutableResolver:
 
 
 class DefaultSandboxPolicy:
-    """Today's open-source sensitive-dir lists from ``sandbox.py``."""
+    """Today's open-source sensitive-dir lists from ``sandbox_tiers.py``."""
 
     def strict_dirs(self) -> List[str]:
         from kiro_crew import sandbox  # circular import: sandbox imports platform
@@ -768,6 +769,14 @@ class DefaultFeedbackTrackerProvider:
         self, bundle: "BundleResult", note: str, *, prefill: bool
     ) -> Optional[str]:
         return None
+
+
+class DefaultAcceptanceCheckProvider:
+    """No edition checks: every name answers exit 2, no installed edition provides it."""
+
+    def run_acceptance_check(self, check: str, ref: str) -> int:
+        print(f"no installed edition provides the acceptance check {check!r}", file=sys.stderr)
+        return 2
 
 
 class DefaultBrowserCredentialProvider:

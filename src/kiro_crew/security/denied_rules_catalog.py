@@ -1142,6 +1142,15 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
         ),
     ),
     DeniedCommandRule(
+        id="local-destructive-dd-of-device",
+        pattern="dd of=/dev/<raw disk>",
+        category="local-destructive",
+        description=(
+            "Blocks dd writing to a raw disk or partition device, which destroys its data even "
+            "with no input file, because dd then copies standard input."
+        ),
+    ),
+    DeniedCommandRule(
         id="sql-drop-database",
         pattern="(?i:DROP\\s+DATABASE.*)",
         category="sql",
@@ -1362,7 +1371,7 @@ BUILTIN_DENIED_RULES: list[DeniedCommandRule] = [
             "code with no chance to inspect the script first."
         ),
     ),
-    # The ``restart`` / ``update`` / ``file-delivery approve`` / ``cloud <lifecycle>`` /
+    # The ``restart`` / ``update`` / ``cloud <lifecycle>`` /
     # ``gateway restart`` self-management commands have NO catalog row.  A regex row opening
     # with an unbounded any-run before the product name matches the name in a worktree path
     # plus the verb word later (``ls ~/kirocrew-wt/restart.log``), and protects nothing the

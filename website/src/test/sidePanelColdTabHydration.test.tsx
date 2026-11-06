@@ -23,6 +23,10 @@ vi.mock('../utils/terminalRegistry', () => ({
   useTerminalTitle: () => 'Terminal',
 }))
 vi.mock('../hooks/useIsMobile', () => ({ useIsMobile: () => false }))
+// These editor tests run on a positively confirmed local session.
+vi.mock('../components/sessionEnvironmentHooks', () => ({
+  useSlotEnvironmentPlacement: () => ({ remote: null, error: null }),
+}))
 vi.mock('../pages/chat/FileBrowserRail', () => ({
   default: () => null,
   useTreeState: () => 'ready',

@@ -1,7 +1,7 @@
 """``class AcpRuntime``: the runtime's constructor, state, properties and constants.
 
 The class body binds each member an owner module defines (``spawn = _rt_entry.spawn``) and
-keeps the constructor, the properties and the class constants. ``_own_methods`` names each
+keeps the constructor, the properties and the class constants. ``own_methods`` names each
 bound function after its class attribute. ``kiro_crew.acp.runtime`` re-exports the class,
 which keeps that module as its ``__module__``: the facade is the import path callers, pickles
 and reprs name.
@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew._facade_bindings import own_methods
 from kiro_crew.acp import kas_secret_storage
 from kiro_crew.acp import runtime_frame_accounting as _rt_frames
 from kiro_crew.acp import runtime_host_requests as _rt_host
@@ -64,25 +65,6 @@ _MEMBER_OWNERS = frozenset(
 )
 
 
-def _own_methods(cls: type) -> type:
-    """Make each member *cls* binds from an owner module read as a method of *cls*.
-
-    A bound function annotates ``self`` so mypy checks its body as a method body;
-    this drops that annotation from the runtime object and names the function after
-    the class attribute (``AcpRuntime._spawn_admitted``), so its ``inspect.signature``
-    and ``__qualname__`` are what the one-module class had, and so are the reprs of
-    the coroutines and tasks it starts. Only ``__module__`` moves: it names the owner
-    module that holds the body.
-    """
-    for name, member in vars(cls).items():
-        function = getattr(member, "__func__", member)
-        if getattr(function, "__module__", None) in _MEMBER_OWNERS:
-            function.__annotations__.pop("self", None)
-            function.__qualname__ = f"{cls.__qualname__}.{name}"
-    return cls
-
-
-@_own_methods
 class AcpRuntime:
     """Owns one kiro-cli acp subprocess with single-reader demux.
 
@@ -359,6 +341,10 @@ class AcpRuntime:
         # positive "the engine is drawing its credential from Crew" signal; later
         # ones (the engine refreshes ahead of expiry) drop to DEBUG.
         self._kas_host_auth_logged = False
+        # The last failed credential callback's reason, logged at WARNING once per
+        # runtime until a callback succeeds or the reason changes: a signed-out
+        # engine re-asks about twice a second, and one line says it all.
+        self._kas_host_auth_failure_logged: str | None = None
         # The one MCP sign-in in flight on this process, as (session_id,
         # server_name). The engine's consent-URL request names neither, so at
         # most one sign-in runs at a time and its URL goes to the session that
@@ -1004,3 +990,6 @@ class AcpRuntime:
     # exactly the report this labelling answers.
     _RC_NOT_REAPED = "<not reaped>"
     _RC_NO_PROCESS = "<no process>"
+
+
+own_methods(AcpRuntime, _MEMBER_OWNERS)

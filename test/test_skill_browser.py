@@ -201,14 +201,17 @@ class TestAgentLoadsSkill:
         }
         assert _agent_loads_skill(agent_json, tmp_path / "a.json", skill_md) is False
 
-    def test_handles_non_string_resources(self, tmp_path):
-        skill_md = tmp_path / "SKILL.md"
-        agent_json = {"name": "x", "resources": [{"oops": "object"}, None, "skill://*/SKILL.md"]}
-        # Should not crash on garbage; should still match the valid glob
-        # (matches anything ending in /SKILL.md so depending on path).
+    def test_handles_non_string_resources(self, fake_home, tmp_path):
+        skill_md = fake_home / ".kiro" / "skills" / "linear" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
         skill_md.write_text("")
-        # Returns True/False — just checks no exception.
-        _agent_loads_skill(agent_json, tmp_path / "a.json", skill_md)
+        valid = "skill://~/.kiro/skills/*/SKILL.md"
+        garbage: list = [{"oops": "object"}, None, 7]
+        # Garbage entries are skipped, and the valid glob beside them still matches.
+        agent_json = {"name": "x", "resources": [*garbage, valid]}
+        assert _agent_loads_skill(agent_json, tmp_path / "a.json", skill_md) is True
+        only_garbage = {"name": "x", "resources": garbage}
+        assert _agent_loads_skill(only_garbage, tmp_path / "a.json", skill_md) is False
 
     def test_resources_can_be_missing_or_non_list(self, tmp_path):
         skill_md = tmp_path / "SKILL.md"
@@ -1240,6 +1243,15 @@ class TestEndpoints:
         async with TestClient(TestServer(_make_app(state))) as client:
             resp = await client.get("/api/skills/kiro-user/nope/-/tree")
             assert resp.status == 404
+            assert (await resp.json())["code"] == "skill_not_found"
+
+    @pytest.mark.asyncio
+    async def test_file_endpoint_404_for_unknown(self, fake_home):
+        state = MagicMock(_slots={}, context_builder=None)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.get("/api/skills/kiro-user/nope/-/file?path=SKILL.md")
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "skill_not_found"
 
     @pytest.mark.asyncio
     async def test_file_endpoint_returns_content(self, fake_home):

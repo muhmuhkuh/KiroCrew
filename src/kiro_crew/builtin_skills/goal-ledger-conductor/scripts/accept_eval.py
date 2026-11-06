@@ -37,9 +37,9 @@ Kinds:
     edition_check   an installed edition answers a named check (below).
 
 ``edition_check`` asks an installed edition. It runs
-``kirocrew acceptance-check --json <check> <ref>``, a command the public build
-does not ship, so here it answers ``error`` ("no edition provides the
-acceptance check"). An edition that provides the check prints one JSON object
+``kirocrew acceptance-check --json <check> <ref>``, which the public build
+answers with exit 2 for every check, so here it answers ``error`` ("no edition
+provides the acceptance check"). An edition that provides the check prints one JSON object
 naming the same ``check``, ``ref`` and ``verdict`` as its exit code: 0 pass,
 8 pending, 1 fail, 3 needs a person (read as ``refused``), 4 could not answer
 (read as ``error``). Exit 2 means only that no edition provides that check.
@@ -149,11 +149,11 @@ _CHECK_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 #: edition's summary as the evidence.
 _EDITION_EXIT_VERDICTS = {0: "pass", 1: "fail", 3: "needs_person", 4: "error", 8: "pending"}
 
-#: argparse's usage exit, and it has one meaning: no installed edition provides
-#: the check. The evaluator validated both fields and always passes both, so
-#: argparse can only be refusing the command (the public ``kirocrew`` has no
-#: ``acceptance-check``) or a check name the edition does not know. A check
-#: that exists but rejects a ref answers exit 4 instead.
+#: Exit 2 has one meaning: no installed edition provides the check. The
+#: evaluator validated both fields and always passes both, so it is a check name
+#: no installed edition knows (the public ``kirocrew`` knows none), or a
+#: ``kirocrew`` too old to have ``acceptance-check``, whose argparse exits 2. A
+#: check that exists but rejects a ref answers exit 4 instead.
 _EDITION_USAGE_EXIT = 2
 
 
@@ -377,25 +377,15 @@ def _evaluate(item):
         if repo:
             argv += ["--repo", str(repo)]
         verdict, evidence = _run(argv)
-        # The draft probe runs HERE, behind a pending verdict, and nowhere else.
+        # The draft probe runs only behind a pending verdict. A draft's checks
+        # can still pass in repos with no check gated on the draft flag, so the
+        # probe must not pre-empt `gh pr checks`, and skipping it on pass/fail
+        # costs nothing.
         #
-        # A draft PR is not unconditionally unsatisfiable, so the probe must not
-        # pre-empt the check: where a repo has no aggregate check gated on the
-        # draft flag, a draft's checks resolve and `gh pr checks` exits 0 - a
-        # `pass` this script keeps returning, since this skill ships to
-        # arbitrary repos. Probing only a pending run also costs nothing on the
-        # pass and fail paths, which is every cycle that was never going to
-        # loop.
-        #
-        # A PENDING draft is refused on the spec, not on a prediction about CI.
-        # The two ways a draft's checks stay pending - a readiness check gated
-        # on the draft flag, which never resolves, and ordinary checks still
-        # running, which do - are indistinguishable to a stateless evaluator,
-        # and this returns the same answer for both ON PURPOSE. A draft is the
-        # author's own "not ready for review", so an unfinished check run on one
-        # is a person's turn; "mark it ready for review" is a step they owe
-        # regardless, and it is bounded. Waiting instead is not: guessing wrong
-        # in that direction is the reported defect, an hour of polling a
+        # A pending draft is refused ON PURPOSE even when its checks are merely
+        # still running: a stateless evaluator cannot tell that apart from a
+        # draft-gated check that never resolves. Marking it ready is a bounded
+        # step the author owes anyway; waiting can poll for an hour on a
         # condition no cycle could change.
         if verdict == "pending" and _pr_is_draft(pr, repo):
             return (

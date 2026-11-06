@@ -59,8 +59,10 @@ vi.mock('framer-motion', async () => {
   const make = (tag: string) => React.forwardRef<unknown, Record<string, unknown>>(
     (props, ref) => React.createElement(tag, { ...strip(props), ref }),
   )
+  // One component per tag: a fresh type on every read would remount the subtree.
+  const byTag = new Map<string, ReturnType<typeof make>>()
   return {
-    motion: new Proxy({} as Record<string, unknown>, { get: (_t, tag: string) => make(tag) }),
+    motion: new Proxy({} as Record<string, unknown>, { get: (_t, tag: string) => { if (!byTag.has(tag)) byTag.set(tag, make(tag)); return byTag.get(tag) } }),
     AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
     LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
@@ -480,7 +482,11 @@ describe('the citation glyph says whose session opened this one', () => {
     const glyph = container.querySelector('[data-orphan-of]')
     expect(glyph).not.toBeNull()
     expect(glyph?.getAttribute('role')).toBe('img')
-    expect(glyph?.getAttribute('aria-label')).toContain('k-absent')
+    // Graceful label, never the raw slot id of the closed creator (#18153); the id
+    // survives on the data attribute alone.
+    expect(glyph?.getAttribute('aria-label')).toBe('Opened by a closed session')
+    expect(glyph?.getAttribute('aria-label')).not.toContain('k-absent')
+    expect(glyph?.getAttribute('data-orphan-of')).toBe('k-absent')
     expect(glyph?.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true')
   })
 })

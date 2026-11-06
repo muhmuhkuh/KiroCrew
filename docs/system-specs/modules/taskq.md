@@ -1101,7 +1101,9 @@ Metrics: a lane key is a session key and so never a metric attribute (the
 data instead: `GET /api/spawn/lanes` (`admission.lane_snapshot_async()`): per-lane
 `queued` / `running` / `waiting` / `weight`, the scheduler credit, and the
 `CapacityView` (`cap_total`, `roots_cap`, `running`, `child_reserve`,
-`reserve_active`, `waiting_parents`, `lifted_from`). A closed
+`reserve_active`, `waiting_parents`, `lifted_from`). A live run counts once:
+`waiting` when it has released its slot, else `running`. Its resume entry in the
+window (`entry_is_resident_resume`) is not also counted as `queued`. A closed
 `lane_kind ∈ {system, session}` attribute on `kirocrew.taskq.depth` is left to
 the health sampler.
 
@@ -1152,7 +1154,7 @@ deferral, so at most what was left of the deferral counts (the wake brings
 forward only rows that now fit, so this is a re-check that lost a race). A row
 not waiting or not deferred is left alone. The subagent adapter fails each row it returns past
 `agent.subagent_queue_max_wait_secs` with a generation-fenced `finish` and
-reports `never started: waiting for memory`
+reports `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up`
 ([subagent.md](subagent.md) § Durable task queue).
 
 That `finish` passes `report_owed=True`: the terminal `transition` event then
@@ -1363,7 +1365,14 @@ at once, so the dispatcher (or the runner's `_resume_after_wait` → `admit` →
 `claim`) writes `running` when capacity is actually granted. A crash in the gap
 leaves a claimable row (`retry_wait` is not ACTIVE, so the boot reconciler
 leaves it alone) instead of a dead-owner `running` row that reconciles to
-`unknown_side_effect`. For a LIVE parent whose last child ended,
+`unknown_side_effect`. With the store reachable, a caller cancellation after
+a persisted dependency wake first uses the handle's generation-fenced terminal
+write. If the wake made that generation stale, a second write fenced to
+`retry_wait` and the wake's exact generation ends only that unclaimed handoff;
+a later `retry_wait` epoch, an answered-input handoff, or a row already claimed
+into `admitted`, `starting` or `running` is refused. Pinned by
+`test_taskq_runner_wait_cancel.py`.
+For a LIVE parent whose last child ended,
 `on_child_terminal(defer_wake=True)` records `children_settled` and leaves the
 row `waiting_children` until `resume_grant`. `answer_input` stores the answer
 text on the `wake` event so a crash cannot lose it: `waiting_input` reads the

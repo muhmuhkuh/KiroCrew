@@ -54,6 +54,7 @@ _BASE_MODULE_NAMES = frozenset("""
     Callable ClaimRefusal DISPLAY_ONLY_ROLES HistoryConsolidator
     LESSON_APPLIES_INSTRUCTION LESSON_APPLIES_ON_TOPIC NamedTuple SKILL_UPDATE
     TYPE_CHECKING ToolApprovalPolicy VERDICT_DUP VERDICT_NEW VERDICT_UPDATE
+    _BoundedTable _SEMANTIC_SNAPSHOT_PAGE _semantic_snapshot_in_pages
     _BoundedTable _CONSOLIDATION_BACKOFF_BASE_SECS _CONSOLIDATION_BACKOFF_MAX_SECS
     _CONSOLIDATION_MAX_ATTEMPTS _CONSOLIDATION_MAX_HEAD_SLICES _CONSOLIDATION_META_KEYS
     _CONSOLIDATION_PROMPT_BUDGET_CHARS _CONSOLIDATION_REFUSED
@@ -140,19 +141,19 @@ _BASE_MEMBERS: dict[str, tuple[str, bool, bool, str]] = {
         "function",
         True,
         False,
-        "(self, key: 'str', include_history: 'bool' = True) -> '_ConsolidationRefusedSentinel | None'",
+        "(self, key: 'str', include_history: 'bool' = True, *, prefs_window: 'PrefsWindow | None' = None) -> '_ConsolidationRefusedSentinel | None'",
     ),
     "_count_off_loop": (
         "function",
         True,
         False,
-        "(self, key: 'str', claim: '_CountClaim', *, floor: 'int | None') -> 'tuple[int, int] | None'",
+        "(self, key: 'str', claim: '_CountClaim', *, floor: 'int | None', floor_generation: 'int | None' = None) -> 'tuple[int, int] | None'",
     ),
     "_count_rows": (
         "function",
         False,
         False,
-        "(self, key: 'str', floor: 'int | None') -> 'tuple[int, int] | None'",
+        "(self, key: 'str', floor: 'int | None', floor_generation: 'int | None' = None) -> 'tuple[int, int] | None'",
     ),
     "_dedupe_candidate": (
         "function",

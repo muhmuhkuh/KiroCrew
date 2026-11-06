@@ -51,8 +51,8 @@ def _render(
     handler ETags the WHOLE serialized response so an unchanged page skips the download
     -- there is no compose cache here, because the compose itself is cheap (the field
     read is memoized by the fold layer) and the download is the cost worth skipping.
-    ``None`` on any failure, so the raw page still renders under the frame's own stale
-    band rather than the tab erroring.
+    ``None`` on any failure, so the raw page still renders rather than the tab
+    erroring.
     """
     try:
         from kiro_crew import dashboard_frame

@@ -904,7 +904,9 @@ what its own edit invalidated, and never reopens anything on the user's behalf.
    screen next to the status dot — colour is reinforcement, not the carrier, so
    the row that errored is findable without hovering every entry. Crews you switch
    between often can be PINNED beside the trigger as chips, so the switch costs no
-   dropdown click — see [Pinned crew chips](#pinned-crew-chips).
+   dropdown click — see [Pinned crew chips](#pinned-crew-chips). While a crew's
+   pane fills the page, the browser tab is titled with that crew's name instead
+   of the hidden local page.
 6. **Diagnose** a flaky instance (runs the ladder), or **Disconnect** from its
    row. **Edit settings** / **Remove** live in the row's overflow menu — a row
    shows two primary actions plus that menu, so everything past them is one
@@ -2198,7 +2200,10 @@ A corrupt or truncated stream answers `transfer_invalid_gzip`, distinct from
 document has a syntax error" send a reader to different places. A concatenated
 (multi-member) gzip is refused rather than decoded to its first member: the
 export writes exactly one member, so decoding one and dropping the rest would be
-a truncation nobody asked for.
+a truncation nobody asked for. A body opening with the zip signature
+(`PK\x03\x04`, the shape of a Kiro IDE session export) answers
+`transfer_unsupported_format`: the file is fine, its format is one the import
+does not read.
 
 **The session is filed under `Imported` / `from <sender>`.** The second rule, and
 the reason it lives beside the first: a gzipped file arriving from a person and a
@@ -2226,7 +2231,7 @@ Four properties make the filing safe to run on an authenticated write route:
   body.
 - **Placement is resolved only after the slot exists**, as the last `await` before
   the durable save. The handler re-checks the live-slot cap after its own last
-  `await` and can answer `429` there, and a folder written in front of that check
+  `await` and can answer `409` there, and a folder written in front of that check
   is left behind when it fires.
 - **Find-or-create is atomic across both levels**, inside one `mutate_folders`
   transaction — the shape `ensure_channel_folder` already uses (§ chat folders) —

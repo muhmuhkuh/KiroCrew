@@ -24,9 +24,7 @@ from aiohttp import web
 from kiro_crew.apps.builtins.dev_fleet import agent_pod_api
 from kiro_crew.mcp_tools import apps as apps_tools
 
-# ---------------------------------------------------------------------------
 # Route registration + admission
-# ---------------------------------------------------------------------------
 
 _EXPECTED_ROUTES = {
     ("POST", "/api/apps/dev-fleet/pod/up"),
@@ -170,7 +168,7 @@ async def test_non_git_source_install_discovers_checkout_before_pod_op(
 def granted(monkeypatch: pytest.MonkeyPatch) -> None:
     """The default posture for the tests below: the Dev Fleet app is enabled."""
     monkeypatch.setattr(
-        "kiro_crew.apps.builtins.dev_fleet.agent_pod_api.is_app_enabled", lambda _n: True
+        "kiro_crew.apps.builtins.dev_fleet.agent_pod_api.host_exec_granted", lambda _n: True
     )
 
 
@@ -216,7 +214,7 @@ async def test_cookie_only_caller_is_refused(granted: None) -> None:
 async def test_disabled_app_is_not_callable(monkeypatch: pytest.MonkeyPatch) -> None:
     """Routes are registered at startup, before any app is known to be enabled."""
     monkeypatch.setattr(
-        "kiro_crew.apps.builtins.dev_fleet.agent_pod_api.is_app_enabled", lambda _n: False
+        "kiro_crew.apps.builtins.dev_fleet.agent_pod_api.host_exec_granted", lambda _n: False
     )
     resp = await agent_pod_api.handle_pod_list(_Req())  # type: ignore[arg-type]
     assert resp.status == 403
@@ -226,12 +224,9 @@ async def test_disabled_app_is_not_callable(monkeypatch: pytest.MonkeyPatch) -> 
 def test_the_capability_is_not_gated_on_an_operator_grant() -> None:
     """Agent pod control is an intended capability, so it carries no operator gate.
 
-    Pinned as a test because the reverse is what a reader would assume from the
-    security note in the module docstring -- and because adding a grant would
-    silently break the unattended QA loop these routes exist to restore. The
-    residual such a grant would appear to close is Kiro Crew's documented posture
-    (security.md, "Scoped user-bus locator forward"), reachable by other paths
-    regardless, so a gate here buys nothing and costs the loop.
+    A grant would break the unattended QA loop these routes serve, and the risk it
+    seems to close is reachable by other paths anyway (security.md, "Scoped user-bus
+    locator forward").
     """
     assert not hasattr(agent_pod_api, "_operator_granted")
     assert not hasattr(agent_pod_api, "_require_operator_grant")
@@ -310,13 +305,8 @@ async def test_every_verb_answers_an_unusable_checkout(
 ) -> None:
     """``repository._repo()`` RAISES, and it sits on more than one branch per verb.
 
-    The four-verb table is the point. Guarding only the subprocess cwd leaves the
-    discovery chain inside ``_pod_checkout_guard`` (``_find_worktree`` ->
-    ``_discover_worktrees`` -> ``_repo()``, repository.py:581) reaching the handler as
-    an unhandled exception, so three of the four verbs would still answer a setup
-    problem with a 500. Catching once around the whole op covers every branch,
-    whichever one raises, which is why this asserts on the verbs rather than on the
-    raise sites.
+    It is reached through the subprocess cwd and through the discovery chain inside
+    ``_pod_checkout_guard``, so this asserts on every verb rather than on raise sites.
     """
     monkeypatch.setattr(agent_pod_api.platform_compat, "IS_WINDOWS", False)
     from kiro_crew.apps.builtins.dev_fleet import repository
@@ -414,9 +404,7 @@ def test_ops_resolves_the_real_worktree_ops_module() -> None:
     assert callable(worktree_ops._pod_ls)
 
 
-# ---------------------------------------------------------------------------
 # MCP tools
-# ---------------------------------------------------------------------------
 
 
 def test_pod_tools_are_advertised_with_handlers() -> None:
@@ -607,6 +595,23 @@ def test_pod_up_tool_says_so_when_the_cli_withheld_the_token(
     assert not out.startswith("Error:")
 
 
+def test_pod_up_tool_prints_the_checkout_a_handle_copies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pod-e2e handle is built from this reply, so the clone it serves must be on it."""
+    monkeypatch.setattr(
+        apps_tools.mcp_core,
+        "_post",
+        lambda *_a, **_k: {
+            "ok": True,
+            "port": 7913,
+            "base_url": "http://127.0.0.1:7913",
+            "token": "tok-abc123",
+            "checkout": "/home/u/clone-a/kc-wt-1",
+        },
+    )
+    out = apps_tools.pod_up("pod_up", {"worktree": "kc-wt-1"})
+    assert "checkout: /home/u/clone-a/kc-wt-1" in out.splitlines()
+
+
 def test_a_route_refusal_reaches_the_model_as_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """``Error:`` is load-bearing: call_tool_with_logging derives the outcome from it."""
     monkeypatch.setattr(
@@ -679,9 +684,7 @@ def test_read_tools_ask_for_more_than_the_telemetry_timeout(
     assert seen["timeout"] > 10
 
 
-# ---------------------------------------------------------------------------
 # Ceilings and the home-keeping restart
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

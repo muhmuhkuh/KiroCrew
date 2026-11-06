@@ -553,6 +553,9 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "app_admission_denied", lambda *a, **k: None)
         # A host no default names, so the client-install answer is the one under test.
         monkeypatch.setattr(sys, "platform", "haiku")
+        # Off ``win32``, ``shutil.which`` ignores ``PATHEXT``, so a Windows host's
+        # ``git.exe`` would read as missing and the git preflight would answer first.
+        monkeypatch.setattr(registry, "git_unavailable_refusal", lambda name: None)
         try:
             result = await registry.install_from_registry("demo")
         except TypeError as exc:
@@ -574,7 +577,7 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
         monkeypatch.setattr(registry, "get_app", lambda name: None)
         monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": "banned"
+            registry, "app_admission_denied", lambda name, manifest=None, action="", **_k: "banned"
         )
         result = await registry.install_from_registry("demo")
         assert result["ok"] is False
@@ -602,7 +605,7 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
         monkeypatch.setattr(registry, "get_app", lambda name: None)
         monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
+            registry, "app_admission_denied", lambda name, manifest=None, action="", **_k: None
         )
         result = await registry.install_from_registry("demo")
         assert result["needsClientInstall"] is True
@@ -623,7 +626,7 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
         monkeypatch.setattr(registry, "get_app", lambda name: None)
         monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
+            registry, "app_admission_denied", lambda name, manifest=None, action="", **_k: None
         )
         monkeypatch.setattr("kiro_crew.apps.version.check_min_version", lambda mv: "needs 999.0.0")
         result = await registry.install_from_registry("demo")
@@ -643,7 +646,7 @@ class TestInstallFromRegistryRefusals:
         monkeypatch.setattr(registry, "_fetch_app_manifest", _manifest)
         monkeypatch.setattr(registry, "get_app", lambda name: None)
         monkeypatch.setattr(
-            registry, "app_admission_denied", lambda name, manifest=None, action="": None
+            registry, "app_admission_denied", lambda name, manifest=None, action="", **_k: None
         )
         monkeypatch.setattr(
             registry,

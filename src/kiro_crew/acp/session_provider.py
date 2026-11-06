@@ -21,7 +21,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from kiro_crew.acp import session_provider_mcp_reinject as _sp_mcp_reinject
 from kiro_crew.acp import stale_compaction
@@ -58,6 +58,7 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.acp.types import (
     ACP_BACKENDS_MATE_WORKER_KIT,
+    ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS,
     ACP_BACKENDS_MATE_WORKER_PROMPT_IN_CONTEXT,
     ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS,
     ACP_BACKENDS_MEMBER_CAPABILITIES,
@@ -536,10 +537,17 @@ class AcpSessionProvider(LLMProvider):
             self._handle.accepts_elicitation = bool(value)
 
     async def answer_elicitation(
-        self, request_id: str | int, action: str, content: dict[str, Any] | None = None
+        self,
+        request_id: str | int,
+        action: str,
+        content: dict[str, Any] | None = None,
+        *,
+        person: bool = True,
     ) -> bool:
         """Answer a pending MCP elicitation (see AcpSessionHandle.answer_elicitation)."""
-        return await self._guarded(self._handle.answer_elicitation(request_id, action, content))
+        return await self._guarded(
+            self._handle.answer_elicitation(request_id, action, content, person=person)
+        )
 
     async def release_runtime_lease(self) -> None:
         """Give up this provider's lease on the runtime, if it holds one.
@@ -874,6 +882,15 @@ class AcpSessionProvider(LLMProvider):
         return self._handle.supports_steer
 
     @property
+    def supports_steer_retract(self) -> bool:
+        """True when the backing handle can take back a steer its turn has not read."""
+        return self._handle.supports_steer_retract is True
+
+    async def clear_pending_steers(self) -> bool | None:
+        """Forward a steer clear to the session handle (kiro ``_session/steer/clear``)."""
+        return await self._guarded(self._handle.clear_pending_steers(), own_write_only=True)
+
+    @property
     def steer_needs_loss_recovery(self) -> bool:
         """True when a delivered steer can still be lost (see the handle)."""
         return self._handle.steer_needs_loss_recovery is True
@@ -1176,6 +1193,11 @@ class AcpSessionProvider(LLMProvider):
         return self._runtime.acp_backend in ACP_BACKENDS_MATE_WORKER_TOOL_LIMITS
 
     @property
+    def mate_worker_mcp_tool_limits_supported(self) -> bool:
+        """The MCP half of a crewmate worker's single-tool limits, by opt-in (H6)."""
+        return self._runtime.acp_backend in ACP_BACKENDS_MATE_WORKER_MCP_TOOL_LIMITS
+
+    @property
     def loaded_capability_template(self) -> str:
         if not (self._owns_runtime and self._runtime.is_alive()):
             return ""
@@ -1337,6 +1359,18 @@ class AcpSessionProvider(LLMProvider):
         session under the kiro label.
         """
         return self._runtime.acp_backend
+
+    def effective_spec_declares_zero_tools(self, *, authored_before_spawn: bool = False) -> bool:
+        """``AcpClient.effective_spec_declares_zero_tools``, judged on the runtime serving this session.
+
+        The runtime carries the agent, work directory and native skill projection
+        that function reads. Blocking; async callers use ``asyncio.to_thread``.
+        """
+        from kiro_crew.acp.client_mcp_array import effective_spec_declares_zero_tools
+
+        return effective_spec_declares_zero_tools(
+            cast(Any, self._runtime), authored_before_spawn=authored_before_spawn
+        )
 
     @property
     def manual_compact_unsupported_backend(self) -> str | None:

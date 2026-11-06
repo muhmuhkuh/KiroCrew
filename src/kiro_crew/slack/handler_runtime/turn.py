@@ -149,6 +149,7 @@ class _SlackTurn:
     _compaction_replay: "_CompactionReplay | None"
     start_priority: "StartPriority"
     user_meta: "dict[str, Any] | None"
+    interpret_commands: "bool"
 
     # Bound by ``handle_message`` before the first phase.
     _t0: "float"
@@ -216,6 +217,7 @@ class _SlackTurn:
         _compaction_replay: "_CompactionReplay | None",
         start_priority: "StartPriority",
         user_meta: "dict[str, Any] | None" = None,
+        interpret_commands: "bool",
         _t0: "float",
         reply_ts: "str",
         session_key: "str",
@@ -251,6 +253,7 @@ class _SlackTurn:
         self._hook_turn = None
         self.start_priority = start_priority
         self.user_meta = user_meta
+        self.interpret_commands = interpret_commands
         self._turn_scope = None
         self._t0 = _t0
         self.reply_ts = reply_ts
@@ -615,6 +618,7 @@ async def _run_turn(turn: _SlackTurn) -> bool:
                 _compaction_replay=replay,
                 start_priority=start_priority,
                 user_meta=turn.user_meta,
+                interpret_commands=turn.interpret_commands,
             )
         finally:
             # The replay has settled and released its permit (or never got
@@ -781,7 +785,9 @@ async def _run_turn(turn: _SlackTurn) -> bool:
             and context_builder.conversation_log
         ):
             _session.prev_turn_cancelled = False
-            _preamble = build_cancelled_turn_preamble(context_builder.conversation_log, session_key)
+            _preamble = await asyncio.to_thread(
+                build_cancelled_turn_preamble, context_builder.conversation_log, session_key
+            )
             if _preamble:
                 offset = len(_preamble) + 2
                 _user_text_range = (offset, offset + len(text))

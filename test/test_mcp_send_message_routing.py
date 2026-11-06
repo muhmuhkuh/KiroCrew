@@ -237,19 +237,20 @@ def test_an_ambiguous_webex_allowlist_is_refused_rather_than_guessed() -> None:
     assert _owner_dm_target(transport) == ""
 
 
-def test_a_channel_that_cannot_dm_proactively_is_in_the_roster_but_yields_no_target() -> None:
+def test_a_channel_needing_prior_inbound_is_in_the_roster_but_yields_no_target() -> None:
     """The asymmetry the derivation must NOT flatten, on a real transport.
 
-    Feishu can only reply to an inbound message, so the roster admits it and
-    ``_owner_dm_target`` declines the send. Uses the real ``FeishuTransport``: a stub
-    with ``available=False`` would not prove a shipped channel sets the flag.
+    Teams can only reach a user who has written to the bot first, so the roster
+    admits it and ``_owner_dm_target`` declines the send. Uses the real
+    ``TeamsTransport``: a stub with ``available=False`` would not prove a shipped
+    channel sets the flag.
     """
     from kiro_crew.dashboard.handlers.messaging import _owner_dm_target
-    from kiro_crew.feishu.transport import FeishuTransport
+    from kiro_crew.teams.transport import TeamsTransport
 
-    transport = FeishuTransport(client=object(), allowed_open_ids=["ou_notarealid"])
+    transport = TeamsTransport(client=object(), allowed_emails=["a@example.invalid"])
 
-    assert "feishu" in _CHANNEL_SESSIONS
+    assert "teams" in _CHANNEL_SESSIONS
     assert [t.available for t in transport.configured_targets()] == [False]
     assert _owner_dm_target(transport) == ""
 
@@ -295,8 +296,18 @@ def test_a_channel_session_forwards_a_strict_caller_session_when_one_exists() ->
         ),
         patch.object(tool.mcp_core, "_post") as post,
     ):
-        post.return_value = {"ok": True, "delivered_to": "webex"}
-        tool.send_message("send_message", {"text": "hi", "session": "webex"})
+
+        def _gateway(_path: str, body: dict, *, session_key: str = "", **_k: object) -> dict:
+            # The gateway re-vets as the caller it is handed; any other principal is refused.
+            if body.get("caller_session") != "webex:a:dm:u1":
+                return {"error": "channel session not permitted for this caller"}
+            return {"ok": True, "delivered_to": "webex"}
+
+        post.side_effect = _gateway
+        result = tool.send_message("send_message", {"text": "hi", "session": "webex"})
+
+    assert not result.startswith("Error:"), result
+    assert "webex" in result
 
     assert post.call_args.args[1]["caller_session"] == "webex:a:dm:u1"
     assert post.call_args.kwargs["session_key"] == "webex:a:dm:u1"

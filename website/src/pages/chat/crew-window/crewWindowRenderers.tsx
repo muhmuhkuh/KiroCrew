@@ -16,8 +16,8 @@
  *  hub's own records. Code is copy-only for
  *  every row through the window's `ReadOnlyCodeCtx`. */
 import { i18nT } from '../../../i18n/t'
-import { formatTs, quoteMessageFor, renderAssistantBubble, type MessageRenderer } from '../../../app-sdk/messageRenderers'
 import { parseFileRecord } from '../../../lib/fileRecord'
+import { formatTs, quoteMessageFor, renderAssistantBubble, type MessageRenderer } from '../../../app-sdk/messageRenderers'
 import UserMessage from '../UserMessage'
 import { renderUserContent } from '../ChatPageMessageContent'
 import { fmtMessageTimeFull } from '../messageTime'
@@ -36,9 +36,11 @@ export function crewWindowSlot(instanceId: string, key: string): string {
 export const PEER_SAFE_ROWS: ReadonlySet<string> = new Set([
   'skill_load', 'subagent_completion', 'tool', 'tool_completion', 'thinking_block',
   'nudge', 'recovery_inject', 'automation_notice_inject', 'system_notice', 'workflow_completion', 'error',
-  'warm_task_brief_claim', 'crew_dispatch_notice',
+  'warm_task_brief_claim', 'crew_dispatch_notice', 'crew_paused_notice',
 ])
 
+/** The peer's file name, by the same record check every `file` row uses
+ *  (lib/fileRecord.ts); '' for a row that is not a file record. */
 function peerFileName(m: ChatMessage): string {
   return parseFileRecord(m.content)?.filename ?? ''
 }

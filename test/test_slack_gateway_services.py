@@ -324,7 +324,6 @@ class TestHeartbeatCallback:
             mock_hs.return_value = mock_hs_inst
             await orch._init_heartbeat()
 
-        # Get the on_task callback
         callback = mock_hs.call_args[1]["on_task"]
 
         with patch(
@@ -445,7 +444,6 @@ class TestAutonudgeFire:
                 mock_ans.return_value = mock_inst
                 await orch._init_autonudge()
 
-        # Get the on_fire callback
         on_fire = mock_ans.call_args[1]["on_fire"]
         loop = MagicMock()
         loop.id = "loop1"
@@ -460,12 +458,8 @@ class TestAutonudgeFire:
     async def test_fire_slot_missing(self):
         """Fire with missing slot → removes loop.
 
-        The rehydrate fallback is stubbed to a miss because that is what "slot
-        missing" means here. It is stubbed explicitly rather than relying on the
-        mock dashboard state's MagicMock metadata reading as ``closed`` and the
-        rehydrate helper's closed-guard bailing: the fire path passes
-        ``adopt_closed=True`` (idle archival must not destroy a loop), so that
-        accident does not stop the walk.
+        The rehydrate fallback is stubbed to a miss explicitly: the fire path passes
+        ``adopt_closed=True``, so MagicMock metadata reading as ``closed`` would not stop it.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()

@@ -221,7 +221,7 @@ def _provider_is_configured(app_name: str, pp: dict[str, Any]) -> bool:
     cfg_path = apps_dir() / app_name / "data" / config_file
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
     return bool(isinstance(cfg, dict) and str(cfg.get(field_name, "")).strip())
 
@@ -347,8 +347,12 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
     # fail-closed CPP, same as every other publish surface.
     deploy_denied = None
     if admits_cloud:
+        # The core row's endpoint is ``/api/deploy/deploy``, which checks the
+        # publish lists itself.
         deploy_denied = await asyncio.to_thread(
-            lambda: publish_denied_reason(request, DEPLOY_WEB_PROVIDER_ID)
+            lambda: publish_denied_reason(
+                request, DEPLOY_WEB_PROVIDER_ID, lists_checked_by_caller=True
+            )
         )
 
     if not admits_cloud or deploy_denied:
@@ -370,6 +374,14 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
                 "providers": [p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID],
             }
         )
+    # An app row under the core id publishes at the app's own endpoint, which does
+    # not check the publish lists, so it is dropped whenever they restrict.
+    if any(p.get("id") == DEPLOY_WEB_PROVIDER_ID for p in providers):
+        squat_denied = await asyncio.to_thread(
+            lambda: publish_denied_reason(request, DEPLOY_WEB_PROVIDER_ID)
+        )
+        if squat_denied:
+            providers = [p for p in providers if p.get("id") != DEPLOY_WEB_PROVIDER_ID]
     try:
         from kiro_crew.deploy import profiles as _deploy_profiles
 
@@ -394,6 +406,11 @@ async def handle_publish_providers(request: web.Request) -> web.Response:
     return web.json_response({"providers": providers})
 
 
+#: The ``code`` of a ``GET /api/apps/{name}`` 404 for a name with no record whose
+#: wheel copy is released (``builtin_adoption.builtin_released``).
+APP_RELEASED_CODE = "app_released"
+
+
 async def handle_get_app(request: web.Request) -> web.Response:
     """GET /api/apps/{name} — get single app details."""
     name = request.match_info["name"]
@@ -404,6 +421,17 @@ async def handle_get_app(request: web.Request) -> web.Response:
         # matches in registration order). Redirect to the canonical endpoint.
         if name == "deploy-web":
             raise web.HTTPTemporaryRedirect(location="/api/deploy/list")
+        # Imported here, not at module level, so the ``routes`` facade does not
+        # serve the helper as one of its own names.
+        from kiro_crew.apps.manager import _wheel_copy_released
+
+        if await asyncio.to_thread(_wheel_copy_released, name):
+            # A former built-in uninstalled after adoption: the wheel copy serves
+            # nothing, so its legacy dashboard route shows the not-installed state
+            # rather than a compiled page with no backend behind it.
+            return web.json_response(
+                {"error": f"app {name!r} not installed", "code": APP_RELEASED_CODE}, status=404
+            )
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
     detail = await asyncio.to_thread(_installed_app_detail, name, info)
     return web.json_response(_mark_unavailable(detail, _unavailable_builtins(request.app)))

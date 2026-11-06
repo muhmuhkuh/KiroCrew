@@ -39,6 +39,7 @@ import { i18nT } from '../i18n/t'
 import { canGoBack, canGoForward } from '../lib/routeHistoryPosition'
 import { useGuardedHistoryStep, useGuardedLeave } from '../components/NavigationLeaveGuard'
 import { MOBILE_BREAKPOINT } from './useIsMobile'
+import { touchFirstForm } from '../lib/touchLayoutForm'
 import { isEditableTarget } from '../utils/editableTarget'
 import { closeShownCrewWindow, crewWindowShown } from '../pages/chat/crew-window/crewWindowStore'
 import { stepTurn } from '../pages/chat/turnStep'
@@ -644,8 +645,8 @@ function isTerminalTarget(target: EventTarget | null): boolean {
  *  keypress so the handler's document listener never re-registers on resize.
  *  Same breakpoint as `useIsMobile` — one source of truth for "narrow". */
 function isNarrowViewport(): boolean {
-  return typeof window.matchMedia === 'function'
-    && window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`).matches
+  return touchFirstForm() ?? (typeof window.matchMedia === 'function'
+    && window.matchMedia(`(max-width: ${MOBILE_BREAKPOINT - 1}px)`).matches)
 }
 
 export function formatShortcut(def: ShortcutDef): string {
@@ -738,10 +739,12 @@ interface UseKeyboardShortcutsOpts {
    *  is already out. Left undefined in a window that has no pop-out control (a
    *  popout or an embedded pane), which leaves the chord to the browser. */
   onPopOutSession?: () => void
+  /** Show this session's terminal in the side panel, or hide the panel when it is showing. */
+  onToggleSideTerminal?: () => void
   disabled?: boolean
 }
 
-export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onPopOutSession, disabled }: UseKeyboardShortcutsOpts) {
+export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycleAgent, onCyclePrevAgent, onCycleReasoningEffort, onCyclePrevReasoningEffort, onCycleApprovalMode, onCyclePrevApprovalMode, onCycleModel, onCyclePrevModel, onToggleFocusMode, onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onPopOutSession, onToggleSideTerminal, disabled }: UseKeyboardShortcutsOpts) {
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
   const guardedHistoryStep = useGuardedHistoryStep()
@@ -810,7 +813,8 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
     'side-panel': onToggleSidePanel,
     'terminal': onToggleTerminal,
     'terminal-new': onNewTerminal,
-  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal])
+    'side-terminal': onToggleSideTerminal,
+  }), [onToggleLeftSidebar, onToggleSessionPanel, onToggleSidePanel, onToggleTerminal, onNewTerminal, onToggleSideTerminal])
 
   const handler = useCallback((e: KeyboardEvent) => {
     const isInput = isEditableTarget(e)
@@ -838,7 +842,7 @@ export function useKeyboardShortcuts({ onToggleShortcutsModal, onNewChat, onCycl
       // the leaked flag would blur the composer with no refocus AND silently
       // eat the NEXT pointer-driven switch's autofocus.
       if (isMacPlatform() && key !== activeSlot) releaseComposerForKeyboardSwitch()
-      dispatch(switchSlot({ key, announceOnMissing: true }))
+      dispatch(switchSlot({ key, announceOnMissing: true, gesture: true }))
       navigate('/chat')
     }
 

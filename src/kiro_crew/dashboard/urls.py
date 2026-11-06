@@ -267,11 +267,22 @@ def tunnel_origin_if_opted_in(use_tunnel_url: bool) -> str:
     does not pull in the tunnel manager, matching the deferred-import style the
     call sites already use.
     """
-    if not use_tunnel_url:
+    if not slack_tunnel_opt_in(use_tunnel_url):
         return ""
     from kiro_crew.tunnel import get_tunnel_url
 
     return get_tunnel_url()
+
+
+def slack_tunnel_opt_in(use_tunnel_url: bool) -> bool:
+    """``slack.use_tunnel_url`` as read; an enterprise build reads it as off.
+
+    The opt-in is a local switch that can point links at, and provision, a public
+    tunnel, so it shares the ``tunnel`` lock (RFC D3, ``kiro_crew.edition_locks``).
+    """
+    from kiro_crew.edition_locks import local_enable_locked
+
+    return use_tunnel_url and not local_enable_locked("tunnel")
 
 
 # ---------------------------------------------------------------------------
@@ -662,16 +673,7 @@ def _governed_origins(origins: set[str], port: int, tailnet_host: str) -> set[st
     enterprise build none passes unless a policy names it (RFC D3); an ``oss`` build
     with no policy naming the key keeps every origin, as before.
     """
-    floor = {
-        f"http://127.0.0.1:{port}",
-        f"http://localhost:{port}",
-        f"http://[::1]:{port}",
-        f"http://kirocrew.localhost:{port}",
-    }
-    floor |= {dashboard_origin(o) for o in floor}
-    if tailnet_host:
-        floor.add(f"https://{tailnet_host}")
-    extras = sorted(origins - floor)
+    extras = sorted(origins - origin_floor(port, tailnet_host))
     if not extras:
         return origins
     refused = {o for o in extras if not origin_permitted(o, audit_tool="dashboard_origin")}
@@ -682,6 +684,20 @@ def _governed_origins(origins: set[str], port: int, tailnet_host: str) -> set[st
         )
     approved = set(extras) - refused
     return (origins - set(extras)) | {stored_origin(o) for o in approved}
+
+
+def origin_floor(port: int, tailnet_host: str) -> set[str]:
+    """The origins ``dashboard_origins`` is never asked about (:func:`_governed_origins`)."""
+    floor = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+        f"http://[::1]:{port}",
+        f"http://kirocrew.localhost:{port}",
+    }
+    floor |= {dashboard_origin(o) for o in floor}
+    if tailnet_host:
+        floor.add(f"https://{tailnet_host}")
+    return floor
 
 
 def stored_origin(origin: str) -> str:

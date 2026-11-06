@@ -832,6 +832,11 @@ class IngestionPipeline:
             on_progress('reading', 0, 1)
         text, meta = await asyncio.to_thread(
             self.reader.read, path, include_paths=include_paths, included=included)
+        if original_name and meta.get('title') == p.stem:
+            # The reader titles a document by the stem of the path it read. An
+            # upload is read from a staging copy (``kn_<hex>``), so its title is
+            # the name the caller gave, as ``display_name`` already is.
+            meta['title'] = Path(original_name).stem
         if meta.get('format') == 'error':
             raise RuntimeError(f"Failed to read {path}: {meta.get('error')}")
 
@@ -869,8 +874,10 @@ class IngestionPipeline:
             uri = src_row["uri"] if src_row else display_name
             props = json.loads(src_row["properties"] or "{}") if src_row else {}
         else:
-            # Local file path: find or create source by URI
-            uri = str(p.resolve())
+            # Local file path: find or create source by URI. Reuse the path
+            # resolved off the loop for the sensitive-path check above: a second
+            # resolve() here would stat the disk on the event loop.
+            uri = resolved
             existing = await asyncio.to_thread(self.store.get_source_by_uri, uri)
             if existing:
                 props = json.loads(existing.get('properties', '{}')) if isinstance(existing.get('properties'), str) else existing.get('properties', {})

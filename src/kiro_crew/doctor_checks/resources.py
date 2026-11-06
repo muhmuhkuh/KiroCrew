@@ -39,6 +39,8 @@ from kiro_crew.doctor_checks import render
 # back. Read through the ``cli_doctor`` facade, not imported by name here: this
 # family binds no project module (test_cli_doctor_refactor_family_reads), and the
 # facade holds the constant so the two can never drift.
+# It is the floor: ``cli_doctor.skill_view_ceiling`` raises it with the authored
+# agent count, exactly as the projection does.
 _SKILL_VIEW_BACKLOG_WARN = cli_doctor.SKILL_VIEW_PROJECTION_CEILING
 
 
@@ -296,6 +298,10 @@ class _AcpRuntime(NamedTuple):
     owner: str
     cpu_pct: float | None
     age_secs: float | None
+    #: Resident memory of the runtime's whole process tree in bytes, ``None`` when
+    #: the page size is unavailable or the tree census failed. Used by
+    #: :func:`_acp_runtime_lines` to report total unowned memory pressure.
+    rss_bytes: int | None = None
 
 
 class _AcpCensus(NamedTuple):
@@ -456,7 +462,7 @@ def _acp_runtime_census(
         children.setdefault(stat.ppid, []).append(pid)
     harness = {pid for pid in first if sp._cmdline_names_a_harness(sp._pid_cmdline(pid, proc_root))}
 
-    found: list[tuple[int, str, set[int]]] = []
+    found: list[tuple[int, str, set[int], frozenset[int]]] = []
     claimed: set[int] = set()
     capped_trees = capped_procs = 0
 
@@ -467,7 +473,7 @@ def _acp_runtime_census(
             capped_trees += 1
             capped_procs += refused
         claimed.update(tree)
-        found.append((root, owner, _backend_chain(tree, harness, root)))
+        found.append((root, owner, _backend_chain(tree, harness, root), frozenset(tree)))
 
     for root, (recorder, token) in sorted(tracked.items()):
         stat = first.get(root)
@@ -510,12 +516,17 @@ def _acp_runtime_census(
             clk_tck = int(os.sysconf("SC_CLK_TCK"))
         except (AttributeError, OSError, ValueError):
             clk_tck = 0
+    page_size: int = 0
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, OSError, ValueError):
+        pass
     if age_of is None:
         age_of = cli_doctor.platform_compat.process_age_secs
     sleep(max(0.0, window_secs - (clock() - first_at)))
     elapsed = clock() - first_at
     runtimes: list[_AcpRuntime] = []
-    for root, owner, chain in found:
+    for root, owner, chain, tree_pids in found:
         cpu_pct: float | None = None
         if clk_tck > 0 and elapsed > 0:
             ticks = 0
@@ -528,7 +539,21 @@ def _acp_runtime_census(
                     continue
                 ticks += max(0, after.cpu_ticks - before.cpu_ticks)
             cpu_pct = 100.0 * ticks / clk_tck / elapsed
-        runtimes.append(_AcpRuntime(root, owner, cpu_pct, age_of(first[root].start_ticks)))
+        rss_bytes: int | None = None
+        if page_size > 0:
+            try:
+                total_pages = sum(
+                    first[p].rss_pages
+                    for p in tree_pids
+                    if p in first and first[p].rss_pages is not None
+                )
+                if total_pages > 0:
+                    rss_bytes = total_pages * page_size
+            except Exception:
+                pass
+        runtimes.append(
+            _AcpRuntime(root, owner, cpu_pct, age_of(first[root].start_ticks), rss_bytes)
+        )
     return _AcpCensus(runtimes, unread, capped_trees, capped_procs)
 
 
@@ -599,6 +624,16 @@ def _acp_runtime_lines(census: _AcpCensus, window_secs: float) -> list[str]:
             f"  no owner:    ⚠️  {len(unowned)} no running gateway owns, so no turn can be "
             "in flight on them"
         )
+        # Only untracked runtimes (no registry record) are reclaimed by Services >
+        # Leaked agent runtimes; stale runtimes have a record and are handled separately.
+        untracked_rss = sum(
+            r.rss_bytes for r in unowned if r.owner == "untracked" and r.rss_bytes is not None
+        )
+        if untracked_rss > 0:
+            lines.append(
+                f"               ~{untracked_rss // (1024 * 1024)} MiB (untracked);"
+                " reclaim from Services > Leaked agent runtimes in the dashboard"
+            )
         lines.append(f"               pids {pids}{more}")
     return lines + caps
 
@@ -1526,7 +1561,12 @@ def _doctor_skill_view_census(agents_dir: Path) -> None:
         if foreign:
             detail += f", {foreign}{floor} owned by another Kiro Crew home"
         detail += ")"
-    warn = bool(unreadable) or total > _SKILL_VIEW_BACKLOG_WARN
+    # The same sizing the projection's ceiling uses, so a host the doctor warns
+    # about is still a host whose next spawn falls back.
+    warn_at = cli_doctor.skill_view_ceiling(
+        cli_doctor.count_authored_agent_files(agents_dir), _SKILL_VIEW_BACKLOG_WARN
+    )
+    warn = bool(unreadable) or total > warn_at
     print(f"  skill views: {'⚠️ ' if warn else '✅'} {detail}")
     if truncated:
         print(f"{render._INDENT}(floors: the census stopped at its retention bound)")
@@ -1538,7 +1578,7 @@ def _doctor_skill_view_census(agents_dir: Path) -> None:
             f"{stopped[1:]}, move that directory out of the way; every"
             f" live projection republishes its own lease."
         )
-    if total <= _SKILL_VIEW_BACKLOG_WARN:
+    if total <= warn_at:
         return
     if unreadable:
         drain = " Nothing is reclaimed until the unreadable lease record(s) above are gone."

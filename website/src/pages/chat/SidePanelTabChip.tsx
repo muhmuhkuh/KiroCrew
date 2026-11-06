@@ -3,29 +3,20 @@
  *
  * `TabChip` (glyph, label, badge, close control and middle-click close),
  * `DraggableTabItem` (a reorderable chip with its press-and-hold drag and its
- * close menu), `TerminalTabTitle` (a terminal chip's live title) and the
- * tab-kind glyphs from `SidePanelTabIcons`. `SidePanel.tsx` lays out the
- * strip and renders these chips; this module never imports it.
+ * close menu). `SidePanel.tsx` lays out the strip and renders these chips;
+ * this module never imports it.
  */
 import TabCloseMenu, { openTabCloseMenu } from '../../components/TabCloseMenu'
 import type { ReactNode } from 'react'
 import { useLongPressReorder } from '../../hooks/useLongPressReorder'
 import { Reorder } from 'framer-motion'
 import { X } from 'lucide-react'
-import { useTerminalTitle } from '../../utils/terminalRegistry'
 import type { PanelTab } from '../../hooks/usePanelTabs'
 import { usePanelTabDescriptors } from '../../hooks/panelTabRegistry'
-import { iconForKind } from './SidePanelTabIcons'
 import { i18nT } from '../../i18n/t'
-
-/** Live terminal tab title — subscribes to the session's title (running command
- *  / cwd basename) pushed by the backend poller; falls back to the tab's default
- *  cwd title until the first frame arrives. Module-scope so it isn't redefined
- *  per render. */
-function TerminalTabTitle({ sessionId, fallback }: { sessionId: string; fallback: string }) {
-  const live = useTerminalTitle(sessionId)
-  return <>{live || fallback}</>
-}
+import { forwardUiLocation } from '../../uiLocations/uiLocation'
+import { iconForKind } from './SidePanelTabIcons'
+import { TAB_CHIP_ID_ATTR, TerminalTabTitle } from './SidePanelTabNav'
 
 /** One reorderable chip in the dynamic half of the strip.
  *
@@ -74,13 +65,15 @@ function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onC
         // Centered in the group's gap-2.
         <span aria-hidden="true" className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border" />
       )}
-      <TabChip tab={tab} active={active} onSelect={onSelect} onClose={onCloseDirect} />
+      <TabChip chipId={tab.id} tab={tab} active={active} onSelect={onSelect} onClose={onCloseDirect} />
     </Reorder.Item>
     </TabCloseMenu>
   )
 }
 
-function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, badge, testId, chipId: _chipId }: {
+function TabChip({ chipId, tab, active, onSelect, onClose, closable = true, pinned = false, host = false, icon, badge, testId, uiLocationId }: {
+  /** The tab's id, read by the strip's reveal and the menu's re-reveal to find this chip. */
+  chipId?: string
   /** A stored tab, or — for the host's leading tab — just a title: that chip has
    *  no `kind` (it is not a `PanelTab`) and brings its own `icon`. */
   tab: Pick<PanelTab, 'title'> & Partial<Pick<PanelTab, 'kind' | 'sessionId' | 'path'>>
@@ -93,8 +86,8 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
   /** Count / status pill rendered after the label. */
   badge?: ReactNode
   testId?: string
-  /** Stable chip id for drag-reorder (fork-only). */
-  chipId?: string
+  /** A host chip's find_ui location (a `SidePanel` segment), put on the chip. */
+  uiLocationId?: string
 }) {
   // App-tab glyphs come from the manifest descriptor (resolved by name); a built-in
   // reads KIND_ICON. Reuses the shared ['apps'] query, so no extra fetch.
@@ -109,6 +102,8 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
   return (
     <div
       role="tab"
+      {...{ [TAB_CHIP_ID_ATTR]: chipId }}
+      {...forwardUiLocation<HTMLDivElement>(uiLocationId)}
       aria-selected={active}
       tabIndex={0}
       onClick={onSelect}
@@ -151,7 +146,9 @@ function TabChip({ tab, active, onSelect, onClose, closable = true, pinned = fal
       // .side-tab-active in index.css). Inactive = muted text with a hover wash.
       // This deliberately supersedes the earlier Figma "Side Navigation" pill
       // spec (28px, 6px all-corner radius, --border active fill).
-      className={`${narrowIconOnly ? 'side-tab-pinned-idle ' : ''}group relative isolate flex items-center gap-1 h-8 rounded-t-md rounded-b-none border cursor-pointer shrink-0 select-none transition-colors ${
+      // The keyboard ring is drawn inset: each chip group is an unpadded
+      // horizontal scroller, which clips an outset ring.
+      className={`${narrowIconOnly ? 'side-tab-pinned-idle ' : ''}group relative isolate flex items-center gap-1 h-8 rounded-t-md rounded-b-none border cursor-pointer shrink-0 select-none transition-colors focus-visible:outline-offset-[-2px] ${
         `max-w-[240px] ${closable ? 'pl-2 pr-1' : 'px-2'}`
       } ${
         active ? 'side-tab-active bg-bg text-accent border-x-border border-t-border border-b-transparent' : 'side-tab-inactive border-transparent text-muted hover:text-text'

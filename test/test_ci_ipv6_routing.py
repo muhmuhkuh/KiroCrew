@@ -266,6 +266,7 @@ def test_workflow_routes_every_scope_without_changing_local_defaults(jobs):
         "|| 'windows-latest') || matrix.os }}"
     )
     assert hosted["strategy"] == {
+        "max-parallel": 4,
         "fail-fast": False,
         "matrix": {"os": ["ubuntu-latest", "windows-latest"]},
     }

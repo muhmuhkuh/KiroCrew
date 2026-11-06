@@ -29,8 +29,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor, within, act } from '@testing-library/react'
 import { Routes, Route } from 'react-router-dom'
-import type { CSSProperties } from 'react'
-import ArtifactPanel from '../components/ArtifactPanel'
+import { createRef, type CSSProperties, type Ref } from 'react'
+import ArtifactPanel, { type ArtifactPanelHandle } from '../components/ArtifactPanel'
 import { renderWithProviders } from './helpers'
 import { api } from '../api/client'
 import { copyToClipboard } from '../utils/clipboard'
@@ -212,9 +212,10 @@ interface PanelOverrides {
   onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
   embedded?: boolean
   connected?: boolean
+  ref?: Ref<ArtifactPanelHandle>
 }
 
-function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitComments, embedded, connected }: PanelOverrides = {}) {
+function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitComments, embedded, connected, ref }: PanelOverrides = {}) {
   const onClose = vi.fn()
   const utils = renderWithProviders(
     <Routes>
@@ -222,6 +223,7 @@ function renderPanel({ kind = 'markdown', content = SEED_CONTENT, onSubmitCommen
         path="/"
         element={
           <ArtifactPanel
+            ref={ref}
             slug={SLUG}
             kind={kind}
             content={content}
@@ -461,6 +463,29 @@ describe('ArtifactPanel', () => {
       expect(draftSlotClears).toEqual(['stacked'])
     })
 
+    it('a host close through the handle asks before a typed draft, running beforePrompt only then', async () => {
+      // The side panel's tab-strip × closes through this handle; its
+      // beforePrompt brings a background tab forward before the prompt shows.
+      stubHasDraft = true
+      const ref = createRef<ArtifactPanelHandle>()
+      const { onClose } = renderPanel({ ref })
+      await screen.findByText(NAME)
+      const beforePrompt = vi.fn()
+      act(() => { ref.current!.requestClose({ beforePrompt }) })
+      const dialog = await screen.findByRole('dialog')
+      expect(within(dialog).getByText('Discard your unsaved comment?')).toBeInTheDocument()
+      expect(beforePrompt).toHaveBeenCalledTimes(1)
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect(onClose).not.toHaveBeenCalled()
+
+      stubHasDraft = false
+      const unasked = vi.fn()
+      act(() => { ref.current!.requestClose({ beforePrompt: unasked }) })
+      expect(onClose).toHaveBeenCalledTimes(1)
+      expect(unasked).not.toHaveBeenCalled()
+    })
+
     it('passes the toolbar no row actions — the composer alone (Add comment, Close) is the row', async () => {
       // A third control beside the box would break the two-per-row cap; copying
       // the selection is the composer's own Cmd/Ctrl+C.
@@ -575,6 +600,27 @@ describe('ArtifactPanel', () => {
       fireEvent.click(within(dialog).getByRole('button', { name: 'Exit full screen' }))
       await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
       expect(document.body.style.overflow).toBe('')
+    })
+
+    // #24784: the native caption buttons of a frameless desktop window cover
+    // the overlay's top-right corner, so the header drops below that band.
+    it('drops the header below the caption band under a Windows host (#24784)', async () => {
+      document.documentElement.classList.add('embedded-win-inset')
+      try {
+        renderPanel()
+        await screen.findByText(NAME)
+        await enterFullscreen()
+        expect(screen.getByTestId('artifact-panel-fullscreen-header').style.marginTop).toBe('42px')
+      } finally {
+        document.documentElement.classList.remove('embedded-win-inset')
+      }
+    })
+
+    it('leaves the header at the top in a plain browser tab', async () => {
+      renderPanel()
+      await screen.findByText(NAME)
+      await enterFullscreen()
+      expect(screen.getByTestId('artifact-panel-fullscreen-header').style.marginTop).toBe('')
     })
 
     it('keeps the body card chrome in fullscreen while the panel body stays flush', async () => {

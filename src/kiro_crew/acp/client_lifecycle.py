@@ -13,9 +13,11 @@ Instance fields written: ``_background_launches``, ``_between_turn_credits``, ``
 ``_channel_id``, ``_child_pids``, ``_claude_settings_authored``,
 ``_claude_settings_claim_unrevoked``, ``_claude_settings_shared``,
 ``_claude_settings_written``, ``_confirmed_capability_session``, ``_consult_future``,
+``_copilot_mcp_config_path``,
 ``_fork_request``, ``_kill_sent``, ``_last_activity``, ``_last_stop_reason``,
 ``_liveness_oracle``, ``_loaded_capability_template``, ``_mcp_ref_spec``,
-``_mcp_report``, ``_mcp_report_frame_floor``, ``_oauth_emitted_servers``,
+``_mcp_report``, ``_mcp_report_frame_floor``, ``_member_stub_allowlist``,
+``_oauth_emitted_servers``,
 ``_opencode_denies_in_force``, ``_opencode_denies_unenforced``,
 ``_opencode_native_mounts``, ``_pending_oauth_requests``,
 ``_permission_surface_share_validated``, ``_pi_mcp_handoff``, ``_pi_mcp_server_names``,
@@ -24,7 +26,8 @@ Instance fields written: ``_background_launches``, ``_between_turn_credits``, ``
 ``_session_agent_spec``, ``_session_harness_deny_rules``, ``_session_id``,
 ``_session_key``, ``_session_mcp_cache``, ``_session_mcp_snapshot``,
 ``_session_mcp_unhonoured``, ``_spawn_start_token``, ``_spawn_work_dir``,
-``_spec_denied_tools``, ``_spec_zero_tools``, ``_stderr_lines``, ``_stderr_task``,
+``_spec_denied_tools``, ``_spec_shell_allowlist``, ``_spec_write_allowlist``,
+``_spec_write_cwd``, ``_spec_zero_tools``, ``_stderr_lines``, ``_stderr_task``,
 ``_stdin_stalled``, ``_windows_tree_cleanup_failed``.
 
 Instance fields read: ``_entitlement_probe_inflight``, ``_mcp_gateway_socket``,
@@ -590,6 +593,15 @@ def _reset_state(self: AcpClient) -> None:
             os.remove(handoff_path)
         except OSError:
             pass
+    # The Copilot CLI launch MCP config of a spawn that never reached initialize
+    # (a spawn error after resolve_spawn wrote it): same shape, one unlink.
+    copilot_config = getattr(self, "_copilot_mcp_config_path", "")
+    self._copilot_mcp_config_path = ""
+    if copilot_config:
+        try:
+            os.remove(copilot_config)
+        except OSError:
+            pass
     # The settings.local.json THIS session seeded is removed by
     # _discard_claude_settings_seed, which every caller awaits in the `try` of
     # the `finally` that reaches here -- it is async because the ownership hash,
@@ -642,6 +654,7 @@ def _reset_state(self: AcpClient) -> None:
     self._session_mcp_cache = None
     self._session_mcp_snapshot = None
     self._session_agent_spec = None
+    self._member_stub_allowlist = None
     self._loaded_capability_template = ""
     self._capability_projection_gaps = ()
     # Per SESSION, not per spawn: a replacement process' session is judged on its
@@ -651,6 +664,9 @@ def _reset_state(self: AcpClient) -> None:
     # what the next session's guard judges, not this one's.
     self._mcp_ref_spec = None
     self._spec_denied_tools = frozenset()
+    self._spec_shell_allowlist = None
+    self._spec_write_allowlist = None
+    self._spec_write_cwd = ""
     self._spec_zero_tools = False
     self._session_mcp_unhonoured = frozenset()
     self._session_harness_deny_rules = ()

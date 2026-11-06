@@ -39,6 +39,9 @@ export interface InlineComment {
 export interface InlineCommentImage {
   /** The image destination exactly as written in the markdown, e.g. `states/a.png`. */
   src: string
+  /** The file the preview resolved `src` to and loaded, decoded, which the
+   *  agent payload names. Absent when the preview had no file for it. */
+  path?: string
   x: number; y: number; w: number; h: number
   /** Which use of the file the box was drawn on: the `nth` (0-based) of `uses`
    *  uses of a file find the same use again after an edit moves both. */

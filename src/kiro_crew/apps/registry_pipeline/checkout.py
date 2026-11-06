@@ -39,6 +39,7 @@ from kiro_crew.apps.registry_pipeline.subprocess_env import (
     anonymous_git_env,
     minimal_env,
 )
+from kiro_crew.owner_only_files import ensure_directory as _ensure_directory
 from kiro_crew.sandbox import (
     cgroup_scope_argv,
     create_subprocess_limited,
@@ -555,19 +556,17 @@ async def _git_fetch_ref(
         "-c",
         "fetch.recurseSubmodules=no",
     ]
-    # Destination lifecycle, stated as one invariant because three reviewer findings
-    # were three exits from the same mistake:
+    # Destination lifecycle, stated as one invariant:
     #
     #   THIS FUNCTION MAY DELETE `dest` IF AND ONLY IF THIS INVOCATION CREATED IT
     #   AND DID NOT SUCCEED -- and that is decided in ONE place, not per branch.
     #
-    # The earlier drafts put cleanup on each failure branch, so each fix closed one
-    # exit and left the others: adopting a non-checkout destination (deleted the
-    # user's files), a moved-aside restore that skipped on cancellation, and finally
-    # a spawn exception between `git init` and `git remote add` that left a `.git`
-    # directory with no origin -- which then wedges every later attempt on
-    # `unreadable_clone_origin`, a fail-closed path that deliberately does not clean
-    # up after itself.
+    # Cleanup on each failure branch leaves the other exits open: adopting a
+    # non-checkout destination (deletes the user's files), a moved-aside restore
+    # skipped on cancellation, or a spawn exception between `git init` and
+    # `git remote add` that leaves a `.git` directory with no origin -- which then
+    # wedges every later attempt on `unreadable_clone_origin`, a fail-closed path
+    # that deliberately does not clean up after itself.
     #
     # Cleanup therefore belongs to the LIFETIME of the thing created, not to the
     # enumeration of ways to fail. The `finally` below covers return, raise and
@@ -598,7 +597,7 @@ async def _git_fetch_ref(
                 ),
             }
         else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            _ensure_directory(dest.parent)
             # Set BEFORE the spawn: `git init` may create the directory and then
             # fail, or the spawn itself may raise, and either way the directory is
             # ours to discard.
@@ -1039,11 +1038,10 @@ async def _git_clone_or_pull(
         if commit:
             # A PINNED INSTALL NEVER REUSES AN EXISTING TREE.
             #
-            # Four review rounds landed here, each a different way of trusting
-            # on-disk state: adopting a destination that was not a checkout, an
-            # exception leaving a half-built one, HEAD equality standing in for
-            # contents, and finally content `git status` cannot report at all. The
-            # last one is why no cleanliness check can close this class: `.git/`
+            # Reusing a tree means trusting on-disk state: a destination that is
+            # not a checkout, a half-built one an exception left, HEAD equality
+            # standing in for contents, or content `git status` cannot report at
+            # all. The last one is why no cleanliness check can close this class: `.git/`
             # is never reported by any `git status` variant, so an added
             # `.git/hooks/post-checkout` is invisible, and an untracked
             # `sitecustomize.py` executes on interpreter start if the tree lands on
@@ -1056,8 +1054,8 @@ async def _git_clone_or_pull(
             # `git init --template=`, which is also what keeps hooks absent.
             #
             # The cost is one shallow fetch of a single commit per pinned reinstall.
-            # The fast path it replaces was buying that round-trip with trust in an
-            # agent-writable directory.
+            # Skipping it would buy that round-trip with trust in an agent-writable
+            # directory.
             moved_aside = await _move_checkout_aside(dest, log_lines)
             # This one is the SAME repository with the user's own edits, so a failed
             # transaction must put it back. The origin-mismatch move above is a
@@ -1189,7 +1187,7 @@ async def _git_clone_or_pull(
             return None
 
         log_lines.append(f"Cloning {_strip_git_target_userinfo(git_url)} (branch: {branch})...")
-        dest.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_directory(dest.parent)
         clone_cmd = [
             "git",
             *_HOOKS_NEUTRALIZER_ARGV,

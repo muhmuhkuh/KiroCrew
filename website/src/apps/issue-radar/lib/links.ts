@@ -270,6 +270,7 @@ function azureProject(ref: RepoRef): string {
 
 /** The repo's landing page on its own host. */
 export function repoWebUrl(ref: RepoRef): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${ref.owner}`
   const path = descriptorOf(ref).repoPath
     .replace('{owner}', ref.owner)
     .replace('{repo}', ref.repo)
@@ -310,6 +311,7 @@ export function commitUrlFor(ref: RepoRef, sha: string): string {
  * segment (`_workitems/edit/<id>`), so both the scope and the path shape come
  * from the table rather than from a suffix appended to the repo URL. */
 export function issueUrlFor(ref: RepoRef, number: number): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/browse/${number}`
   const d = descriptorOf(ref)
   const tail = d.itemSegment ? `${d.itemSegment}/${number}` : `${number}`
   return scopedPath(ref, d.issuesScope, `${d.issuesSegment}/${tail}`)
@@ -317,6 +319,7 @@ export function issueUrlFor(ref: RepoRef, number: number): string {
 
 /** Link to the repo's issue / work-item list. */
 export function issuesUrlFor(ref: RepoRef): string {
+  if (isJira(ref)) return repoWebUrl(ref)
   const d = descriptorOf(ref)
   return scopedPath(ref, d.issuesScope, d.issuesSegment)
 }
@@ -326,6 +329,7 @@ export function issuesUrlFor(ref: RepoRef): string {
  * The path noun differs, not just the host: GitHub serves `/pull/<n>`, GitLab
  * `/-/merge_requests/<n>`, Azure DevOps `/_git/<repo>/pullrequest/<n>`. */
 export function changeUrlFor(ref: RepoRef, number: number): string {
+  if (isJira(ref)) return issueUrlFor(ref, number)
   return repoPagePath(ref, `${descriptorOf(ref).changeSegment}/${number}`)
 }
 
@@ -340,6 +344,7 @@ export function userUrlFor(ref: RepoRef, login: string): string {
 
 /** Link to the page where repo access is administered. */
 export function membersUrlFor(ref: RepoRef): string {
+  if (isJira(ref)) return `https://${hostOf(ref)}/plugins/servlet/project-config/${ref.owner}/summary`
   const d = descriptorOf(ref)
   return scopedPath(ref, d.membersScope, d.membersPath)
 }
@@ -389,6 +394,19 @@ export function sameRepoRef(a: RepoRef, b: RepoRef): boolean {
  * "Pull request" and "Pull Request" end up on adjacent screens.
  */
 export function providerTerms(ref?: Pick<RepoRef, 'provider'>): ProviderTerms {
+  if (isJira(ref)) {
+    return {
+      ...providerTerms(),
+      changeRequest: 'issue',
+      changeRequestTitle: 'Issue',
+      changeRequestPlural: 'issues',
+      changeRequestPluralTitle: 'Issues',
+      changeRequestShort: 'issue',
+      sigil: '',
+      providerName: 'Jira',
+      cli: '',
+    }
+  }
   if (providerKeyOf(ref) === 'azure') {
     return {
       ...providerTerms(),

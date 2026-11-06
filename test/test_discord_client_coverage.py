@@ -1,14 +1,8 @@
 """Coverage tests for the Discord Gateway + REST client (``discord/client.py``).
 
-Targets the paths the behavioural suite leaves untouched: the lifecycle
-(start/close/wait_ready), every outbound REST wrapper, the gateway connection
-loop and its close-code classification, frame handling (hello / resume /
-heartbeat / reconnect / invalid-session), the heartbeat task's failure modes,
-dispatch normalization for READY / RESUMED / INTERACTION_CREATE, handler
-error isolation, and the ``_api`` retry + degrade ladder.
-
-Everything runs against stubbed transports -- no socket, no network, no
-subprocess, and no writes outside ``tmp_path``.
+Targets paths the behavioural suite leaves untouched: lifecycle, REST wrappers, the
+gateway loop and close codes, frame and heartbeat handling, and the ``_api`` retry
+ladder. Stubbed transports only; no network and no writes outside ``tmp_path``.
 """
 
 from __future__ import annotations
@@ -744,6 +738,46 @@ class TestRunConnection:
         assert session.ws_urls == [_GATEWAY_URL]
         assert session.ws_kwargs[0]["max_msg_size"] == 0
         assert session.ws_kwargs[0]["heartbeat"] == dc._WS_HEARTBEAT_SECS
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad",
+        ["not json {oops secret-ish", "[]", "5", "null", '"a string"'],
+        ids=["unparseable", "list", "number", "null", "string"],
+    )
+    async def test_bad_text_frame_is_dropped_and_the_connection_keeps_reading(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        bad: str,
+    ) -> None:
+        # One bad TEXT frame must cost that frame, not the connection: the
+        # gateway loop's catch-all would otherwise reconnect, re-identify
+        # and stall 5 s. The frame after it must still be dispatched.
+        client = _make_client()
+        ws = FakeWS(
+            [
+                _WSMessage(aiohttp.WSMsgType.TEXT, bad),
+                _WSMessage(aiohttp.WSMsgType.TEXT, json.dumps({"op": _OP_HEARTBEAT_ACK})),
+                _WSMessage(aiohttp.WSMsgType.CLOSED),
+            ],
+            close_code=1000,
+        )
+        _bind_session(client, FakeSession(ws=ws), monkeypatch)
+        client._hb_acked = False
+
+        with caplog.at_level(logging.WARNING, logger=dc.logger.name):
+            try:
+                await client._run_connection()
+            except Exception as exc:
+                pytest.fail(f"a bad frame escaped the read loop: {type(exc).__name__}")
+
+        assert client._hb_acked is True
+        dropped = [r for r in caplog.records if "dropping" in r.getMessage()]
+        assert len(dropped) == 1
+        # Only safe metadata is logged, never the frame body.
+        assert "secret-ish" not in caplog.text
+        assert "a string" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_resume_url_is_preferred_when_a_session_exists(
@@ -1505,11 +1539,8 @@ class TestResolveProxy:
 class TestMentionSuppression:
     """No send may notify anyone: every message body is model- or tool-derived.
 
-    ``allowed_mentions: {"parse": []}`` is Discord's own suppression, so it holds
-    for a mention no text pass ever saw — including one reassembled across a
-    chunk boundary, and on the several send paths that never route through the
-    renderer's text-level defang (the option-choice echo, the help card, a queue
-    receipt, a threshold notice, every proactive delivery).
+    ``allowed_mentions: {"parse": []}`` also covers mentions reassembled across a
+    chunk boundary and send paths that skip the renderer's text-level defang.
     """
 
     def _payloads(self, monkeypatch: pytest.MonkeyPatch, client: Any) -> list[Any]:

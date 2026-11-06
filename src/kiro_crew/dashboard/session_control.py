@@ -125,6 +125,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _sel_off_loop,
         _store_is_member_owned,
         caller_slot_key,
+        is_person_tab,
         manager_chain_enabled,
         manager_chain_snapshot,
         member_admitted_to_scoped_surface,
@@ -218,6 +219,7 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _inherited_project_dir,
         _model_pin_refusal,
         _record_spawn,
+        _refuse_if_crew_paused,
         _register_spawn_pending_edge,
         _store_s_crewmate,
         create_session,
@@ -309,10 +311,12 @@ if TYPE_CHECKING:  # every owner-defined name this module forwards, for type che
         _clean_new_session_title,
         _clean_rename_title,
         _is_allowed_format_char,
+        _parse_session_color,
         _refuse_hidden_title_characters,
         _shows_nothing,
         generate_title_target,
         rename_target,
+        set_color_target,
     )
     from kiro_crew.dashboard.session_control_parts.session_tree import (  # noqa: F401
         _MAX_FORK_TITLE_CHARS,
@@ -438,6 +442,7 @@ if TYPE_CHECKING:  # names this module re-exported from other modules
     from kiro_crew.dashboard.relay_archive import RELAY_ARCHIVE_CODE  # noqa: F401
     from kiro_crew.dashboard.relay_archive import RELAY_ARCHIVE_ERROR  # noqa: F401
     from kiro_crew.dashboard.relay_archive import is_relay_archive  # noqa: F401
+    from kiro_crew.dashboard.slot_color import write_slot_color  # noqa: F401
     from kiro_crew.dashboard.state import MAX_LIVE_SLOTS  # noqa: F401
     from kiro_crew.dashboard.state import MAX_SLOTS_PER_CREATOR  # noqa: F401
     from kiro_crew.dashboard.state import SlotOrigin  # noqa: F401
@@ -483,3 +488,5 @@ if TYPE_CHECKING:  # names this module re-exported from other modules
     from kiro_crew.validation import MAX_SESSION_STATUS_ROWS  # noqa: F401
     from kiro_crew.validation import MAX_SESSION_STATUS_TITLE_CHARS  # noqa: F401
     from kiro_crew.validation import MAX_SHORT_STRING  # noqa: F401
+    from kiro_crew.validation import SESSION_COLOR_CHOICES  # noqa: F401
+    from kiro_crew.validation import SESSION_PALETTE_SIZE  # noqa: F401

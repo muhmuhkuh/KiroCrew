@@ -13,6 +13,14 @@ const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { createLaunchLog } = require("./launch-log");
+
+// First, so the stdio 'error' listeners are attached before anything writes to
+// the console: a write to a dead tty must not become an uncaughtException that
+// the safety net mirrors back to the same tty (#15950).
+const launchLog = createLaunchLog({
+  append: (entry) => fs.appendFileSync(gatewayLogPath(), entry),
+});
 
 const { findConfiguredDashboardPort } = require("./data-home");
 const { onQuitForUpdate } = require("./close-action");
@@ -80,7 +88,6 @@ const { createWindowLifecycle } = require("./window-lifecycle");
 const { createIpcRegistrar } = require("./ipc-registrar");
 const { createDownloadExpectations } = require("./download-expectations");
 const { installEarlyBootGuard } = require("./early-boot-guard");
-const { createLaunchLog } = require("./launch-log");
 
 // Everything from here to `app.whenReady()` runs synchronously at module load,
 // before Chromium is ready and before any window, tray, or crash reporter
@@ -89,9 +96,6 @@ const { createLaunchLog } = require("./launch-log");
 // `gatewayLogPath` are function declarations further down; they hoist, so the
 // guard can call them when it fires. The ready handler releases it once the
 // post-ready safety net below can take over.
-const launchLog = createLaunchLog({
-  append: (entry) => fs.appendFileSync(gatewayLogPath(), entry),
-});
 const releaseEarlyBootGuard = installEarlyBootGuard({
   app,
   dialog,
@@ -128,6 +132,8 @@ const store = new Store({
     updateChannel: "",
     autoDownloadUpdates: true,
     runLocalGateway: true,
+    // "background" or "quit". See close-action.js.
+    closeAction: "background",
     linuxFrameless: null,
     // Written by gpu-crash-fallback.js when the GPU process dies at startup;
     // read before Chromium initializes on the next launch.
@@ -232,6 +238,7 @@ function gatewayLogPath() {
   return path.join(directory, "gateway-launch.log");
 }
 
+// The console mirror stops once stdio is dead; see launch-log.js.
 function glog(line) {
   launchLog.glog(line);
 }

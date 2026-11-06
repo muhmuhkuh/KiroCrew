@@ -49,10 +49,12 @@ const OWNER_MODULES = [
   'browserEvents.ts',
   'bundleReload.ts',
   'chatStream.ts',
+  'chunkWatch.ts',
   'composerCards.ts',
   'connection.ts',
   'contextTraceRefresh.ts',
   'dashboardFields.ts',
+  'foldWatch.ts',
   'frames.ts',
   'gatewayConnectivity.ts',
   'idleRowRefresh.ts',
@@ -66,6 +68,7 @@ const OWNER_MODULES = [
   'streamBuffers.ts',
   'turnCompletion.ts',
   'voicePlayback.ts',
+  'workDelta.ts',
   'workflowRuns.ts',
 ]
 

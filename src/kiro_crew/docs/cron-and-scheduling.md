@@ -122,7 +122,7 @@ A command cron runs under `sh -c` and is vetted when it is added and again each 
 - command substitution: `$(...)`, backticks, `$((...))`;
 - any `${...}` other than a plain `${NAME}` (no `${X:-default}`, `${X#prefix}`, `${#X}`);
 - `$'...'` ANSI-C quoting;
-- brace expansion such as `{a,b}` or `{1..9}`, including a quoted regex interval like `'[0-9]{1,3}'`. For a basic-regex tool, escape the braces inside double quotes (`grep "[0-9]\{1,3\}"`);
+- brace expansion such as `{a,b}` or `{1..9}`, including a quoted regex interval like `'[0-9]{1,3}'`. A spaceless jq object such as `jq '{id,name}'` is accepted once a plain space follows the comma inside the same quotes (`jq '{id, name}'`). For a basic-regex tool, escape the braces inside double quotes (`grep "[0-9]\{1,3\}"`);
 - positional and special parameters: `$1`, `$@`, `$*`, `$#`;
 - loops and compound commands: `for`, `while`, `until`, `case`;
 - a variable reference (`A=x; cmd $A`, `A=x cmd $A`, `A=x && cmd $A`): the check does not model how the shell scopes or rewrites a value, so any `$NAME` or `${NAME}` read anywhere in the text is refused, comments, quoted values and nested shells included, assigned or not. Only `$HOME` may be read, and `HOME` may appear only as `$HOME` or `${HOME}` (so `read HOME`, `HOME=x` and `export HOME` are refused);
@@ -141,7 +141,7 @@ def run(ctx):
     raise Report("Result recorded; keep this cron scheduled")
 ```
 
-`ctx.notify(text, **kwargs)` sends a gateway message and `ctx.call_tool(server, tool, args)` invokes an MCP tool and returns every text block of its result, in order, joined by newlines (a tool that puts a notice ahead of its JSON returns both, the notice first). `call_tool` keeps one server per name for the whole run: a call the server answers, with a result or a tool error, leaves it running for the next call; a call that fails any other way stops it, and the next call starts a fresh one. `kirocrew cron preview` uses the same lifecycle. `raise Skip()` ends this tick silently, `raise Done()` completes and removes the job, and `raise Report(message)` delivers a message while keeping the job scheduled.
+`ctx.notify(text, **kwargs)` sends a gateway message and `ctx.call_tool(server, tool, args)` invokes an MCP tool and returns every text block of its result, in order, joined by newlines (a tool that puts a notice ahead of its JSON returns both, the notice first). `call_tool` keeps one server per name for the whole run: a call the server answers, with a result or a tool error, leaves it running for the next call; a call that fails any other way stops it, and the next call starts a fresh one. `kirocrew cron preview` uses the same lifecycle. Arguments are scanned for credentials before they are sent: a credential-shaped span inside a longer string is replaced by a `[REDACTED: ...]` placeholder, and when a whole argument is a credential (a long opaque id can look like one) the call is not sent: it raises `ValueError` naming the argument's path, never its value. `kirocrew cron preview` refuses it the same way. `raise Skip()` ends this tick silently, `raise Done()` completes and removes the job, and `raise Report(message)` delivers a message while keeping the job scheduled.
 
 A script can also drive dashboard sessions. Each method raises `RuntimeError` carrying the gateway's reason when the gateway refuses or cannot be reached:
 
@@ -158,6 +158,16 @@ Preview a script cron locally with real MCP tools; notifications are captured an
 ```bash
 kirocrew cron preview ~/.kiro/crew/crons/my.py:run --message "arguments for ctx.message"
 ```
+
+### A long job that must outlive the chat
+
+A process the agent starts from its shell, `nohup`, `&`, `setsid` and `disown` included, belongs to the agent's runtime. That runtime can be recycled between turns while nobody is watching, and the process stops with it without any notice. A job that fits in an hour can run as a one-shot command cron instead:
+
+```bash
+kirocrew cron add "train" "" --at "in 1 minute" --command "cd ~/proj && python train.py > train.log 2>&1" --timeout 3600 --timeout-secs 3660
+```
+
+It runs from the gateway, not from the agent's runtime, so a recycled runtime does not stop it. Its `timeout` still does (at most 3600 seconds, and `--timeout-secs` must be at least 5 seconds more), and a gateway restart can interrupt it. A longer job, or one that needs more than the cron sandbox allows, belongs outside Kiro Crew, for example in a `systemd-run --user` unit you start yourself.
 
 ## Approval Mode
 

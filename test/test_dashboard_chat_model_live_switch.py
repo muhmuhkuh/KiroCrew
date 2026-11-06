@@ -64,11 +64,8 @@ class TestSlotModelLiveSwitch:
     """POST /api/chat/slots/{slot}/model — prefer an in-place session/set_model
     over tearing the session down.
 
-    A reset costs a full process-tree teardown now plus a cold start and
-    transcript replay on the next message. kiro-cli's ``session/set_model``
-    switches a live session instead (verified against 2.15.1: acked
-    synchronously, conversation carried across the switch, sticky over later
-    turns), so the reset is only a fallback.
+    A reset costs a teardown plus a cold start and replay; kiro-cli's
+    ``session/set_model`` keeps the conversation, so the reset is only a fallback.
     """
 
     @staticmethod
@@ -486,12 +483,8 @@ class TestSlotModelLiveSwitch:
     async def test_unavailable_model_is_4xx_and_keeps_the_session(self, tmp_path):
         """An entitlement refusal must NOT take the reset fallback.
 
-        The generic ``except Exception`` here treats
-        every set_model failure as "the call didn't land" and recovers with a
-        reset. For a model the account cannot use that recovery is wrong twice
-        over — it destroys the live conversation AND cold-starts on a different
-        model, while the handler still answers ok:True. The slot must also keep
-        its previous model, or the picker asserts a model that was refused.
+        A reset would destroy the conversation and cold-start on another model while
+        answering ok:True. The slot keeps its previous model so the picker stays truthful.
         """
         from kiro_crew.acp.client import AcpModelUnavailable
 
@@ -544,7 +537,7 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_refused_pick_rolls_back_the_pick_generation(self, tmp_path):
-        """REGRESSION (review finding): a refused pick changed nothing, so the
+        """A refused pick changed nothing, so the
         explicit-pick generation must roll back with the model. Leaving the
         bump in place would make the model-fallback restore probe read the
         FAILED attempt as an explicit choice and silently abandon restoring
@@ -573,7 +566,7 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_refused_pick_rollback_spares_a_newer_concurrent_pick(self, tmp_path):
-        """REGRESSION (review finding on eb3cf067): two picks arriving together
+        """Two picks arriving together
         must not roll back each other's state. The pick transaction is
         serialised per slot (_model_pick_lock), so the refused pick unwinds
         cleanly before the next pick's snapshot is taken — the surviving state
@@ -704,7 +697,7 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_same_value_pick_still_bumps_the_pick_generation(self, tmp_path):
-        """REGRESSION (review finding): picking the model the slot already
+        """Picking the model the slot already
         reports takes the equality early-return, but it is still an EXPLICIT
         affirmation — without the bump, a user who deliberately re-picks the
         very model the session fell back to would have that choice silently
@@ -727,7 +720,7 @@ class TestSlotModelLiveSwitch:
 
     @pytest.mark.asyncio
     async def test_same_value_pick_during_fallback_takes_the_live_switch_path(self, tmp_path):
-        """REGRESSION (review finding on 1a61ddcf): with a fallback actively
+        """With a fallback actively
         serving the session, a pick of the DISPLAYED primary equals slot.model
         but the wire model is the fallback — the equality early-return would
         record the pick and switch nothing, stranding the session on the
@@ -755,10 +748,8 @@ class TestSlotModelSwitchContextBroadcast:
     """POST /api/chat/slots/{slot}/model — one ``context_usage`` event per
     switch so the meter updates immediately.
 
-    Regression: nothing broadcast on a model switch, so the frontend's stored
-    ``slotContextTokens`` kept the OLD model's {used, window} until the next
-    turn. The event carries ``reset: true`` so the reducer may replace or
-    delete the stored entry (per-turn events never delete).
+    Without it ``slotContextTokens`` keeps the old model's {used, window} until the next
+    turn. ``reset: true`` lets the reducer replace or delete the entry.
     """
 
     _app = staticmethod(TestSlotModelLiveSwitch._app)
@@ -887,10 +878,7 @@ class TestDeferredModelSwitchAtTheBoundary:
     """``apply_deferred_model_switch``: what the turn boundary does with a pick
     the picker took mid-turn.
 
-    Called at the end of the turn the pick arrived in and at the next turn's
-    admission. It moves the session exactly as an idle pick would -- the
-    harness's live switch first, the deferred reset when that is not available --
-    so each backend takes the path it already takes for the picker, and it
+    It moves the session as an idle pick would (live switch, else deferred reset) and
     leaves the pick deferred while the session is still busy.
     """
 

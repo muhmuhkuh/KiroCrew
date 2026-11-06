@@ -299,7 +299,7 @@ def test_zero_tool_confirmation_judges_the_view_kiro_loads(
     from kiro_crew.acp import client as acp_client
 
     _home, agents, project = native_tree
-    spec = {"name": "custom", "tools": [], "resources": resources}
+    spec = {"name": "custom", "tools": [], "includeMcpJson": False, "resources": resources}
     (agents / "custom.json").write_text(json.dumps(spec), encoding="utf-8")
     client = acp_client.AcpClient(agent="custom", work_dir=project)
     client._native_skill_projection = projection.prepare_native_skill_projection(
@@ -325,7 +325,9 @@ def test_rollback_switch_confirms_a_zero_tool_spec_through_the_authored_bracket(
     project_agents = project / ".kiro" / "agents"
     project_agents.mkdir(parents=True)
     spec_path = project_agents / "custom.json"
-    spec_path.write_text(json.dumps({"name": "custom", "tools": []}), encoding="utf-8")
+    spec_path.write_text(
+        json.dumps({"name": "custom", "tools": [], "includeMcpJson": False}), encoding="utf-8"
+    )
     monkeypatch.setenv("KIROCREW_NATIVE_SKILL_PROJECTION", "0")
     client = acp_client.AcpClient(agent="custom", work_dir=project)
     client._native_skill_projection = projection.prepare_native_skill_projection(
@@ -718,7 +720,7 @@ def test_the_ceiling_fallback_still_prunes_so_the_backlog_can_drain(
     monkeypatch.setattr(projection, "SKILL_VIEW_PROJECTION_CEILING", 3)
     # Reclaimable legacy aliases this home owns, aged past the reclaim floor.
     backlog = [_legacy_alias(agents, digest=f"{n:024x}") for n in range(5)]
-    assert projection._count_projected_aliases(agents) >= 3  # over the ceiling
+    assert projection._count_projected_aliases(agents, 3) >= 3  # over the ceiling
     # Fallback path (no view minted), but the prune still runs under the lock.
     assert projection.prepare_native_skill_projection(project) is None
     reclaimed = [p for p in backlog if not p.exists()]

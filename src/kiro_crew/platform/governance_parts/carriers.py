@@ -102,6 +102,8 @@ def _version_tuple(value: str) -> Tuple[int, ...]:
         return ()
 
 
+#: Release channels a policy may pin; ``update_layout.RELEASE_CHANNELS`` (a test
+#: keeps the two equal).
 UPDATE_CHANNELS = ("stable", "insider", "nightly")
 
 
@@ -130,6 +132,10 @@ class UpdatePins:
     source: str = ""
     # The minimum version this fleet may run. Empty = no floor.
     min_version: str = ""
+    # The release channel this fleet follows (one of :data:`UPDATE_CHANNELS`), in
+    # place of the local ``$KIROCREW_HOME/channel`` file (RFC
+    # crew-enterprise-edition, appendix row "Update channel"). Empty = unpinned:
+    # the local file decides, except an enterprise build follows ``stable``.
     channel: str = ""
     # The operator-authored shell commands for the command update provider. Their
     # PRESENCE is what enables the provider (there is no mechanism selector): when
@@ -248,6 +254,8 @@ class UpdatePins:
                 platform_commands[plat_key] = entry
         channel = str(d.get("channel") or "").strip().lower()
         if channel and channel not in UPDATE_CHANNELS:
+            # The channel becomes a path segment in every feed URL, so an unknown
+            # one fails the load rather than reading as unpinned.
             raise PlatformCompositionError(
                 f"updates.channel must be one of {list(UPDATE_CHANNELS)}, got {channel!r}"
             )
@@ -676,6 +684,10 @@ class GovernanceCeiling:
     # Empty when omitted — runtime then uses env or a later default. A profile
     # cannot carry this key. Read through :func:`agentcore_workload_name`.
     agentcore_workload_name: str = ""
+    # Policy-only cap on an auto-approve (YOLO) grant, in seconds (top-level
+    # ``yolo_max_seconds``; RFC crew-enterprise-edition, appendix row
+    # "Auto-approval duration"). 0 = no cap. Read through
+    # ``safety_override_permits.yolo_ttl_cap``.
     yolo_max_seconds: int = 0
     # Which precedence tier produced this ceiling (one of the ``TIER_*`` names, or
     # "" for a ceiling parsed outside the loader).  Its one consumer is the tier

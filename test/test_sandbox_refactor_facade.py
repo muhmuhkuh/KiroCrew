@@ -213,12 +213,13 @@ _MOVED: dict[str, tuple[str, ...]] = {
         _migrate_md_notebook_legacy_state _member_records_move
         _AUTH_STORE_PUBLISHED_KEY_LEAF _AUTH_STORE_LEGACY_TEMP_PREFIX
         _reconcile_auth_store_staging_links _sweep_legacy_auth_store_temps
-        _LEGACY_AUTH_SWEEP_CLEAN
+        _LEGACY_AUTH_SWEEP_CLEAN _materialize_env_mask_target
         _sweep_one_md_notebook_state_dir _materialize_md_notebook_mask_targets
         """.split()),
     "kiro_crew.sandbox_workspace": tuple("""
         _voice_runtime_paths_lock _voice_runtime_paths_cache _ensure_voice_runtime_directory
-        _literal_ancestor_guards prime_voice_runtime_sandbox_paths
+        _literal_ancestor_guards _caller_can_rename _renameable_ancestor_guards
+        _MAX_LINK_HOPS _resolution_entries prime_voice_runtime_sandbox_paths
         _restore_missing_voice_runtime_roots _voice_runtime_sandbox_paths
         _voice_runtime_parent_paths _voice_runtime_ancestor_guards _path_identity
         _identity_within_sealed_parent CANONICAL_TEMP_KEYS DECLARED_TEMP_REFUSAL_REASONS

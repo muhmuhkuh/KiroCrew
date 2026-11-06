@@ -351,8 +351,8 @@ def _archived_target_refusal(
             return None
         if str(meta.get("created_by") or "") != caller_key:
             return "target session was created by another session", "not_creator"
-        # The metadata line is a file an agent's file tools can edit
-        # (``chat_persistence`` says so where it restores ``created_by``), so for a
+        # The metadata line is a file a sandboxed shell can write
+        # (``metadata_codec._read_created_by`` says so where it restores it), so for a
         # FENCED caller the claim above is only a claim: a caller that rewrote
         # ``created_by`` in an archived transcript would otherwise revive a session
         # it never made and then hold it. The ownership is therefore corroborated
@@ -1085,11 +1085,18 @@ async def revive_own_archived_worker(
             return target
     except Exception:  # noqa: BLE001 - an unresolvable target keeps its own answer
         return target
+
+    def _caller_is_conductor() -> bool:
+        from kiro_crew.config.loader import KiroCrewConfig
+
+        execution = read_session_execution(caller_session_key)
+        return is_conductor_execution(execution, KiroCrewConfig.load())
+
     try:
-        execution = await asyncio.to_thread(read_session_execution, caller_session_key)
+        is_conductor = await asyncio.to_thread(_caller_is_conductor)
     except Exception:  # noqa: BLE001 - an unreadable caller record revives nothing
         return target
-    if not is_conductor_execution(execution):
+    if not is_conductor:
         return target
     try:
         revived = await revive_session(

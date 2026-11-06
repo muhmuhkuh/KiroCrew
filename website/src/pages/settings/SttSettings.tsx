@@ -77,6 +77,7 @@ interface SttConfig {
   threads_env?: string | null
   endpointing?: boolean
   submit_on_release?: boolean
+  slide_to_send?: boolean
   dictation_panel?: boolean
   transcribe_region?: string
   transcribe_profile?: string
@@ -1586,6 +1587,12 @@ export default function SttSettings({ cardIndex }: {
               apart from Auto-submit above, which judges the speech itself. */}
           <SettingsToggle label={i18nT('pages.settings.sttSettings.submit_on_release')} hint={i18nT('pages.settings.sttSettings.submit_on_release_desc')} checked={!!stt.submit_on_release} onChange={v => set({ submit_on_release: v })} disabled={saving} configKey="stt.submit_on_release" />
 
+          {/* The phone hold bar's up-right send. Opt-in: with it off, sliding up
+              any way cancels, which is the gesture people already know. It only
+              applies while letting go keeps a draft, so it is greyed out while
+              the toggle above already makes letting go send. */}
+          <SettingsToggle label={i18nT('pages.settings.sttSettings.slide_to_send')} hint={i18nT('pages.settings.sttSettings.slide_to_send_desc')} checked={!!stt.slide_to_send} onChange={v => set({ slide_to_send: v })} disabled={saving || !!stt.submit_on_release} configKey="stt.slide_to_send" />
+
           <SettingsToggle label={i18nT('pages.settings.sttSettings.dictation_panel')} hint={i18nT('pages.settings.sttSettings.show_an_animated_panel_while_recording_instead_of')} checked={stt.dictation_panel !== false} onChange={v => set({ dictation_panel: v })} disabled={saving} />
 
           {/* The thread picker is the local provider's alone: the others run their
@@ -1633,7 +1640,7 @@ export default function SttSettings({ cardIndex }: {
               onConsentChange={() => qc.invalidateQueries({ queryKey: ['sttVocabularies'] })}
             />
             <SettingsInput label={i18nT('pages.settings.sttSettings.aws_profile_transcribe')} description={i18nT('pages.settings.sttSettings.aws_credentials_profile_for_transcribe_blank_def')} value={localProfile} onChange={setLocalProfile} onBlur={() => set({ transcribe_profile: localProfile.trim() })} placeholder={i18nT('pages.settings.sttSettings.default')} disabled={saving} />
-            <SettingsInput label={i18nT('pages.settings.sttSettings.aws_region_transcribe')} description={i18nT('pages.settings.sttSettings.aws_region_for_transcribe')} value={localRegion} onChange={setLocalRegion} onBlur={() => set({ transcribe_region: localRegion.trim() })} placeholder={i18nT('pages.settings.sttSettings.us_east_1')} disabled={saving} />
+            <SettingsInput label={i18nT('pages.settings.sttSettings.aws_region_transcribe')} value={localRegion} onChange={setLocalRegion} onBlur={() => set({ transcribe_region: localRegion.trim() })} placeholder={i18nT('pages.settings.sttSettings.us_east_1')} disabled={saving} />
             {/* Below the profile and region because it is read FROM them. Shown once
                 AWS may be asked for the list, or while a vocabulary is stored, so a
                 stored one can always be seen and cleared. */}

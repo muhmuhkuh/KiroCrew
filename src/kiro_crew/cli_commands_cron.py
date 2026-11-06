@@ -327,7 +327,9 @@ def _cron_add(svc: CronService, args: argparse.Namespace) -> None:
     if channel and (len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel)):
         _cron_add_fail(f"invalid channel ID format (expected {CHANNEL_ID_RE.pattern.strip('^$')})")
     if model:
-        if len(model) > MAX_SHORT_STRING or not _MODEL_NAME_RE.match(model):
+        if len(model) > MAX_SHORT_STRING:
+            _cron_add_fail(f"invalid model format (expected at most {MAX_SHORT_STRING} characters)")
+        if not _MODEL_NAME_RE.match(model):
             # Read here, not at module level: the facade mirrors every module-level
             # import of its owners, and its import inventory is frozen.
             from kiro_crew.validation import MODEL_NAME_HINT
@@ -517,11 +519,31 @@ def _cron(args: argparse.Namespace) -> None:
     `pause`, `resume` and `adopt` all persist through the same ``_save``, so
     catching at the dispatch boundary covers them without eight duplicated
     blocks, and any verb added later is covered by construction.
+
+    A ``PermissionError`` is translated the same way. The OS can refuse this
+    process a path the gateway itself can read: macOS data protection blocks a
+    terminal from even stat-ing ``.vault``, which ``cron remove`` must read to
+    revoke a job's secret grant before deleting it. The verb still refuses (the
+    revoke fence stays fail-closed); only the traceback is replaced by one line
+    naming the path and the OS refusal.
     """
     try:
         _cron_dispatch(args)
     except CronStoreUnreadable as exc:
         print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except PermissionError as exc:
+        if exc.errno is None:
+            # A policy refusal (``raise PermissionError("...")``), not the OS:
+            # keep it as it was rather than mislabel it an OS refusal.
+            raise
+        where = exc.filename or "a Kiro Crew data file"
+        print(
+            f"Error: the OS refused this process access to {where} ({exc.strerror or exc}). "
+            "Manage the job from the dashboard Schedule page, "
+            "or grant this terminal access to the data home (macOS: Full Disk Access).",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
 
@@ -833,7 +855,14 @@ def _cron_dispatch(args: argparse.Namespace) -> None:
 def _cron_preview(args: argparse.Namespace) -> None:
     """Dry-run a script cron with real MCP tools but suppressed hooks."""
     # Imported here (not at module top) to avoid a cron_script import cycle.
-    from kiro_crew.cron_script import Done, KeptMcpServers, Report, Skip, resolve_script_path
+    from kiro_crew.cron_script import (
+        Done,
+        KeptMcpServers,
+        Report,
+        Skip,
+        _scanned_tool_args,
+        resolve_script_path,
+    )
 
     # Resolve and validate script path (same validation as production cron runner:
     # format, existence, sensitive path, containment under ~/.kiro/crew/crons/)
@@ -895,14 +924,11 @@ def _cron_preview(args: argparse.Namespace) -> None:
             self._kept_servers = KeptMcpServers()
 
         def call_tool(self, server: str, tool: str, tool_args: dict) -> str:
-            # Redact credentials/exfiltration URLs (same as production ScriptContext.call_tool)
-            args_str = json.dumps(tool_args)
-            args_str = redact(args_str)
-            safe_args = json.loads(args_str)
-            # One server per name kept for the run, stopped by close() once the
-            # script returns (same lifecycle as production ScriptContext.call_tool)
+            # The argument scan and one server per name kept for the run, stopped by
+            # close() once the script returns (same as production ScriptContext.call_tool)
             outcome = "ok"
             try:
+                safe_args = _scanned_tool_args(server, tool, tool_args)
                 result = self._kept_servers.call_tool(server, tool, safe_args)
             except Exception:
                 outcome = "error"

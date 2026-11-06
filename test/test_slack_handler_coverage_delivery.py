@@ -19,6 +19,7 @@ from slack_handler_coverage_helpers import (  # noqa: F401 -- fixtures are reque
     _clean_handler_state,
     slack_fixture,
 )
+from slack_wire_helpers import slack_wire
 
 from kiro_crew.slack import handler as h
 
@@ -150,11 +151,14 @@ class TestSafeUpdates:
         assert text.startswith("x")
 
     @pytest.mark.asyncio
-    async def test_update_failure_is_swallowed(self):
+    async def test_update_failure_is_swallowed(self, caplog):
+        caplog.set_level("DEBUG", logger=h.logger.name)
         broken = MagicMock()
         broken.update_message = AsyncMock(side_effect=RuntimeError("gone"))
         await h._safe_update(broken, "C1", "m1", "hi")
         broken.update_message.assert_awaited_once_with("C1", "m1", "hi")
+        msgs = [r.getMessage() for r in caplog.records if r.name == h.logger.name]
+        assert "Failed to update message m1" in msgs
 
     @pytest.mark.asyncio
     async def test_final_update_splits_long_text(self, slack):
@@ -165,21 +169,24 @@ class TestSafeUpdates:
         assert [a for a in slack.actions if a[0] == "post"]
 
     @pytest.mark.asyncio
-    async def test_final_update_survives_both_failures(self):
-        broken = MagicMock()
-        broken.update_message = AsyncMock(side_effect=RuntimeError("x"))
-        broken.post_message = AsyncMock(side_effect=RuntimeError("y"))
-        await h._safe_final_update(broken, "C1", "m1", "z " * 8000, "t1")
-        broken.update_message.assert_awaited_once()
+    async def test_final_update_survives_both_failures(self, monkeypatch):
+        async with slack_wire(monkeypatch) as wire:
+            wire.fail("chat.update", "message_not_found")
+            wire.fail("chat.postMessage", "channel_not_found")
+            await h._safe_final_update(wire.client, "C1", "m1", "z " * 8000, "t1")
+        [update] = wire.sent("chat.update")
+        assert (update.get("channel"), update.get("ts")) == ("C1", "m1")
         # Every overflow part is still attempted after the primary update failed.
-        assert broken.post_message.await_count >= 1
-        assert all(c.args[2] == "t1" for c in broken.post_message.await_args_list)
+        posts = wire.posts()
+        assert posts and all((p.get("channel"), p.get("thread_ts")) == ("C1", "t1") for p in posts)
+        sent_text = update.get("text") + "".join(p.get("text") for p in posts)
+        assert sent_text.count("z") == 8000
 
     @pytest.mark.asyncio
     async def test_reject_orphaned_tool_swallows_failure(self):
         provider = MagicMock()
         provider.reject_tool = AsyncMock(side_effect=RuntimeError("dead"))
-        await h._reject_orphaned_tool(provider, "r1")
+        assert await h._reject_orphaned_tool(provider, "r1") is False
         provider.reject_tool.assert_awaited_once_with("r1")
 
     @pytest.mark.asyncio

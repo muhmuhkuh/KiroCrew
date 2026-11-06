@@ -44,8 +44,9 @@ import { ErrorCard, SESSION_START_REPEAT_REFUSAL_AT, capabilityRefusal, isAppAge
 import { isFeatureRequestRow } from '../../prompts/featureRequest'
 import { feedbackTracker } from '../../feedbackTracker'
 import NoticeCard from './NoticeCard'
-import { resolveGatewayNotice } from './gatewayNotice'
+import { kasSignedOutBesideButton, resolveGatewayNotice } from './gatewayNotice'
 import CrewDispatchNoticeCard from './CrewDispatchNoticeCard'
+import CrewPausedNoticeCard from './CrewPausedNoticeCard'
 import WorkflowRunCard, { extractWorkflowRunId, isWorkflowRunTool } from './WorkflowRunCard'
 import SubagentRunCard, { extractSpawnRunLaunch, isSpawnRunTool } from './SubagentRunCard'
 import WorkflowCompletionCard, { isWorkflowCompletionMessage } from './WorkflowCompletionCard'
@@ -102,9 +103,10 @@ export interface TranscriptRendererOptions {
   /** The transcript is scrolling / streaming hard; tool rows defer their
    *  heavier work. */
   transcriptHot?: boolean
-  /** What to draw for a `file` row whose content is not JSON. Default: nothing
-   *  (a pane); the single-chat surface has always fallen through to its
-   *  conversational bubble for one and passes that. */
+  /** What to draw for a `file` row whose content is not a file record (see
+   *  lib/fileRecord.ts: not JSON, or no non-empty `filename`, or malformed
+   *  metadata). Default: nothing (a pane); the single-chat surface falls
+   *  through to its conversational bubble for one and passes that. */
   renderUnparsedFile?: (m: ChatMessage, ctx: MessageRenderContext) => React.ReactNode
   /** Session routing for EVERY row this factory draws: open a session chip, and
    *  the title map + active key the chip resolver needs. The completion cards
@@ -212,6 +214,13 @@ export interface TranscriptRendererOptions {
    *  `crewmate`. A getter, called on every row render, so the host can keep
    *  this renderer set's identity while the transcript streams. */
   crewmateTranscript?: () => ChatMessage[] | undefined
+  /** Read a crewmate's reply aloud from its More menu, the same action the
+   *  Sessions chat offers (`speakReply`). Read only with `crewmate`. */
+  onSpeak?: (content: string) => void
+  /** The browser blocked playback for this crewmate's slot: its replies show
+   *  their action rows without hover (the Sessions chat's `revealActions`).
+   *  Read only with `crewmate`. */
+  revealActions?: boolean
 }
 
 /** True when the error row at `index` is the seeded feature-request turn's own
@@ -418,6 +427,15 @@ export function createTranscriptRenderers(
         />,
       ),
     },
+    {
+      // The main chat's one "You paused the crew" row (Ultra Mode Pause all).
+      id: 'crew_paused_notice',
+      roles: ['notice'],
+      match: m => m.meta?.kind === 'crew_paused_notice',
+      render: (m, ctx) => ctx.row(
+        <CrewPausedNoticeCard key={ctx.key} stopped={Number(m.meta?.stopped) || 0} />,
+      ),
+    },
     // ── Shape-matched rows, ahead of anything keyed only by role ──
     {
       // A dollar-picked skill is gateway-authored context, not a conversational
@@ -560,7 +578,9 @@ export function createTranscriptRenderers(
       render: (m, ctx) => (hasReasoningContent(m) ? ctx.row(<ThinkingBlock content={m.content} disclosureKey={ctx.key} />) : null),
     },
     {
-      // Replaces the default's null with the player / download card.
+      // Same card and the same record check as the default (lib/fileRecord.ts);
+      // only the fallback differs: a row that is not a file record goes to
+      // renderUnparsedFile instead of drawing nothing.
       id: 'file',
       roles: ['file'],
       render: (m, ctx) => {
@@ -717,6 +737,8 @@ export function createTranscriptRenderers(
               activeSession: o.activeSession,
               messageTs: m.ts,
               redactionSlot: o.revealSlot,
+              onSpeak: o.onSpeak,
+              revealActions: o.revealActions,
             })
             if (bubble === null) return null
             return ctx.row(
@@ -775,9 +797,11 @@ export function createTranscriptRenderers(
         // already answered past, is settled and its session may already be new.
         const overflow = isContextOverflow(m)
         const imageRepair = isImageRepair(m)
+        // The sign-in button sits under the row, so its copy points at it.
+        const besideSignIn = authRequired && o.onOpenSignIn ? kasSignedOutBesideButton(m) : null
         return ctx.row(
           <ErrorCard
-            content={transient ? transient.text : m.content}
+            content={besideSignIn ?? (transient ? transient.text : m.content)}
             resumeContent={transient?.card === 'error' ? transient.resumeText : undefined}
             meta={m.meta}
             // A rejection the backend says no retry can fix never offers Continue,

@@ -17,6 +17,8 @@ from kiro_crew.dashboard.state import (
     _mark_permission_resolved,
 )
 from kiro_crew.dashboard.turn_dispatch import (
+    APPROVAL_EXPIRED_NOTE_TITLE,
+    format_approval_expired_note,
     format_approval_no_budget_card,
     format_approval_timeout_card,
 )
@@ -87,6 +89,9 @@ async def _on_permission_prompt(
     session_key = turn.session_key
     slot = turn.slot
     state = turn.state
+    # The title is model-written and can carry a secret the log filter's narrow
+    # patterns miss, so every log line below uses this redacted copy.
+    _log_title = _redact_display_text(event.title or "")
     # Auto-reject remaining tools after one rejection in a batch
     if getattr(slot, "_batch_rejected", False):
         _cascade_offer = getattr(turn, "_deny_override", None)
@@ -167,7 +172,7 @@ async def _on_permission_prompt(
             "resolved": "rejected",
         }
         slot.append("permission", _title, json.dumps(perm_meta))
-        logger.warning("AUTO-REJECTED tool=%r (batch rejection)", event.title)
+        logger.warning("AUTO-REJECTED tool=%r (batch rejection)", _log_title)
         return _Flow.CONTINUE
     # Interactive approval — send to frontend, wait for decision
     #
@@ -377,7 +382,7 @@ async def _on_permission_prompt(
                 # the moment this decline is recorded.
                 logger.warning(
                     "Linked approval delivery to Slack failed; auto-rejecting tool %r",
-                    event.title,
+                    _log_title,
                 )
                 slot.append(
                     "assistant",
@@ -399,14 +404,14 @@ async def _on_permission_prompt(
                     "Linked approval delivery to Slack failed after the prompt "
                     "was answered from the dashboard; keeping that answer for "
                     "tool %r",
-                    event.title,
+                    _log_title,
                 )
         except Exception:
             # Any failure before the future is resolved (ImportError,
             # post_linked_approval raising, slot.append/push raising in
             # the delivery-failure branch) would otherwise fall through
-            # to the approval wait_for with an unresolved future — the exact
-            # wedge this fix prevents. Auto-reject so the turn unblocks,
+            # to the approval wait_for with an unresolved future and wedge
+            # the turn. Auto-reject so the turn unblocks,
             # mirroring the _slack_approval_ts is None branch.
             logger.warning("Error mirroring approval prompt to Slack", exc_info=True)
             if not fut.done():
@@ -494,7 +499,7 @@ async def _on_permission_prompt(
             # relabels the unanswered approval as a turn timeout.
             logger.warning(
                 "Declining approval for %r without waiting: no turn budget left",
-                event.title,
+                _log_title,
             )
             _approval_card = format_approval_no_budget_card()
             _host_deny_cause = DENY_CAUSE_APPROVAL_NO_BUDGET
@@ -510,7 +515,7 @@ async def _on_permission_prompt(
         # is never told an approval was waiting.
         logger.warning(
             "Tool approval for %r went unanswered for %.0fs; declining",
-            event.title,
+            _log_title,
             _approval_window,
         )
         _approval_card = format_approval_timeout_card(_approval_window)
@@ -555,6 +560,22 @@ async def _on_permission_prompt(
                 _autonudge.notify_approval_stalled(slot.key)
         except Exception:
             logger.debug("autonudge.notify_approval_stalled failed", exc_info=True)
+        # The card above reaches only someone looking at this session.
+        # The bell note reaches the rest of the dashboard. It carries no
+        # publisher session, so muting this session does not hide it:
+        # it is a gateway report about the session, not the session's
+        # own note.
+        try:
+            state.notify(
+                "agent",
+                APPROVAL_EXPIRED_NOTE_TITLE,
+                format_approval_expired_note(
+                    event.tool_name or "", slot.display_title, _approval_window
+                ),
+                meta={"slot": slot.key},
+            )
+        except Exception:
+            logger.warning("approval-expiry notification failed", exc_info=True)
     except asyncio.CancelledError:
         # The task itself was cancelled (slot deletion, shutdown) while
         # the prompt was still open. The decision is host-driven, not a
@@ -930,7 +951,7 @@ async def _on_permission_prompt(
         # Deny this one tool but do NOT cascade to remaining batch
         logger.info(
             "PERM REJECTED ONCE tool=%r — remaining batch unaffected",
-            event.title,
+            _log_title,
         )
         return _Flow.CONTINUE
     if outcome != "approved":
@@ -960,7 +981,7 @@ async def _on_permission_prompt(
         turn._batch_cascade_steered = _batch_cascade_steered
         logger.warning(
             "PERM REJECTED tool=%r outcome=%r — auto-rejecting remaining batch",
-            event.title,
+            _log_title,
             outcome,
         )
         return _Flow.CONTINUE

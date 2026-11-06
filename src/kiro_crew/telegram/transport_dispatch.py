@@ -424,6 +424,9 @@ class TelegramDispatcher:
         # start, popped in finally. Records text only — no buffer slicing, so
         # none of the old steer-split fragility.
         self._active_renderers: dict[str, TelegramRenderer] = {}
+        # session_key -> (chat id, provider) of the turn holding it; the mid-turn
+        # steer checks both.
+        self._turn_chats: dict[str, tuple[int, object]] = {}
         # route -> the model id the user picked with /model, applied to every
         # session this conversation starts from now on. Keyed by ROUTE, not
         # session_key, so the choice survives /new and the idle/daily rotation
@@ -587,6 +590,11 @@ class TelegramDispatcher:
             thread_id=str(reply_thread) if reply_thread else "",
             message_id=str(getattr(msg, "message_id", "") or ""),
             attachments_dropped=len(getattr(msg, "attachments", None) or ()),
+            attachment_names=tuple(
+                a.get("file_name") or ""
+                for a in getattr(msg, "attachments", None) or ()
+                if isinstance(a, dict)
+            ),
         )
         if not await admit_inbound_callback(
             self.sessions,
@@ -1150,6 +1158,7 @@ class TelegramDispatcher:
 
     # dispatch/pickers.py
     _installed_agent_names = staticmethod(_pickers._installed_agent_names)
+    _agent_labels = staticmethod(_pickers._agent_labels)
     _agent_choices = _pickers._agent_choices
     _handle_agent = _pickers._handle_agent
     _apply_agent = _pickers._apply_agent

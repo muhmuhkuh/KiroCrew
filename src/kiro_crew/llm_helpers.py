@@ -86,6 +86,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
         _is_transient_acp_error,
         acp_error_after_tool_activity,
         acp_error_is_connection_failure,
+        acp_error_is_pipe_death,
         acp_error_is_session_not_found,
         acp_error_is_throttle,
         acp_error_is_transient,
@@ -102,6 +103,7 @@ if TYPE_CHECKING:  # every owner-defined name in _EXPORTS, for type checkers and
     from kiro_crew.llm_helpers_parts.background_turns import (  # noqa: F401
         _background_crew_log_owner,
         _cleanup_memory_consolidation_session,
+        _lite_spec_unconfirmed,
         _raise_if_unfinished,
         _record_background_crew_log,
         _start_fresh_conversation,

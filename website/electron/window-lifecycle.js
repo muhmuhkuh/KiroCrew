@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 
-const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
+const { createTokenRetryHandler, dashboardRetryPath, loadDashboardWithToken } = require("./token-retry");
 const { createRendererRecovery, withSafeReload, hasSafeReload } = require("./renderer-recovery");
 const { createRendererExhaustedNotice } = require("./renderer-exhausted-notice");
 const { createHangRecovery } = require("./hang-recovery");
@@ -11,6 +11,11 @@ const { armSplashHistoryClear, fileShellPageBasename } = require("./splash-histo
 const { armSwipeHistory, browserPanelUnderCursor } = require("./swipe-history");
 const { armScrollTouch } = require("./scroll-touch");
 const { hideToTray, cancelPendingTrayHide, shouldKeepAppHidden } = require("./hide-to-tray");
+const {
+  createCloseHandler,
+  getCloseAction,
+  setCloseAction,
+} = require("./close-action");
 const { attachHtmlFullScreen } = require("./html-fullscreen");
 const { menuBarCanOverlap } = require("./fullscreen-top-reserve");
 const {
@@ -796,8 +801,8 @@ function createWindowLifecycle(options) {
         ({ token: tokenValue } = await fetchRemoteToken(port));
       }
       if (tokenValue && !mainWindow.isDestroyed()) {
-        const target = `${backendUrl}?token=${tokenValue}`;
-        mainWindow.webContents.loadURL(retrySafe ? withSafeReload(target) : target);
+        const target = retrySafe ? withSafeReload(backendUrl) : backendUrl;
+        await loadDashboardWithToken(mainWindow.webContents, target, tokenValue);
       }
     });
     mainWindow.webContents.on("did-navigate", (_event, url, httpCode) => {
@@ -834,9 +839,7 @@ function createWindowLifecycle(options) {
         }
         if (mainWindow.isDestroyed()) return;
         // `safe=1`: do not reopen the chat that may have caused the crash.
-        mainWindow.webContents.loadURL(withSafeReload(
-          tokenValue ? `${backendUrl}?token=${tokenValue}` : backendUrl,
-        ));
+        await loadDashboardWithToken(mainWindow.webContents, withSafeReload(backendUrl), tokenValue);
       })().catch((error) => {
         glog(`renderer recovery reload failed: ${error && error.message}`);
       });
@@ -928,9 +931,15 @@ function createWindowLifecycle(options) {
       rendererRecovery.handleGone(details || {});
     });
 
-    mainWindow.on("close", (event) => {
-      if (!isQuitting()) {
-        event.preventDefault();
+    mainWindow.on("close", createCloseHandler({
+      isQuitting,
+      getAction: () => getCloseAction(store),
+      cancelPendingHide: () => {
+        glog("close: quitting (closeAction=quit)");
+        cancelPendingTrayHide(mainWindow);
+      },
+      requestQuit,
+      hide: () => {
         // macOS must leave its native fullscreen Space before hiding or the Space
         // becomes an orphaned black surface, and the hide that follows is an
         // app-level one: AppKit may have left a full-display overlay on screen
@@ -950,14 +959,15 @@ function createWindowLifecycle(options) {
             fullScreenWatch ? fullScreenWatch.exitSettlingFor() : Infinity
           ),
         });
-        return;
-      }
-      if (saveTimer) {
-        clearTimeout(saveTimer);
-        saveTimer = null;
-      }
-      persist();
-    });
+      },
+      persist: () => {
+        if (saveTimer) {
+          clearTimeout(saveTimer);
+          saveTimer = null;
+        }
+        persist();
+      },
+    }));
 
     return mainWindow;
   }
@@ -976,13 +986,31 @@ function createWindowLifecycle(options) {
     }
   }
 
+  // A focused show answers an explicit user gesture (a relaunch, the tray's
+  // Show item, a notification click) that usually reaches the app while another
+  // app is frontmost. On macOS 14+ `win.focus()` alone orders the window in
+  // without activating the app, so the other app keeps the keyboard and stays
+  // in front; steal activation the way the summon hotkey and the gateway-error
+  // reveal do. A show without `focus` never activates the app.
+  function activateApp() {
+    if (!IS_MAC || typeof app.focus !== "function") return;
+    try {
+      app.focus({ steal: true });
+    } catch {
+      /* best effort — the window is already shown and focused */
+    }
+  }
+
   function showMainWindow({ focus = false } = {}) {
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     cancelPendingTrayHide(mainWindow);
     unhideApp();
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.show();
-    if (focus) mainWindow.focus();
+    if (focus) {
+      mainWindow.focus();
+      activateApp();
+    }
     return true;
   }
 
@@ -1032,6 +1060,13 @@ function createWindowLifecycle(options) {
     ]));
     tray.on("click", showFromTray);
     return tray;
+  }
+
+  // Returns the stored value, which the Settings switch renders.
+  function setCloseActionAndLog(value) {
+    const written = setCloseAction(store, value);
+    glog(`closeAction set to ${written}`);
+    return written;
   }
 
   async function promptRemoteHost() {
@@ -1215,7 +1250,7 @@ function createWindowLifecycle(options) {
     }
     if (win.isDestroyed()) return;
     if (tokenValue) {
-      win.webContents.loadURL(`${targetUrl}?token=${tokenValue}`);
+      await loadDashboardWithToken(win.webContents, targetUrl, tokenValue);
       return;
     }
     // Resolver, not the port alone: a crew an older version left under the empty
@@ -1290,8 +1325,7 @@ function createWindowLifecycle(options) {
       }
       if (tokenValue && !connWin.isDestroyed()) {
         const target = new URL(retryTarget || "", connectionBackendUrl);
-        target.searchParams.set("token", tokenValue);
-        connWin.webContents.loadURL(target.toString());
+        await loadDashboardWithToken(connWin.webContents, target.toString(), tokenValue);
       }
     });
     connWin.webContents.on("did-navigate", (_event, url, httpCode) => {
@@ -1687,6 +1721,10 @@ function createWindowLifecycle(options) {
     setupWindowContents,
     getMainWindow: () => mainWindow,
     getTray: () => tray,
+    closeAction: {
+      get: () => getCloseAction(store),
+      set: setCloseActionAndLog,
+    },
     getSummonWindow,
     focusedDashboardWindow,
     focusedDashboardWebContents,

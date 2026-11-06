@@ -30,7 +30,7 @@ from kiro_crew.dashboard.origin import (
     resolve_dashboard_host,
 )
 from kiro_crew.dashboard.token_auth import LINK_WINDOW_SECS, MAX_SESSION_TTL_SECS, generate_token
-from kiro_crew.dashboard.urls import tunnel_origin_if_opted_in
+from kiro_crew.dashboard.urls import slack_tunnel_opt_in, tunnel_origin_if_opted_in
 from kiro_crew.sel import sel
 from kiro_crew.slack.handler import is_allowed_user, is_tracked_channel
 from kiro_crew.tunnel import get_tunnel_url, publish_disabled
@@ -219,8 +219,10 @@ async def send_dashboard_link(
     token = generate_token(user_id, session_ttl)
 
     # Tunnel URL is only used when explicitly opted in via slack.use_tunnel_url
-    # (default false until tunnel mechanism is scaled for general use).
-    tunnel_url = tunnel_origin_if_opted_in(cfg.slack.use_tunnel_url)
+    # (default false until tunnel mechanism is scaled for general use). An
+    # enterprise build reads the opt-in as off, so neither door below opens.
+    use_tunnel = slack_tunnel_opt_in(cfg.slack.use_tunnel_url)
+    tunnel_url = tunnel_origin_if_opted_in(use_tunnel)
     # Set when the link is knowingly loopback-only and cannot ever become
     # reachable, so the DM can say that rather than leaving it to the log.
     no_tunnel_notice = False
@@ -239,7 +241,7 @@ async def send_dashboard_link(
     # does not keep. Falling through leaves ``tunnel_url`` empty, so the link is
     # composed from the local origin below — the same outcome as an edition whose
     # seam is a no-op, and the behavior every standalone install already gets.
-    if cfg.slack.use_tunnel_url and local_only and not tunnel_url and publish_disabled():
+    if use_tunnel and local_only and not tunnel_url and publish_disabled():
         # Audited, not just logged: this is the same security control as the boot
         # refusal in ``tunnel.setup`` (which records ``tunnel.start_denied``), and a
         # control whose denials are only half auditable cannot be reviewed after the
@@ -262,7 +264,7 @@ async def send_dashboard_link(
         # requester taps a link that times out every time and the only explanation
         # is in the log they cannot see.
         no_tunnel_notice = True
-    elif cfg.slack.use_tunnel_url and local_only and not tunnel_url:
+    elif use_tunnel and local_only and not tunnel_url:
         from kiro_crew.platform import current_context
         from kiro_crew.platform.context import async_safe_context_call
 
@@ -369,6 +371,8 @@ def _update_config_list(
 
     Each entry is a dict with at least *id_field*.  Idempotent — adding
     a duplicate or removing a missing entry is a no-op (no write at all).
+    Raises ``ValueError`` and writes nothing when ``slack`` is not an object
+    or the list is not a list.
     Goes through :func:`update_config_locked` so the read-modify-write holds
     the sidecar advisory lock: a concurrent config writer (dashboard PATCH,
     CLI, the boot-time meta refresh) cannot land inside this write's window
@@ -376,11 +380,21 @@ def _update_config_list(
     the read happens fresh inside the lock hold.
     """
     changed = ""
+    bad_shape = ""
 
     def _apply(data: dict) -> dict | None:
-        nonlocal changed
+        nonlocal changed, bad_shape
+        # A wrong-shaped entry is kept as written and nothing is saved:
+        # `None` tells update_config_locked there is no change to persist,
+        # and the caller gets a ValueError naming the entry.
         slack_cfg = data.setdefault("slack", {})
-        entries: list[dict] = slack_cfg.setdefault(section_key, [])
+        if not isinstance(slack_cfg, dict):
+            bad_shape = "'slack' is not an object"
+            return None
+        entries = slack_cfg.setdefault(section_key, [])
+        if not isinstance(entries, list):
+            bad_shape = f"'slack.{section_key}' is not a list"
+            return None
         if remove:
             filtered = [e for e in entries if e.get(id_field) != target_id]
             if len(filtered) == len(entries):
@@ -398,6 +412,8 @@ def _update_config_list(
         return data
 
     update_config_locked(config_path(), mutate=_apply)
+    if bad_shape:
+        raise ValueError(f"Config entry {bad_shape}; fix config.json first")
     if changed == "Removed":
         logger.info("Removed %s=%s from config slack.%s", id_field, target_id, section_key)
     elif changed == "Added":

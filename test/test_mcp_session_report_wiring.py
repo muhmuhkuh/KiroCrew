@@ -202,6 +202,7 @@ class TestPublish:
         _publish_session_mcp_report(state, slot, acp)
 
         assert state.broadcast_ws.call_count == 1
+        assert slot.mcp_report_payload() == report.payload()
 
     def test_object_without_the_accessor_is_a_no_op(self):
         # The dashboard reaches this duck-typed, and a foreign or placeholder
@@ -218,6 +219,7 @@ class TestPublish:
         slot = _ChatSlot("s1")
         state = MagicMock()
         _publish_session_mcp_report(state, slot, None)
+        assert slot.mcp_report_payload() is None
         state.broadcast_ws.assert_not_called()
 
     def test_accessor_raising_is_swallowed(self):
@@ -300,6 +302,9 @@ class TestLiveEvents:
         _record_session_mcp_event(state, slot, acp, EVENT_MCP_SERVER_INITIALIZED, "a")
 
         assert state.broadcast_ws.call_count == 1
+        payload = slot.mcp_report_payload()
+        assert payload is not None
+        assert payload["ready"] == ["a"]
 
 
 class TestResetInvalidation:
@@ -498,10 +503,14 @@ class TestReportFrameFloor:
         # client), so this pins the one line the leak lives on. The OAuth and
         # config captures above it must stay UNgated.
         import inspect
+        import sys
 
         from kiro_crew.acp import client as client_mod
 
-        src = inspect.getsource(client_mod)
+        src = "".join(
+            inspect.getsource(sys.modules[name])
+            for name in (client_mod.__name__, *client_mod._CLIENT_OWNERS)
+        )
         marker = "if idx >= self._mcp_report_frame_floor:"
         assert marker in src, (
             "the buffered drain records into the report without the attempt floor, "

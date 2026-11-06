@@ -334,6 +334,8 @@ async def api_stt_config(request: web.Request) -> web.Response:
                 stt_section["endpointing"] = body["endpointing"]
             if "submit_on_release" in body and isinstance(body["submit_on_release"], bool):
                 stt_section["submit_on_release"] = body["submit_on_release"]
+            if "slide_to_send" in body and isinstance(body["slide_to_send"], bool):
+                stt_section["slide_to_send"] = body["slide_to_send"]
             # `polish` is the one CONSENT setting on this surface -- it sends the
             # finished transcript to a model -- so its round trip is load-bearing in a
             # way an ordinary toggle's is not. Omitting it here is what made the
@@ -475,6 +477,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             "streaming": cfg.stt.streaming,
             "endpointing": cfg.stt.endpointing,
             "submit_on_release": cfg.stt.submit_on_release,
+            "slide_to_send": cfg.stt.slide_to_send,
             "dictation_panel": cfg.stt.dictation_panel,
             "polish": cfg.stt.polish,
             "transcribe_region": cfg.stt.transcribe_region,
@@ -518,7 +521,7 @@ async def api_stt_config(request: web.Request) -> web.Response:
             # Which of those providers can stream partial results. Served from the
             # backend's own `streaming_providers()` so the Settings UI gates the
             # streaming controls on a CAPABILITY rather than on a hardcoded provider
-            # name — the latter silently hid the toggle when `apple` was added.
+            # name, which would silently hide the toggle for a newly added provider.
             "streaming_providers": list(streaming_providers()),
             # Which providers identify languages among `transcribe_languages`, so
             # the mixed-language picker is gated on that capability as well.

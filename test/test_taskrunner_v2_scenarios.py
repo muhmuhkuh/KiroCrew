@@ -735,7 +735,6 @@ class TestScenarioWorktreeIsolation:
 
         await git_coord.init_workspace(run)
 
-        # Create file in worktree
         wt = Path(run.work_dir)
         (wt / "new_file.py").write_text("new")
         step = Step(index=1, title="Add file", description="d")
@@ -788,7 +787,6 @@ class TestScenarioCompletionNotification:
             sessions=sessions, auto_test=False, on_notify=_on_notify, work_dir=tmp_path
         )
 
-        # Patch git_coord to set branch_name
         async def _mock_init(run):
             run.branch_name = "kirocrew/task/test_branch"
 

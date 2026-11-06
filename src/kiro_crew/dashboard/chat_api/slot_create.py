@@ -590,9 +590,9 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # wait. The state-owned 10 ms handoff moves its coalesced full-list frame past
     # the response. Only known request keys may qualify; metadata-bearing,
     # app-owned, mode-specific and nonpersistent creates remain
-    # synchronous. Errors before a successful handoff retain request-visible
-    # publication semantics; delayed publication failures are logged and retried
-    # once by the guarded callback.
+    # synchronous. Without a successful handoff the flush runs at block exit; a
+    # delayed publication failure is logged and retried once by the guarded
+    # callback.
     defer_plain_create_broadcast = bool(
         set(body).issubset(_DEFERRED_PLAIN_CREATE_KNOWN_KEYS)
         and is_new_slot
@@ -604,6 +604,11 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         and memory_mode == "persistent"
         and not body.get("ephemeral")
     )
+    # Crew Mode new-chat counters, decided at the mint and emitted only after the
+    # creation block exits without a refusal or a retraction.
+    count_new_chat = False
+    born_crew = False
+    crew_repeat = False
     async with contextlib.AsyncExitStack() as creation_stack:
         request_deferred_flush = creation_stack.enter_context(state.suspend_slots_push())
         if request_app and _requested_key:
@@ -959,25 +964,35 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                     )
                 if assigned_store:
                     slot.memory_store = assigned_store
+        if is_new_slot and not getattr(slot, "crew_mode_agent", ""):
+            # A chat born on the Crew Mode conductor (the conductor as the default
+            # template, or a create naming it) is stamped the way the agent switch
+            # stamps one, so it stays in Crew Mode after `agent.crew_mode_agent`
+            # changes. The stamp counts only while the chat is still on that agent.
+            # Stamped after the owner branch records the namespace the pick was
+            # committed in, and before the slot's first save and frame; the counters
+            # are emitted once the create has committed, below.
+            from kiro_crew import crew_mode
+
+            slot.crew_mode_agent = crew_mode.stamp_for_switch(slot.agent, slot.agent_kind)
+            # Only an unnamed create is certainly a new conversation: a named one
+            # can reopen a saved session, the same reason the session counter in
+            # `get_or_create_slot` and the session folder below skip it.
+            if not _requested_key:
+                count_new_chat = True
+                born_crew = bool(slot.crew_mode_agent)
+                crew_repeat = born_crew and bool(crew_mode.known_roots() - {slot.key})
         _sync_dashboard_slots(state)
         # Persist INSIDE the suspension, ahead of the coalesced broadcast, the
         # same ordering `session_control_parts/session_create.py`'s create span uses ("the whole
         # allocation-to-persist span runs under `suspend_slots_push`", so "a
-        # slot whose birth write fails is never broadcast at all"). Two paths
-        # mint a slot through this context manager; leaving the durable write
-        # outside it is what makes the failure below reachable:
-        #
-        # `suspend_slots_push`'s `__exit__` flushes the owed push, and on the
-        # coalescing window's LEADING edge that flush broadcasts synchronously
-        # (`state.push_slots_update`). An exception there — a non-serializable
-        # value reaching `json.dumps` is the evidenced shape —
-        # escapes `__exit__`, so with the write out here it skipped a metadata
-        # mutation the request had already acknowledged: this `force=True` save
-        # is the ONLY durable record of a recreate's folder filing or pinned
-        # title (see `_save_slot_to_history`'s message-less merge), and the slot
-        # itself survives in memory, so nothing later reconciles the two. Every
-        # client repairs a dropped FRAME on its next read; none of them repairs
-        # a write that never happened.
+        # slot whose birth write fails is never broadcast at all"). This
+        # `force=True` save is the ONLY durable record of a recreate's folder
+        # filing or pinned title (see `_save_slot_to_history`'s message-less
+        # merge), so it lands before `__exit__` publishes anything; a broadcast
+        # that fails there is logged and the create still answers success.
+        # Every client repairs a dropped FRAME on its next read; none of them
+        # repairs a write that never happened.
         #
         # The cost this ordering accepts, named by the comment it replaces: the
         # suspension is process-wide, so other clients' slot updates coalesce
@@ -1133,12 +1148,35 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         state.push_slots_update()
         if defer_plain_create_broadcast:
             request_deferred_flush(f"create slot {slot.key!r}")
+    # The create is committed here: every refusal and retraction above returns
+    # from inside the block, and an exception leaving it retracts the newborn.
+    if count_new_chat:
+        from kiro_crew.metrics import crew_mode as crew_mode_metrics
+
+        crew_mode_metrics.record_new_chat(crew_mode=born_crew)
+        if born_crew:
+            crew_mode_metrics.record_turned_on("create", repeat=crew_repeat)
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
     #
     # Skipped for a relay archive: it never runs, so a spawned kiro-cli would
     # idle until it timed out.
-    if slot.executor != "remote":
+    #
+    # A NEW owner chat starts on the default session environment when one is set,
+    # unprewarmed: a local spawn would run on the wrong machine, a remote one would
+    # start billed compute for a chat that may never send a message.
+    bound_remote = False
+    if slot.executor != "remote" and existing_slot is None and is_owner_dashboard_request(request):
+        from kiro_crew.dashboard.handlers.session_environments import (
+            apply_default_environment,
+        )
+
+        bound_remote = await apply_default_environment(
+            slot,
+            getattr(state, "sessions", None),
+            getattr(state, "_terminal_sessions", None),
+        )
+    if slot.executor != "remote" and not bound_remote:
         schedule_eager_spawn(state, slot, start_priority=owner_start_priority(request))
     created = _created_slot_row(state, request, slot)
     if session_folder_notice:

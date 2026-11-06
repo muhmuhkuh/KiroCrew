@@ -5,8 +5,8 @@ The switches are the ones registered in :data:`kiro_crew.slack_manifest.FEATURE_
 a switch there is all this module needs. Two layers decide whether one runs, and
 both are read here so every caller answers "is it on?" the same way:
 
-* the **toggle** -- ``slack.<feature>`` in ``config.json`` (Settings → Slack). It
-  also decides what the generated app manifest asks Slack for
+* the **toggle** -- ``slack.<feature>`` in ``config.json`` (Settings → Messaging
+  Channels → Slack). It also decides what the generated app manifest asks Slack for
   (:func:`manifest_features`). Anything that is not a real ``True`` is off. Read
   live, so a flip applies on the next event.
 * the **capability** -- whether the installed Slack app can actually use the
@@ -201,6 +201,26 @@ def record_granted_scopes(scopes: Iterable[str] | None) -> None:
             for feature, error in list(_CAPS.latched.items()):
                 if error == "missing_scope" and REQUIRED_SCOPE.get(feature, "") in granted:
                     del _CAPS.latched[feature]
+        listeners = list(_SCOPE_LISTENERS) if granted is not None else []
+    for listener in listeners:
+        try:
+            listener()
+        except Exception:
+            logger.debug("scope listener failed", exc_info=True)
+
+
+#: Called (outside the lock) each time the granted scopes are recorded as known.
+_SCOPE_LISTENERS: list[Callable[[], None]] = []
+
+
+def on_scopes_recorded(listener: Callable[[], None]) -> None:
+    """Call *listener* whenever the connect probe records the app's scopes.
+
+    For work that waited on the gate (which reads shut while the scopes are
+    unknown) and must run once it can open. *listener* must be cheap and must
+    not block: it may run on any thread.
+    """
+    _SCOPE_LISTENERS.append(listener)
 
 
 def granted_scopes() -> frozenset[str] | None:

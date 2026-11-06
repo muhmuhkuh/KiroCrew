@@ -652,7 +652,6 @@ class TestUpdateDispatch:
         # The function will call git rev-parse, then git fetch, then git diff.
         # After git diff returns 0 (no new commits), it prints "Already up to date!"
         cs._update()
-        # Verify git commands were issued
         git_calls = [c for c in calls if c[0] == "git"]
         assert any("rev-parse" in c for c in git_calls)
 
@@ -757,6 +756,8 @@ class TestUpdateDivergenceGuard:
         # before these steps, and they are not what these tests assert on.
         monkeypatch.setattr("kiro_crew.cli_server.shutil.which", lambda *_: None)
         monkeypatch.setattr("kiro_crew.cli._ensure_node", lambda *_: None)
+        # The update puts the recorded node dirs first on PATH; restore it at teardown.
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
         monkeypatch.setattr(
             "kiro_crew.cli_server.build_frontend_sync",
             lambda *_: FrontendBuildResult("built"),

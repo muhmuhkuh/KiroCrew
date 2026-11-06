@@ -17,7 +17,7 @@ the only place a sign-in is offered.
 
 ## The vendor catalogue
 
-`src/kiro_crew/connections/registry.json` holds **36** curated providers. A catalogue
+`src/kiro_crew/connections/registry.json` holds **38** curated providers. A catalogue
 entry is what lets Kiro Crew offer a one-click **Connect** instead of asking you for
 a URL: the entry carries the vendor's MCP endpoint, the scopes worth asking for, the
 revoke page to send you to later, and a baseline of the vendor's published OAuth
@@ -103,6 +103,135 @@ looks like the sign-in failed.
 
 After authorizing: drain the warm pool (or restart the gateway) **first**, then start
 a fresh session.
+
+### Render: an API key instead of a sign-in
+
+Render hosts an MCP server at `https://mcp.render.com/mcp`. It is not in the
+catalogue: Render's sign-in refuses apps it has not registered itself and documents
+no way to register one, so a sign-in started from Kiro Crew cannot complete. It
+takes a Render API key instead.
+
+Before you connect it:
+
+- **Some tools change your account.** They create services and databases that
+  Render bills for, overwrite all of a service's environment variables (any left
+  out are deleted), and start deploys. Rollback is not one of the server's tools;
+  roll back in the Render Dashboard.
+- **The agent holds the key.** A `.env` value reaches the agent's shell, so the
+  agent can also use the key through Render's own API, which can delete services and
+  databases. Picking a workspace in step 4 does not limit the key. Use one you are
+  willing to hand to the agent.
+- **Removing the server does not revoke the key.** Revoke it on Render's Account
+  Settings page.
+
+To connect it:
+
+1. Create an API key on your Render **Account Settings** page.
+2. Add `RENDER_API_KEY=<your key>` to `~/.kiro/crew/.env`, then stop and start the
+   gateway ([Credentials](configuration.md#credentials)).
+3. Add a [remote server](#adding-your-own-mcp-server) named `render`:
+
+   ```json
+   { "url": "https://mcp.render.com/mcp", "headers": { "Authorization": "Bearer ${RENDER_API_KEY}" } }
+   ```
+
+4. In a [cold session](#the-tools-appear-in-the-next-cold-session), tell the agent
+   which Render workspace to use. Every Render tool acts on the workspace it selects.
+
+### Bland.ai: an API key instead of a sign-in
+
+Bland.ai is not in the catalogue. Its hosted MCP server, `https://api.bland.ai/v1/mcp`,
+has no runtime client registration for OAuth, so the chat **Authorize** link cannot
+finish. Connect it with an API key instead.
+
+**Know what the key can do first.** Restricted keys cannot connect, so the key has
+full access to one Bland organization. Through it the agent can place real phone
+calls and send texts billed to that organization, spend and buy credits, buy phone
+numbers and plans, deploy agent versions to production, and create more API keys;
+`call_bland_api` reaches any write endpoint of the Bland API. Bland's
+[tool reference](https://docs.bland.ai/integrations/mcp/tools) marks each tool that
+does. Bland's server never asks before running one. Kiro Crew does not ask either in
+a scheduled job set to `approval_mode: "auto"`, or wherever `agent.approval_mode`
+applies while it is at its default, `"auto"`, messaging-channel sessions included.
+
+1. Set `agent.approval_mode` to `"interactive"`, then restart the gateway: the
+   setting applies only at a restart.
+2. Create a full-access API key in the Bland dashboard, and add
+   `BLAND_API_KEY=<your key>` to `~/.kiro/crew/.env`.
+3. Add the server on this page, and enable it:
+
+   ```json
+   { "mcpServers": { "bland": {
+       "url": "https://api.bland.ai/v1/mcp",
+       "headers": { "Authorization": "Bearer ${env:BLAND_API_KEY}" } } } }
+   ```
+
+4. Start a fresh session, as described above.
+
+An unrecognised `.env` line reaches every process the gateway starts, the agent's
+own shell included, so the agent can read this key. When you stop using it, delete
+it in Bland, along with any key you did not create yourself: removing the server
+entry here revokes nothing.
+
+### Redmine: a local server and an API key
+
+Redmine has no hosted MCP server, and every Redmine is its own site, so it has no
+catalogue card. A community server,
+[`redmine-mcp-server`](https://github.com/jztan/redmine-mcp-server) (MIT), runs on
+your machine and calls your Redmine's REST API with your API key. Kiro Crew does not
+maintain or review it. These steps were checked against its version 2.20.0 and
+Redmine 7.0.
+
+Before you connect it:
+
+- **The agent holds the key, and the key acts as you.** It carries every permission
+  your Redmine account has, and a `.env` value reaches the agent's shell, so the
+  agent can call Redmine's API with it directly, deleting included. The tool list in
+  step 4 does not limit the key.
+- **Removing the server does not revoke the key.** Reset it on your Redmine
+  **My account** page.
+
+To connect it:
+
+1. Have a Redmine administrator tick **Enable REST web service** (Administration →
+   Settings → API). Then copy your **API access key** from **My account**.
+2. Add `REDMINE_API_KEY=<your key>` to `~/.kiro/crew/.env`, and install
+   [uv](https://docs.astral.sh/uv/), which provides `uvx`.
+3. Run `kirocrew config set hooks.confirm_tools '["@redmine/manage_time_entry"]'`,
+   keeping any patterns you already list there. A server added on this page is
+   otherwise approved for every tool, so not even a time entry would ask first.
+4. Choose **Add Custom**, paste this block, and enable it. Do not install it from
+   **Add Server**: the registry's entry leaves out `REDMINE_MCP_TRANSPORT`, and
+   without it the server opens a network port on every interface instead of talking
+   to Kiro Crew. Set `REDMINE_URL` to your Redmine, and `ATTACHMENTS_DIR` to an
+   absolute path of an empty folder; otherwise the server makes an `attachments`
+   folder in the session's project.
+
+   ```json
+   { "mcpServers": { "redmine": {
+       "command": "uvx",
+       "args": ["redmine-mcp-server@2.20.0"],
+       "env": {
+         "REDMINE_URL": "https://redmine.example.com",
+         "REDMINE_API_KEY": "${env:REDMINE_API_KEY}",
+         "REDMINE_MCP_TRANSPORT": "stdio",
+         "ATTACHMENTS_DIR": "/home/you/redmine-mcp",
+         "REDMINE_MCP_ALLOW_TOOLS": "list_redmine_projects,list_redmine_issues,get_redmine_issue,create_redmine_issue,update_redmine_issue,list_time_entry_activities,manage_time_entry" } } } }
+   ```
+
+5. Stop and start the gateway, then start a
+   [cold session](#the-tools-appear-in-the-next-cold-session).
+
+Then ask in chat: list the issues assigned to you, explain one, update one, or
+create one in a project you name.
+
+**Logging time, with your approval.** Kiro Crew has no timer, so nothing measures
+the agent's own working time. Instead, in one chat, tell the agent when you start on
+an issue and when you stop, and ask it to note the time at each. It then proposes a
+time entry with the hours in between, an activity and a comment, and writes it with
+`manage_time_entry` only after you approve that call, while the chat's approval mode
+is **Normal** or **Reads**. **Trust** and **YOLO** approve it without asking. A
+messaging-channel session asks only while `agent.approval_mode` is `"interactive"`.
 
 ## Credentials, and what Kiro Crew can see
 
@@ -193,9 +322,10 @@ so no provider dispatch happens outside the governed, audited agent path.
 
 Two MCP servers can ship the same tool name. Linear, Vercel and TickTick all expose
 `list_projects`; Linear, GitHub and GitLab all expose `list_issues`; Atlassian,
-Todoist and TickTick all expose `search` and `fetch`. An agent calls a tool by bare
-name, so the second server to mount would shadow the first — one provider's tool
-becomes unreachable and the agent silently calls the other one's.
+Todoist and TickTick all expose `search` and `fetch`; Sentry, Figma and Railway all
+expose `whoami`. An agent calls a tool by bare name, so the second server to mount
+would shadow the first — one provider's tool becomes unreachable and the agent
+silently calls the other one's.
 
 Kiro Crew renames the collision instead. The pattern is always
 `<provider>_<tool>`, and **every** claimant is renamed — none keeps the bare name, so
@@ -205,12 +335,13 @@ there is no "first one wins" to reason about:
 list_projects  →  linear_list_projects, ticktick_list_projects, vercel_list_projects
 list_issues    →  github_list_issues, gitlab_list_issues, linear_list_issues
 search         →  atlassian_search, gitlab_search, neon_search, ticktick_search, todoist_search
+whoami         →  figma_whoami, railway_whoami, sentry_whoami
 ```
 
-Renames are declared in the catalogue for eight providers today — GitHub, Linear,
-Vercel, GitLab, Atlassian, Neon, Todoist and TickTick — and only for the tools that
-actually collide. A server that is not the catalogue provider gets no renames,
-whatever it calls itself.
+Renames are declared in the catalogue for eleven providers today — GitHub, Linear,
+Vercel, GitLab, Atlassian, Neon, Todoist, TickTick, Sentry, Figma and Railway — and
+only for the tools that actually collide. A server that is not the catalogue provider
+gets no renames, whatever it calls itself.
 
 **If you are an agent:** when a tool you expected is absent, check for the
 `<provider>_<tool>` spelling before reporting the server broken, and call the tool

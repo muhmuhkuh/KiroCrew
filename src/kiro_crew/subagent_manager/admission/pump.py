@@ -18,7 +18,6 @@ if TYPE_CHECKING:
     from ...subagent import (
         _RELEASE_REPUMP_SECS,
         DENY_CAUSE_APPROVAL_UNDELIVERABLE,
-        DENY_CAUSE_HOOK_ERROR,
         MEMORY_PRESSURE_NEVER_STARTED,
         SpawnAdmissionCoordinator,
         SpawnApprovalUnreachable,
@@ -1217,7 +1216,7 @@ class _PumpMixin(ManagerComponent):
         # the same shape the chat runner's own host-cancelled approval writes.
         # Seeding them and writing in a ``finally`` is what makes the pair total
         # over every exit; an unanswered request left in the fold's ``pending``
-        # map forever is the same silence this fix removes, one step along.
+        # map forever is the same missing record of the wait, one step along.
         _log_origin: tuple[str, int] = ("", 0)
         _log_decision: str = "rejected"
         _log_by: str = "host"
@@ -1322,7 +1321,9 @@ class _PumpMixin(ManagerComponent):
                     exc_info=info.memory_mode == "persistent",
                 )
                 approved = False
-                _log_cause = DENY_CAUSE_HOOK_ERROR
+                # The approval callback itself raised; no hook ran, so the cause
+                # is a failure to deliver the prompt, not a hook error.
+                _log_cause = DENY_CAUSE_APPROVAL_UNDELIVERABLE
         finally:
             # The request's answer, on every exit including the cancelled one.
             # A no-op when no request was written, so the two are all-or-nothing.
@@ -1736,6 +1737,7 @@ class _PumpMixin(ManagerComponent):
             # settles the failure before allocating a provider, for every store.
             info.error = "memory_unavailable: could not persist this run's memory binding"
             return
+        info._folder_seeded = True
 
         # Written HERE, past the folder write, for the reason the stat below is:
         # this is the point a start is confirmed. A run whose memory binding

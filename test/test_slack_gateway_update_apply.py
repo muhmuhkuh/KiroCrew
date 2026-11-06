@@ -80,12 +80,9 @@ class TestCheckForUpdates:
     async def test_commit_distance_alone_lights_the_badge_but_does_not_auto_apply(self):
         """A git checkout behind upstream with an UNCHANGED version is not reset.
 
-        `available` is true on commit distance alone so the dashboard stops
-        claiming "you're on the latest version". This path is not the dashboard:
-        it applies `git reset --hard`, so acting on commit distance would reset a
-        developer's checkout within 12 hours of any upstream commit, where before
-        it only did so at a release. The badge is lit instead; the dashboard's own
-        apply (`git pull`, dirty tree refused) is the non-destructive way in.
+        `available` is true on commit distance alone, but this path runs
+        `git reset --hard`, so acting on it would reset a developer's checkout after any
+        upstream commit. The badge is lit instead.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -136,13 +133,9 @@ class TestCheckForUpdates:
     async def test_min_version_mandate_without_a_newer_build_notifies(self):
         """A below-floor git checkout with no newer build must NOT hard-reset.
 
-        The mandate is real, but `_auto_apply_update` resets hard onto the
-        upstream tip, and `update_available` is true for a checkout on any commit
-        distance — released or not. Resetting on that alone drags the checkout to
-        every intermediate commit on every cycle and at every boot without the
-        running `__version__` ever moving toward the floor. The mandatory branch
-        now reads the same `version_newer` signal the voluntary branch does, so a
-        floor with no newer build available notifies instead of resetting.
+        `update_available` is true on any commit distance, so resetting on it would drag
+        the checkout to every intermediate commit without `__version__` reaching the floor.
+        The mandatory branch reads `version_newer` and notifies instead.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -276,16 +269,10 @@ class TestAutoApplyUpdate:
 
     @pytest.mark.asyncio
     async def test_failure_path_resolves_the_restart_hint_off_the_event_loop(self, tmp_path):
-        # The except handler prints `restart_command_hint()`, which stats the
-        # per-user unit file under the account's home; a disconnected network
-        # home holds that stat for as long as it is disconnected. Called on the
-        # loop thread, the wait freezes chat and the liveness heartbeat together
-        # with nothing in-band to clear it. The double below stands in for that
-        # slow stat and blocks until the LOOP sets an event: only a hint
-        # resolved off the loop lets the loop run the task that sets it, so a
-        # hint called synchronously on the loop thread times out and answers
-        # `LOOP BLOCKED` instead of the command — deterministic, not a timing
-        # race, because nothing but the loop can set the event.
+        # `restart_command_hint()` stats a unit file under the home, which a disconnected
+        # network home can hold forever. The double blocks until the LOOP sets an event,
+        # so a hint called on the loop thread answers `LOOP BLOCKED` (deterministic: only
+        # the loop can set the event).
         orch = _make_orchestrator()
         orch.dashboard_state = real_dashboard_state(tmp_path)
         loop_ran = threading.Event()
@@ -362,7 +349,7 @@ class TestBrazilInstallAndDeps:
         is_brazil.assert_called_once_with("/proj")
         spawn.assert_not_awaited()
 
-    # --- _check_console_script -------------------------------------------------
+    # _check_console_script
 
     def test_check_console_script_skips_when_no_project_dir(self):
         orch = _make_orchestrator()
@@ -472,6 +459,97 @@ class TestBrazilInstallAndDeps:
                     asyncio.run(orch._check_console_script())
         spawn.assert_awaited_once()
 
+    def test_check_console_script_probes_the_checkout_off_the_event_loop(self, tmp_path):
+        """The startup probe stats and reads the checkout, which may be on a network
+        mount, so none of it may run on the loop thread that serves every session."""
+        (tmp_path / ".install-method").write_text("pip")
+        venv_py = gw.dep_sync.project_venv_python(tmp_path)
+        script = gw.dep_sync.console_script_path(venv_py)
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\n")
+        script.chmod(0o755)
+        orch = _make_orchestrator()
+        seen: dict[str, int] = {}
+        real_is_brazil = GatewayOrchestrator._is_brazil_install
+        real_read_text = Path.read_text
+        real_access = gw.os.access
+        read_kwargs: dict = {}
+
+        def is_brazil(proj):
+            seen["is_brazil"] = threading.get_ident()
+            return real_is_brazil(proj)
+
+        def read_text(self_path, *args, **kwargs):
+            if self_path.name == ".install-method":
+                seen["read_method"] = threading.get_ident()
+                read_kwargs.update(kwargs)
+            return real_read_text(self_path, *args, **kwargs)
+
+        def access(path, mode, *args, **kwargs):
+            if Path(path) == script:
+                seen["access"] = threading.get_ident()
+            return real_access(path, mode, *args, **kwargs)
+
+        async def run() -> int:
+            loop_thread = threading.get_ident()
+            await orch._check_console_script()
+            return loop_thread
+
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": str(tmp_path)}, clear=False),
+            patch.object(GatewayOrchestrator, "_is_brazil_install", side_effect=is_brazil),
+            patch.object(Path, "read_text", read_text),
+            patch.object(gw.os, "access", side_effect=access),
+            patch.object(gw, "sandboxed_spawn_argv_async", new_callable=AsyncMock) as spawn,
+        ):
+            loop_thread = asyncio.run(run())
+
+        # The script is present and executable, so this is the healthy no-op path.
+        spawn.assert_not_awaited()
+        assert set(seen) == {"is_brazil", "read_method", "access"}
+        assert all(ident != loop_thread for ident in seen.values()), seen
+        # The marker is ASCII we wrote; decode it as such, not in the locale code page.
+        assert read_kwargs.get("encoding") == "utf-8"
+
+    def test_check_console_script_resolves_the_repair_module_off_the_event_loop(self, tmp_path):
+        """On the repair path the dep_sync module path is resolved in the probe's
+        thread too, not on the loop before the sandboxed spawn."""
+        (tmp_path / ".install-method").write_text("pip")
+        gw.dep_sync.project_venv_python(tmp_path).parent.mkdir(parents=True)
+        orch = _make_orchestrator()
+        dep_sync_file = Path(gw.dep_sync.__file__)
+        real_resolve = Path.resolve
+        seen: list[int] = []
+
+        def resolve(self_path, *args, **kwargs):
+            if self_path == dep_sync_file:
+                seen.append(threading.get_ident())
+            return real_resolve(self_path, *args, **kwargs)
+
+        async def fake_prepare(cmd, **kwargs):
+            return list(cmd), {}, None
+
+        async def run() -> int:
+            loop_thread = threading.get_ident()
+            await orch._check_console_script()
+            return loop_thread
+
+        with (
+            patch.dict("os.environ", {"KIROCREW_PROJECT_DIR": str(tmp_path)}, clear=False),
+            patch.object(Path, "resolve", resolve),
+            patch.object(gw, "sandboxed_spawn_argv_async", side_effect=fake_prepare),
+            patch.object(
+                gw,
+                "create_subprocess_limited",
+                new_callable=AsyncMock,
+                return_value=_fake_async_proc(),
+            ) as spawn,
+        ):
+            loop_thread = asyncio.run(run())
+
+        spawn.assert_awaited_once()
+        assert seen and all(ident != loop_thread for ident in seen), seen
+
     def test_check_console_script_skipped_when_sandbox_unavailable(self, tmp_path):
         """Fail CLOSED: no sandbox backend means the repair does NOT run.
 
@@ -558,11 +636,8 @@ class TestBrazilInstallAndDeps:
     async def test_check_console_script_is_sandbox_routed_and_limited(self, tmp_path):
         """The repair spawn MUST route through the sandbox chokepoint.
 
-        The child EXECUTES the project's own venv interpreter (dep_sync probes
-        it), so it must get OS isolation, a scrubbed env, and the kernel
-        resource ceiling. Reverting to a bare ``asyncio.create_subprocess_exec``
-        fails this two ways: the seams below are never awaited, and the poisoned
-        ``create_subprocess_exec`` raises the moment the old path touches it.
+        The child runs the project's own venv interpreter, so it needs OS isolation, a
+        scrubbed env and the resource ceiling. ``create_subprocess_exec`` is poisoned.
         """
         (tmp_path / ".install-method").write_text("pip")
         venv_py = gw.dep_sync.project_venv_python(tmp_path)
@@ -647,25 +722,12 @@ class TestAutoApplyUpdateGitPath:
 
     @pytest.fixture(autouse=True)
     def _permit_update_preconditions(self):
-        """Neutralize the two seam preconditions so these tests keep their subject.
+        """Neutralize the seam preconditions so these tests reach the reset sequence.
 
-        `_auto_apply_update` refuses outright when the checkout declares a
-        repo-named git driver, when the branch does not track the remote it resets
-        to, or when a tracked edit is hidden by assume-unchanged. All read the REAL
-        git metadata of ``KIROCREW_PROJECT_DIR``, which these tests point at a path
-        that is not a repo — so without this they would all pass vacuously by
-        refusing before reaching the fetch/reset sequence they exist to cover. The
-        refusals have their own tests in ``TestAutoApplyUpdatePreconditions`` and
-        ``TestAutoApplyUpdateResetPath``.
-
-        The git binary is pinned too: ``_auto_apply_update`` resolves it through
-        ``platform_compat.trusted_git_bin`` (fixed trusted directories, never
-        PATH) and skips the whole update when that answers ``None``. Every spawn
-        below is faked, so the value only has to be an argv[0]; without the pin,
-        a host whose git lives outside those directories (a per-user Git for
-        Windows install) made every test here pass or fail on the refusal branch
-        instead of the sequence it covers. A test about the resolver itself
-        patches it again explicitly, and that inner patch wins.
+        The preconditions read real git metadata of ``KIROCREW_PROJECT_DIR``, a non-repo
+        here, so without these patches every test would refuse before the fetch. The git
+        binary is pinned because a host git outside the trusted directories skips the
+        update.
         """
         with (
             # The network fetch runs through the shared isolated helper; stub it
@@ -698,16 +760,9 @@ class TestAutoApplyUpdateGitPath:
                 "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
                 return_value=None,
             ),
-            # The pre-restart drain, shortened to nothing. Nothing in these tests
-            # makes its condition true, so it polled at 10ms all the way to its
-            # 30s deadline and then deferred the restart -- the same verdict these
-            # tests already assert, reached thirty seconds later. Eleven tests
-            # across the three TestAutoApplyUpdate* classes paid it in full:
-            # ~330s of pure sleeping per full suite run, measured identically in
-            # five runs. The branch still executes and the deferral still happens;
-            # only the waiting goes. The 30.0 itself stays pinned by
-            # test_restart_fences_then_closes_and_final_drains, which is the test
-            # that is ABOUT it.
+            # The pre-restart drain never finishes here, so its 30s deadline would only
+            # add sleep before the same deferral. The 30.0 is pinned by
+            # test_restart_fences_then_closes_and_final_drains.
             patch.object(gw.GatewayOrchestrator, "_UPDATE_DRAIN_TIMEOUT_SECS", 0.0),
         ):
             yield
@@ -758,15 +813,8 @@ class TestAutoApplyUpdateGitPath:
     async def test_mandatory_no_diff_is_visible_to_the_operator(self, tmp_path):
         """A floor-mandated no-diff apply refreshes the badge without a restart.
 
-        Reaching the no-diff branch means the required code is already on disk
-        and a restart is what remains. The ``restarting`` step is reserved for
-        the moment the gateway is about to exec itself: it arms the SPA's reload
-        latch, which a later reconnect consumes. No exec happens here, so the step
-        must NOT be pushed — doing so would reload a tab over an unrelated
-        reconnect and leave the progress bar stuck mid-"restarting". The mandated
-        no-diff path therefore clears the bar (so it is not stuck) and refreshes
-        the badge (so the pending update stays visible), unlike the voluntary
-        no-diff path which only clears.
+        ``restarting`` arms the SPA's reload latch and is pushed only right before an
+        exec. No exec happens here, so the bar is cleared and the badge refreshed.
         """
         orch = _make_orchestrator()
         ds = real_dashboard_state(tmp_path)
@@ -800,25 +848,12 @@ class TestAutoApplyUpdateVenvPath:
 
     @pytest.fixture(autouse=True)
     def _permit_update_preconditions(self):
-        """Neutralize the two seam preconditions so these tests keep their subject.
+        """Neutralize the seam preconditions so these tests reach the reset sequence.
 
-        `_auto_apply_update` refuses outright when the checkout declares a
-        repo-named git driver, when the branch does not track the remote it resets
-        to, or when a tracked edit is hidden by assume-unchanged. All read the REAL
-        git metadata of ``KIROCREW_PROJECT_DIR``, which these tests point at a path
-        that is not a repo — so without this they would all pass vacuously by
-        refusing before reaching the fetch/reset sequence they exist to cover. The
-        refusals have their own tests in ``TestAutoApplyUpdatePreconditions`` and
-        ``TestAutoApplyUpdateResetPath``.
-
-        The git binary is pinned too: ``_auto_apply_update`` resolves it through
-        ``platform_compat.trusted_git_bin`` (fixed trusted directories, never
-        PATH) and skips the whole update when that answers ``None``. Every spawn
-        below is faked, so the value only has to be an argv[0]; without the pin,
-        a host whose git lives outside those directories (a per-user Git for
-        Windows install) made every test here pass or fail on the refusal branch
-        instead of the sequence it covers. A test about the resolver itself
-        patches it again explicitly, and that inner patch wins.
+        The preconditions read real git metadata of ``KIROCREW_PROJECT_DIR``, a non-repo
+        here, so without these patches every test would refuse before the fetch. The git
+        binary is pinned because a host git outside the trusted directories skips the
+        update.
         """
         with (
             # The network fetch runs through the shared isolated helper; stub it
@@ -851,16 +886,9 @@ class TestAutoApplyUpdateVenvPath:
                 "kiro_crew.slack.gateway.dep_sync.incoming_python_floor_breach",
                 return_value=None,
             ),
-            # The pre-restart drain, shortened to nothing. Nothing in these tests
-            # makes its condition true, so it polled at 10ms all the way to its
-            # 30s deadline and then deferred the restart -- the same verdict these
-            # tests already assert, reached thirty seconds later. Eleven tests
-            # across the three TestAutoApplyUpdate* classes paid it in full:
-            # ~330s of pure sleeping per full suite run, measured identically in
-            # five runs. The branch still executes and the deferral still happens;
-            # only the waiting goes. The 30.0 itself stays pinned by
-            # test_restart_fences_then_closes_and_final_drains, which is the test
-            # that is ABOUT it.
+            # The pre-restart drain never finishes here, so its 30s deadline would only
+            # add sleep before the same deferral. The 30.0 is pinned by
+            # test_restart_fences_then_closes_and_final_drains.
             patch.object(gw.GatewayOrchestrator, "_UPDATE_DRAIN_TIMEOUT_SECS", 0.0),
         ):
             yield
@@ -910,14 +938,8 @@ class TestAutoApplyUpdateVenvPath:
     async def test_kiro_cli_update_timeout_kills_child_and_stays_nonfatal(self):
         """A hung `kiro-cli update` is tree-killed AND the update stays non-fatal.
 
-        Both halves matter. If the 120s timeout is swallowed by a bare
-        ``except Exception`` → DEBUG, the run falls through to the frontend
-        build and dep reinstall while the ABANDONED `kiro-cli update` keeps
-        mutating the installation concurrently — the
-        same half-replaced-install race the wheel path's CancelledError branch
-        exists to prevent. A kill-only assertion would pass on a fix that
-        turned the timeout fatal; the non-fatal half pins that the surrounding
-        contract (log at DEBUG, continue the update) is unchanged.
+        An unkilled child keeps mutating the install while the frontend build and dep
+        reinstall run. The non-fatal half pins that the update logs at DEBUG and goes on.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -989,12 +1011,8 @@ class TestAutoApplyUpdateVenvPath:
     async def test_kiro_cli_update_execs_resolved_absolute_path(self):
         """The kiro-cli update spawns the RESOLVED path, never a bare argv0.
 
-        A bare `"kiro-cli"` argv0 is re-resolved off the gateway's inherited
-        `PATH` inside `exec`, and that `PATH` can lead with an agent-writable
-        directory — so a planted shim would run unattended as the gateway user.
-        Asserting the absolute path reached `create_subprocess_exec` is what
-        pins the lookup to the resolver: with the bare name restored, argv0 is
-        `"kiro-cli"` and this fails.
+        A bare argv0 is resolved off the inherited `PATH`, which can lead with an
+        agent-writable directory holding a planted shim.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
@@ -1040,11 +1058,8 @@ class TestAutoApplyUpdateVenvPath:
     async def test_kiro_cli_update_resolves_without_inherited_path(self):
         """The candidate set excludes the inherited `PATH`.
 
-        Pinning argv0 is not enough on its own: with the inherited `PATH` in
-        the candidate set, a leading agent-writable directory still gets to
-        name the binary this unattended path resolves to. Asserting the
-        keyword is what pins that — the default is `True`, so a call that
-        forgets it fails here.
+        With `PATH` in the candidate set an agent-writable directory still names the
+        binary. The keyword defaults to `True`, so a call that omits it fails here.
         """
         orch = _make_orchestrator()
         ds = _mock_dashboard_state()
