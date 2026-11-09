@@ -1962,6 +1962,19 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
   },
   {
+    "id": "developer.agent-harness-per-mate",
+    "label": "Agent harness per mate",
+    "labelKey": "pages.developer.featurePreviewsTab.crewmate_harness",
+    "description": "Lets one Bot run on another AI coding tool.",
+    "hint": "Adds an Agent harness setting to each mate's profile, so one mate can run on a different AI coding tool, such as Claude Code, with that tool's models, while the rest keep the default.",
+    "tab": "developer",
+    "type": "toggle",
+    "occurrence": 1,
+    "params": {
+      "sub": "feature-previews"
+    }
+  },
+  {
     "id": "developer.also-send-screenshots-of-the-agent-s-browser-tab",
     "label": "Also send screenshots of the agent's browser tab",
     "labelKey": "pages.developer.featurePreviewsTab.decisions_browser_images",

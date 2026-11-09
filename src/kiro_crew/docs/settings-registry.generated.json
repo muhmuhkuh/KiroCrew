@@ -1143,6 +1143,14 @@
       "description": "Client ID, client secret and redirect URI for a provider that needs a registered OAuth app"
     },
     {
+      "id": "developer.agent-harness-per-mate",
+      "label": "Agent harness per mate",
+      "tab": "developer",
+      "route": "/settings/developer/feature-previews?highlight=developer.agent-harness-per-mate",
+      "description": "Lets one Bot run on another AI coding tool.",
+      "hint": "Adds an Agent harness setting to each mate's profile, so one mate can run on a different AI coding tool, such as Claude Code, with that tool's models, while the rest keep the default."
+    },
+    {
       "id": "developer.also-send-screenshots-of-the-agent-s-browser-tab",
       "label": "Also send screenshots of the agent's browser tab",
       "tab": "developer",
