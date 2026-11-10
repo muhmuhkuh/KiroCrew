@@ -76,9 +76,9 @@ import statistics
 import subprocess
 import sys
 import time
-from collections.abc import Callable
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import Callable
 
 from kiro_crew import platform_compat
 from kiro_crew.platform.context import redact_via_context
@@ -97,7 +97,6 @@ from ...spine.contracts import (
     StageBreakdown,
 )
 from ...spine.profile import CalibrationParams, ProfileFieldAliases
-from .pr_recipe import GitHubPRRecipe
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +327,7 @@ def _run(
     # candidate's own conftest/reproducing test — which is precisely who must not see the
     # operator's credentials. Measured on the author's host: under "standard" the child saw
     # all 7 ~/.aws entries; under "strict", 0. The agent SPAWN was already switched to
-    # strict; this is the gate, the other place untrusted code executes. Raised by review.
+    # strict; this is the gate, the other place untrusted code executes.
     # Also MASK Kiro Crew's own write-protected files. `mode="strict"` hides 52 credential
     # paths so agent-authored code cannot READ secrets, but it does not make the rest of the
     # filesystem read-only — measured on this host: a strict-mode child appended to
@@ -340,7 +339,7 @@ def _run(
     # under both `.kiro/crew` and `.kirocrew`), i.e. the one-way doors that
     # would corrupt the installation; broader hiding is not possible here because the
     # interpreter's own stdlib can live under `$HOME` (measured: hiding `~/.local/share`
-    # broke `import platform` outright). Raised by the GPT review of this branch.
+    # broke `import platform` outright).
     sandboxed, scrubbed_env, cleanup = sandboxed_spawn_argv(
         list(argv),
         mode="strict",
@@ -416,7 +415,7 @@ def _measure_env(tree: Path) -> dict[str, str]:
     # so anything inherited here is put straight back after the sandbox removed it.
     # Measured before fixing: an `AWS_SECRET_ACCESS_KEY` scrubbed by the sandbox
     # reappeared in the child's env once this dict was applied — handing the operator's
-    # credentials to agent-authored test code. Raised by review of this branch.
+    # credentials to agent-authored test code.
     #
     # A few HOST variables are still required for a subprocess to run at all (PATH) or to
     # behave like a normal user session (HOME, TMPDIR, locale). Those are matched against
@@ -1487,6 +1486,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
         # urls are neutralized so agent-run Bash inside it cannot find a push target.
         # Only the pr_recipe (a trusted publisher) receives it.
         origin_url: str = "",
+        provider: str = "github",
         track: str = TRACK_BUG,
         benchmark_cmd: str = "",
         scope_base: str = "",
@@ -1494,16 +1494,7 @@ class GitHubRepoProfile(ProfileFieldAliases):
         baseline_reps: int = 5,
         noise_floor_s: float = 0.25,
         log_dir: Path | None = None,
-        #: Which PR/MR recipe assembles field ⑤. The GitLab profile swaps in
-        #: :class:`..gitlab_repo.pr_recipe.GitLabPRRecipe`; everything else in
-        #: this profile is host-agnostic.
-        recipe_cls: type = GitHubPRRecipe,
-        #: The code-host hostname (gitlab instances) handed to the recipe so it
-        #: can pin its provider CLI. Empty for GitHub (no pinning needed).
-        host: str = "",
     ) -> None:
-        #: Reported by the spine as ``profile_id``; mirrors the registry id.
-        self.id = getattr(recipe_cls, "provider_name", "github") + "-repo"
         self.clone_path = Path(clone_path)
         self.track = track
         #: The ``scopeDiffBase`` ref: when set, discovery and the edit fence are both
@@ -1568,13 +1559,18 @@ class GitHubRepoProfile(ProfileFieldAliases):
         #: reads, so discovery keys off this raw value (see ``discover``).
         self._user_edit_globs = list(allowed_globs) if allowed_globs else None
         self.isolation = RepoIsolation(clone_path=self.clone_path, base_ref=base_ref)  # ④
-        self.pr_recipe = recipe_cls(  # ⑤ — the provider-specific seam field
+        # ⑤ — chosen by the configured target's provider. One profile serves both
+        # forges because only the draft CLI differs; the measurement machinery is
+        # provider-independent.
+        from .. import build_pr_recipe
+
+        self.pr_recipe = build_pr_recipe(
+            provider,
             user=user,
             clone_path=self.clone_path,
             pr_queue_dir=Path(pr_queue_dir),
             base_ref=base_ref,
             fetch_url=origin_url or None,
-            host=host or None,
         )
         self.calibration = CalibrationParams(  # ⑥
             # 5–10 reps, not the protocol's 30: each rep is a FULL suite run, so 30
@@ -1801,7 +1797,7 @@ def _resolve_origin_url(cfg: dict) -> str:
     return resolve_origin_url(cfg)
 
 
-def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> GitHubRepoProfile:
+def build_profile(config: dict) -> GitHubRepoProfile:
     """Assemble a :class:`GitHubRepoProfile` from the app's on-disk config.
 
     Reads the same keys the routes write (``clone``, ``branch``, ``scopeDiffBase``,
@@ -1809,9 +1805,6 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
     resolves the queue/log dirs from :mod:`...backend.store`, so a caller only has to
     hand over the config dict. Raises :class:`ValueError` when no clone is configured
     — a profile pointed at nothing would fail later and less legibly.
-
-    ``profile_cls`` lets the GitLab profile reuse this assembler unchanged — it
-    swaps the PR/MR recipe class via its own constructor default.
     """
     from ...backend import store
 
@@ -1831,11 +1824,15 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
     else:
         base_ref = f"origin/{branch}"
 
-    return profile_cls(
+    # Which review provider field ⑤ drafts against, from the target URL.
+    from .. import target_provider
+
+    return GitHubRepoProfile(
         clone_path=Path(clone),
         pr_queue_dir=store.pr_queue_dir(),
         user=str(cfg.get("prUser") or cfg.get("user") or ""),
         base_ref=base_ref,
+        provider=target_provider(cfg),
         track=str(cfg.get("track") or TRACK_BUG),
         benchmark_cmd=str(cfg.get("benchmarkCommand") or ""),
         scope_base=str(cfg.get("scopeDiffBase") or ""),
@@ -1848,5 +1845,4 @@ def build_profile(config: dict, *, profile_cls: type = GitHubRepoProfile) -> Git
         baseline_reps=int(cfg.get("calibrationReps") or 5),
         noise_floor_s=float(cfg.get("noiseFloorSeconds") or 0.25),
         log_dir=store.logs_dir(),
-        host=str(cfg.get("host") or ""),
     )

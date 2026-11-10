@@ -18,31 +18,92 @@ from typing import Any
 __all__ = ["PROFILE_IDS", "build_profile"]
 
 #: Selectable profile ids (config key ``profile``). ``github-repo`` is the reference
-#: implementation and the default; ``gitlab-repo`` is selected by the persisted
-#: ``provider`` (or inferred from the target URL) when the setup target is GitLab.
-#: An unknown id falls back to the provider-derived profile rather than raising,
+#: implementation and the default; an unknown id falls back to it rather than raising,
 #: because a stale config value should not brick the Start button.
-PROFILE_IDS = ("github-repo", "gitlab-repo")
+PROFILE_IDS = ("github-repo",)
+
+#: The hosts that mean "GitHub", for the whole app (intake, transport rewrites,
+#: provider dispatch). Every other host the app accepts is a GitLab.
+GITHUB_HOSTS = frozenset({"github.com", "www.github.com"})
 
 
-def _infer_provider(config: dict[str, Any]) -> str:
-    """Derive the provider for a legacy config that predates the ``provider`` key.
+def _provider_of(target_url: str) -> str:
+    """The review provider a stored target URL names: GitHub or GitLab.
 
-    The authoritative value is written by ``POST /setup-clone`` (Stage 2); this
-    is only the fallback for configs written before the GitLab port. Cheap
-    string checks only — the ``host`` key is the reliable marker (setup always
-    stores it), with ``target_url`` as a secondary hint. Fails closed to
-    ``"github"`` (the pre-port behavior).
+    Decided by the host alone, never by the self-managed allowlist: setup accepts
+    exactly the GitHub hosts in :data:`GITHUB_HOSTS`, so every other host it stored is a
+    GitLab. A GitLab target whose host later leaves ``dashboard.gitlab_hosts`` therefore
+    stays a GitLab target, and its push is refused by the remote allowlist instead of
+    being routed to the GitHub recipe. An empty or unparseable URL is GitHub, the forge
+    every target was before GitLab support.
     """
-    host = str((config or {}).get("host") or "").lower().strip()
-    if host and host not in {"github.com", "www.github.com"}:
-        return "gitlab"
-    target = str((config or {}).get("target_url") or "").lower().strip()
-    if target.startswith("https://"):
-        netloc = target.split("/")[2] or ""
-        if netloc and netloc.split(":", 1)[0] not in {"github.com", "www.github.com"}:
-            return "gitlab"
-    return "github"
+    from urllib.parse import urlparse
+
+    raw = str(target_url or "").strip()
+    try:
+        host = (urlparse(raw).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return "github"
+    if not host or host in GITHUB_HOSTS:
+        return "github"
+    return "gitlab"
+
+
+def target_provider(config: dict[str, Any] | None) -> str:
+    """The configured target's review provider. The target URL is the one source."""
+    return _provider_of(str((config or {}).get("target_url") or ""))
+
+
+def build_pr_recipe(
+    provider: str,
+    *,
+    user: str,
+    clone_path: Any,
+    pr_queue_dir: Any,
+    base_ref: str | None = None,
+    fetch_url: str | None = None,
+) -> Any:
+    """The field-⑤ recipe for ``provider``: GitLab drafts an MR, anything else a PR.
+
+    The one place a recipe is chosen; the profile and the draft route both call it.
+    The recipe modules are imported lazily for the same boot-cost reason as
+    :func:`build_profile`. ``user`` is display metadata only.
+    """
+    kwargs: dict[str, Any] = {
+        "user": user,
+        "clone_path": clone_path,
+        "pr_queue_dir": pr_queue_dir,
+        "base_ref": base_ref,
+        "fetch_url": fetch_url,
+    }
+    if provider == "gitlab":
+        from .gitlab_repo.mr_recipe import GitLabMRRecipe
+
+        return GitLabMRRecipe(**kwargs)
+    from .github_repo.pr_recipe import GitHubPRRecipe
+
+    return GitHubPRRecipe(**kwargs)
+
+
+def prefer_authenticated_remote(url: str) -> str:
+    """Rewrite ``url`` onto the transport its host's provider CLI authenticates.
+
+    Dispatches on the URL's own host so a caller (``backend/commit.py``) needs no
+    provider knowledge. Non-HTTPS and hostless strings pass through untouched —
+    the rewrites only ever change the transport of a validated HTTPS URL.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(str(url or "").strip()).hostname or "").lower()
+    if not host:
+        return url
+    if host in GITHUB_HOSTS:
+        from .github_repo.pr_recipe import _prefer_authenticated_remote
+
+        return _prefer_authenticated_remote(url)
+    from .gitlab_repo.mr_recipe import prefer_authenticated_gitlab_remote
+
+    return prefer_authenticated_gitlab_remote(url)
 
 
 def build_profile(config: dict[str, Any]) -> Any:
@@ -53,20 +114,9 @@ def build_profile(config: dict[str, Any]) -> Any:
     on every gateway boot, and importing the profile (and through it the whole spine)
     at module scope would undo that. Nothing here is needed until a run starts.
 
-    Dispatch key: the persisted ``provider`` (or the inferred one). The ``profile``
-    config key stays writable but is advisory — provider, which is derived from the
-    validated setup URL, is authoritative, so a stale ``profile`` value can never
-    point the app at the wrong forge (or brick the Start button).
-
     Raises :class:`ValueError` when no repository is configured — a user-fixable setup
     problem the supervisor turns into a 409, not a crash.
     """
-    cfg = config or {}
-    provider = str(cfg.get("provider") or _infer_provider(cfg)).lower()
-    if provider == "gitlab":
-        from .gitlab_repo.profile import build_profile as _build_gitlab_repo
-
-        return _build_gitlab_repo(cfg)
     from .github_repo.profile import build_profile as _build_github_repo
 
-    return _build_github_repo(cfg)
+    return _build_github_repo(config or {})

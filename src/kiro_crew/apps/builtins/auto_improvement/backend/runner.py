@@ -47,7 +47,7 @@ from typing import Any
 
 from kiro_crew.dashboard.crash_dump_store import current_process_identity, pid_identity_alive
 
-from . import clone_setup, store
+from . import clone_setup, deps, store
 
 logger = logging.getLogger(__name__)
 
@@ -716,6 +716,7 @@ class RunSupervisor:
         """The body of :meth:`_build_driver`, which owns the clone lock. Split out so the
         lock acquisition is a single visible statement rather than an indent over 100
         lines — and so a future edit cannot add an early ``return`` that skips it."""
+        _refuse_without_gate_pytest()
 
         # Put the clone on the CONFIGURED branch BEFORE building the profile. A fresh
         # clone sits on the repo default (main); a run targeting another branch would
@@ -980,10 +981,15 @@ class RunSupervisor:
             if self._in_flight():
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
 
+            admitted_at = self._stop_seq
+        _refuse_without_gate_pytest()
+
         run_id = f"cal-{time.time():.0f}"
         with self._lock:
             if self._in_flight():
                 raise RuntimeError(f"a run is already active (run_id={self._state.run_id})")
+            if self._stop_seq != admitted_at:
+                raise RuntimeError("the calibration was stopped before it started")
             self._stop_requested = False
             self._state = RunState(
                 status=STATUS_CALIBRATING, run_id=run_id, started_at=time.time(), stage="calibrate"
@@ -1528,6 +1534,13 @@ def _opt_float(value: Any, default: float | None) -> float | None:
     except (TypeError, ValueError):
         return default
     return out if out > 0 else default
+
+
+def _refuse_without_gate_pytest() -> None:
+    """Refuse before starting work when the gate interpreter cannot run tests."""
+    problem = deps.gate_pytest_problem()
+    if problem:
+        raise RuntimeError(f"refusing to start: {problem}")
 
 
 def _as_bool(value: Any, default: bool) -> bool:

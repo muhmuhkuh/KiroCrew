@@ -1030,6 +1030,9 @@ class SlotCloseError(Exception):
 # while a worker thread is still on its way to the rename.
 _GUARDED_WRITE_WAIT_SECS = 5.0
 
+#: Maximum wait for file-change chips before a close archives the slot.
+_FILE_CHANGES_DRAIN_SECS = 25.0
+
 
 # Serializes slot SWITCH transactions that share one session, keyed by
 # ``effective_session_key``. The per-slot locks the switch handlers take

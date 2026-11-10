@@ -5,8 +5,8 @@
 Copilot's process adapter lives in `acp/harness/copilot.py`; its session-specific
 permission helpers live in `client_copilot.py`. The client mirror includes that
 owner and `client_native_children.py`, preserving patches through `acp.client`.
-Its MCP-array accessors and permission-state tripwires are bound from their
-respective client owners before the client class is imported.
+Its MCP-array accessors and permission-state tripwires each have one definition
+in their respective client owners before the client class is imported.
 Session handles feed and persist advertised models through their model-selection
 owner after create or load when the selected backend advertises its model list.
 

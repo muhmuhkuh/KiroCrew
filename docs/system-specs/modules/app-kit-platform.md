@@ -8,6 +8,9 @@ the publish-facing policy in
 [../../app-kit/publishing-guide.md](../../app-kit/publishing-guide.md); this
 document is the behaviour and the one-way doors.
 
+The app-registration bridge facade exposes only names its owners implement;
+its type-checking imports follow the same owner namespace as runtime mirroring.
+
 ## Embedded chat title
 
 A framed `ChatEmbed` with no title displays a localized label, never its

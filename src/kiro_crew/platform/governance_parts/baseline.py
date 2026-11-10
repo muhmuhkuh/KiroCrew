@@ -97,14 +97,6 @@ BASELINE_CONTROLS: Dict[str, Mapping[str, object]] = {
     "capabilities.kiro_cloud_sessions": _CAPABILITY_OFF,
 }
 
-#: Inner lists of a capability that keep their baseline when the remote policy
-#: names the capability but not the list. Without this, a policy that turns
-#: ``publish`` on to name its destinations would leave every region, audience and
-#: account open, because an unnamed inner list permits.
-BASELINE_INNER_LISTS: Dict[str, Mapping[str, Mapping[str, object]]] = {
-    "capabilities.publish": _PUBLISH_LISTS_OFF,
-}
-
 _OPEN = "open control (RFC D3): "
 
 BASELINE_UNGATED: Dict[str, str] = {

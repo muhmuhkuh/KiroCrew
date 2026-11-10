@@ -3,7 +3,7 @@
 `governance_parts.baseline` owns the enterprise value defaults alongside the
 scope controls: the stable update channel, a 1800-second auto-approval cap,
 and an empty Slack channel allowlist. The tier composer imports these values.
-The optional inner-list baseline registry is empty in this build; its parser
+The optional inner-list baseline registry has one empty definition in this build; its parser
 keeps unnamed lists unchanged when the registry has no entry for the capability.
 
 The `kiro_crew.platform.governance` (with its `governance_parts` owners) +

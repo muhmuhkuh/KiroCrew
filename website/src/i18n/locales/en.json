@@ -131,7 +131,7 @@
         "configuration_1": "The gateway host needs git and an authenticated gh CLI; connect a GitHub repository, choose its base branch, and calibrate a ruler before performance runs."
       },
       "setupPanel": {
-        "https_github_com_owner_repo": "https://github.com/owner/repo"
+        "repo_url_placeholder": "https://github.com/owner/repo or https://gitlab.com/group/project"
       }
     },
     "autoResearch": {

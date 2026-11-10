@@ -27,7 +27,7 @@ from kiro_crew.json_line import parse_json_object_line, recover_line_id
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
 
-from . import deps, progress, runner, store
+from . import deps, progress, runner
 
 #: JSON-RPC 2.0 error codes used here.
 _PARSE_ERROR = -32700
@@ -190,12 +190,7 @@ def _tool_get_progress(_args: dict[str, Any]) -> dict[str, Any]:
 def _tool_get_deps(_args: dict[str, Any]) -> dict[str, Any]:
     """Which external tools the configured forge needs and whether they are present."""
 
-    config = store.read_json(store.config_path(), {})
-    config = config if isinstance(config, dict) else {}
-    return deps.check_deps(
-        str(config.get("provider") or "github"),
-        str(config.get("host") or ""),
-    )
+    return deps.check_deps()
 
 
 #: Read-only tools, with the minimal schema ``tools/list`` needs. Every one is

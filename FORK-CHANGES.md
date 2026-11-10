@@ -1,66 +1,45 @@
 # Fork-Änderungen gegenüber Upstream
 
-Dieses Dokument inventarisiert alle bekannten fork-spezifischen Anpassungen des
-Repositorys `kiro-crew-for-pi` gegenüber dem Upstream
+Dieses Inventar beschreibt die verbleibenden Anpassungen gegenüber
 [kirodotdev/KiroCrew](https://github.com/kirodotdev/KiroCrew).
 
-Stand: 2026-11-02 · Branch `main` · letzter Sync-Commit `d2ce39a0f3`
+## Verbleibende Fork-Funktionen
 
----
+| Funktion | Abgrenzung | Hauptdateien |
+|---|---|---|
+| **Mistral Vibe** | Zusätzliches ACP-Backend mit Worker-Kit und Effort-Unterstützung; die gemeinsame Backend-Auswahl bleibt Upstream-Infrastruktur. | `src/kiro_crew/agent_sdk/backends.py`, `src/kiro_crew/crewmate_harness.py`, `src/kiro_crew/acp/` |
+| **Chat-Backend-Wähler** | Sichtbare Auswahl und Wechsel-Endpoint pro Chat. Upstreams Backend-Pin beim Erstellen einer Session ersetzt diese Oberfläche nicht vollständig. | `src/kiro_crew/dashboard/chat_backend.py`, `website/src/` |
+| **Meetings-Systemaudio** | System-/Tab-Audio zusätzlich zum Mikrofon; nicht mit Upstreams Mikrofon-Transkription gleichsetzen. | `website/src/apps/meetings/hooks/useMeetingAudio.ts`, `website/src/apps/meetings/components/MeetingAudioControl.tsx` |
+| **Jira im Issue Radar** | Issue-Radar-Integration einschließlich Client und OAuth, nicht bloß eine allgemeine Atlassian-Verbindung. | `src/kiro_crew/apps/builtins/issue_radar/` |
 
-## Eigenentwicklungen
+Vibe besitzt automatisierte Tests. Eine statische Inventarisierung ist keine
+E2E-Paritätszusage für die verbleibenden Funktionen.
 
-| Feature | Beschreibung | Status | Hauptdatei(en) / Beleg |
-|---|---|---|---|
-| **ACP_BACKEND_VIBE** | Mistral Vibe als ACP-Backend: `SelfServedLaunch`-Eintrag, Routing, Label | Erhalten | `src/kiro_crew/agent_sdk/backends.py` (Zeilen 302–3088) |
-| **Chat-lokale Backend-Selektion** | Backend pro Chat wählbar (UI + API); nicht in upstream/main | Erhalten | Commit `743507c7f7`, `src/kiro_crew/dashboard/handlers/agents.py` |
-| **Meetings-Backend** | Vollständiges Meetings-App-Backend (~9 044 Zeilen, kein Upstream-Äquivalent) | Erhalten | `src/kiro_crew/apps/builtins/meetings/` |
-| **Meetings-Frontend Audio** | `MeetingAudioControl.tsx` + `useMeetingAudio.ts` Hooks + Tests | Erhalten | `website/src/apps/meetings/components/MeetingAudioControl.tsx`, `website/src/apps/meetings/hooks/useMeetingAudio.ts`, `website/src/test/` (Commit `7d8677836b`) |
-| **Import-Refactoring agents.py** | `_facade_compose` → `agent_admin.compose` und weitere Handler-Anpassungen | Erhalten | `src/kiro_crew/dashboard/handlers/agents.py` |
-| **ACP_BACKEND_COPILOT entfernt** | `ACP_BACKEND_COPILOT` aus Re-Exports und Selektion entfernt | Erhalten | `src/kiro_crew/acp_backends.py` (Re-Export-Shim) |
+## Gemeinsame Upstream-Funktionen
 
----
-
-## Upstream-Sync-Commits (fork-seitig)
-
-| Commit | Nachricht |
-|---|---|
-| `d2ce39a0f3` | chore: finalize upstream sync compatibility checks |
-| `b4fda851d0` | chore: refresh upstream and remove fork-only sage changes |
-| `24b77f2a9d` | chore: sync upstream main and retain public fork boundaries |
-| `8e24c807e5` | chore: sync upstream main and retain fork backends |
-| `22f92ca889` | NO-ISSUE: integrate upstream main and preserve fork backends |
-
----
-
-## Prüfbedarf
-
-- [ ] `ACP_BACKEND_VIBE` hat noch keinen automatisierten Test (Key Result `kca5404f7` offen)
-- [ ] Meetings-Frontend-Audio in Upstream prüfen (neu, kein PR bekannt)
-- [ ] Chat-lokale Backend-Selektion: Upstream-PR oder upstream/main-Äquivalent prüfen
-
----
-
-## Upstream-PR-Status
-
-Geprueft: 2026-11-02
-
-| Eigenentwicklung | In upstream/main? | Upstream-PR/Issue | Empfehlung |
-|---|---|---|---|
-| ACP_BACKEND_VIBE | Nein | Kein PR/Issue | Erhalten |
-| Chat-lokale Backend-Selektion (acp_backend_override) | Nein | Kein PR/Issue | Erhalten |
-| Meetings-Frontend Audio | Nein | Issue #2814 offen (T2, enhancement) | Beobachten |
-| Meetings-Backend Reduktion | Teilweise | Kein PR | Erhalten (Pi-Hardware) |
-| Import-Refactoring (agent_admin.compose) | Divergenz in agents.py L46 | Kein PR | Erhalten, L46 bei naechstem Sync pruefen |
-| ACP_BACKEND_COPILOT entfernt | Upstream hat Copilot+Strands | Kein PR | Erhalten (Copilot nicht auf Pi verfuegbar) |
+- **Backend-Auswahl pro Bot und Pi-Anbindung** sind Upstream-Funktionen. Die
+  Vibe-Erweiterung bleibt eine zusätzliche Fork-Anpassung.
+- **Auto-Improvement für GitLab** verwendet die Upstream-Implementierung:
+  gemeinsame Profile-/PR-Infrastruktur, `GitLabMRRecipe`, hostgebundenes `glab`
+  und die vorhandene `dashboard.gitlab_hosts`-Allowlist. Es gibt kein separates
+  Fork-Profil `gitlab-repo` und keine parallele GitLab-Recipe mehr.
+- **Meetings-Backend** ist keine eigenständige Fork-Entwicklung und erhält beim
+  Sync keine pauschale `--ours`-Behandlung.
+- **Agent-Handler-Komposition** ist gemeinsame Infrastruktur, keine zu bewahrende
+  Import-Divergenz.
+- **Copilot** ist vorhanden; „Copilot entfernt“ ist kein Fork-Vertrag.
+- **Dateiauslieferung** verwendet die vorhandenen Owner-/Scanner-Pfade. Der
+  ungenutzte Consent-Store, seine API-Routen und seine Hilfsfunktionen entfallen.
+  Vorhandene Dateien im Datenverzeichnis werden dabei nicht gelöscht.
 
 ## Sync-Checkliste
 
-1. src/kiro_crew/agent_sdk/acp_backends.py + src/kiro_crew/acp/harness/__init__.py: nach Merge VIBE manuell restaurieren
-2. src/kiro_crew/dashboard/handlers/agents.py L46: Import-Divergenz pruefen
-3. Meetings-Backend: 5 Dateien mit --ours behalten
-4. Issue #2814 beobachten (Upstream plant Meetings-Audio)
-
----
-
-*Dieses Dokument wird bei jedem Upstream-Sync aktualisiert.*
+1. Upstream in einem isolierten Worktree integrieren, nicht im laufenden Checkout.
+2. Nur die oben abgegrenzten Fork-Funktionen gezielt erhalten; keine vollständigen
+   Handler oder App-Verzeichnisse mit `--ours` einfrieren.
+3. Vibe-Routing und -Tests, Chat-Backend-Auswahl, Meetings-Systemaudio und Jira
+   prüfen, bevor eine verbleibende Anpassung entfernt wird.
+4. GitLab über den gemeinsamen Upstream-Pfad testen, einschließlich selbst
+   gehosteter Hosts und Credential-Isolation.
+5. Build und diff-bezogene Tests prüfen; Merge, Push und Aktivierung bleiben
+   getrennte, ausdrücklich freizugebende Schritte.

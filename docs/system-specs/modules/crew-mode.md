@@ -22,8 +22,8 @@ store.
 
 ## Crew Mode
 
-CrewMate creation and updates validate an explicit `acp_backend` before
-writing the record; an empty value inherits the configured member backend.
+CrewMate creation and updates validate an explicit `acp_backend` against the
+loaded gateway configuration before writing the record; an empty value inherits the configured member backend.
 Model eligibility on creation is checked against the selected backend.
 The profile picker receives the selectable harness list from the gateway,
 including Vibe when it is permitted by the active policy.
@@ -1423,7 +1423,7 @@ or host name. The kickoff carries exactly one language sentence: the preamble's
 in -- the configured `dashboard.language`, else the tab's `X-UI-Lang` header that
 `api.memberGreet` sends -- and left as it is for English or no usable tag
 (`mate_welcome.hidden_turn_language`, `with_language`;
-[config](config.md#the-tag-also-writes-a-crewmates-hidden-turns)); a goal check-in's
+[config](config.md#the-tag-also-writes-a-bots-hidden-turns)); a goal check-in's
 `wake.preamble` sentence is swapped the same way, telling it to follow the user's
 language in the thread. The route answers `{"outcome": ...}` (`started`, `already_greeted`,
 `not_empty`, `busy`, `not_crewmate`, `no_thread`, `not_owed`). A welcome turn that
@@ -3754,7 +3754,7 @@ principles ask for one reply to a burst that adds only what is new. A mate chat
 draws a requeued steer's queue entry as no second bubble: its send already has
 its row. Cancellation is
 not proof a tool or external side effect stopped. The full scheduling and recovery contract is in
-[session](session.md#responsive-human-sends-in-a-mate-dm). Ordinary Sessions
+[session](session.md#responsive-human-sends-in-a-bot-dm). Ordinary Sessions
 and the reply-thread panel's separate reply endpoint retain their behavior.
 
 How it is drawn: the mate's messages form **runs**. A message carries NO

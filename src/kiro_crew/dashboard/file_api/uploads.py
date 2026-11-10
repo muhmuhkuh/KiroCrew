@@ -633,11 +633,7 @@ async def api_directory_upload(request: web.Request) -> web.Response:
     content leaving the workspace toward a third party, which is the opposite
     trust direction from a user dropping their OWN file into their OWN
     workspace, so porting it here would be inventing a new gate rather than
-    reusing an existing one. The ``file_delivery_consent`` module the handlers
-    module already imports is not the missing piece either: its one class
-    (``CLASS_OWNER_DASHBOARD``) gates handing workspace content OUT to the
-    dashboard, so consulting it here would be asking permission for the
-    opposite direction of travel.
+    reusing an existing one.
 
     Unlike ``api_upload_file``'s aggressive ``[^\\w.\\-]`` character
     replacement (harmless there -- every scratch upload is UUID-prefixed and

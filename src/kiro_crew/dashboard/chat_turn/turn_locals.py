@@ -181,6 +181,7 @@ class _ChatTurn:
     _mirror_task_counter: "int"
     _mirror_thread: "str | None"
     _msg: "str"
+    _native_child_tc: "set[str]"
     _native_card_output: "dict[str, list[str]]"
     _native_card_output_len: "dict[str, int]"
     _native_result_seen: "set[str]"

@@ -5,23 +5,33 @@ through a cycle wastes the whole cycle, so the UI asks this up front and can sho
 what to install.
 
 Reports rather than repairs. The upstream version could install its internal
-toolchain packages itself; here the hard dependencies (``git`` plus ``gh`` or
-``glab`` for the selected forge) are things a user installs and authenticates
-deliberately — silently installing an authenticated CLI on someone's behalf is
-not this app's business. Only the optional linter, which is a plain pip package
-in the app's own environment, is offered as an install.
+toolchain packages itself; here the hard dependencies (``git`` plus the forge CLI
+matching the configured target — ``gh`` for GitHub, ``glab`` for GitLab) are
+things a user installs and authenticates deliberately — silently installing an
+authenticated CLI on someone's behalf is not this app's business. Only the
+optional linter, which is a plain pip package in the app's own environment, is
+offered as an install.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
+import sys
+import tempfile
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.sandbox_spawn import scrub_env
 from kiro_crew.security import redact_and_truncate
+from kiro_crew.subprocess_utf8 import UTF8_TEXT
+
+from ..profiles import target_provider
+from ..profiles.gitlab_repo.glab_cli import gitlab_url_host, glab_env
+from ..spine.push_policy import strip_credential_env
+from .clone_setup import PROVIDER_GITHUB, PROVIDER_GITLAB
+from .store import config_path, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -32,55 +42,112 @@ def _which(binary: str) -> str:
     return shutil.which(binary) or ""
 
 
-def _cli_authenticated(
-    binary: str, login_command: str, *, env: dict[str, str] | None = None
+def _forge_cli_authenticated(
+    binary: str, *, host: str = "", env: "dict[str, str] | None" = None
 ) -> tuple[bool, str]:
-    """Whether a provider CLI is present and has a live login."""
+    """Whether a forge CLI (``gh``/``glab``) has a live login.
+
+    Presence on PATH is not enough: an unauthenticated CLI fails only when a
+    pull/merge request is drafted, which is the worst moment to find out. A
+    *host* asks about that host's login alone (``--hostname``).
+    """
     if not _which(binary):
         return False, f"{binary} is not on PATH"
-    kwargs: dict[str, Any] = {
-        "capture_output": True,
-        "text": True,
-        "timeout": _PROBE_TIMEOUT_S,
-    }
-    if env is not None:
-        kwargs["env"] = env
+    argv = [binary, "auth", "status"] + (["--hostname", host] if host else [])
     try:
-        proc = subprocess.run([binary, "auth", "status"], **kwargs)
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=_PROBE_TIMEOUT_S,
+            env=env,
+            **UTF8_TEXT,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"could not run {binary} auth status: {exc}"
     if proc.returncode != 0:
-        return False, f"{binary} is present but not logged in — run `{login_command}`"
+        return False, f"{binary} is present but not logged in — run `{binary} auth login`"
     return True, "authenticated"
 
 
+def gate_pytest_problem() -> str:
+    """Why the gate's interpreter cannot run pytest, or ``""`` when it can.
+
+    Every gate step runs ``sys.executable -m pytest``. A packaged app's bundled
+    interpreter ships without pytest, so without this probe each candidate fails
+    "reproducing test does not collect" and the harness fault is reported as the
+    agent's. Run from an empty directory so no target conftest is loaded, with the
+    environment the gate's own runs get: the scrubbed host environment (so a
+    user-site pytest stays importable) with ``PYTEST_ADDOPTS`` cleared.
+    """
+    env = strip_credential_env(scrub_env())
+    env["PYTEST_ADDOPTS"] = ""
+    try:
+        with tempfile.TemporaryDirectory() as empty:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pytest", "--version"],
+                cwd=empty,
+                env=env,
+                capture_output=True,
+                timeout=_PROBE_TIMEOUT_S,
+                **UTF8_TEXT,
+            )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"could not run {sys.executable} -m pytest: {exc}"
+    if proc.returncode != 0:
+        return (
+            f"pytest is not installed in the interpreter the test gate uses ({sys.executable}), "
+            "so no test can run"
+        )
+    return ""
+
+
 def _gh_authenticated() -> tuple[bool, str]:
-    """Whether ``gh`` has a live login."""
-    return _cli_authenticated("gh", "gh auth login")
+    return _forge_cli_authenticated("gh")
 
 
-def _glab_authenticated(host: str = "") -> tuple[bool, str]:
-    """Whether ``glab`` has a live login for the configured GitLab host."""
-    env: dict[str, str] | None = None
-    if host:
-        env = dict(os.environ)
-        env["GITLAB_HOST"] = host
-    return _cli_authenticated("glab", "glab auth login", env=env)
+def _glab_authenticated(host: str) -> tuple[bool, str]:
+    """``glab``'s login on the target *host* only, with the host-pinned environment.
+
+    An unpinned ``glab auth status`` checks every host in glab's config with the
+    ambient gitlab.com token, so it would send that token to a self-managed host.
+    """
+    if not host:
+        return False, "the GitLab target has no host"
+    return _forge_cli_authenticated("glab", host=host, env=glab_env(host))
 
 
-def check_deps(provider: str = "github", host: str = "") -> dict[str, Any]:
+def _configured_provider() -> str:
+    """The configured target's forge, or ``""`` when no target is configured yet."""
+    cfg = read_json(config_path(), {}) or {}
+    if not str(cfg.get("target_url") or "").strip():
+        return ""
+    return target_provider(cfg)
+
+
+def _configured_host() -> str:
+    """The configured target's canonical GitLab host (port kept), or ``""``."""
+    cfg = read_json(config_path(), {}) or {}
+    return gitlab_url_host(str(cfg.get("target_url") or ""))
+
+
+def check_deps() -> dict[str, Any]:
     """Report every dependency, whether it is satisfied, and how to fix it.
 
     ``required`` entries block a run; an unsatisfied optional entry only narrows
-    what discovery can find.
+    what discovery can find. Only the forge CLI matching the configured target is
+    required — with no target configured yet, neither CLI can block setup.
     """
+    provider = _configured_provider()
     git_path = _which("git")
-    selected_provider = str(provider or "github").lower()
-    cli_id = "glab" if selected_provider == "gitlab" else "gh"
-    cli_name = "GitLab CLI (glab)" if cli_id == "glab" else "GitHub CLI (gh)"
-    cli_login = "glab auth login" if cli_id == "glab" else "gh auth login"
-    cli_ok, cli_detail = _glab_authenticated(host) if cli_id == "glab" else _gh_authenticated()
+    gh_ok, gh_detail = _gh_authenticated()
+    if provider == PROVIDER_GITLAB:
+        glab_ok, glab_detail = _glab_authenticated(_configured_host())
+    else:
+        # glab's login is checked only for a GitLab target, against that host.
+        glab_path = _which("glab")
+        glab_ok, glab_detail = bool(glab_path), glab_path or "glab is not on PATH"
     ruff_path = _which("ruff")
+    pytest_problem = gate_pytest_problem()
 
     deps: list[dict[str, Any]] = [
         {
@@ -93,12 +160,30 @@ def check_deps(provider: str = "github", host: str = "") -> dict[str, Any]:
             "installable": False,
         },
         {
-            "id": cli_id,
-            "name": cli_name,
+            "id": "gh",
+            "name": "GitHub CLI (gh)",
+            "required": provider == PROVIDER_GITHUB,
+            "ok": gh_ok,
+            "detail": gh_detail,
+            "fix": "install the GitHub CLI, then run `gh auth login`",
+            "installable": False,
+        },
+        {
+            "id": "pytest",
+            "name": "pytest (runs the target's tests)",
             "required": True,
-            "ok": cli_ok,
-            "detail": cli_detail,
-            "fix": f"install the {cli_name}, then run `{cli_login}`",
+            "ok": not pytest_problem,
+            "detail": pytest_problem or sys.executable,
+            "fix": "run Kiro Crew from a Python environment that has pytest installed",
+            "installable": False,
+        },
+        {
+            "id": "glab",
+            "name": "GitLab CLI (glab)",
+            "required": provider == PROVIDER_GITLAB,
+            "ok": glab_ok,
+            "detail": glab_detail,
+            "fix": "install the GitLab CLI, then run `glab auth login`",
             "installable": False,
         },
         {

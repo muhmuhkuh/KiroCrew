@@ -4,7 +4,7 @@
 
 The work ledger's `max_depth` default (2), accepted bounds (2–10), and setting
 name (`work_ledger.max_depth`) live in the import-light `work_vocab` module,
-shared by the configuration section, its builder, and the ledger guards.
+defined once and shared by the configuration section, its builder, and the ledger guards.
 `KiroCrewConfig` loads and serializes `work_ledger` and `power` through their
 section builders. The agent DTO declares `crew_mode_agent`, and the dashboard
 DTO declares the persisted `translucent_panels` choice, so their builders

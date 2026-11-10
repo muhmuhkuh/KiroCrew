@@ -10,11 +10,9 @@
 src/kiro_crew/acp/worker_pool.py
 src/kiro_crew/apps/app_storage.py
 src/kiro_crew/apps/backend.py
-src/kiro_crew/apps/builtins/auto_improvement/backend/routes.py
 src/kiro_crew/apps/builtins/auto_improvement/spine/gate.py
 src/kiro_crew/apps/builtins/auto_improvement/tests/test_data_home_isolation.py
 src/kiro_crew/apps/builtins/auto_improvement/tests/test_dogfood_learnings.py
-src/kiro_crew/apps/builtins/auto_improvement/tests/test_finding_detail.py
 src/kiro_crew/apps/builtins/auto_improvement/tests/test_github_profile.py
 src/kiro_crew/apps/builtins/auto_improvement/tests/test_lint_findings.py
 src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_checks.py
@@ -246,8 +244,6 @@ test/test_acp_prompt_blocks.py
 test/test_acp_true_provider_error.py
 test/test_agent_discovery.py
 test/test_agent_source_ownership_durability.py
-test/test_ai_agent_runner_coverage.py
-test/test_ai_backend_routes_coverage.py
 test/test_api_agents_order.py
 test/test_api_file_diff.py
 test/test_api_input_validation.py
@@ -315,9 +311,7 @@ test/test_bench_scorers.py
 test/test_bench_windows_symlink.py
 test/test_bootstrap.py
 test/test_brand_name_gate.py
-test/test_browser_cli_snapshots.py
 test/test_browser_recording_skill.py
-test/test_bug_proposal_skip_status_default.py
 test/test_bug_validation_send_message_schema.py
 test/test_build_desktop_launcher_symlink.py
 test/test_build_desktop_rm_resilient.py
@@ -602,7 +596,6 @@ test/test_notification_legacy_actions.py
 test/test_notification_phase5.py
 test/test_notifications_push.py
 test/test_official_catalog.py
-test/test_omc_ledger_sync_coverage.py
 test/test_onboarding_import.py
 test/test_one_conversation_one_session.py
 test/test_open_dm_retry.py
@@ -652,11 +645,9 @@ test/test_resource_health_endpoint.py
 test/test_resource_pressure_notify.py
 test/test_reveal_in_file_manager.py
 test/test_reveal_path.py
-test/test_review_driver_loopback.py
 test/test_route_registry.py
 test/test_run_config_write.py
 test/test_safety_override.py
-test/test_sage_backend_routes_coverage.py
 test/test_sandbox_backend_cache.py
 test/test_sandbox_default_fix.py
 test/test_sandbox_first_party_exec.py
@@ -753,7 +744,6 @@ test/test_turn_duration_slack.py
 test/test_turn_duration_task_runner.py
 test/test_turn_duration_workflow.py
 test/test_update_venv_detection.py
-test/test_use_builtin_browser_config.py
 test/test_user_resolution_fallback.py
 test/test_validation.py
 test/test_validation_user_actions.py

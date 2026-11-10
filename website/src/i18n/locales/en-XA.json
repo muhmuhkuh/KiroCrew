@@ -212,7 +212,7 @@
         "configuration_1": "[Ţĥè ğàţèẁàý ĥøşţ ñèèðş ğìţ àñð àñ àùţĥèñţìçàţèð ğĥ ÇĹÌ; çøññèçţ à ĞìţĤùƀ ŕèþøşìţøŕý, çĥøøşè ìţş ƀàşè ƀŕàñçĥ, àñð çàĺìƀŕàţè à ŕùĺèŕ ƀèƒøŕè þèŕƒøŕɱàñçè ŕùñş. ···············································]"
       },
       "setupPanel": {
-        "https_github_com_owner_repo": "[https://github.com/owner/repo]"
+        "repo_url_placeholder": "[https://github.com/owner/repo or https://gitlab.com/group/project]"
       }
     },
     "autoResearch": {

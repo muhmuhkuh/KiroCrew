@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from aiohttp import web
-from kiro_crew import file_delivery_consent  # noqa: F401
 
 if TYPE_CHECKING:
     from kiro_crew.dashboard.handlers.files import (
@@ -302,79 +301,6 @@ def _caller_is_owner(request: web.Request) -> bool:
     )
 
     return bool(is_owner_dashboard_request(request))
-
-
-async def _owner_grant_releases_flagged(request: web.Request) -> bool:
-    """Whether the owner's ``owner_dashboard`` grant releases flagged bytes to THIS caller.
-
-    The one test every owner-facing download route applies to a file the scanner
-    flagged: ``GET /api/outbox/{filename}`` and ``GET /api/file-download`` serve the
-    same audience, so they share one gate rather than two copies of it. Call it only
-    inside a flagged-content branch, so a clean file never touches the store.
-
-    The store read goes through ``asyncio.to_thread``: ``is_granted`` ends in a
-    synchronous file read, and a coroutine that waits on storage stalls the whole
-    gateway event loop.
-
-    TWO conjuncts, and the second is not redundant. A route absent from every
-    ``token_auth`` bypass list needs AUTHENTICATION, which is not OWNER IDENTITY. A
-    Slack allow-listed non-owner running ``!dashboard`` authenticates with
-    ``app == ""`` and ``sub != owner_id``, so ordinary token auth admits them while
-    ``is_owner_dashboard_request`` does not. Without the owner conjunct the grant
-    would convert a clean 400-for-everyone into raw bytes for every authenticated
-    caller -- widening the audience as a side effect of a control meant to narrow
-    it. A route with its own front owner gate still asks here, so the grant's
-    audience never depends on each caller remembering that gate.
-    """
-    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
-        is_owner_dashboard_request,
-    )
-
-    granted = await asyncio.to_thread(
-        file_delivery_consent.is_granted, file_delivery_consent.CLASS_OWNER_DASHBOARD
-    )
-    return granted and is_owner_dashboard_request(request)
-
-
-def _audit_owner_grant_refusal(request: web.Request, *, name: str, what: str) -> None:
-    """Record a flagged download the grant gate refused, naming the conjunct that refused.
-
-    *what* names the scan that tripped (``"flagged content"`` or ``"flagged binary
-    content"``). The reason then says which conjunct stopped it.
-
-    Identity is the discriminator, not the grant. The conjunction short-circuits, so
-    in the default no-grant state a non-owner is refused before identity is ever
-    examined; an entry keyed off the grant would record a Slack allow-listed
-    non-owner reaching for a flagged file as an ordinary scanner hold-back,
-    byte-identical to the owner's own -- losing the attribution exactly in the
-    configuration almost every install runs. The identity read is pure attribute
-    reads, so unlike the grant it needs no thread.
-    """
-    from kiro_crew.dashboard.handlers.source_providers import (  # lazy: import cycle
-        is_owner_dashboard_request,
-    )
-
-    cross_principal = not is_owner_dashboard_request(request)
-    file_delivery_consent.audit_refusal(
-        file_delivery_consent.CLASS_OWNER_DASHBOARD,
-        leg="download",
-        name=name,
-        reason=f"{what}, non-owner caller" if cross_principal else f"{what}, no grant",
-        caller=str(request.get("user") or "unknown") if cross_principal else "",
-    )
-
-
-def _audit_consented_download(name: str) -> None:
-    """Record that flagged bytes left for the owner's browser under the grant.
-
-    The refusal this replaces is self-evident in the 400, whereas a successful
-    consented download would otherwise leave no trace.
-    """
-    file_delivery_consent.audit_decision(
-        file_delivery_consent.CLASS_OWNER_DASHBOARD,
-        outcome="delivered",
-        detail=f"download: {name}",
-    )
 
 
 async def api_outbox_download(request: web.Request) -> web.StreamResponse:

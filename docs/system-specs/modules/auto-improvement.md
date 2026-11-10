@@ -7,11 +7,11 @@
 > This spec describes internals.
 
 Auto-Improvement is an opt-in (`defaultEnabled: false`) built-in app that runs a
-measurement-first self-improvement loop against a GitHub repository. It calibrates
+measurement-first self-improvement loop against a GitHub or GitLab repository. It calibrates
 a metric (the "ruler"), **proves** the metric can detect a known win, and only
 then runs keep-or-revert improvement cycles. Candidates that survive a
 deterministic gate and an A/B (or RED/GREEN) measurement are opened as **draft**
-GitHub pull requests for human review.
+GitHub pull requests or GitLab merge requests for human review.
 
 The load-bearing design property is that every *decision* is deterministic Python
 and every *proposal* is an agent: the agent writes candidate fixes, and the gate,
@@ -21,6 +21,10 @@ own work.
 The app's origin as a port of an upstream app, and the design decisions the port
 made, are recorded in
 [`PORT_PLAN.md`](../../../src/kiro_crew/apps/builtins/auto_improvement/docs/PORT_PLAN.md).
+
+Runs and calibration refuse synchronously when the gate interpreter cannot run
+pytest. Calibration captures the stop sequence before that probe and rechecks
+it before starting its worker, so a stop during the probe cancels admission.
 
 ## Routes
 
@@ -132,7 +136,7 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Control | Where | Behavior |
 |---|---|---|
 | Push-disabled clone | `backend/clone_setup.py:_disable_push` + `profiles/github_repo/profile.py:RepoIsolation.push_disabled` | **Every** configured fetch/push URL is replaced with exactly one `DISABLED_NO_PUSH` value; setup and runtime fail closed on extra values. The real remote lives in config (`origin_url`), handed only to trusted publishers |
-| Draft-only PRs | `profiles/github_repo/pr_recipe.py` | `gh pr create --draft`; never `--web`, merge, ready, or auto-merge |
+| Draft-only PRs/MRs | `profiles/pr_recipe_base.py`, `profiles/github_repo/pr_recipe.py`, `profiles/gitlab_repo/mr_recipe.py` | `gh pr create --draft` or `glab mr create --draft`; never `--web`, merge, ready, or auto-merge |
 | Generated head branch | same | `auto-improvement/<kind>-<fingerprint>`; never a human's branch |
 | Protected-branch denylist | `spine/push_policy.py` | non-overridable; a hand-edited config cannot widen it |
 | Edit allowlist | `spine/gate.py` + profile | ruler/harness/tests/auth are mechanically off-limits |
@@ -147,6 +151,18 @@ and never drive the verdict, or one flaky optional job would nudge forever.
 | Pre-push content scan | `spine/push_policy.py:scan_content_for_secrets` | ONE scanner behind all three exits — draft-PR push, F10 direct push, one-click commit. The full pushed range is scanned; a hit **refuses** the push and the change stays in the local queue; **fail-closed** |
 | Audited subprocess agent (NOT SELECTED) | `spine/agent_runner.py:_audit_unattended_agent` | same — retained for a future caller. The `claude -p` path passes `--dangerously-skip-permissions`, so the launch is one blanket approval — logged `critical=True` before the spawn, and an unwritable audit REFUSES to launch |
 | Redacted PR prose | same, `_redact_prose` | title and description are redacted (prose survives rewriting; a diff does not) |
+
+### Shared GitHub/GitLab integration
+
+`profiles.build_profile` uses the shared `github-repo` profile for both providers;
+`build_pr_recipe` selects `GitHubPRRecipe` or `GitLabMRRecipe`. Shared git,
+redaction and publication checks live in `profiles/pr_recipe_base.py`. GitLab
+accepts gitlab.com and exact entries in `dashboard.gitlab_hosts`; synchronous
+validators reuse `source_providers.hosts.gitlab_hosts_blocking` off the event
+loop. All `glab` calls pin the validated host and withhold ambient SaaS tokens
+from self-managed hosts. Existing stored GitLab targets are detected from their
+`target_url`, not from a separate profile id. Watchers use canonical URL paths
+to distinguish merge requests from GitHub repositories named `merge_requests`.
 
 ### Clone setup and reuse contract
 

@@ -8,13 +8,13 @@ import re as _re
 from dataclasses import dataclass, field
 from typing import Any
 
-from kiro_crew.acp.tool_name_normalization import _normalize_to_kebab
-
 # The ``_session/steering`` readers, re-exported for existing importers.
 from kiro_crew.acp.steering_wire import (  # noqa: F401
     steering_advertised,
     steering_outcome,
 )
+from kiro_crew.acp.tool_name_normalization import _normalize_to_kebab
+
 # Backend identifiers, the capability sets and the selectable registry live in the
 # leaf module
 # ``kiro_crew.acp_backends`` (it imports nothing from this package, which is what

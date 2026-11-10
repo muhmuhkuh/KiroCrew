@@ -44,7 +44,7 @@ from kiro_crew.acp.mcp_session_report import ERROR_CAP as MCP_REPORT_ERROR_CAP
 from kiro_crew.acp.mcp_session_report import NAME_CAP as MCP_REPORT_NAME_CAP
 from kiro_crew.acp.mcp_session_report import McpSessionReport, sanitize_sink_text
 from kiro_crew.acp.mcp_startable import PrunedServer, prune_unstartable
-from kiro_crew.acp.session_mcp import ToolsAllowlist, agent_spec_snapshot
+from kiro_crew.acp.session_mcp import agent_spec_snapshot
 from kiro_crew.acp.session_mcp_crewmate import worker_array_outruns_seed
 from kiro_crew.acp.spec_tools_allowlists import (
     session_allowlist_spec,
@@ -1426,93 +1426,3 @@ def _harness_mcp_server_names(self: AcpClient) -> tuple[str, ...]:
     found = getattr(self, "_opencode_config_mcp_servers", ())
     handed_off = getattr(self, "_pi_mcp_server_names", ())
     return tuple(dict.fromkeys([*self._placed_mcp_server_names(), *found, *handed_off]))
-
-
-def _copilot_session_mcp_servers(self: AcpClient) -> list:
-    """MCP server array passed to a Copilot CLI ``session/new`` / ``session/load``.
-
-    The copilot twin of :meth:`_deepseek_session_mcp_servers`: ``copilot --acp``
-    reads no ``~/.kiro/agents/<name>.json``, and with copilot in ``MIRRORS``
-    :meth:`_pooled_mcp_servers` answers ``[]`` for it, so this array is the only
-    route for Crew's own tools, the spec's servers and a member session's own
-    mounts. The stdio element is measured end to end for this harness
-    (``test/fixtures/acp_frames/copilot/mcp-stdio-mount-live.jsonl``).
-
-    In-memory only. The spawn path warms ``_session_mcp_cache`` off the loop, so
-    this accessor adds no scheduling or failure point to a call site shared with
-    kiro-cli (harness-parity H13).
-    """
-    return self._session_mcp_servers()
-
-
-async def _discard_copilot_mcp_config(self: AcpClient) -> None:
-    """Remove this session's Copilot CLI launch MCP config and forget it.
-
-    Copilot CLI reads the file when its process starts, so once the session exists
-    nothing reads it again, and it carries a session credential. Off-loop: an unlink.
-    """
-    from kiro_crew.acp.harness.copilot import discard_copilot_mcp_config
-
-    path = getattr(self, "_copilot_mcp_config_path", "")
-    self._copilot_mcp_config_path = ""
-    if path:
-        await asyncio.to_thread(discard_copilot_mcp_config, path)
-
-
-def spec_is_toolless(spec: object) -> bool:
-    """True when *spec* mounts nothing: no tool, no grant, no MCP server, no hook.
-
-    All must hold: ``tools`` is an empty list; ``allowedTools`` is absent or an
-    empty list; ``mcpServers`` is absent or an empty object; ``hooks``,
-    ``permissions`` and ``toolsSettings`` are absent or empty; ``includePowers``
-    is absent or ``False`` (KAS reads an absent one as False); and
-    ``includeMcpJson`` is exactly ``False`` (kiro-cli defaults it to True and would
-    then start every server in the user-level ``mcp.json``). An empty ``tools``
-    alone is not enough: a server listed under ``mcpServers`` is still started, a
-    hook still runs a command, and either include flag widens the visible tools
-    (``acp.kas_agents`` forwards both), in a turn that must run none.
-
-    Fails closed: a non-dict and any key of the wrong type answer False.
-    """
-    if not isinstance(spec, dict):
-        return False
-    tools = spec.get("tools")
-    if not (isinstance(tools, list) and not tools):
-        return False
-    if "allowedTools" in spec and not (
-        isinstance(spec["allowedTools"], list) and not spec["allowedTools"]
-    ):
-        return False
-    if "mcpServers" in spec and not (
-        isinstance(spec["mcpServers"], dict) and not spec["mcpServers"]
-    ):
-        return False
-    for key in ("hooks", "permissions", "toolsSettings"):
-        if key in spec and not (isinstance(spec[key], (dict, list)) and not spec[key]):
-            return False
-    if "includePowers" in spec and spec["includePowers"] is not False:
-        return False
-    return spec.get("includeMcpJson") is False
-
-
-def authored_agent_spec_is_toolless(agent: str, work_dir: Any = None) -> bool:
-    """True when the authored spec *agent* resolves to in *work_dir* is :func:`spec_is_toolless`.
-
-    Reads the spec through :func:`agent_spec_snapshot`, project checkout first and
-    user level second, which is the order the harness resolves ``--agent`` in, so
-    a project-level spec that shadows the installed one is the one judged. Needs no
-    client, so a caller can take the pre-spawn read before any session exists.
-
-    Blocking (reads the spec); async callers run it with ``asyncio.to_thread``.
-    Fails closed: an unreadable spec answers False.
-    """
-    try:
-        spec = agent_spec_snapshot(agent, work_dir=work_dir)
-    except Exception:
-        logger.warning(
-            "agent spec for %r unreadable; not confirming zero tools",
-            agent,
-            exc_info=True,
-        )
-        return False
-    return spec_is_toolless(spec)

@@ -78,8 +78,8 @@ from kiro_crew.acp.kas_app_identity import (
     without_noop_restrictions,
 )
 from kiro_crew.acp.kas_auto_approve import auto_approve_refs
-from kiro_crew.acp.kas_hoist_compat import hoist_managed_servers  # noqa: F401
 from kiro_crew.acp.kas_env_literals import _loggable_key_names, _relayable_literal
+from kiro_crew.acp.kas_hoist_compat import hoist_managed_servers  # noqa: F401
 from kiro_crew.acp.kas_permissions import (
     CREW_ANSWERED_BUILTINS_KEY,
     CREW_ANSWERED_COMMANDS_KEY,
